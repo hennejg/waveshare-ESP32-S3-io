@@ -1,13 +1,16 @@
 #include <nvs_flash.h>
 #include <esp_log.h>
+#include <esp_spiffs.h>
 #include <wifi_config.h>
+#include "app_config.h"
+#include "web_server.h"
 
 static const char *TAG = "main";
 
 static void on_wifi_ready(void)
 {
-    ESP_LOGI(TAG, "WiFi connected — starting application");
-    /* Add application logic here */
+    ESP_LOGI(TAG, "WiFi connected — starting web server");
+    ESP_ERROR_CHECK(web_server_start());
 }
 
 void app_main(void)
@@ -19,7 +22,17 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    /* First boot: starts SoftAP "Waveshare-Setup" for browser-based WiFi config.
-       Subsequent boots: reconnects to saved credentials and calls on_wifi_ready. */
+    ESP_ERROR_CHECK(app_config_init());
+
+    esp_vfs_spiffs_conf_t spiffs = {
+        .base_path              = "/www",
+        .partition_label        = "storage",
+        .max_files              = 8,
+        .format_if_mount_failed = false,
+    };
+    ESP_ERROR_CHECK(esp_vfs_spiffs_register(&spiffs));
+
+    /* First boot: SoftAP "Waveshare-Setup" → captive portal → save credentials.
+       Subsequent boots: reconnects and calls on_wifi_ready. */
     wifi_config_init("Waveshare-Setup", NULL, on_wifi_ready);
 }
