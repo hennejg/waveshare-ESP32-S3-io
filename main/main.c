@@ -3,6 +3,7 @@
 #include <esp_spiffs.h>
 #include <wifi_config.h>
 #include "app_config.h"
+#include "button.h"
 #include "web_server.h"
 
 static const char *TAG = "main";
@@ -23,6 +24,7 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     ESP_ERROR_CHECK(app_config_init());
+    button_init();
 
     esp_vfs_spiffs_conf_t spiffs = {
         .base_path              = "/www",
