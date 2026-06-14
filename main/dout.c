@@ -115,9 +115,12 @@ bool dout_get(uint8_t n)
 esp_err_t dout_set(uint8_t n, bool state)
 {
     if (n >= NUM_DO) return ESP_ERR_INVALID_ARG;
+    bool changed = (s_state[n] != state);
     s_state[n] = state;
     esp_err_t ret = write_outputs();
-    if (ret == ESP_OK && app_mqtt_is_connected()) publish_one(n);
+    /* Only publish when the state changed — avoids an infinite echo loop
+       caused by receiving our own confirmations back from the broker. */
+    if (ret == ESP_OK && changed && app_mqtt_is_connected()) publish_one(n);
     return ret;
 }
 
