@@ -81,6 +81,7 @@ Output state is driven by bit-level writes to the TCA9554 output port register. 
 |--------------|-----------------|
 | On / true    | `true`, `1`, `high`, `on` |
 | Off / false  | `false`, `0`, `low`, `off` |
+| Toggle       | `toggle` |
 
 ### State topics (published)
 

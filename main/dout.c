@@ -42,6 +42,16 @@ static bool parse_payload(const char *data, size_t len, bool *out)
     return false;
 }
 
+static bool parse_toggle(const char *data, size_t len)
+{
+    char buf[8];
+    if (len == 0 || len >= sizeof(buf)) return false;
+    memcpy(buf, data, len);
+    buf[len] = '\0';
+    for (size_t i = 0; i < len; i++) buf[i] = (char)tolower((unsigned char)buf[i]);
+    return !strcmp(buf, "toggle");
+}
+
 /* Build the physical output byte and write it to the TCA9554. */
 static esp_err_t write_outputs(void)
 {
@@ -146,9 +156,12 @@ void dout_on_mqtt_message(const char *topic, size_t tlen,
         uint8_t ch = (uint8_t)topic[tlen - 1];
         if (ch >= '1' && ch <= '8' &&
             memcmp(topic + tlen - os - 1, OUT_SUFFIX, os) == 0) {
+            uint8_t n = (uint8_t)(ch - '1');
             bool state;
-            if (parse_payload(data, dlen, &state)) {
-                dout_set((uint8_t)(ch - '1'), state);
+            if (parse_toggle(data, dlen)) {
+                dout_set(n, !dout_get(n));
+            } else if (parse_payload(data, dlen, &state)) {
+                dout_set(n, state);
             } else {
                 ESP_LOGW(TAG, "Unrecognised payload for output/%c", ch);
             }
