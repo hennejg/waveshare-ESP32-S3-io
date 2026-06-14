@@ -1,5 +1,6 @@
 #include <nvs_flash.h>
 #include <esp_log.h>
+#include <esp_netif.h>
 #include <esp_spiffs.h>
 #include <wifi_config.h>
 #include "app_config.h"
@@ -37,4 +38,12 @@ void app_main(void)
     /* First boot: SoftAP "Waveshare-Setup" → captive portal → save credentials.
        Subsequent boots: reconnects and calls on_wifi_ready. */
     wifi_config_init("Waveshare-Setup", NULL, on_wifi_ready);
+
+    /* wifi_config_init creates the STA netif synchronously; DHCP only starts
+       once WiFi associates, so setting the hostname here reaches the first
+       DHCP DISCOVER. */
+    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta) {
+        esp_netif_set_hostname(sta, app_config_get()->device_name);
+    }
 }

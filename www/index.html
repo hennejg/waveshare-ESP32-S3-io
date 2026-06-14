@@ -7,12 +7,14 @@
   <style>
     *, *::before, *::after { box-sizing: border-box; }
     body { font-family: system-ui, sans-serif; max-width: 560px; margin: 2rem auto; padding: 0 1rem; color: #222; }
-    h1 { font-size: 1.4rem; margin-bottom: 1.5rem; }
-    label { display: block; margin-top: 1.2rem; font-size: 0.85rem; font-weight: 600; color: #555; }
-    input[type="text"], input[type="number"] {
+    h1 { font-size: 1.4rem; margin-bottom: 0.5rem; }
+    h2 { font-size: 1rem; color: #555; border-bottom: 1px solid #ddd; padding-bottom: 0.3rem; margin: 1.8rem 0 0.8rem; }
+    label { display: block; margin-top: 1rem; font-size: 0.85rem; font-weight: 600; color: #555; }
+    input[type="text"], input[type="password"], input[type="url"] {
       width: 100%; margin-top: 0.3rem; padding: 0.5rem 0.6rem;
       border: 1px solid #ccc; border-radius: 4px; font-size: 1rem;
     }
+    .hint { font-size: 0.78rem; color: #888; margin-top: 0.25rem; }
     button {
       margin-top: 1.8rem; padding: 0.6rem 1.6rem;
       background: #1a73e8; color: #fff; border: none; border-radius: 4px;
@@ -27,10 +29,29 @@
 <body>
   <h1>Device Configuration</h1>
   <form id="form">
+
+    <h2>Device</h2>
     <label>Device Name
       <input type="text" id="device_name" maxlength="31" required>
     </label>
-    <!-- Add further fields here; mirror them in app_config.h and the REST handlers -->
+    <p class="hint">Used as DHCP hostname. Alphanumeric and hyphens only.</p>
+
+    <h2>MQTT Broker</h2>
+    <label>Broker URL
+      <input type="text" id="mqtt_url" maxlength="127" placeholder="mqtt://broker.example.com:1883">
+    </label>
+    <label>Username
+      <input type="text" id="mqtt_user" maxlength="63" autocomplete="username">
+    </label>
+    <label>Password
+      <input type="password" id="mqtt_password" maxlength="63" autocomplete="current-password"
+             placeholder="(leave blank to keep current)">
+    </label>
+    <p class="hint" id="pass_hint"></p>
+    <label>Topic Prefix
+      <input type="text" id="mqtt_topic_prefix" maxlength="63" placeholder="home/boat">
+    </label>
+
     <button type="submit" id="btn">Save</button>
   </form>
   <p id="status"></p>
@@ -42,9 +63,14 @@
     async function load() {
       try {
         const r = await fetch('/api/config');
-        if (!r.ok) throw new Error(r.status);
+        if (!r.ok) throw new Error('HTTP ' + r.status);
         const cfg = await r.json();
-        document.getElementById('device_name').value = cfg.device_name ?? '';
+        document.getElementById('device_name').value       = cfg.device_name ?? '';
+        document.getElementById('mqtt_url').value          = cfg.mqtt_url ?? '';
+        document.getElementById('mqtt_user').value         = cfg.mqtt_user ?? '';
+        document.getElementById('mqtt_topic_prefix').value = cfg.mqtt_topic_prefix ?? '';
+        document.getElementById('pass_hint').textContent   =
+          cfg.mqtt_password_set ? 'Password is set.' : 'No password stored.';
       } catch (e) {
         status.className = 'err';
         status.textContent = 'Failed to load config: ' + e.message;
@@ -57,7 +83,11 @@
       status.textContent = '';
       try {
         const cfg = {
-          device_name: document.getElementById('device_name').value.trim(),
+          device_name:       document.getElementById('device_name').value.trim(),
+          mqtt_url:          document.getElementById('mqtt_url').value.trim(),
+          mqtt_user:         document.getElementById('mqtt_user').value,
+          mqtt_password:     document.getElementById('mqtt_password').value,
+          mqtt_topic_prefix: document.getElementById('mqtt_topic_prefix').value.trim(),
         };
         const r = await fetch('/api/config', {
           method: 'POST',
@@ -65,8 +95,15 @@
           body: JSON.stringify(cfg),
         });
         const res = await r.json();
-        status.className = res.status === 'ok' ? 'ok' : 'err';
-        status.textContent = res.status === 'ok' ? 'Saved.' : 'Error: ' + JSON.stringify(res);
+        if (res.status === 'ok') {
+          status.className = 'ok';
+          status.textContent = 'Saved.';
+          document.getElementById('mqtt_password').value = '';
+          load(); // refresh password_set indicator
+        } else {
+          status.className = 'err';
+          status.textContent = 'Error: ' + JSON.stringify(res);
+        }
       } catch (e) {
         status.className = 'err';
         status.textContent = 'Save failed: ' + e.message;

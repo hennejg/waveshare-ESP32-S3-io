@@ -56,11 +56,20 @@ static bool json_get_str(const char *json, const char *key,
 static esp_err_t api_config_get(httpd_req_t *req)
 {
     const app_config_t *cfg = app_config_get();
-    char json[256];
-    /* Mirror new fields here when extending app_config_t. */
+    char json[512];
+    /* mqtt_password is intentionally omitted — never expose credentials via GET.
+       The UI password field always starts blank; a non-empty POST value updates it. */
     int len = snprintf(json, sizeof(json),
-        "{\"device_name\":\"%s\"}",
-        cfg->device_name);
+        "{\"device_name\":\"%.31s\","
+        "\"mqtt_url\":\"%.127s\","
+        "\"mqtt_user\":\"%.63s\","
+        "\"mqtt_password_set\":%s,"
+        "\"mqtt_topic_prefix\":\"%.63s\"}",
+        cfg->device_name,
+        cfg->mqtt_url,
+        cfg->mqtt_user,
+        cfg->mqtt_password[0] ? "true" : "false",
+        cfg->mqtt_topic_prefix);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, len);
@@ -91,8 +100,16 @@ static esp_err_t api_config_post(httpd_req_t *req)
     app_config_t cfg;
     memcpy(&cfg, app_config_get(), sizeof(cfg));
 
-    /* Mirror new fields here when extending app_config_t. */
-    json_get_str(body, "device_name", cfg.device_name, sizeof(cfg.device_name));
+    json_get_str(body, "device_name",      cfg.device_name,       sizeof(cfg.device_name));
+    json_get_str(body, "mqtt_url",         cfg.mqtt_url,          sizeof(cfg.mqtt_url));
+    json_get_str(body, "mqtt_user",        cfg.mqtt_user,         sizeof(cfg.mqtt_user));
+    json_get_str(body, "mqtt_topic_prefix",cfg.mqtt_topic_prefix, sizeof(cfg.mqtt_topic_prefix));
+
+    /* Only update the password if a non-empty value was posted. */
+    char new_pass[APP_CFG_MQTT_PASS_LEN] = "";
+    if (json_get_str(body, "mqtt_password", new_pass, sizeof(new_pass)) && new_pass[0]) {
+        strlcpy(cfg.mqtt_password, new_pass, sizeof(cfg.mqtt_password));
+    }
 
     free(body);
     app_config_update(&cfg);
