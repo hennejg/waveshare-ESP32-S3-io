@@ -63,6 +63,13 @@
     </table>
     <p class="hint">Invert: checked = active-low (GPIO low → <code>true</code>).</p>
 
+    <h2>Digital Outputs</h2>
+    <table>
+      <thead><tr><th>Output</th><th>Invert</th></tr></thead>
+      <tbody id="dout-table"></tbody>
+    </table>
+    <p class="hint">Invert: checked = physical output bit flipped relative to logical state.</p>
+
     <button type="submit" id="btn">Save</button>
   </form>
   <p id="status"></p>
@@ -70,14 +77,21 @@
   <script>
     const status = document.getElementById('status');
     const btn    = document.getElementById('btn');
-    const diTbl  = document.getElementById('di-table');
+    const diTbl   = document.getElementById('di-table');
+    const doutTbl = document.getElementById('dout-table');
 
-    /* Build the 8 DI rows once */
+    /* Build the 8 DI and DO rows once */
     for (let i = 0; i < 8; i++) {
       const tr = document.createElement('tr');
       tr.innerHTML = `<td>DI${i + 1}</td>` +
         `<td><input type="checkbox" id="di_${i}_invert"></td>`;
       diTbl.appendChild(tr);
+    }
+    for (let i = 0; i < 8; i++) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>DO${i + 1}</td>` +
+        `<td><input type="checkbox" id="dout_${i}_invert"></td>`;
+      doutTbl.appendChild(tr);
     }
 
     async function load() {
@@ -95,6 +109,10 @@
           const el = document.getElementById(`di_${i}_invert`);
           if (el) el.checked = !!di.invert;
         });
+        (cfg.dout ?? []).forEach((dout, i) => {
+          const el = document.getElementById(`dout_${i}_invert`);
+          if (el) el.checked = !!dout.invert;
+        });
       } catch (e) {
         status.className = 'err';
         status.textContent = 'Failed to load config: ' + e.message;
@@ -110,6 +128,10 @@
         for (let i = 0; i < 8; i++) {
           di.push({ invert: document.getElementById(`di_${i}_invert`).checked });
         }
+        const dout = [];
+        for (let i = 0; i < 8; i++) {
+          dout.push({ invert: document.getElementById(`dout_${i}_invert`).checked });
+        }
         const cfg = {
           device_name:       document.getElementById('device_name').value.trim(),
           mqtt_url:          document.getElementById('mqtt_url').value.trim(),
@@ -117,6 +139,7 @@
           mqtt_password:     document.getElementById('mqtt_password').value,
           mqtt_topic_prefix: document.getElementById('mqtt_topic_prefix').value.trim(),
           di,
+          dout,
         };
         const r = await fetch('/api/config', {
           method: 'POST',

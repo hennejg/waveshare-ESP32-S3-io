@@ -1,6 +1,7 @@
 #include "web_server.h"
 #include "app_config.h"
 #include "di.h"
+#include "dout.h"
 
 #include <stdio.h>
 #include <stdbool.h>
@@ -87,6 +88,25 @@ static void json_parse_di(const char *json, di_config_t out[APP_CFG_DI_COUNT])
     }
 }
 
+static void json_parse_dout(const char *json, di_config_t out[APP_CFG_DO_COUNT])
+{
+    const char *p = strstr(json, "\"dout\":[");
+    if (!p) return;
+    p += 8;
+    for (int i = 0; i < APP_CFG_DO_COUNT; i++) {
+        const char *ob = strchr(p, '{');
+        const char *cb = ob ? strchr(ob, '}') : NULL;
+        if (!ob || !cb) return;
+        char buf[128];
+        size_t n = (size_t)(cb - ob);
+        if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+        memcpy(buf, ob, n);
+        buf[n] = '\0';
+        json_get_bool(buf, "invert", &out[i].invert);
+        p = cb + 1;
+    }
+}
+
 /* ----------------------------------------------------------------- /api/config */
 
 static esp_err_t api_config_get(httpd_req_t *req)
@@ -104,21 +124,34 @@ static esp_err_t api_config_get(httpd_req_t *req)
     }
     snprintf(di_arr + da, sizeof(di_arr) - (size_t)da, "]");
 
+    /* Build DO array — same structure as DI */
+    char dout_arr[160];
+    int  doa = snprintf(dout_arr, sizeof(dout_arr), "[");
+    for (int i = 0; i < APP_CFG_DO_COUNT; i++) {
+        doa += snprintf(dout_arr + doa, sizeof(dout_arr) - (size_t)doa,
+            "{\"invert\":%s}%s",
+            cfg->dout[i].invert ? "true" : "false",
+            i < APP_CFG_DO_COUNT - 1 ? "," : "");
+    }
+    snprintf(dout_arr + doa, sizeof(dout_arr) - (size_t)doa, "]");
+
     /* mqtt_password is intentionally omitted — never expose credentials via GET. */
-    char json[768];
+    char json[960];
     int len = snprintf(json, sizeof(json),
         "{\"device_name\":\"%.31s\","
         "\"mqtt_url\":\"%.127s\","
         "\"mqtt_user\":\"%.63s\","
         "\"mqtt_password_set\":%s,"
         "\"mqtt_topic_prefix\":\"%.63s\","
-        "\"di\":%.159s}",
+        "\"di\":%.159s,"
+        "\"dout\":%.159s}",
         cfg->device_name,
         cfg->mqtt_url,
         cfg->mqtt_user,
         cfg->mqtt_password[0] ? "true" : "false",
         cfg->mqtt_topic_prefix,
-        di_arr);
+        di_arr,
+        dout_arr);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, len);
@@ -161,10 +194,12 @@ static esp_err_t api_config_post(httpd_req_t *req)
     }
 
     json_parse_di(body, cfg.di);
+    json_parse_dout(body, cfg.dout);
 
     free(body);
     app_config_update(&cfg);
     di_publish_all();
+    dout_publish_all();
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\"}");

@@ -60,16 +60,35 @@ The board has 8 optocoupler-isolated digital inputs on GPIO4–GPIO11.
 
 ---
 
-## Planned
+---
 
-### Digital Outputs (DO1–DO8)
+## Digital Outputs (DO1–DO8)
 
-The board has 8 optocoupler-isolated digital outputs driven via a PCA9554 I²C expander (address 0x20, SDA GPIO42, SCL GPIO41).
+The board has 8 optocoupler-isolated digital outputs driven via a TCA9554 I²C expander (address 0x20, SDA GPIO42, SCL GPIO41, 100 kHz).
 
-Planned topics:
+Output state is driven by bit-level writes to the TCA9554 output port register. The invert flag per output is set in the web UI config page.
 
-| Topic | Direction | Payload | Description |
-|-------|-----------|---------|-------------|
-| `<prefix>/output/0` … `<prefix>/output/7` | Subscribe | `true` / `false` / `toggle` | Set output state |
-| `<prefix>/output/0` … `<prefix>/output/7` | Publish | `true` / `false` | Confirms output state after change |
-| `<prefix>/output/read` | Subscribe | any | Publish current state of all outputs |
+### Command topics (subscribed)
+
+| Topic | Payload | Description |
+|-------|---------|-------------|
+| `<prefix>/output/1` … `<prefix>/output/8` | see below | Set output state |
+| `<prefix>/output/read` | any | Publish current state of all 8 outputs |
+
+**Accepted payloads** (case-insensitive):
+
+| Logical state | Accepted values |
+|--------------|-----------------|
+| On / true    | `true`, `1`, `high`, `on` |
+| Off / false  | `false`, `0`, `low`, `off` |
+
+### State topics (published)
+
+| Topic | QoS | Retained | Payload |
+|-------|-----|----------|---------|
+| `<prefix>/output/1` … `<prefix>/output/8` | 0 | no | `true` or `false` |
+
+**When published:**
+- On every MQTT broker connect (full state refresh)
+- After every successful output change (confirmation)
+- When `output/read` is received
