@@ -95,3 +95,55 @@ Output state is driven by bit-level writes to the TCA9554 output port register. 
 - On every MQTT broker connect (full state refresh)
 - After every successful output change (confirmation)
 - When `output/read` is received
+
+---
+
+## LED (WS2812)
+
+Single RGB LED on GPIO38.
+
+### Command topic (subscribed)
+
+| Topic | Payload | Description |
+|-------|---------|-------------|
+| `<prefix>/led/set` | see below | Set LED colour |
+
+**Accepted payload formats:**
+
+| Format | Example | Notes |
+|--------|---------|-------|
+| Web hex | `#ff8000` | Case-insensitive |
+| JSON array | `[255,128,0]` | Spaces around values allowed |
+
+To turn the LED off: `#000000` or `[0,0,0]`.
+
+### State topic (published)
+
+| Topic | QoS | Retained | Payload |
+|-------|-----|----------|---------|
+| `<prefix>/led` | 0 | no | `#rrggbb` |
+
+Published on connect and after each colour change.
+
+---
+
+## Buzzer
+
+Piezo buzzer on GPIO46 (LEDC PWM, 50% duty square wave).
+
+### Command topic (subscribed)
+
+| Topic | Payload | Description |
+|-------|---------|-------------|
+| `<prefix>/buzzer/beep` | JSON object | Trigger a beep |
+
+**Payload fields:**
+
+| Field | Type | Default | Range | Description |
+|-------|------|---------|-------|-------------|
+| `freq` | integer | 1000 | 100–10000 | Frequency in Hz |
+| `duration` | integer | 200 | 1–5000 | Duration in ms |
+
+**Example:** `{"freq": 2000, "duration": 300}`
+
+If a beep is already playing when a new command arrives, the new beep queues and plays immediately after the current one finishes.

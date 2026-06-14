@@ -6,8 +6,10 @@
 #include "app_config.h"
 #include "app_mqtt.h"
 #include "button.h"
+#include "buzzer.h"
 #include "di.h"
 #include "dout.h"
+#include "led.h"
 #include "web_server.h"
 
 static const char *TAG = "main";
@@ -16,6 +18,8 @@ static void on_mqtt_connected(void)
 {
     di_on_mqtt_connected();
     dout_on_mqtt_connected();
+    led_on_mqtt_connected();
+    buzzer_on_mqtt_connected();
 }
 
 static void on_mqtt_message(const char *topic, size_t tlen,
@@ -23,6 +27,8 @@ static void on_mqtt_message(const char *topic, size_t tlen,
 {
     di_on_mqtt_message(topic, tlen, data, dlen);
     dout_on_mqtt_message(topic, tlen, data, dlen);
+    led_on_mqtt_message(topic, tlen, data, dlen);
+    buzzer_on_mqtt_message(topic, tlen, data, dlen);
 }
 
 static void on_wifi_ready(void)
@@ -47,6 +53,8 @@ void app_main(void)
     button_init();
     ESP_ERROR_CHECK(di_init());
     ESP_ERROR_CHECK(dout_init());
+    ESP_ERROR_CHECK(led_init());
+    ESP_ERROR_CHECK(buzzer_init());
 
     esp_vfs_spiffs_conf_t spiffs = {
         .base_path              = "/www",
