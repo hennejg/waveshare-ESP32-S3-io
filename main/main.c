@@ -4,6 +4,7 @@
 #include <esp_spiffs.h>
 #include <wifi_config.h>
 #include "app_config.h"
+#include "app_mqtt.h"
 #include "button.h"
 #include "web_server.h"
 
@@ -11,8 +12,9 @@ static const char *TAG = "main";
 
 static void on_wifi_ready(void)
 {
-    ESP_LOGI(TAG, "WiFi connected — starting web server");
+    ESP_LOGI(TAG, "WiFi connected");
     ESP_ERROR_CHECK(web_server_start());
+    ESP_ERROR_CHECK(app_mqtt_start());
 }
 
 void app_main(void)
