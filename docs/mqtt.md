@@ -72,8 +72,10 @@ Output state is driven by bit-level writes to the TCA9554 output port register. 
 
 | Topic | Payload | Description |
 |-------|---------|-------------|
-| `<prefix>/output/1` … `<prefix>/output/8` | see below | Set output state |
+| `<prefix>/output/1/set` … `<prefix>/output/8/set` | see below | Set output state |
 | `<prefix>/output/read` | any | Publish current state of all 8 outputs |
+
+> **Note:** Commands use the `/set` suffix so the device does not receive its own state publications as commands. This matches the Home Assistant MQTT switch convention (`command_topic` / `state_topic`).
 
 **Accepted payloads** (case-insensitive):
 

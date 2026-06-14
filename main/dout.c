@@ -132,9 +132,11 @@ void dout_publish_all(void)
 
 void dout_on_mqtt_connected(void)
 {
+    /* Commands arrive on output/N/set — separate from the state topic
+       output/N to avoid receiving our own published confirmations as commands. */
     for (uint8_t i = 1; i <= NUM_DO; i++) {
-        char topic[16];
-        snprintf(topic, sizeof(topic), "output/%u", i);
+        char topic[20];
+        snprintf(topic, sizeof(topic), "output/%u/set", i);
         app_mqtt_subscribe(topic, 0);
     }
     app_mqtt_subscribe("output/read", 0);
@@ -152,21 +154,24 @@ void dout_on_mqtt_message(const char *topic, size_t tlen,
         return;
     }
 
-    /* Match suffix "output/N" where N is '1'..'8' */
-    static const char OUT_SUFFIX[] = "output/";
-    const size_t os = sizeof(OUT_SUFFIX) - 1;
-    if (tlen >= os + 1) {
-        uint8_t ch = (uint8_t)topic[tlen - 1];
-        if (ch >= '1' && ch <= '8' &&
-            memcmp(topic + tlen - os - 1, OUT_SUFFIX, os) == 0) {
-            uint8_t n = (uint8_t)(ch - '1');
-            bool state;
-            if (parse_toggle(data, dlen)) {
-                dout_set(n, !dout_get(n));
-            } else if (parse_payload(data, dlen, &state)) {
-                dout_set(n, state);
-            } else {
-                ESP_LOGW(TAG, "Unrecognised payload for output/%c", ch);
+    /* Match suffix "output/N/set" where N is '1'..'8'.
+       Minimum topic: "output/1/set" = 12 chars. */
+    if (tlen >= 12 && memcmp(topic + tlen - 4, "/set", 4) == 0) {
+        uint8_t ch = (uint8_t)topic[tlen - 5];
+        if (ch >= '1' && ch <= '8') {
+            static const char OUT_SUFFIX[] = "output/";
+            const size_t os = sizeof(OUT_SUFFIX) - 1;
+            /* Verify "output/" precedes the digit */
+            if (memcmp(topic + tlen - os - 5, OUT_SUFFIX, os) == 0) {
+                uint8_t n = (uint8_t)(ch - '1');
+                bool state;
+                if (parse_toggle(data, dlen)) {
+                    dout_set(n, !dout_get(n));
+                } else if (parse_payload(data, dlen, &state)) {
+                    dout_set(n, state);
+                } else {
+                    ESP_LOGW(TAG, "Unrecognised payload for output/%c/set", ch);
+                }
             }
         }
     }
