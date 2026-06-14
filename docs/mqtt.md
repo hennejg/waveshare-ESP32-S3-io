@@ -43,10 +43,10 @@ The board has 8 optocoupler-isolated digital inputs on GPIO4–GPIO11.
 
 | Topic | QoS | Retained | Payload |
 |-------|-----|----------|---------|
-| `<prefix>/input/0` | 0 | no | `true` or `false` |
 | `<prefix>/input/1` | 0 | no | `true` or `false` |
+| `<prefix>/input/2` | 0 | no | `true` or `false` |
 | … | | | |
-| `<prefix>/input/7` | 0 | no | `true` or `false` |
+| `<prefix>/input/8` | 0 | no | `true` or `false` |
 
 **When published:**
 - On every MQTT broker connect (full state refresh of all 8 inputs)

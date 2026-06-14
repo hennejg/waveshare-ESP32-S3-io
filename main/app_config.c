@@ -11,13 +11,15 @@
 #define K_MQTT_USER     "mqtt_user"
 #define K_MQTT_PASS     "mqtt_password"
 #define K_MQTT_TOPIC    "mqtt_topic"
+#define K_DI_CFG        "di_cfg"
 
 static app_config_t s_cfg = {
-    .device_name      = "Waveshare-ESP32",
-    .mqtt_url         = "",
-    .mqtt_user        = "",
-    .mqtt_password    = "",
+    .device_name       = "Waveshare-ESP32",
+    .mqtt_url          = "",
+    .mqtt_user         = "",
+    .mqtt_password     = "",
     .mqtt_topic_prefix = "",
+    /* di[].invert defaults to false — all zero-init */
 };
 
 #define NVS_GET_STR(h, key, dst) \
@@ -35,6 +37,11 @@ esp_err_t app_config_init(void)
     NVS_GET_STR(h, K_MQTT_USER,   s_cfg.mqtt_user);
     NVS_GET_STR(h, K_MQTT_PASS,   s_cfg.mqtt_password);
     NVS_GET_STR(h, K_MQTT_TOPIC,  s_cfg.mqtt_topic_prefix);
+
+    /* DI config blob — silently keep defaults if not found or size changed
+       (the latter happens when di_config_t grows beyond its reserved bytes). */
+    size_t sz = sizeof(s_cfg.di);
+    nvs_get_blob(h, K_DI_CFG, s_cfg.di, &sz);
 
     nvs_close(h);
     return ESP_OK;
@@ -58,6 +65,7 @@ esp_err_t app_config_update(const app_config_t *cfg)
     nvs_set_str(h, K_MQTT_USER,   s_cfg.mqtt_user);
     nvs_set_str(h, K_MQTT_PASS,   s_cfg.mqtt_password);
     nvs_set_str(h, K_MQTT_TOPIC,  s_cfg.mqtt_topic_prefix);
+    nvs_set_blob(h, K_DI_CFG,    s_cfg.di, sizeof(s_cfg.di));
 
     nvs_commit(h);
     nvs_close(h);

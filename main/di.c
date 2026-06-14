@@ -1,5 +1,6 @@
 #include "di.h"
 #include "app_mqtt.h"
+#include "app_config.h"
 
 #include <string.h>
 
@@ -24,13 +25,15 @@ static TaskHandle_t s_task;
 
 static inline bool read_pin(uint8_t n)
 {
-    return gpio_get_level(s_gpios[n]) == 0;  /* active low — optocoupler */
+    /* Default sense: GPIO high → true.  Flip with di[n].invert = true. */
+    bool level = (bool)gpio_get_level(s_gpios[n]);
+    return level ^ app_config_get()->di[n].invert;
 }
 
 static void publish_one(uint8_t n, bool state)
 {
     char topic[16];
-    snprintf(topic, sizeof(topic), "input/%u", n);
+    snprintf(topic, sizeof(topic), "input/%u", n + 1);  /* 1-based, matches box label */
     app_mqtt_publish(topic, state ? "true" : "false", -1, 0, false);
 }
 
