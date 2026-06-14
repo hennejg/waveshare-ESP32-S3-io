@@ -40,6 +40,7 @@ static void publish_one(uint8_t n, bool state)
 void di_publish_all(void)
 {
     for (uint8_t i = 0; i < NUM_DI; i++) {
+        s_state[i] = read_pin(i);   /* refresh from hardware before publishing */
         publish_one(i, s_state[i]);
     }
 }
