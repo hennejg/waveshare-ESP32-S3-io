@@ -1,5 +1,6 @@
 #include "web_server.h"
 #include "app_config.h"
+#include "di.h"
 
 #include <stdio.h>
 #include <stdbool.h>
@@ -163,6 +164,7 @@ static esp_err_t api_config_post(httpd_req_t *req)
 
     free(body);
     app_config_update(&cfg);
+    di_publish_all();
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
