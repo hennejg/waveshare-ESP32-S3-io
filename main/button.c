@@ -4,6 +4,7 @@
 #include <freertos/task.h>
 #include <driver/gpio.h>
 #include <esp_log.h>
+#include <esp_system.h>
 #include <wifi_config.h>
 
 #define TAG          "button"
@@ -39,8 +40,8 @@ static void button_task(void *arg)
 
             if (held_ms >= HOLD_MS) {
                 ESP_LOGW(TAG, "WiFi reset triggered — clearing credentials and rebooting");
-                wifi_config_reset(); /* clears NVS config, calls esp_restart() */
-                /* never returns */
+                wifi_config_reset();
+                esp_restart();
             }
         } else {
             if (held_ms > 0 && held_ms < HOLD_MS) {
