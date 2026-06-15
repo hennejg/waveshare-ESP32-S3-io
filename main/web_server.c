@@ -10,6 +10,7 @@
 
 #include <esp_http_server.h>
 #include <esp_log.h>
+#include "cJSON.h"
 
 #define TAG        "web_server"
 #define WWW_BASE   "/www"
@@ -34,76 +35,16 @@ static const char *mime_type(const char *path)
     return "application/octet-stream";
 }
 
-/* Extract a JSON string value: {"key":"value"} → value.
-   Does not handle escape sequences — sufficient for simple config fields. */
-static bool json_get_str(const char *json, const char *key,
-                         char *out, size_t out_len)
+/* Parse a cJSON array of {invert: bool} objects into a di_config_t array. */
+static void parse_invert_array(cJSON *arr, di_config_t *out, int max)
 {
-    char needle[64];
-    snprintf(needle, sizeof(needle), "\"%s\":\"", key);
-    const char *p = strstr(json, needle);
-    if (!p) return false;
-    p += strlen(needle);
-    const char *end = strchr(p, '"');
-    if (!end) return false;
-    size_t n = (size_t)(end - p);
-    if (n >= out_len) n = out_len - 1;
-    memcpy(out, p, n);
-    out[n] = '\0';
-    return true;
-}
-
-/* Extract a JSON boolean value: {"key":true} or {"key":false}. */
-static bool json_get_bool(const char *json, const char *key, bool *out)
-{
-    char needle[40];
-    snprintf(needle, sizeof(needle), "\"%s\":", key);
-    const char *p = strstr(json, needle);
-    if (!p) return false;
-    p += strlen(needle);
-    while (*p == ' ' || *p == '\t') p++;
-    if (strncmp(p, "true",  4) == 0) { *out = true;  return true; }
-    if (strncmp(p, "false", 5) == 0) { *out = false; return true; }
-    return false;
-}
-
-/* Parse the "di" JSON array into out[APP_CFG_DI_COUNT].
-   Expects: "di":[{"invert":bool,...},...]  — unknown keys are ignored. */
-static void json_parse_di(const char *json, di_config_t out[APP_CFG_DI_COUNT])
-{
-    const char *p = strstr(json, "\"di\":[");
-    if (!p) return;
-    p += 6;
-    for (int i = 0; i < APP_CFG_DI_COUNT; i++) {
-        const char *ob = strchr(p, '{');
-        const char *cb = ob ? strchr(ob, '}') : NULL;
-        if (!ob || !cb) return;
-        char buf[128];
-        size_t n = (size_t)(cb - ob);
-        if (n >= sizeof(buf)) n = sizeof(buf) - 1;
-        memcpy(buf, ob, n);
-        buf[n] = '\0';
-        json_get_bool(buf, "invert", &out[i].invert);
-        p = cb + 1;
-    }
-}
-
-static void json_parse_dout(const char *json, di_config_t out[APP_CFG_DO_COUNT])
-{
-    const char *p = strstr(json, "\"dout\":[");
-    if (!p) return;
-    p += 8;
-    for (int i = 0; i < APP_CFG_DO_COUNT; i++) {
-        const char *ob = strchr(p, '{');
-        const char *cb = ob ? strchr(ob, '}') : NULL;
-        if (!ob || !cb) return;
-        char buf[128];
-        size_t n = (size_t)(cb - ob);
-        if (n >= sizeof(buf)) n = sizeof(buf) - 1;
-        memcpy(buf, ob, n);
-        buf[n] = '\0';
-        json_get_bool(buf, "invert", &out[i].invert);
-        p = cb + 1;
+    if (!cJSON_IsArray(arr)) return;
+    int n = cJSON_GetArraySize(arr);
+    if (n > max) n = max;
+    for (int i = 0; i < n; i++) {
+        cJSON *item = cJSON_GetArrayItem(arr, i);
+        cJSON *inv  = item ? cJSON_GetObjectItem(item, "invert") : NULL;
+        if (cJSON_IsBool(inv)) out[i].invert = cJSON_IsTrue(inv);
     }
 }
 
@@ -113,48 +54,34 @@ static esp_err_t api_config_get(httpd_req_t *req)
 {
     const app_config_t *cfg = app_config_get();
 
-    /* Build DI array: [{"invert":bool},...]  max 145 chars */
-    char di_arr[160];
-    int  da = snprintf(di_arr, sizeof(di_arr), "[");
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "device_name",       cfg->device_name);
+    cJSON_AddStringToObject(root, "mqtt_url",          cfg->mqtt_url);
+    cJSON_AddStringToObject(root, "mqtt_user",         cfg->mqtt_user);
+    /* Never expose the password — return a flag instead. */
+    cJSON_AddBoolToObject  (root, "mqtt_password_set", cfg->mqtt_password[0] != '\0');
+    cJSON_AddStringToObject(root, "mqtt_topic_prefix", cfg->mqtt_topic_prefix);
+
+    cJSON *di = cJSON_AddArrayToObject(root, "di");
     for (int i = 0; i < APP_CFG_DI_COUNT; i++) {
-        da += snprintf(di_arr + da, sizeof(di_arr) - (size_t)da,
-            "{\"invert\":%s}%s",
-            cfg->di[i].invert ? "true" : "false",
-            i < APP_CFG_DI_COUNT - 1 ? "," : "");
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddBoolToObject(item, "invert", cfg->di[i].invert);
+        cJSON_AddItemToArray(di, item);
     }
-    snprintf(di_arr + da, sizeof(di_arr) - (size_t)da, "]");
 
-    /* Build DO array — same structure as DI */
-    char dout_arr[160];
-    int  doa = snprintf(dout_arr, sizeof(dout_arr), "[");
+    cJSON *dout = cJSON_AddArrayToObject(root, "dout");
     for (int i = 0; i < APP_CFG_DO_COUNT; i++) {
-        doa += snprintf(dout_arr + doa, sizeof(dout_arr) - (size_t)doa,
-            "{\"invert\":%s}%s",
-            cfg->dout[i].invert ? "true" : "false",
-            i < APP_CFG_DO_COUNT - 1 ? "," : "");
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddBoolToObject(item, "invert", cfg->dout[i].invert);
+        cJSON_AddItemToArray(dout, item);
     }
-    snprintf(dout_arr + doa, sizeof(dout_arr) - (size_t)doa, "]");
 
-    /* mqtt_password is intentionally omitted — never expose credentials via GET. */
-    char json[960];
-    int len = snprintf(json, sizeof(json),
-        "{\"device_name\":\"%.31s\","
-        "\"mqtt_url\":\"%.127s\","
-        "\"mqtt_user\":\"%.63s\","
-        "\"mqtt_password_set\":%s,"
-        "\"mqtt_topic_prefix\":\"%.63s\","
-        "\"di\":%.159s,"
-        "\"dout\":%.159s}",
-        cfg->device_name,
-        cfg->mqtt_url,
-        cfg->mqtt_user,
-        cfg->mqtt_password[0] ? "true" : "false",
-        cfg->mqtt_topic_prefix,
-        di_arr,
-        dout_arr);
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
 
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, json, len);
+    httpd_resp_sendstr(req, json ? json : "{}");
+    cJSON_free(json);
     return ESP_OK;
 }
 
@@ -179,24 +106,38 @@ static esp_err_t api_config_post(httpd_req_t *req)
     }
     body[received] = '\0';
 
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_OK;
+    }
+
     app_config_t cfg;
     memcpy(&cfg, app_config_get(), sizeof(cfg));
 
-    json_get_str(body, "device_name",      cfg.device_name,       sizeof(cfg.device_name));
-    json_get_str(body, "mqtt_url",         cfg.mqtt_url,          sizeof(cfg.mqtt_url));
-    json_get_str(body, "mqtt_user",        cfg.mqtt_user,         sizeof(cfg.mqtt_user));
-    json_get_str(body, "mqtt_topic_prefix",cfg.mqtt_topic_prefix, sizeof(cfg.mqtt_topic_prefix));
+    /* String fields — macro to keep it terse */
+    #define STR(key, dst) do { \
+        cJSON *_v = cJSON_GetObjectItem(root, key); \
+        if (cJSON_IsString(_v)) strlcpy(dst, _v->valuestring, sizeof(dst)); \
+    } while (0)
 
-    /* Only update the password if a non-empty value was posted. */
-    char new_pass[APP_CFG_MQTT_PASS_LEN] = "";
-    if (json_get_str(body, "mqtt_password", new_pass, sizeof(new_pass)) && new_pass[0]) {
-        strlcpy(cfg.mqtt_password, new_pass, sizeof(cfg.mqtt_password));
-    }
+    STR("device_name",      cfg.device_name);
+    STR("mqtt_url",         cfg.mqtt_url);
+    STR("mqtt_user",        cfg.mqtt_user);
+    STR("mqtt_topic_prefix",cfg.mqtt_topic_prefix);
+    #undef STR
 
-    json_parse_di(body, cfg.di);
-    json_parse_dout(body, cfg.dout);
+    /* Password: only update when a non-empty value is sent */
+    cJSON *pass = cJSON_GetObjectItem(root, "mqtt_password");
+    if (cJSON_IsString(pass) && pass->valuestring[0])
+        strlcpy(cfg.mqtt_password, pass->valuestring, sizeof(cfg.mqtt_password));
 
-    free(body);
+    parse_invert_array(cJSON_GetObjectItem(root, "di"),   cfg.di,   APP_CFG_DI_COUNT);
+    parse_invert_array(cJSON_GetObjectItem(root, "dout"), cfg.dout, APP_CFG_DO_COUNT);
+
+    cJSON_Delete(root);
     app_config_update(&cfg);
     di_publish_all();
     dout_publish_all();

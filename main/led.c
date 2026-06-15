@@ -2,8 +2,8 @@
 #include "app_mqtt.h"
 
 #include <string.h>
-#include <stdio.h>
 
+#include "cJSON.h"
 #include "led_strip.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -41,14 +41,15 @@ static bool parse_color(const char *data, size_t dlen,
     }
 
     if (buf[0] == '[') {
-        int rv = 0, gv = 0, bv = 0;
-        /* %d skips leading whitespace, so "[0, 255, 128]" also works */
-        if (sscanf(buf, "[%d,%d,%d]", &rv, &gv, &bv) == 3) {
-            *r = (uint8_t)rv;
-            *g = (uint8_t)gv;
-            *b = (uint8_t)bv;
-            return true;
+        cJSON *arr = cJSON_Parse(buf);
+        bool ok = cJSON_IsArray(arr) && cJSON_GetArraySize(arr) == 3;
+        if (ok) {
+            *r = (uint8_t)cJSON_GetArrayItem(arr, 0)->valuedouble;
+            *g = (uint8_t)cJSON_GetArrayItem(arr, 1)->valuedouble;
+            *b = (uint8_t)cJSON_GetArrayItem(arr, 2)->valuedouble;
         }
+        cJSON_Delete(arr);
+        if (ok) return true;
     }
 
     return false;

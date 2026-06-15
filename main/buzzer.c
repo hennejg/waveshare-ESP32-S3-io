@@ -9,6 +9,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "cJSON.h"
 #include "esp_check.h"
 #include "esp_log.h"
 
@@ -28,23 +29,6 @@
 typedef struct { uint32_t freq_hz; uint32_t dur_ms; } beep_t;
 
 static QueueHandle_t s_queue;
-
-/* ------------------------------------------------------------------ helpers */
-
-static bool json_get_u32(const char *json, const char *key, uint32_t *out)
-{
-    char needle[32];
-    snprintf(needle, sizeof(needle), "\"%s\":", key);
-    const char *p = strstr(json, needle);
-    if (!p) return false;
-    p += strlen(needle);
-    while (*p == ' ') p++;
-    if (*p < '0' || *p > '9') return false;
-    uint32_t v = 0;
-    while (*p >= '0' && *p <= '9') v = v * 10 + (uint32_t)(*p++ - '0');
-    *out = v;
-    return true;
-}
 
 /* ------------------------------------------------------------------- task */
 
@@ -111,8 +95,14 @@ void buzzer_on_mqtt_message(const char *topic, size_t tlen,
     buf[dlen] = '\0';
 
     uint32_t freq_hz = 1000, dur_ms = 200;
-    json_get_u32(buf, "freq", &freq_hz);
-    json_get_u32(buf, "duration", &dur_ms);
+    cJSON *root = cJSON_Parse(buf);
+    if (root) {
+        cJSON *f = cJSON_GetObjectItem(root, "freq");
+        cJSON *d = cJSON_GetObjectItem(root, "duration");
+        if (cJSON_IsNumber(f)) freq_hz = (uint32_t)f->valuedouble;
+        if (cJSON_IsNumber(d)) dur_ms  = (uint32_t)d->valuedouble;
+        cJSON_Delete(root);
+    }
 
     if (freq_hz < FREQ_MIN) freq_hz = FREQ_MIN;
     if (freq_hz > FREQ_MAX) freq_hz = FREQ_MAX;

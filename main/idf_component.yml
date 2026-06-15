@@ -2,3 +2,4 @@ dependencies:
   idf: ">=6.0"
   espressif/mqtt: "^1.0.0"
   espressif/led_strip: "^3.0.0"
+  espressif/cjson: "*"
