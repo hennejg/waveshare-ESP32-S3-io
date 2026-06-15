@@ -103,15 +103,15 @@ static void led_task(void *arg)
 /* ============================================================ status mode === */
 
 /* Colours (50% brightness for persistent states, 100% for flashes) */
-#define STA_BOOT_R  127 /* 50% yellow  */
-#define STA_BOOT_G  127
+#define STA_BOOT_R  77  /* 30% yellow  */
+#define STA_BOOT_G  77
 #define STA_BOOT_B  0
-#define STA_NET_R   0   /* 50% green   */
-#define STA_NET_G   127
+#define STA_NET_R   0   /* 30% green   */
+#define STA_NET_G   77
 #define STA_NET_B   0
-#define STA_MQTT_R  100 /* 50% purple  */
+#define STA_MQTT_R  77  /* 30% purple  */
 #define STA_MQTT_G  0
-#define STA_MQTT_B  127
+#define STA_MQTT_B  77
 #define STA_RX_R    255 /* 100% red    */
 #define STA_RX_G    0
 #define STA_RX_B    0

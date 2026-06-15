@@ -161,17 +161,17 @@ void dout_on_mqtt_connected(void)
         app_mqtt_subscribe(topic, 0);
     }
     app_mqtt_subscribe("output/read", 0);
-    app_mqtt_subscribe("outputs/set", 0);
+    app_mqtt_subscribe("output/set", 0);
     dout_publish_all();
 }
 
 void dout_on_mqtt_message(const char *topic, size_t tlen,
                            const char *data,  size_t dlen)
 {
-    /* Match suffix "outputs/set" — bulk set all outputs at once.
+    /* Match suffix "output/set" — bulk set all outputs at once.
        Single value: apply same state/toggle to every output.
        JSON array:   apply each element to the corresponding output (1-indexed). */
-    static const char BULK_SUFFIX[] = "outputs/set";
+    static const char BULK_SUFFIX[] = "output/set";
     const size_t bs = sizeof(BULK_SUFFIX) - 1;
     if (tlen >= bs && memcmp(topic + tlen - bs, BULK_SUFFIX, bs) == 0) {
         char buf[256];
@@ -182,7 +182,7 @@ void dout_on_mqtt_message(const char *topic, size_t tlen,
         if (buf[0] == '[') {
             cJSON *arr = cJSON_Parse(buf);
             if (!cJSON_IsArray(arr)) {
-                ESP_LOGW(TAG, "outputs/set: invalid JSON array");
+                ESP_LOGW(TAG, "output/set: invalid JSON array");
                 cJSON_Delete(arr);
                 return;
             }
@@ -198,7 +198,7 @@ void dout_on_mqtt_message(const char *topic, size_t tlen,
             } else if (parse_payload(data, dlen, &state)) {
                 for (uint8_t i = 0; i < NUM_DO; i++) s_state[i] = state;
             } else {
-                ESP_LOGW(TAG, "outputs/set: unrecognised payload");
+                ESP_LOGW(TAG, "output/set: unrecognised payload");
                 return;
             }
         }

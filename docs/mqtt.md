@@ -88,7 +88,7 @@ Example: `toggle` → `<prefix>/output/3/set` flips DO3; if DO3 is named `pump`,
 
 | Topic                  | Payload          | Description                     |
 |------------------------|------------------|---------------------------------|
-| `<prefix>/outputs/set` | value or array   | Set all outputs in one message  |
+| `<prefix>/output/set` | value or array   | Set all outputs in one message  |
 
 **Single value** — applies the same state to all 8 outputs:
 
@@ -133,9 +133,9 @@ Single RGB LED on GPIO38. Operates in one of two modes set in the web UI:
 
 | State | Colour | Brightness |
 |-------|--------|-----------|
-| Boot / no network | Yellow | 50% |
-| Network (WiFi or Ethernet) | Green | 50% |
-| MQTT broker connected | Purple | 50% |
+| Boot / no network | Yellow | 30% |
+| Network (WiFi or Ethernet) | Green | 30% |
+| MQTT broker connected | Purple | 30% |
 | MQTT message received | Red flash | 100%, 100 ms |
 | MQTT message published | Blue flash | 100%, 100 ms |
 
