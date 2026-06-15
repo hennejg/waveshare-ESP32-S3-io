@@ -90,6 +90,18 @@ static void buzzer_task(void *arg)
 
 /* ------------------------------------------------------------------ public */
 
+void buzzer_beep_once(uint32_t freq_hz, uint32_t dur_ms)
+{
+    if (freq_hz < FREQ_MIN) freq_hz = FREQ_MIN;
+    if (freq_hz > FREQ_MAX) freq_hz = FREQ_MAX;
+    if (dur_ms  < DUR_MIN_MS) dur_ms = DUR_MIN_MS;
+    if (dur_ms  > DUR_MAX_MS) dur_ms = DUR_MAX_MS;
+    bseq_t seq = { .count = 1 };
+    seq.steps[0].freq_hz = freq_hz;
+    seq.steps[0].dur_ms  = dur_ms;
+    xQueueOverwrite(s_queue, &seq);
+}
+
 esp_err_t buzzer_init(void)
 {
     ledc_timer_config_t timer = {

@@ -13,6 +13,7 @@
 #define K_MQTT_TOPIC    "mqtt_topic"
 #define K_DI_CFG        "di_cfg"
 #define K_DOUT_CFG      "dout_cfg"
+#define K_MODBUS_CFG    "mb_cfg"
 
 static app_config_t s_cfg = {
     .device_name       = "Waveshare-ESP32",
@@ -20,7 +21,8 @@ static app_config_t s_cfg = {
     .mqtt_user         = "",
     .mqtt_password     = "",
     .mqtt_topic_prefix = "",
-    /* di[].invert defaults to false — all zero-init */
+    /* di/dout names and invert default to zero */
+    .modbus = { .enable = 0, .address = 1, .baudrate = 9600 },
 };
 
 #define NVS_GET_STR(h, key, dst) \
@@ -45,6 +47,8 @@ esp_err_t app_config_init(void)
     nvs_get_blob(h, K_DI_CFG, s_cfg.di, &sz);
     sz = sizeof(s_cfg.dout);
     nvs_get_blob(h, K_DOUT_CFG, s_cfg.dout, &sz);
+    sz = sizeof(s_cfg.modbus);
+    nvs_get_blob(h, K_MODBUS_CFG, &s_cfg.modbus, &sz);
 
     nvs_close(h);
     return ESP_OK;
@@ -70,6 +74,7 @@ esp_err_t app_config_update(const app_config_t *cfg)
     nvs_set_str(h, K_MQTT_TOPIC,  s_cfg.mqtt_topic_prefix);
     nvs_set_blob(h, K_DI_CFG,    s_cfg.di,   sizeof(s_cfg.di));
     nvs_set_blob(h, K_DOUT_CFG,  s_cfg.dout, sizeof(s_cfg.dout));
+    nvs_set_blob(h, K_MODBUS_CFG, &s_cfg.modbus, sizeof(s_cfg.modbus));
 
     nvs_commit(h);
     nvs_close(h);

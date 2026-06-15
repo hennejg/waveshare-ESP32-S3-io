@@ -5,6 +5,9 @@
 /* Initialise the piezo buzzer on GPIO46 (LEDC). */
 esp_err_t buzzer_init(void);
 
+/* One-shot beep — frequency clamped to 100-10 000 Hz, duration to 1-5 000 ms. */
+void buzzer_beep_once(uint32_t freq_hz, uint32_t dur_ms);
+
 /* Wire into MQTT callbacks in main.c. */
 void buzzer_on_mqtt_connected(void);
 void buzzer_on_mqtt_message(const char *topic, size_t tlen,

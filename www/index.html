@@ -70,6 +70,24 @@
     </table>
     <p class="hint">Name: used as MQTT topic fragment. Invert: checked = physical bit flipped relative to logical state.</p>
 
+    <h2>Modbus RTU</h2>
+    <label style="display:flex;align-items:center;gap:.5rem;font-weight:600;color:#555;margin-top:1rem">
+      <input type="checkbox" id="mb_enable"> Enable Modbus RTU server
+    </label>
+    <p class="hint">RS485 on GPIO17/18. Changes take effect after reboot.</p>
+    <label>Slave Address (1–247)
+      <input type="number" id="mb_address" min="1" max="247" value="1">
+    </label>
+    <label>Baudrate
+      <select id="mb_baudrate" style="width:100%;margin-top:.3rem;padding:.5rem .6rem;border:1px solid #ccc;border-radius:4px;font-size:1rem">
+        <option value="9600">9600</option>
+        <option value="19200">19200</option>
+        <option value="38400">38400</option>
+        <option value="57600">57600</option>
+        <option value="115200">115200</option>
+      </select>
+    </label>
+
     <button type="submit" id="btn">Save</button>
   </form>
   <p id="status"></p>
@@ -105,6 +123,11 @@
         document.getElementById('mqtt_url').value          = cfg.mqtt_url ?? '';
         document.getElementById('mqtt_user').value         = cfg.mqtt_user ?? '';
         document.getElementById('mqtt_topic_prefix').value = cfg.mqtt_topic_prefix ?? '';
+        if (cfg.modbus) {
+          document.getElementById('mb_enable').checked  = !!cfg.modbus.enable;
+          document.getElementById('mb_address').value   = cfg.modbus.address  ?? 1;
+          document.getElementById('mb_baudrate').value  = cfg.modbus.baudrate ?? 9600;
+        }
         document.getElementById('pass_hint').textContent   =
           cfg.mqtt_password_set ? 'Password is set.' : 'No password stored.';
         (cfg.di ?? []).forEach((di, i) => {
@@ -150,6 +173,11 @@
           mqtt_user:         document.getElementById('mqtt_user').value,
           mqtt_password:     document.getElementById('mqtt_password').value,
           mqtt_topic_prefix: document.getElementById('mqtt_topic_prefix').value.trim(),
+          modbus: {
+            enable:   document.getElementById('mb_enable').checked,
+            address:  parseInt(document.getElementById('mb_address').value, 10),
+            baudrate: parseInt(document.getElementById('mb_baudrate').value, 10),
+          },
           di,
           dout,
         };

@@ -11,6 +11,7 @@
 #include "dout.h"
 #include "eth.h"
 #include "led.h"
+#include "mb_server.h"
 #include "web_server.h"
 
 static const char *TAG = "main";
@@ -61,6 +62,7 @@ void app_main(void)
     ESP_ERROR_CHECK(dout_init());
     ESP_ERROR_CHECK(led_init());
     ESP_ERROR_CHECK(buzzer_init());
+    ESP_ERROR_CHECK(mb_server_init());
 
     esp_vfs_spiffs_conf_t spiffs = {
         .base_path              = "/www",

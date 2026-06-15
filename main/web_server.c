@@ -84,6 +84,11 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON_AddBoolToObject  (root, "mqtt_password_set", cfg->mqtt_password[0] != '\0');
     cJSON_AddStringToObject(root, "mqtt_topic_prefix", cfg->mqtt_topic_prefix);
 
+    cJSON *mb = cJSON_AddObjectToObject(root, "modbus");
+    cJSON_AddBoolToObject  (mb, "enable",   cfg->modbus.enable);
+    cJSON_AddNumberToObject(mb, "address",  cfg->modbus.address);
+    cJSON_AddNumberToObject(mb, "baudrate", cfg->modbus.baudrate);
+
     cJSON *di = cJSON_AddArrayToObject(root, "di");
     for (int i = 0; i < APP_CFG_DI_COUNT; i++) {
         cJSON *item = cJSON_CreateObject();
@@ -160,6 +165,19 @@ static esp_err_t api_config_post(httpd_req_t *req)
 
     parse_invert_array(cJSON_GetObjectItem(root, "di"),   cfg.di,   APP_CFG_DI_COUNT);
     parse_invert_array(cJSON_GetObjectItem(root, "dout"), cfg.dout, APP_CFG_DO_COUNT);
+
+    cJSON *mb = cJSON_GetObjectItem(root, "modbus");
+    if (cJSON_IsObject(mb)) {
+        cJSON *v;
+        if ((v = cJSON_GetObjectItem(mb, "enable"))   && cJSON_IsBool(v))
+            cfg.modbus.enable = cJSON_IsTrue(v) ? 1 : 0;
+        if ((v = cJSON_GetObjectItem(mb, "address"))  && cJSON_IsNumber(v)) {
+            uint32_t a = (uint32_t)v->valuedouble;
+            if (a >= 1 && a <= 247) cfg.modbus.address = (uint8_t)a;
+        }
+        if ((v = cJSON_GetObjectItem(mb, "baudrate")) && cJSON_IsNumber(v))
+            cfg.modbus.baudrate = (uint32_t)v->valuedouble;
+    }
 
     cJSON_Delete(root);
 

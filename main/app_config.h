@@ -30,9 +30,15 @@ typedef struct {
     char         mqtt_password[APP_CFG_MQTT_PASS_LEN];
     char         mqtt_topic_prefix[APP_CFG_MQTT_TOPIC_LEN];
     di_config_t  di[APP_CFG_DI_COUNT];
-
-    /* Per-output configuration — same layout as di_config_t for consistency. */
     di_config_t  dout[APP_CFG_DO_COUNT];
+
+    /* Modbus RTU server */
+    struct {
+        uint8_t  enable;     /* 0 = disabled; changes take effect on reboot */
+        uint8_t  address;    /* slave address 1–247 */
+        uint8_t  _pad[2];
+        uint32_t baudrate;   /* 9600 / 19200 / 38400 / 57600 / 115200 */
+    } modbus;
 } app_config_t;
 
 esp_err_t           app_config_init(void);

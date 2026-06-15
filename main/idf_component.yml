@@ -4,3 +4,4 @@ dependencies:
   espressif/led_strip: "^3.0.0"
   espressif/cjson: "*"
   espressif/w5500: "^1.0.1"
+  espressif/esp-modbus: "^2.1.2"
