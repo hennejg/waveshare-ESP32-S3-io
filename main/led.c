@@ -106,8 +106,9 @@ esp_err_t led_set_rgb(uint8_t r, uint8_t g, uint8_t b)
 esp_err_t led_init(void)
 {
     led_strip_config_t strip_cfg = {
-        .strip_gpio_num = LED_GPIO,
-        .max_leds       = 1,
+        .strip_gpio_num         = LED_GPIO,
+        .max_leds               = 1,
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,  /* WS2812 is GRB */
     };
     led_strip_rmt_config_t rmt_cfg = {
         .resolution_hz  = 10 * 1000 * 1000,
