@@ -40,12 +40,12 @@ typedef struct {
 
     /* CAN bus */
     struct {
-        uint8_t  enable;
-        uint8_t  _pad[1];
-        uint16_t base_id;          /* 11-bit base CAN ID (0x000–0x7FF) */
-        uint32_t bitrate;          /* 125000 / 250000 / 500000 / 1000000 */
-        uint16_t tx_interval_ms;   /* periodic DI TX; 0 = on-change only */
-        uint8_t  _pad2[2];
+        uint8_t  mode;             /* 0=off  1=basic (11-bit)  2=NMEA2000 (29-bit) */
+        uint8_t  n2k_addr;         /* NMEA2000 preferred source address (1–251) */
+        uint16_t base_id;          /* 11-bit base CAN ID for basic mode */
+        uint32_t bitrate;          /* 125000/250000/500000/1000000; N2k forces 250000 */
+        uint16_t tx_interval_ms;   /* periodic DI TX interval; 0 = on-change only */
+        uint8_t  _pad[2];
     } can;
 
     /* Modbus RTU server */

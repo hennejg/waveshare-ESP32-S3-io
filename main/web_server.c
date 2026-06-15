@@ -89,7 +89,8 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "led_mode",          cfg->led_mode);
 
     cJSON *can = cJSON_AddObjectToObject(root, "can");
-    cJSON_AddBoolToObject  (can, "enable",         cfg->can.enable);
+    cJSON_AddNumberToObject(can, "mode",           cfg->can.mode);
+    cJSON_AddNumberToObject(can, "n2k_addr",       cfg->can.n2k_addr);
     cJSON_AddNumberToObject(can, "base_id",        cfg->can.base_id);
     cJSON_AddNumberToObject(can, "bitrate",        cfg->can.bitrate);
     cJSON_AddNumberToObject(can, "tx_interval_ms", cfg->can.tx_interval_ms);
@@ -183,8 +184,14 @@ static esp_err_t api_config_post(httpd_req_t *req)
     cJSON *can_j = cJSON_GetObjectItem(root, "can");
     if (cJSON_IsObject(can_j)) {
         cJSON *v;
-        if ((v = cJSON_GetObjectItem(can_j, "enable"))  && cJSON_IsBool(v))
-            cfg.can.enable = cJSON_IsTrue(v) ? 1 : 0;
+        if ((v = cJSON_GetObjectItem(can_j, "mode")) && cJSON_IsNumber(v)) {
+            uint8_t m = (uint8_t)v->valuedouble;
+            if (m <= 2) cfg.can.mode = m;
+        }
+        if ((v = cJSON_GetObjectItem(can_j, "n2k_addr")) && cJSON_IsNumber(v)) {
+            uint8_t a = (uint8_t)v->valuedouble;
+            if (a >= 1 && a <= 251) cfg.can.n2k_addr = a;
+        }
         if ((v = cJSON_GetObjectItem(can_j, "base_id")) && cJSON_IsNumber(v)) {
             uint32_t id = (uint32_t)v->valuedouble;
             if (id <= 0x7FF) cfg.can.base_id = (uint16_t)id;

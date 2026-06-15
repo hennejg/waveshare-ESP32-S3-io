@@ -80,13 +80,25 @@
     <p class="hint">Name: used as MQTT topic fragment. Invert: checked = physical bit flipped relative to logical state.</p>
 
     <h2>CAN Bus</h2>
-    <label style="display:flex;align-items:center;gap:.5rem;font-weight:600;color:#555;margin-top:1rem">
-      <input type="checkbox" id="can_enable"> Enable CAN bus server
-    </label>
     <p class="hint">GPIO2 (TX) / GPIO3 (RX). Changes take effect after reboot.</p>
+    <label>Mode
+      <select id="can_mode" style="width:100%;margin-top:.3rem;padding:.5rem .6rem;border:1px solid #ccc;border-radius:4px;font-size:1rem" onchange="updateCanFields()">
+        <option value="0">Off</option>
+        <option value="1">Basic (11-bit standard frames)</option>
+        <option value="2">NMEA2000 (29-bit extended, 250 kbit/s)</option>
+      </select>
+    </label>
+    <div id="can_basic_fields">
     <label>Base CAN ID (hex, 0x000–0x7FF)
       <input type="text" id="can_base_id" maxlength="5" placeholder="0x100">
     </label>
+    </div>
+    <div id="can_n2k_fields">
+    <label>Preferred Source Address (1–251)
+      <input type="number" id="can_n2k_addr" min="1" max="251" value="80">
+    </label>
+    <p class="hint">If already taken on the bus, the device will claim the next free address automatically.</p>
+    </div>
     <label>Bit Rate
       <select id="can_bitrate" style="width:100%;margin-top:.3rem;padding:.5rem .6rem;border:1px solid #ccc;border-radius:4px;font-size:1rem">
         <option value="125000">125 kbit/s</option>
@@ -156,10 +168,12 @@
         document.getElementById('mqtt_user').value         = cfg.mqtt_user ?? '';
         document.getElementById('mqtt_topic_prefix').value = cfg.mqtt_topic_prefix ?? '';
         if (cfg.can) {
-          document.getElementById('can_enable').checked      = !!cfg.can.enable;
-          document.getElementById('can_base_id').value       = '0x' + (cfg.can.base_id ?? 0x100).toString(16).toUpperCase();
-          document.getElementById('can_bitrate').value       = cfg.can.bitrate  ?? 250000;
-          document.getElementById('can_tx_interval').value  = cfg.can.tx_interval_ms ?? 1000;
+          document.getElementById('can_mode').value         = cfg.can.mode ?? 0;
+          document.getElementById('can_n2k_addr').value     = cfg.can.n2k_addr ?? 80;
+          document.getElementById('can_base_id').value      = '0x' + (cfg.can.base_id ?? 0x100).toString(16).toUpperCase();
+          document.getElementById('can_bitrate').value      = cfg.can.bitrate ?? 250000;
+          document.getElementById('can_tx_interval').value = cfg.can.tx_interval_ms ?? 1000;
+          updateCanFields();
         }
         if (cfg.modbus) {
           document.getElementById('mb_enable').checked  = !!cfg.modbus.enable;
@@ -213,7 +227,8 @@
           mqtt_password:     document.getElementById('mqtt_password').value,
           mqtt_topic_prefix: document.getElementById('mqtt_topic_prefix').value.trim(),
           can: {
-            enable:         document.getElementById('can_enable').checked,
+            mode:           parseInt(document.getElementById('can_mode').value, 10),
+            n2k_addr:       parseInt(document.getElementById('can_n2k_addr').value, 10),
             base_id:        parseInt(document.getElementById('can_base_id').value, 16),
             bitrate:        parseInt(document.getElementById('can_bitrate').value, 10),
             tx_interval_ms: parseInt(document.getElementById('can_tx_interval').value, 10),
@@ -248,6 +263,13 @@
         btn.disabled = false;
       }
     });
+
+    function updateCanFields() {
+      const mode = parseInt(document.getElementById('can_mode').value, 10);
+      document.getElementById('can_basic_fields').style.display = mode === 1 ? '' : 'none';
+      document.getElementById('can_n2k_fields').style.display   = mode === 2 ? '' : 'none';
+    }
+    updateCanFields();
 
     document.getElementById('reboot-btn').addEventListener('click', async () => {
       if (!confirm('Reboot the device?')) return;
