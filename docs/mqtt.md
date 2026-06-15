@@ -39,14 +39,13 @@ The board has 8 optocoupler-isolated digital inputs on GPIO4–GPIO11.
 - `false` = input inactive
 - Edge detection with 10 ms hardware debounce
 
+Each input can be given a **name** in the web UI config page (max 20 characters, no `/`, unique among all inputs). The name replaces the index number in the MQTT topic.
+
 ### Published topics
 
-| Topic              | QoS | Retained | Payload           |
-|--------------------|-----|----------|-------------------|
-| `<prefix>/input/1` | 0   | no       | `true` or `false` |
-| `<prefix>/input/2` | 0   | no       | `true` or `false` |
-| …                  |     |          |                   |
-| `<prefix>/input/8` | 0   | no       | `true` or `false` |
+| Topic                           | QoS | Retained | Payload           |
+|---------------------------------|-----|----------|-------------------|
+| `<prefix>/input/<name-or-1..8>` | 0   | no       | `true` or `false` |
 
 **When published:**
 
@@ -63,7 +62,9 @@ The board has 8 optocoupler-isolated digital inputs on GPIO4–GPIO11.
 
 ## Digital Outputs (DO1–DO8)
 
-The board has 8 optocoupler-isolated digital outputs driven via a TCA9554 I²C expander (address 0x20, SDA GPIO42, SCL GPIO41, 100 kHz). The invert flag per output is set in the web UI.
+The board has 8 optocoupler-isolated digital outputs driven via a TCA9554 I²C expander (address 0x20, SDA GPIO42, SCL GPIO41, 100 kHz). The invert flag and an optional name per output are set in the web UI.
+
+Each output can be given a **name** (max 20 characters, no `/`, unique among all outputs). The name replaces the index number in all output-related topics.
 
 > **Note:** Commands use a `/set` suffix so the device never receives its own state publications as commands. This matches the Home Assistant MQTT switch convention (`command_topic` / `state_topic`).
 
@@ -77,11 +78,11 @@ The board has 8 optocoupler-isolated digital outputs driven via a TCA9554 I²C e
 
 ### Individual output commands
 
-| Topic                                             | Payload          | Description                 |
-|---------------------------------------------------|------------------|-----------------------------|
-| `<prefix>/output/1/set` … `<prefix>/output/8/set` | value (see above) | Set one output              |
+| Topic                                                           | Payload           | Description   |
+|-----------------------------------------------------------------|-------------------|---------------|
+| `<prefix>/output/<name-or-1..8>/set` (one per output)          | value (see above) | Set one output |
 
-Example: publish `toggle` to `<prefix>/output/3/set` to flip DO3.
+Example: `toggle` → `<prefix>/output/3/set` flips DO3; if DO3 is named `pump`, use `<prefix>/output/pump/set`.
 
 ### Bulk output command
 
@@ -111,9 +112,9 @@ toggle                 → flip all
 
 ### State topics (published)
 
-| Topic                                     | QoS | Retained | Payload           |
-|-------------------------------------------|-----|----------|-------------------|
-| `<prefix>/output/1` … `<prefix>/output/8` | 0   | no       | `true` or `false` |
+| Topic                                      | QoS | Retained | Payload           |
+|--------------------------------------------|-----|----------|-------------------|
+| `<prefix>/output/<name-or-1..8>` per output | 0   | no       | `true` or `false` |
 
 Published on broker connect, after every successful state change, and when `output/read` is received.
 
