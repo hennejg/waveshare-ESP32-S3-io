@@ -61,46 +61,13 @@ The board has 8 optocoupler-isolated digital inputs on GPIO4–GPIO11.
 
 ---
 
----
-
 ## Digital Outputs (DO1–DO8)
 
-The board has 8 optocoupler-isolated digital outputs driven via a TCA9554 I²C expander (address 0x20, SDA GPIO42, SCL
-GPIO41, 100 kHz).
+The board has 8 optocoupler-isolated digital outputs driven via a TCA9554 I²C expander (address 0x20, SDA GPIO42, SCL GPIO41, 100 kHz). The invert flag per output is set in the web UI.
 
-Output state is driven by bit-level writes to the TCA9554 output port register. The invert flag per output is set in the
-web UI config page.
+> **Note:** Commands use a `/set` suffix so the device never receives its own state publications as commands. This matches the Home Assistant MQTT switch convention (`command_topic` / `state_topic`).
 
-### Command topics (subscribed)
-
-| Topic                                             | Payload   | Description                            |
-|---------------------------------------------------|-----------|----------------------------------------|
-| `<prefix>/output/1/set` … `<prefix>/output/8/set` | see below | Set individual output state            |
-| `<prefix>/outputs/set`                            | see below | Set all outputs at once (bulk)         |
-| `<prefix>/output/read`                            | any       | Publish current state of all 8 outputs |
-
-**Bulk set payloads (`outputs/set`):**
-
-*Single value* — applied to all 8 outputs:
-
-```
-true   1   high   on     → all ON
-false  0   low    off    → all OFF
-toggle                   → flip all
-```
-
-*JSON array* — one element per output (in order DO1…DO8); accepts the same values as individual outputs plus JSON booleans and numbers:
-
-```json
-[true, false, 1, 0, "on", "off", "toggle", true]
-```
-
-Array may be shorter than 8; unspecified outputs are left unchanged.
-
-> **Note:** Commands use the `/set` suffix so the device does not receive its own state publications as commands. This
-> matches the Home Assistant MQTT switch convention (`command_topic` / `state_topic`).
-
-**Accepted payloads** (case-insensitive):
+### Accepted payload values (all commands, case-insensitive)
 
 | Logical state | Accepted values            |
 |---------------|----------------------------|
@@ -108,17 +75,47 @@ Array may be shorter than 8; unspecified outputs are left unchanged.
 | Off / false   | `false`, `0`, `low`, `off` |
 | Toggle        | `toggle`                   |
 
+### Individual output commands
+
+| Topic                                             | Payload          | Description                 |
+|---------------------------------------------------|------------------|-----------------------------|
+| `<prefix>/output/1/set` … `<prefix>/output/8/set` | value (see above) | Set one output              |
+
+Example: publish `toggle` to `<prefix>/output/3/set` to flip DO3.
+
+### Bulk output command
+
+| Topic                  | Payload          | Description                     |
+|------------------------|------------------|---------------------------------|
+| `<prefix>/outputs/set` | value or array   | Set all outputs in one message  |
+
+**Single value** — applies the same state to all 8 outputs:
+
+```
+true   on   1   high   → all ON
+false  off  0   low    → all OFF
+toggle                 → flip all
+```
+
+**JSON array** — one element per output, DO1 first. Elements may be JSON booleans, numbers, or strings from the table above (including `"toggle"` per element). A shorter array leaves the remaining outputs unchanged.
+
+```json
+[true, false, 1, 0, "on", "off", "toggle", true]
+```
+
+### Read command
+
+| Topic                  | Payload | Effect                                  |
+|------------------------|---------|-----------------------------------------|
+| `<prefix>/output/read` | any     | Publish current state of all 8 outputs  |
+
 ### State topics (published)
 
 | Topic                                     | QoS | Retained | Payload           |
 |-------------------------------------------|-----|----------|-------------------|
 | `<prefix>/output/1` … `<prefix>/output/8` | 0   | no       | `true` or `false` |
 
-**When published:**
-
-- On every MQTT broker connect (full state refresh)
-- After every successful output change (confirmation)
-- When `output/read` is received
+Published on broker connect, after every successful state change, and when `output/read` is received.
 
 ---
 
