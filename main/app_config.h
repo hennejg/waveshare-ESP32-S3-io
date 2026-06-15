@@ -10,13 +10,15 @@
 #define APP_CFG_MQTT_TOPIC_LEN    64
 #define APP_CFG_DI_COUNT           8
 #define APP_CFG_DO_COUNT           8
+#define APP_CFG_IO_NAME_MAX        20   /* max visible chars; empty = use index number */
 
-/* Per-input configuration.
-   Stored as a fixed-size NVS blob.  Adding fields that fit inside _reserved
-   is backward-compatible.  Growing beyond 4 bytes requires a new blob key. */
+/* Per-input / per-output configuration (shared layout for DI and DO).
+   Stored as a fixed-size NVS blob.  If the blob size changes the old data is
+   silently discarded and defaults apply. */
 typedef struct {
-    bool    invert;        /* true = invert logical state (high → false) */
-    uint8_t _reserved[3]; /* pad to 4 bytes for future use */
+    bool    invert;                        /* true = invert logical state */
+    char    name[APP_CFG_IO_NAME_MAX + 1]; /* MQTT topic fragment, no '/', empty = "1".."8" */
+    uint8_t _reserved[2];                  /* pad to 24 bytes */
 } di_config_t;
 
 /* To add a scalar field: extend this struct, then mirror the change in

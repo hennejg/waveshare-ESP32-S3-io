@@ -15,7 +15,7 @@
 #define TAG        "web_server"
 #define WWW_BASE   "/www"
 #define CHUNK_SIZE  4096
-#define BODY_MAX    1024
+#define BODY_MAX    2048  /* names add ~768 bytes to the di/dout arrays */
 
 static httpd_handle_t s_server = NULL;
 
@@ -35,7 +35,7 @@ static const char *mime_type(const char *path)
     return "application/octet-stream";
 }
 
-/* Parse a cJSON array of {invert: bool} objects into a di_config_t array. */
+/* Parse a cJSON array of {invert, name} objects into a di_config_t array. */
 static void parse_invert_array(cJSON *arr, di_config_t *out, int max)
 {
     if (!cJSON_IsArray(arr)) return;
@@ -43,9 +43,31 @@ static void parse_invert_array(cJSON *arr, di_config_t *out, int max)
     if (n > max) n = max;
     for (int i = 0; i < n; i++) {
         cJSON *item = cJSON_GetArrayItem(arr, i);
-        cJSON *inv  = item ? cJSON_GetObjectItem(item, "invert") : NULL;
-        if (cJSON_IsBool(inv)) out[i].invert = cJSON_IsTrue(inv);
+        if (!item) continue;
+        cJSON *inv  = cJSON_GetObjectItem(item, "invert");
+        cJSON *name = cJSON_GetObjectItem(item, "name");
+        if (cJSON_IsBool(inv))    out[i].invert = cJSON_IsTrue(inv);
+        if (cJSON_IsString(name)) strlcpy(out[i].name, name->valuestring, sizeof(out[i].name));
     }
+}
+
+/* Validate names: no '/', unique within the array (empty names ignored). */
+static bool validate_names(const di_config_t *arr, int count, const char **err_msg)
+{
+    for (int i = 0; i < count; i++) {
+        if (!arr[i].name[0]) continue;
+        if (strchr(arr[i].name, '/')) {
+            *err_msg = "name must not contain '/'";
+            return false;
+        }
+        for (int j = i + 1; j < count; j++) {
+            if (arr[j].name[0] && strcmp(arr[i].name, arr[j].name) == 0) {
+                *err_msg = "names must be unique";
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 /* ----------------------------------------------------------------- /api/config */
@@ -65,14 +87,16 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON *di = cJSON_AddArrayToObject(root, "di");
     for (int i = 0; i < APP_CFG_DI_COUNT; i++) {
         cJSON *item = cJSON_CreateObject();
-        cJSON_AddBoolToObject(item, "invert", cfg->di[i].invert);
+        cJSON_AddBoolToObject  (item, "invert", cfg->di[i].invert);
+        cJSON_AddStringToObject(item, "name",   cfg->di[i].name);
         cJSON_AddItemToArray(di, item);
     }
 
     cJSON *dout = cJSON_AddArrayToObject(root, "dout");
     for (int i = 0; i < APP_CFG_DO_COUNT; i++) {
         cJSON *item = cJSON_CreateObject();
-        cJSON_AddBoolToObject(item, "invert", cfg->dout[i].invert);
+        cJSON_AddBoolToObject  (item, "invert", cfg->dout[i].invert);
+        cJSON_AddStringToObject(item, "name",   cfg->dout[i].name);
         cJSON_AddItemToArray(dout, item);
     }
 
@@ -138,9 +162,22 @@ static esp_err_t api_config_post(httpd_req_t *req)
     parse_invert_array(cJSON_GetObjectItem(root, "dout"), cfg.dout, APP_CFG_DO_COUNT);
 
     cJSON_Delete(root);
+
+    /* Validate names before saving */
+    const char *err = NULL;
+    if (!validate_names(cfg.di,   APP_CFG_DI_COUNT, &err) ||
+        !validate_names(cfg.dout, APP_CFG_DO_COUNT, &err)) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "{\"status\":\"error\",\"message\":\"%s\"}", err);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, msg);
+        return ESP_OK;
+    }
+
     app_config_update(&cfg);
     di_publish_all();
-    dout_publish_all();
+    /* Re-subscribe with potentially new names, then publish all DO states. */
+    dout_on_mqtt_connected();
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\"}");

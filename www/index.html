@@ -58,17 +58,17 @@
 
     <h2>Digital Inputs</h2>
     <table>
-      <thead><tr><th>Input</th><th>Invert</th></tr></thead>
+      <thead><tr><th>Input</th><th>Name</th><th>Invert</th></tr></thead>
       <tbody id="di-table"></tbody>
     </table>
-    <p class="hint">Invert: checked = active-low (GPIO low → <code>true</code>).</p>
+    <p class="hint">Name: used as MQTT topic fragment instead of the number (max 20 chars, no <code>/</code>, unique). Invert: checked = active-low (GPIO low → <code>true</code>).</p>
 
     <h2>Digital Outputs</h2>
     <table>
-      <thead><tr><th>Output</th><th>Invert</th></tr></thead>
+      <thead><tr><th>Output</th><th>Name</th><th>Invert</th></tr></thead>
       <tbody id="dout-table"></tbody>
     </table>
-    <p class="hint">Invert: checked = physical output bit flipped relative to logical state.</p>
+    <p class="hint">Name: used as MQTT topic fragment. Invert: checked = physical bit flipped relative to logical state.</p>
 
     <button type="submit" id="btn">Save</button>
   </form>
@@ -84,13 +84,15 @@
     for (let i = 0; i < 8; i++) {
       const tr = document.createElement('tr');
       tr.innerHTML = `<td>DI${i + 1}</td>` +
-        `<td><input type="checkbox" id="di_${i}_invert"></td>`;
+        `<td><input type="text" id="di_${i}_name" maxlength="20" style="width:9rem"></td>` +
+        `<td style="text-align:center"><input type="checkbox" id="di_${i}_invert"></td>`;
       diTbl.appendChild(tr);
     }
     for (let i = 0; i < 8; i++) {
       const tr = document.createElement('tr');
       tr.innerHTML = `<td>DO${i + 1}</td>` +
-        `<td><input type="checkbox" id="dout_${i}_invert"></td>`;
+        `<td><input type="text" id="dout_${i}_name" maxlength="20" style="width:9rem"></td>` +
+        `<td style="text-align:center"><input type="checkbox" id="dout_${i}_invert"></td>`;
       doutTbl.appendChild(tr);
     }
 
@@ -106,12 +108,16 @@
         document.getElementById('pass_hint').textContent   =
           cfg.mqtt_password_set ? 'Password is set.' : 'No password stored.';
         (cfg.di ?? []).forEach((di, i) => {
-          const el = document.getElementById(`di_${i}_invert`);
-          if (el) el.checked = !!di.invert;
+          const inv  = document.getElementById(`di_${i}_invert`);
+          const name = document.getElementById(`di_${i}_name`);
+          if (inv)  inv.checked   = !!di.invert;
+          if (name) name.value    = di.name ?? '';
         });
         (cfg.dout ?? []).forEach((dout, i) => {
-          const el = document.getElementById(`dout_${i}_invert`);
-          if (el) el.checked = !!dout.invert;
+          const inv  = document.getElementById(`dout_${i}_invert`);
+          const name = document.getElementById(`dout_${i}_name`);
+          if (inv)  inv.checked   = !!dout.invert;
+          if (name) name.value    = dout.name ?? '';
         });
       } catch (e) {
         status.className = 'err';
@@ -126,11 +132,17 @@
       try {
         const di = [];
         for (let i = 0; i < 8; i++) {
-          di.push({ invert: document.getElementById(`di_${i}_invert`).checked });
+          di.push({
+            invert: document.getElementById(`di_${i}_invert`).checked,
+            name:   document.getElementById(`di_${i}_name`).value.trim(),
+          });
         }
         const dout = [];
         for (let i = 0; i < 8; i++) {
-          dout.push({ invert: document.getElementById(`dout_${i}_invert`).checked });
+          dout.push({
+            invert: document.getElementById(`dout_${i}_invert`).checked,
+            name:   document.getElementById(`dout_${i}_name`).value.trim(),
+          });
         }
         const cfg = {
           device_name:       document.getElementById('device_name').value.trim(),

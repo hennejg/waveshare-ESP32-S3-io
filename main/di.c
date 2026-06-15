@@ -32,8 +32,10 @@ static inline bool read_pin(uint8_t n)
 
 static void publish_one(uint8_t n, bool state)
 {
-    char topic[16];
-    snprintf(topic, sizeof(topic), "input/%u", n + 1);  /* 1-based, matches box label */
+    const char *name = app_config_get()->di[n].name;
+    char topic[32];
+    if (name[0]) snprintf(topic, sizeof(topic), "input/%.20s",   name);
+    else         snprintf(topic, sizeof(topic), "input/%u",    n + 1);
     app_mqtt_publish(topic, state ? "true" : "false", -1, 0, false);
 }
 

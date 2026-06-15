@@ -86,8 +86,10 @@ static esp_err_t write_outputs(void)
 
 static void publish_one(uint8_t n)
 {
-    char topic[16];
-    snprintf(topic, sizeof(topic), "output/%u", n + 1);
+    const char *name = app_config_get()->dout[n].name;
+    char topic[32];
+    if (name[0]) snprintf(topic, sizeof(topic), "output/%.20s",   name);
+    else         snprintf(topic, sizeof(topic), "output/%u",    n + 1);
     app_mqtt_publish(topic, s_state[n] ? "true" : "false", -1, 0, false);
 }
 
@@ -150,15 +152,16 @@ void dout_publish_all(void)
 
 void dout_on_mqtt_connected(void)
 {
-    /* Commands arrive on output/N/set — separate from the state topic
-       output/N to avoid receiving our own published confirmations as commands. */
-    for (uint8_t i = 1; i <= NUM_DO; i++) {
-        char topic[20];
-        snprintf(topic, sizeof(topic), "output/%u/set", i);
+    const app_config_t *cfg = app_config_get();
+    for (uint8_t i = 0; i < NUM_DO; i++) {
+        char topic[36];
+        const char *name = cfg->dout[i].name;
+        if (name[0]) snprintf(topic, sizeof(topic), "output/%.20s/set",   name);
+        else         snprintf(topic, sizeof(topic), "output/%u/set",    i + 1);
         app_mqtt_subscribe(topic, 0);
     }
     app_mqtt_subscribe("output/read", 0);
-    app_mqtt_subscribe("outputs/set", 0);  /* bulk set */
+    app_mqtt_subscribe("outputs/set", 0);
     dout_publish_all();
 }
 
@@ -211,24 +214,21 @@ void dout_on_mqtt_message(const char *topic, size_t tlen,
         return;
     }
 
-    /* Match suffix "output/N/set" where N is '1'..'8'.
-       Minimum topic: "output/1/set" = 12 chars. */
-    if (tlen >= 12 && memcmp(topic + tlen - 4, "/set", 4) == 0) {
-        uint8_t ch = (uint8_t)topic[tlen - 5];
-        if (ch >= '1' && ch <= '8') {
-            static const char OUT_SUFFIX[] = "output/";
-            const size_t os = sizeof(OUT_SUFFIX) - 1;
-            /* Verify "output/" precedes the digit */
-            if (memcmp(topic + tlen - os - 5, OUT_SUFFIX, os) == 0) {
-                uint8_t n = (uint8_t)(ch - '1');
+    /* Match individual output command topics (name or number). */
+    {
+        const app_config_t *cfg = app_config_get();
+        for (uint8_t i = 0; i < NUM_DO; i++) {
+            char cmd[36];
+            const char *name = cfg->dout[i].name;
+            if (name[0]) snprintf(cmd, sizeof(cmd), "output/%.20s/set",   name);
+            else         snprintf(cmd, sizeof(cmd), "output/%u/set",    i + 1);
+            size_t clen = strlen(cmd);
+            if (tlen >= clen && memcmp(topic + tlen - clen, cmd, clen) == 0) {
                 bool state;
-                if (parse_toggle(data, dlen)) {
-                    dout_set(n, !dout_get(n));
-                } else if (parse_payload(data, dlen, &state)) {
-                    dout_set(n, state);
-                } else {
-                    ESP_LOGW(TAG, "Unrecognised payload for output/%c/set", ch);
-                }
+                if (parse_toggle(data, dlen))              dout_set(i, !dout_get(i));
+                else if (parse_payload(data, dlen, &state)) dout_set(i, state);
+                else ESP_LOGW(TAG, "Unrecognised payload for %s", cmd);
+                return;
             }
         }
     }
