@@ -12,8 +12,10 @@
 
 static esp_mqtt_client_handle_t s_client    = NULL;
 static volatile bool            s_connected = false;
-static app_mqtt_connected_cb_t  s_on_connected = NULL;
-static app_mqtt_msg_cb_t        s_on_msg       = NULL;
+static app_mqtt_connected_cb_t  s_on_connected    = NULL;
+static app_mqtt_msg_cb_t        s_on_msg          = NULL;
+static void                   (*s_on_disconnected)(void) = NULL;
+static void                   (*s_on_publish_cb)(void)   = NULL;
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -47,6 +49,7 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "Disconnected from broker");
         s_connected = false;
+        if (s_on_disconnected) s_on_disconnected();
         break;
 
     case MQTT_EVENT_SUBSCRIBED:
@@ -146,7 +149,9 @@ int app_mqtt_publish(const char *topic, const char *payload, int len,
     if (!s_client) return -1;
     char full[TOPIC_MAXLEN];
     make_topic(topic, full, sizeof(full));
-    return esp_mqtt_client_publish(s_client, full, payload, len, qos, retain);
+    int id = esp_mqtt_client_publish(s_client, full, payload, len, qos, retain);
+    if (id >= 0 && s_on_publish_cb) s_on_publish_cb();
+    return id;
 }
 
 int app_mqtt_subscribe(const char *topic, int qos)
@@ -169,6 +174,9 @@ void app_mqtt_set_connected_callback(app_mqtt_connected_cb_t cb)
 {
     s_on_connected = cb;
 }
+
+void app_mqtt_set_disconnected_callback(void (*cb)(void)) { s_on_disconnected = cb; }
+void app_mqtt_set_publish_callback(void (*cb)(void))      { s_on_publish_cb   = cb; }
 
 void app_mqtt_set_msg_callback(app_mqtt_msg_cb_t cb)
 {

@@ -122,9 +122,30 @@ Published on broker connect, after every successful state change, and when `outp
 
 ## LED (WS2812)
 
-Single RGB LED on GPIO38.
+Single RGB LED on GPIO38. Operates in one of two modes set in the web UI:
 
-### Command topic (subscribed)
+| Mode | Description |
+|------|-------------|
+| **IO device** *(default)* | Fully controlled via MQTT and Modbus HR 40001 |
+| **Status feedback** | Shows device connectivity state automatically (see below) |
+
+### Status feedback mode
+
+| State | Colour | Brightness |
+|-------|--------|-----------|
+| Boot / no network | Yellow | 50% |
+| Network (WiFi or Ethernet) | Green | 50% |
+| MQTT broker connected | Purple | 50% |
+| MQTT message received | Red flash | 100%, 100 ms |
+| MQTT message published | Blue flash | 100%, 100 ms |
+
+Transitions are evaluated automatically: losing MQTT falls back to green (if network is up) or yellow; losing the network falls back to yellow.
+
+In Status mode the MQTT and Modbus LED commands are ignored.
+
+---
+
+### IO mode — Command topic (subscribed)
 
 | Topic              | Payload   | Description               |
 |--------------------|-----------|---------------------------|
@@ -180,13 +201,13 @@ To turn off at the end of a sequence, make the last step `{"color": "#000000", "
 ]
 ```
 
-### State topic (published)
+### IO mode — State topic (published)
 
 | Topic          | QoS | Retained | Payload   |
 |----------------|-----|----------|-----------|
 | `<prefix>/led` | 0   | no       | `#rrggbb` |
 
-Published on connect and after each colour change (including at the end of a sequence).
+Published on connect and after each colour change (including at the end of a sequence). Not published in Status mode.
 
 ---
 

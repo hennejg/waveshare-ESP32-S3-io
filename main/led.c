@@ -1,4 +1,5 @@
 #include "led.h"
+#include "app_config.h"
 #include "app_mqtt.h"
 
 #include <string.h>
@@ -30,6 +31,7 @@ typedef struct {
 static led_strip_handle_t s_strip;
 static uint8_t            s_r, s_g, s_b;
 static QueueHandle_t      s_queue;
+static bool               s_status_mode;
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -98,8 +100,99 @@ static void led_task(void *arg)
 
 /* ------------------------------------------------------------------ public */
 
+/* ============================================================ status mode === */
+
+/* Colours (50% brightness for persistent states, 100% for flashes) */
+#define STA_BOOT_R  127 /* 50% yellow  */
+#define STA_BOOT_G  127
+#define STA_BOOT_B  0
+#define STA_NET_R   0   /* 50% green   */
+#define STA_NET_G   127
+#define STA_NET_B   0
+#define STA_MQTT_R  100 /* 50% purple  */
+#define STA_MQTT_G  0
+#define STA_MQTT_B  127
+#define STA_RX_R    255 /* 100% red    */
+#define STA_RX_G    0
+#define STA_RX_B    0
+#define STA_TX_R    0   /* 100% blue   */
+#define STA_TX_G    0
+#define STA_TX_B    255
+#define FLASH_MS    100
+
+typedef struct { uint8_t r, g, b; } flash_t;
+
+static uint8_t       s_bg_r, s_bg_g, s_bg_b;  /* current background colour  */
+static uint8_t       s_net_level;              /* 0=boot 1=network 2=mqtt    */
+static int           s_net_count;              /* # interfaces with an IP    */
+static QueueHandle_t s_flash_q;
+
+static void set_background(uint8_t r, uint8_t g, uint8_t b)
+{
+    s_bg_r = r; s_bg_g = g; s_bg_b = b;
+    hw_apply(r, g, b);
+}
+
+static void refresh_status(void)
+{
+    switch (s_net_level) {
+    case 0: set_background(STA_BOOT_R, STA_BOOT_G, STA_BOOT_B); break;
+    case 1: set_background(STA_NET_R,  STA_NET_G,  STA_NET_B);  break;
+    case 2: set_background(STA_MQTT_R, STA_MQTT_G, STA_MQTT_B); break;
+    }
+}
+
+static void flash_task(void *arg)
+{
+    flash_t f;
+    for (;;) {
+        xQueueReceive(s_flash_q, &f, portMAX_DELAY);
+        hw_apply(f.r, f.g, f.b);
+        vTaskDelay(pdMS_TO_TICKS(FLASH_MS));
+        hw_apply(s_bg_r, s_bg_g, s_bg_b);
+    }
+}
+
+void led_status_set_network(bool up)
+{
+    if (!s_status_mode) return;
+    if (up) {
+        s_net_count++;
+        if (s_net_level < 1) { s_net_level = 1; refresh_status(); }
+    } else {
+        if (--s_net_count <= 0) {
+            s_net_count = 0;
+            if (s_net_level > 0) { s_net_level = 0; refresh_status(); }
+        }
+    }
+}
+
+void led_status_set_mqtt(bool up)
+{
+    if (!s_status_mode) return;
+    if (up) {
+        s_net_level = 2;
+    } else {
+        s_net_level = (s_net_count > 0) ? 1 : 0;
+    }
+    refresh_status();
+}
+
+static void do_flash(uint8_t r, uint8_t g, uint8_t b)
+{
+    if (!s_status_mode || !s_flash_q) return;
+    flash_t f = {r, g, b};
+    xQueueOverwrite(s_flash_q, &f);
+}
+
+void led_status_flash_rx(void) { do_flash(STA_RX_R, STA_RX_G, STA_RX_B); }
+void led_status_flash_tx(void) { do_flash(STA_TX_R, STA_TX_G, STA_TX_B); }
+
+/* ============================================================== IO mode ==== */
+
 esp_err_t led_set_rgb(uint8_t r, uint8_t g, uint8_t b)
 {
+    if (s_status_mode) return ESP_OK;   /* ignore in status mode */
     hw_apply(r, g, b);
     return ESP_OK;
 }
@@ -121,15 +214,24 @@ esp_err_t led_init(void)
     led_strip_clear(s_strip);
     led_strip_refresh(s_strip);
 
-    s_queue = xQueueCreate(1, sizeof(led_seq_t));
-    xTaskCreate(led_task, "led", 3072, NULL, 5, NULL);
+    s_status_mode = (app_config_get()->led_mode == LED_MODE_STATUS);
 
-    ESP_LOGI(TAG, "Initialized WS2812 on GPIO%d", LED_GPIO);
+    if (s_status_mode) {
+        s_flash_q = xQueueCreate(1, sizeof(flash_t));
+        xTaskCreate(flash_task, "led_flash", 2048, NULL, 6, NULL);
+        refresh_status();   /* boot = 50% yellow */
+        ESP_LOGI(TAG, "WS2812 on GPIO%d — Status mode", LED_GPIO);
+    } else {
+        s_queue = xQueueCreate(1, sizeof(led_seq_t));
+        xTaskCreate(led_task, "led", 3072, NULL, 5, NULL);
+        ESP_LOGI(TAG, "WS2812 on GPIO%d — IO mode", LED_GPIO);
+    }
     return ESP_OK;
 }
 
 void led_on_mqtt_connected(void)
 {
+    if (s_status_mode) return;   /* status mode doesn't subscribe to led/set */
     app_mqtt_subscribe("led/set", 0);
     publish_color();
 }
@@ -137,6 +239,7 @@ void led_on_mqtt_connected(void)
 void led_on_mqtt_message(const char *topic, size_t tlen,
                           const char *data,  size_t dlen)
 {
+    if (s_status_mode) return;   /* status mode ignores MQTT LED commands */
     static const char SUFFIX[] = "led/set";
     const size_t sl = sizeof(SUFFIX) - 1;
     if (tlen < sl || memcmp(topic + tlen - sl, SUFFIX, sl) != 0) return;

@@ -12,6 +12,9 @@
 #define APP_CFG_DO_COUNT           8
 #define APP_CFG_IO_NAME_MAX        20   /* max visible chars; empty = use index number */
 
+#define LED_MODE_IO     0   /* LED controlled via MQTT and Modbus */
+#define LED_MODE_STATUS 1   /* LED shows device connectivity state */
+
 /* Per-input / per-output configuration (shared layout for DI and DO).
    Stored as a fixed-size NVS blob.  If the blob size changes the old data is
    silently discarded and defaults apply. */
@@ -31,6 +34,9 @@ typedef struct {
     char         mqtt_topic_prefix[APP_CFG_MQTT_TOPIC_LEN];
     di_config_t  di[APP_CFG_DI_COUNT];
     di_config_t  dout[APP_CFG_DO_COUNT];
+
+    uint8_t led_mode;    /* LED_MODE_IO or LED_MODE_STATUS */
+    uint8_t _led_pad[3];
 
     /* Modbus RTU server */
     struct {

@@ -41,6 +41,13 @@
       <input type="text" id="device_name" maxlength="31" required>
     </label>
     <p class="hint">Used as DHCP hostname. Alphanumeric and hyphens only.</p>
+    <label>LED Mode
+      <select id="led_mode" style="width:100%;margin-top:.3rem;padding:.5rem .6rem;border:1px solid #ccc;border-radius:4px;font-size:1rem">
+        <option value="0">IO device — controlled via MQTT / Modbus</option>
+        <option value="1">Status feedback — shows connectivity state</option>
+      </select>
+    </label>
+    <p class="hint">Status mode: 50% yellow = alive, 50% green = network, 50% purple = MQTT. Red/blue flashes = RX/TX traffic. Takes effect after reboot.</p>
 
     <h2>MQTT Broker</h2>
     <label>Broker URL
@@ -124,6 +131,7 @@
         if (!r.ok) throw new Error('HTTP ' + r.status);
         const cfg = await r.json();
         document.getElementById('device_name').value       = cfg.device_name ?? '';
+        document.getElementById('led_mode').value          = cfg.led_mode ?? 0;
         document.getElementById('mqtt_url').value          = cfg.mqtt_url ?? '';
         document.getElementById('mqtt_user').value         = cfg.mqtt_user ?? '';
         document.getElementById('mqtt_topic_prefix').value = cfg.mqtt_topic_prefix ?? '';
@@ -173,6 +181,7 @@
         }
         const cfg = {
           device_name:       document.getElementById('device_name').value.trim(),
+          led_mode:          parseInt(document.getElementById('led_mode').value, 10),
           mqtt_url:          document.getElementById('mqtt_url').value.trim(),
           mqtt_user:         document.getElementById('mqtt_user').value,
           mqtt_password:     document.getElementById('mqtt_password').value,

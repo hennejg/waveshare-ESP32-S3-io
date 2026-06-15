@@ -26,3 +26,8 @@ int app_mqtt_unsubscribe(const char *topic);
 
 void app_mqtt_set_connected_callback(app_mqtt_connected_cb_t cb);
 void app_mqtt_set_msg_callback(app_mqtt_msg_cb_t cb);
+
+/* Called on MQTT_EVENT_DISCONNECTED. */
+void app_mqtt_set_disconnected_callback(void (*cb)(void));
+/* Called after every successful publish (QoS 0: fire-and-forget). */
+void app_mqtt_set_publish_callback(void (*cb)(void));

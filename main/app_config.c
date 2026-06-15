@@ -14,6 +14,7 @@
 #define K_DI_CFG        "di_cfg"
 #define K_DOUT_CFG      "dout_cfg"
 #define K_MODBUS_CFG    "mb_cfg"
+#define K_LED_MODE      "led_mode"
 
 static app_config_t s_cfg = {
     .device_name       = "Waveshare-ESP32",
@@ -49,6 +50,9 @@ esp_err_t app_config_init(void)
     nvs_get_blob(h, K_DOUT_CFG, s_cfg.dout, &sz);
     sz = sizeof(s_cfg.modbus);
     nvs_get_blob(h, K_MODBUS_CFG, &s_cfg.modbus, &sz);
+    uint8_t led_mode_val = 0;
+    nvs_get_u8(h, K_LED_MODE, &led_mode_val);
+    s_cfg.led_mode = led_mode_val;
 
     nvs_close(h);
     return ESP_OK;
@@ -75,6 +79,7 @@ esp_err_t app_config_update(const app_config_t *cfg)
     nvs_set_blob(h, K_DI_CFG,    s_cfg.di,   sizeof(s_cfg.di));
     nvs_set_blob(h, K_DOUT_CFG,  s_cfg.dout, sizeof(s_cfg.dout));
     nvs_set_blob(h, K_MODBUS_CFG, &s_cfg.modbus, sizeof(s_cfg.modbus));
+    nvs_set_u8(h, K_LED_MODE, s_cfg.led_mode);
 
     nvs_commit(h);
     nvs_close(h);

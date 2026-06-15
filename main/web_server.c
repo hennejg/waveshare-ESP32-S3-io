@@ -86,6 +86,7 @@ static esp_err_t api_config_get(httpd_req_t *req)
     /* Never expose the password — return a flag instead. */
     cJSON_AddBoolToObject  (root, "mqtt_password_set", cfg->mqtt_password[0] != '\0');
     cJSON_AddStringToObject(root, "mqtt_topic_prefix", cfg->mqtt_topic_prefix);
+    cJSON_AddNumberToObject(root, "led_mode",          cfg->led_mode);
 
     cJSON *mb = cJSON_AddObjectToObject(root, "modbus");
     cJSON_AddBoolToObject  (mb, "enable",   cfg->modbus.enable);
@@ -168,6 +169,10 @@ static esp_err_t api_config_post(httpd_req_t *req)
 
     parse_invert_array(cJSON_GetObjectItem(root, "di"),   cfg.di,   APP_CFG_DI_COUNT);
     parse_invert_array(cJSON_GetObjectItem(root, "dout"), cfg.dout, APP_CFG_DO_COUNT);
+
+    cJSON *led_mode_v = cJSON_GetObjectItem(root, "led_mode");
+    if (cJSON_IsNumber(led_mode_v))
+        cfg.led_mode = (uint8_t)led_mode_v->valuedouble;
 
     cJSON *mb = cJSON_GetObjectItem(root, "modbus");
     if (cJSON_IsObject(mb)) {
