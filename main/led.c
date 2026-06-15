@@ -67,7 +67,8 @@ static bool parse_step(cJSON *obj, led_step_t *s)
 static void hw_apply(uint8_t r, uint8_t g, uint8_t b)
 {
     s_r = r; s_g = g; s_b = b;
-    led_strip_set_pixel(s_strip, 0, r, g, b);
+    /* WS2812 wire order is GRB — swap red and green at the call site. */
+    led_strip_set_pixel(s_strip, 0, g, r, b);
     led_strip_refresh(s_strip);
 }
 
@@ -106,9 +107,8 @@ esp_err_t led_set_rgb(uint8_t r, uint8_t g, uint8_t b)
 esp_err_t led_init(void)
 {
     led_strip_config_t strip_cfg = {
-        .strip_gpio_num         = LED_GPIO,
-        .max_leds               = 1,
-        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,  /* WS2812 is GRB */
+        .strip_gpio_num = LED_GPIO,
+        .max_leds       = 1,
     };
     led_strip_rmt_config_t rmt_cfg = {
         .resolution_hz  = 10 * 1000 * 1000,
