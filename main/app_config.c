@@ -15,6 +15,7 @@
 #define K_DOUT_CFG      "dout_cfg"
 #define K_MODBUS_CFG    "mb_cfg"
 #define K_LED_MODE      "led_mode"
+#define K_CAN_CFG       "can_cfg"
 
 static app_config_t s_cfg = {
     .device_name       = "Waveshare-ESP32",
@@ -24,6 +25,7 @@ static app_config_t s_cfg = {
     .mqtt_topic_prefix = "",
     /* di/dout names and invert default to zero */
     .modbus = { .enable = 0, .address = 1, .baudrate = 9600 },
+    .can    = { .enable = 0, .base_id = 0x100, .bitrate = 250000, .tx_interval_ms = 1000 },
 };
 
 #define NVS_GET_STR(h, key, dst) \
@@ -53,6 +55,8 @@ esp_err_t app_config_init(void)
     uint8_t led_mode_val = 0;
     nvs_get_u8(h, K_LED_MODE, &led_mode_val);
     s_cfg.led_mode = led_mode_val;
+    sz = sizeof(s_cfg.can);
+    nvs_get_blob(h, K_CAN_CFG, &s_cfg.can, &sz);
 
     nvs_close(h);
     return ESP_OK;
@@ -80,6 +84,7 @@ esp_err_t app_config_update(const app_config_t *cfg)
     nvs_set_blob(h, K_DOUT_CFG,  s_cfg.dout, sizeof(s_cfg.dout));
     nvs_set_blob(h, K_MODBUS_CFG, &s_cfg.modbus, sizeof(s_cfg.modbus));
     nvs_set_u8(h, K_LED_MODE, s_cfg.led_mode);
+    nvs_set_blob(h, K_CAN_CFG, &s_cfg.can, sizeof(s_cfg.can));
 
     nvs_commit(h);
     nvs_close(h);

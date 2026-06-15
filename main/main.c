@@ -12,6 +12,7 @@
 #include "dout.h"
 #include "eth.h"
 #include "led.h"
+#include "can_server.h"
 #include "mb_server.h"
 #include "web_server.h"
 
@@ -89,6 +90,7 @@ void app_main(void)
     ESP_ERROR_CHECK(led_init());
     ESP_ERROR_CHECK(buzzer_init());
     ESP_ERROR_CHECK(mb_server_init());
+    ESP_ERROR_CHECK(can_server_init());
 
     esp_vfs_spiffs_conf_t spiffs = {
         .base_path              = "/www",

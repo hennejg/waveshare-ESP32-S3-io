@@ -38,6 +38,16 @@ typedef struct {
     uint8_t led_mode;    /* LED_MODE_IO or LED_MODE_STATUS */
     uint8_t _led_pad[3];
 
+    /* CAN bus */
+    struct {
+        uint8_t  enable;
+        uint8_t  _pad[1];
+        uint16_t base_id;          /* 11-bit base CAN ID (0x000–0x7FF) */
+        uint32_t bitrate;          /* 125000 / 250000 / 500000 / 1000000 */
+        uint16_t tx_interval_ms;   /* periodic DI TX; 0 = on-change only */
+        uint8_t  _pad2[2];
+    } can;
+
     /* Modbus RTU server */
     struct {
         uint8_t  enable;     /* 0 = disabled; changes take effect on reboot */

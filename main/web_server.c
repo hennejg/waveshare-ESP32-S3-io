@@ -88,6 +88,12 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON_AddStringToObject(root, "mqtt_topic_prefix", cfg->mqtt_topic_prefix);
     cJSON_AddNumberToObject(root, "led_mode",          cfg->led_mode);
 
+    cJSON *can = cJSON_AddObjectToObject(root, "can");
+    cJSON_AddBoolToObject  (can, "enable",         cfg->can.enable);
+    cJSON_AddNumberToObject(can, "base_id",        cfg->can.base_id);
+    cJSON_AddNumberToObject(can, "bitrate",        cfg->can.bitrate);
+    cJSON_AddNumberToObject(can, "tx_interval_ms", cfg->can.tx_interval_ms);
+
     cJSON *mb = cJSON_AddObjectToObject(root, "modbus");
     cJSON_AddBoolToObject  (mb, "enable",   cfg->modbus.enable);
     cJSON_AddNumberToObject(mb, "address",  cfg->modbus.address);
@@ -173,6 +179,21 @@ static esp_err_t api_config_post(httpd_req_t *req)
     cJSON *led_mode_v = cJSON_GetObjectItem(root, "led_mode");
     if (cJSON_IsNumber(led_mode_v))
         cfg.led_mode = (uint8_t)led_mode_v->valuedouble;
+
+    cJSON *can_j = cJSON_GetObjectItem(root, "can");
+    if (cJSON_IsObject(can_j)) {
+        cJSON *v;
+        if ((v = cJSON_GetObjectItem(can_j, "enable"))  && cJSON_IsBool(v))
+            cfg.can.enable = cJSON_IsTrue(v) ? 1 : 0;
+        if ((v = cJSON_GetObjectItem(can_j, "base_id")) && cJSON_IsNumber(v)) {
+            uint32_t id = (uint32_t)v->valuedouble;
+            if (id <= 0x7FF) cfg.can.base_id = (uint16_t)id;
+        }
+        if ((v = cJSON_GetObjectItem(can_j, "bitrate")) && cJSON_IsNumber(v))
+            cfg.can.bitrate = (uint32_t)v->valuedouble;
+        if ((v = cJSON_GetObjectItem(can_j, "tx_interval_ms")) && cJSON_IsNumber(v))
+            cfg.can.tx_interval_ms = (uint16_t)v->valuedouble;
+    }
 
     cJSON *mb = cJSON_GetObjectItem(root, "modbus");
     if (cJSON_IsObject(mb)) {
