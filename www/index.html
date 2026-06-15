@@ -25,7 +25,8 @@
       font-size: 1rem; cursor: pointer;
     }
     button:disabled { background: #aaa; cursor: default; }
-    #reboot-btn { background: #b0413e; margin-left: .5rem; }
+    #reboot-btn        { background: #b0413e; margin-left: .5rem; }
+    #factory-reset-btn { background: #7a1e1e; margin-left: .5rem; }
     #status { margin-top: 0.8rem; font-size: 0.9rem; min-height: 1.2em; }
     .ok  { color: #2d7d46; }
     .err { color: #c0392b; }
@@ -91,6 +92,7 @@
 
     <button type="submit" id="btn">Save</button>
     <button type="button" id="reboot-btn">Reboot</button>
+    <button type="button" id="factory-reset-btn">Factory Reset</button>
   </form>
   <p id="status"></p>
 
@@ -211,6 +213,19 @@
       status.className = 'ok';
       status.textContent = 'Rebooting…';
       try { await fetch('/api/reboot', { method: 'POST' }); } catch (_) { /* expected */ }
+    });
+
+    document.getElementById('factory-reset-btn').addEventListener('click', async () => {
+      if (!confirm(
+        'Factory Reset will erase ALL settings:\n' +
+        '  • WiFi credentials (device will start AP provisioning)\n' +
+        '  • MQTT broker, topic prefix, passwords\n' +
+        '  • IO names and invert flags\n' +
+        '  • Modbus configuration\n\n' +
+        'Continue?')) return;
+      status.className = 'ok';
+      status.textContent = 'Resetting to factory defaults and rebooting…';
+      try { await fetch('/api/factory-reset', { method: 'POST' }); } catch (_) { /* expected */ }
     });
 
     load();

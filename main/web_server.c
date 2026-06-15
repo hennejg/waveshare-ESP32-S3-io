@@ -12,6 +12,7 @@
 #include <esp_log.h>
 #include <esp_system.h>
 #include <esp_timer.h>
+#include <nvs_flash.h>
 #include "cJSON.h"
 
 #define TAG        "web_server"
@@ -256,6 +257,23 @@ static esp_err_t file_get(httpd_req_t *req)
 
 static void do_restart(void *arg) { esp_restart(); }
 
+static esp_err_t api_factory_reset(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"resetting\"}");
+
+    /* Erase the entire NVS default partition, then reboot.
+       This clears WiFi credentials, all config, and IO names. */
+    nvs_flash_erase();
+
+    esp_timer_handle_t t;
+    esp_timer_create(&(esp_timer_create_args_t){
+        .callback = do_restart, .name = "factory_reset"
+    }, &t);
+    esp_timer_start_once(t, 200 * 1000);
+    return ESP_OK;
+}
+
 static esp_err_t api_reboot(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "application/json");
@@ -275,7 +293,8 @@ static esp_err_t api_reboot(httpd_req_t *req)
 static const httpd_uri_t s_handlers[] = {
     { .uri = "/api/config", .method = HTTP_GET,  .handler = api_config_get  },
     { .uri = "/api/config", .method = HTTP_POST, .handler = api_config_post },
-    { .uri = "/api/reboot", .method = HTTP_POST, .handler = api_reboot      },
+    { .uri = "/api/reboot",        .method = HTTP_POST, .handler = api_reboot        },
+    { .uri = "/api/factory-reset", .method = HTTP_POST, .handler = api_factory_reset },
     { .uri = "/*",          .method = HTTP_GET,  .handler = file_get        },
 };
 
