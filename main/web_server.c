@@ -10,6 +10,8 @@
 
 #include <esp_http_server.h>
 #include <esp_log.h>
+#include <esp_system.h>
+#include <esp_timer.h>
 #include "cJSON.h"
 
 #define TAG        "web_server"
@@ -250,11 +252,30 @@ static esp_err_t file_get(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ------------------------------------------------------------------ /api/reboot */
+
+static void do_restart(void *arg) { esp_restart(); }
+
+static esp_err_t api_reboot(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"rebooting\"}");
+
+    /* Delay restart by 200 ms so the HTTP response has time to flush. */
+    esp_timer_handle_t t;
+    esp_timer_create(&(esp_timer_create_args_t){
+        .callback = do_restart, .name = "reboot"
+    }, &t);
+    esp_timer_start_once(t, 200 * 1000);
+    return ESP_OK;
+}
+
 /* -------------------------------------------------------------- start / stop */
 
 static const httpd_uri_t s_handlers[] = {
     { .uri = "/api/config", .method = HTTP_GET,  .handler = api_config_get  },
     { .uri = "/api/config", .method = HTTP_POST, .handler = api_config_post },
+    { .uri = "/api/reboot", .method = HTTP_POST, .handler = api_reboot      },
     { .uri = "/*",          .method = HTTP_GET,  .handler = file_get        },
 };
 

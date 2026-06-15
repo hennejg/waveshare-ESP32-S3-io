@@ -25,6 +25,7 @@
       font-size: 1rem; cursor: pointer;
     }
     button:disabled { background: #aaa; cursor: default; }
+    #reboot-btn { background: #b0413e; margin-left: .5rem; }
     #status { margin-top: 0.8rem; font-size: 0.9rem; min-height: 1.2em; }
     .ok  { color: #2d7d46; }
     .err { color: #c0392b; }
@@ -89,6 +90,7 @@
     </label>
 
     <button type="submit" id="btn">Save</button>
+    <button type="button" id="reboot-btn">Reboot</button>
   </form>
   <p id="status"></p>
 
@@ -202,6 +204,13 @@
       } finally {
         btn.disabled = false;
       }
+    });
+
+    document.getElementById('reboot-btn').addEventListener('click', async () => {
+      if (!confirm('Reboot the device?')) return;
+      status.className = 'ok';
+      status.textContent = 'Rebooting…';
+      try { await fetch('/api/reboot', { method: 'POST' }); } catch (_) { /* expected */ }
     });
 
     load();
