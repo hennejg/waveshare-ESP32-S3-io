@@ -16,5 +16,8 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # WiFi
 CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
 
+# Ethernet — enable SPI Ethernet support (required for W5500)
+CONFIG_ETH_USE_SPI_ETHERNET=y
+
 # Logging
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y

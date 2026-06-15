@@ -1,7 +1,7 @@
 idf_component_register(
-    SRCS "main.c" "app_config.c" "app_mqtt.c" "button.c" "buzzer.c" "di.c" "dout.c" "led.c" "web_server.c"
+    SRCS "main.c" "app_config.c" "app_mqtt.c" "button.c" "buzzer.c" "di.c" "dout.c" "eth.c" "led.c" "web_server.c"
     INCLUDE_DIRS "."
-    REQUIRES esp32-wifi-bootstrap nvs_flash spiffs esp_http_server esp_driver_gpio esp_netif esp_driver_i2c esp_driver_ledc
+    REQUIRES esp32-wifi-bootstrap nvs_flash spiffs esp_http_server esp_driver_gpio esp_netif esp_driver_i2c esp_driver_ledc esp_eth esp_driver_spi
 )
 
 spiffs_create_partition_image(storage ${CMAKE_SOURCE_DIR}/www FLASH_IN_PROJECT)

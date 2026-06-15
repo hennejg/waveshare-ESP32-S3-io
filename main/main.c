@@ -9,6 +9,7 @@
 #include "buzzer.h"
 #include "di.h"
 #include "dout.h"
+#include "eth.h"
 #include "led.h"
 #include "web_server.h"
 
@@ -31,14 +32,19 @@ static void on_mqtt_message(const char *topic, size_t tlen,
     buzzer_on_mqtt_message(topic, tlen, data, dlen);
 }
 
-static void on_wifi_ready(void)
+/* Called when either WiFi or Ethernet obtains an IP.
+   Both web_server_start() and app_mqtt_start() are idempotent. */
+static void on_network_ready(const char *iface)
 {
-    ESP_LOGI(TAG, "WiFi connected");
+    ESP_LOGI(TAG, "%s connected — starting services", iface);
     ESP_ERROR_CHECK(web_server_start());
     app_mqtt_set_connected_callback(on_mqtt_connected);
     app_mqtt_set_msg_callback(on_mqtt_message);
     ESP_ERROR_CHECK(app_mqtt_start());
 }
+
+static void on_wifi_ready(void) { on_network_ready("WiFi"); }
+static void on_eth_ready(void)  { on_network_ready("Ethernet"); }
 
 void app_main(void)
 {
@@ -64,15 +70,17 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(esp_vfs_spiffs_register(&spiffs));
 
-    /* First boot: SoftAP "Waveshare-Setup" → captive portal → save credentials.
-       Subsequent boots: reconnects and calls on_wifi_ready. */
+    /* WiFi: captive portal on first boot, reconnects on subsequent boots. */
     wifi_config_init("Waveshare-Setup", NULL, on_wifi_ready);
 
-    /* wifi_config_init creates the STA netif synchronously; DHCP only starts
-       once WiFi associates, so setting the hostname here reaches the first
-       DHCP DISCOVER. */
+    /* Set WiFi STA hostname before DHCP starts. */
     esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (sta) {
-        esp_netif_set_hostname(sta, app_config_get()->device_name);
+    if (sta) esp_netif_set_hostname(sta, app_config_get()->device_name);
+
+    /* Ethernet: W5500 over SPI. Event loop is ready after wifi_config_init. */
+    esp_err_t eth_ret = eth_init(on_eth_ready);
+    if (eth_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Ethernet init failed: %s (continuing without ETH)",
+                 esp_err_to_name(eth_ret));
     }
 }
