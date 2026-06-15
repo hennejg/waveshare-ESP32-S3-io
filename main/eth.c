@@ -11,6 +11,7 @@
 #include "esp_netif.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "lwip/ip4_addr.h"
 
 #define TAG  "eth"
@@ -97,6 +98,18 @@ esp_err_t eth_init(eth_connected_cb_t on_connected)
     esp_eth_config_t eth_cfg  = ETH_DEFAULT_CONFIG(mac, phy);
     esp_eth_handle_t eth_hdl  = NULL;
     ESP_RETURN_ON_ERROR(esp_eth_driver_install(&eth_cfg, &eth_hdl), TAG, "driver install");
+
+    /* 5b — Set MAC address from ESP32 eFuse base MAC.
+       W5500 has no built-in MAC; without this it sends 00:00:00:00:00:00
+       and most DHCP servers silently ignore the discover. */
+    {
+        uint8_t mac[6];
+        ESP_RETURN_ON_ERROR(esp_read_mac(mac, ESP_MAC_ETH), TAG, "read eFuse MAC");
+        ESP_RETURN_ON_ERROR(esp_eth_ioctl(eth_hdl, ETH_CMD_S_MAC_ADDR, mac),
+                            TAG, "set MAC");
+        ESP_LOGI(TAG, "MAC: %02x:%02x:%02x:%02x:%02x:%02x",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
 
     /* 6 — Network interface */
     esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
