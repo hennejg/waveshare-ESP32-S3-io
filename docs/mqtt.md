@@ -75,8 +75,27 @@ web UI config page.
 
 | Topic                                             | Payload   | Description                            |
 |---------------------------------------------------|-----------|----------------------------------------|
-| `<prefix>/output/1/set` … `<prefix>/output/8/set` | see below | Set output state                       |
+| `<prefix>/output/1/set` … `<prefix>/output/8/set` | see below | Set individual output state            |
+| `<prefix>/outputs/set`                            | see below | Set all outputs at once (bulk)         |
 | `<prefix>/output/read`                            | any       | Publish current state of all 8 outputs |
+
+**Bulk set payloads (`outputs/set`):**
+
+*Single value* — applied to all 8 outputs:
+
+```
+true   1   high   on     → all ON
+false  0   low    off    → all OFF
+toggle                   → flip all
+```
+
+*JSON array* — one element per output (in order DO1…DO8); accepts the same values as individual outputs plus JSON booleans and numbers:
+
+```json
+[true, false, 1, 0, "on", "off", "toggle", true]
+```
+
+Array may be shorter than 8; unspecified outputs are left unchanged.
 
 > **Note:** Commands use the `/set` suffix so the device does not receive its own state publications as commands. This
 > matches the Home Assistant MQTT switch convention (`command_topic` / `state_topic`).

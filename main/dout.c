@@ -5,6 +5,7 @@
 #include <string.h>
 #include <ctype.h>
 
+#include "cJSON.h"
 #include "driver/i2c_master.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -50,6 +51,23 @@ static bool parse_toggle(const char *data, size_t len)
     buf[len] = '\0';
     for (size_t i = 0; i < len; i++) buf[i] = (char)tolower((unsigned char)buf[i]);
     return !strcmp(buf, "toggle");
+}
+
+/* Apply a single cJSON item (bool / number / string) to output n.
+   Strings use the same vocabulary as individual output commands. */
+static void apply_json_item(cJSON *item, uint8_t n)
+{
+    if (cJSON_IsBool(item)) {
+        s_state[n] = cJSON_IsTrue(item);
+    } else if (cJSON_IsNumber(item)) {
+        s_state[n] = (item->valuedouble != 0.0);
+    } else if (cJSON_IsString(item)) {
+        const char *s = item->valuestring;
+        size_t slen   = strlen(s);
+        bool state;
+        if (parse_toggle(s, slen))          s_state[n] = !s_state[n];
+        else if (parse_payload(s, slen, &state)) s_state[n] = state;
+    }
 }
 
 /* Build the physical output byte and write it to the TCA9554. */
@@ -140,12 +158,51 @@ void dout_on_mqtt_connected(void)
         app_mqtt_subscribe(topic, 0);
     }
     app_mqtt_subscribe("output/read", 0);
+    app_mqtt_subscribe("outputs/set", 0);  /* bulk set */
     dout_publish_all();
 }
 
 void dout_on_mqtt_message(const char *topic, size_t tlen,
                            const char *data,  size_t dlen)
 {
+    /* Match suffix "outputs/set" — bulk set all outputs at once.
+       Single value: apply same state/toggle to every output.
+       JSON array:   apply each element to the corresponding output (1-indexed). */
+    static const char BULK_SUFFIX[] = "outputs/set";
+    const size_t bs = sizeof(BULK_SUFFIX) - 1;
+    if (tlen >= bs && memcmp(topic + tlen - bs, BULK_SUFFIX, bs) == 0) {
+        char buf[256];
+        if (dlen == 0 || dlen >= sizeof(buf)) return;
+        memcpy(buf, data, dlen);
+        buf[dlen] = '\0';
+
+        if (buf[0] == '[') {
+            cJSON *arr = cJSON_Parse(buf);
+            if (!cJSON_IsArray(arr)) {
+                ESP_LOGW(TAG, "outputs/set: invalid JSON array");
+                cJSON_Delete(arr);
+                return;
+            }
+            int n = cJSON_GetArraySize(arr);
+            if (n > NUM_DO) n = NUM_DO;
+            for (int i = 0; i < n; i++)
+                apply_json_item(cJSON_GetArrayItem(arr, i), (uint8_t)i);
+            cJSON_Delete(arr);
+        } else {
+            bool state;
+            if (parse_toggle(data, dlen)) {
+                for (uint8_t i = 0; i < NUM_DO; i++) s_state[i] = !s_state[i];
+            } else if (parse_payload(data, dlen, &state)) {
+                for (uint8_t i = 0; i < NUM_DO; i++) s_state[i] = state;
+            } else {
+                ESP_LOGW(TAG, "outputs/set: unrecognised payload");
+                return;
+            }
+        }
+        dout_publish_all();
+        return;
+    }
+
     /* Match suffix "output/read" */
     static const char READ_SUFFIX[] = "output/read";
     const size_t rs = sizeof(READ_SUFFIX) - 1;
