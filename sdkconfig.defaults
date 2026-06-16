@@ -21,3 +21,10 @@ CONFIG_ETH_USE_SPI_ETHERNET=y
 
 # Logging
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Disable mbedTLS hardware acceleration — enabling it (when mbedtls was
+# temporarily in explicit REQUIRES) caused GDMA conflicts with the I2C driver.
+CONFIG_MBEDTLS_HARDWARE_SHA=n
+CONFIG_MBEDTLS_HARDWARE_AES=n
+CONFIG_MBEDTLS_HARDWARE_MPI=n
+CONFIG_MBEDTLS_HARDWARE_RSA_DS_PERIPHERAL=n
