@@ -1,8 +1,10 @@
 #include "web_server.h"
 #include "app_config.h"
 #include "auth.h"
+#include "buzzer.h"
 #include "di.h"
 #include "dout.h"
+#include "led.h"
 
 #include <stdio.h>
 #include <stdbool.h>
@@ -481,6 +483,140 @@ static esp_err_t api_reboot(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ----------------------------------------------------------------- /api/io/... */
+
+/* GET /api/io/state — current logical state of all DI and DO channels */
+static esp_err_t api_io_state(httpd_req_t *req)
+{
+    if (!check_auth(req)) return send_401(req);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *di   = cJSON_AddArrayToObject(root, "di");
+    cJSON *dout = cJSON_AddArrayToObject(root, "dout");
+    for (int i = 0; i < 8; i++) {
+        cJSON_AddItemToArray(di,   cJSON_CreateBool(di_get((uint8_t)i)));
+        cJSON_AddItemToArray(dout, cJSON_CreateBool(dout_get((uint8_t)i)));
+    }
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json ? json : "{}");
+    cJSON_free(json);
+    return ESP_OK;
+}
+
+/* POST /api/io/output — {"channel":0-7,"value":bool} or {"channel":0-7,"toggle":true} */
+static esp_err_t api_io_output(httpd_req_t *req)
+{
+    if (!check_auth(req)) return send_401(req);
+    if (req->content_len == 0 || req->content_len > 64) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad body");
+        return ESP_OK;
+    }
+    char body[65];
+    int n = httpd_req_recv(req, body, req->content_len);
+    if (n <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
+    body[n] = '\0';
+
+    cJSON *root = cJSON_Parse(body);
+    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
+
+    cJSON *ch_j = cJSON_GetObjectItem(root, "channel");
+    if (!cJSON_IsNumber(ch_j) || (int)ch_j->valuedouble < 0 || (int)ch_j->valuedouble > 7) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "channel 0-7 required");
+        return ESP_OK;
+    }
+    uint8_t ch = (uint8_t)ch_j->valuedouble;
+
+    bool new_val;
+    cJSON *tog = cJSON_GetObjectItem(root, "toggle");
+    cJSON *val = cJSON_GetObjectItem(root, "value");
+    if (cJSON_IsTrue(tog)) {
+        new_val = !dout_get(ch);
+    } else if (cJSON_IsBool(val)) {
+        new_val = cJSON_IsTrue(val);
+    } else {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "value or toggle required");
+        return ESP_OK;
+    }
+    cJSON_Delete(root);
+
+    dout_set(ch, new_val);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+    return ESP_OK;
+}
+
+/* POST /api/io/led — {"r":0-255,"g":0-255,"b":0-255} or {"color":"#RRGGBB"} */
+static esp_err_t api_io_led(httpd_req_t *req)
+{
+    if (!check_auth(req)) return send_401(req);
+    if (req->content_len == 0 || req->content_len > 64) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad body");
+        return ESP_OK;
+    }
+    char body[65];
+    int n = httpd_req_recv(req, body, req->content_len);
+    if (n <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
+    body[n] = '\0';
+
+    cJSON *root = cJSON_Parse(body);
+    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
+
+    uint8_t r = 0, g = 0, b = 0;
+    cJSON *color_j = cJSON_GetObjectItem(root, "color");
+    if (cJSON_IsString(color_j) && color_j->valuestring[0] == '#') {
+        unsigned int ri = 0, gi = 0, bi = 0;
+        if (sscanf(color_j->valuestring + 1, "%02x%02x%02x", &ri, &gi, &bi) == 3) {
+            r = (uint8_t)ri; g = (uint8_t)gi; b = (uint8_t)bi;
+        }
+    } else {
+        cJSON *rj = cJSON_GetObjectItem(root, "r");
+        cJSON *gj = cJSON_GetObjectItem(root, "g");
+        cJSON *bj = cJSON_GetObjectItem(root, "b");
+        if (cJSON_IsNumber(rj)) r = (uint8_t)(int)rj->valuedouble;
+        if (cJSON_IsNumber(gj)) g = (uint8_t)(int)gj->valuedouble;
+        if (cJSON_IsNumber(bj)) b = (uint8_t)(int)bj->valuedouble;
+    }
+    cJSON_Delete(root);
+
+    led_set_rgb(r, g, b);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+    return ESP_OK;
+}
+
+/* POST /api/io/buzzer — {"freq":440,"duration":200} */
+static esp_err_t api_io_buzzer(httpd_req_t *req)
+{
+    if (!check_auth(req)) return send_401(req);
+    if (req->content_len == 0 || req->content_len > 64) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad body");
+        return ESP_OK;
+    }
+    char body[65];
+    int n = httpd_req_recv(req, body, req->content_len);
+    if (n <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
+    body[n] = '\0';
+
+    cJSON *root = cJSON_Parse(body);
+    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
+
+    uint32_t freq = 440, dur = 200;
+    cJSON *fj = cJSON_GetObjectItem(root, "freq");
+    cJSON *dj = cJSON_GetObjectItem(root, "duration");
+    if (cJSON_IsNumber(fj)) freq = (uint32_t)fj->valuedouble;
+    if (cJSON_IsNumber(dj)) dur  = (uint32_t)dj->valuedouble;
+    cJSON_Delete(root);
+
+    buzzer_beep_once(freq, dur);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+    return ESP_OK;
+}
+
 /* -------------------------------------------------------------- start / stop */
 
 static const httpd_uri_t s_handlers[] = {
@@ -490,6 +626,10 @@ static const httpd_uri_t s_handlers[] = {
     { .uri = "/api/auth/set-password", .method = HTTP_POST, .handler = api_auth_set_password },
     { .uri = "/api/config",            .method = HTTP_GET,  .handler = api_config_get        },
     { .uri = "/api/config",            .method = HTTP_POST, .handler = api_config_post       },
+    { .uri = "/api/io/state",          .method = HTTP_GET,  .handler = api_io_state          },
+    { .uri = "/api/io/output",         .method = HTTP_POST, .handler = api_io_output         },
+    { .uri = "/api/io/led",            .method = HTTP_POST, .handler = api_io_led            },
+    { .uri = "/api/io/buzzer",         .method = HTTP_POST, .handler = api_io_buzzer         },
     { .uri = "/api/reboot",            .method = HTTP_POST, .handler = api_reboot            },
     { .uri = "/api/factory-reset",     .method = HTTP_POST, .handler = api_factory_reset     },
     { .uri = "/*",                     .method = HTTP_GET,  .handler = file_get              },
@@ -501,7 +641,7 @@ esp_err_t web_server_start(void)
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn     = httpd_uri_match_wildcard;
-    cfg.max_uri_handlers = 12;
+    cfg.max_uri_handlers = 16;
     cfg.stack_size       = 8192;
 
     esp_err_t ret = httpd_start(&s_server, &cfg);
