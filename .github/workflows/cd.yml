@@ -17,7 +17,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: false
 
@@ -25,7 +25,7 @@ jobs:
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Cache managed components
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: managed_components
           key: managed-${{ hashFiles('main/idf_component.yml') }}
@@ -50,7 +50,7 @@ jobs:
           (cd release && zip "../waveshare-esp32s3-${TAG}-full-flash.zip" *)
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           files: |
