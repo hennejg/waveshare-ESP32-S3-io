@@ -112,32 +112,6 @@
 
   <h1>Device Configuration</h1>
 
-  <!-- IO Monitor & Control — shown after auth, populated by JS -->
-  <div id="io-panel" style="display:none">
-
-    <h2>Digital Inputs</h2>
-    <div id="di-grid" class="io-grid"></div>
-
-    <h2>Digital Outputs</h2>
-    <div id="do-grid" class="io-grid"></div>
-
-    <h2>LED</h2>
-    <div class="io-row">
-      <input type="color" id="led-color" value="#000000" title="Pick colour">
-      <button onclick="setLed()">Set</button>
-      <button onclick="setLed('#000000')" style="background:#888">Off</button>
-    </div>
-    <p class="hint">Only effective when LED Mode is set to "IO device". In Status mode the LED shows connectivity state.</p>
-
-    <h2>Buzzer</h2>
-    <div class="io-row">
-      <label>Freq (Hz) <input type="number" id="buzz-freq" min="100" max="10000" value="440"></label>
-      <label>Duration (ms) <input type="number" id="buzz-dur" min="1" max="5000" value="200"></label>
-      <button onclick="testBuzzer()">Beep</button>
-    </div>
-
-  </div>
-
   <form id="form">
 
     <h2>Device</h2>
@@ -152,6 +126,19 @@
       </select>
     </label>
     <p class="hint">Status mode: 50% yellow = alive, 50% green = network, 50% purple = MQTT. Red/blue flashes = RX/TX traffic. Takes effect after reboot.</p>
+    <p style="font-size:.85rem;font-weight:600;color:#555;margin:1rem 0 .3rem">LED Colour</p>
+    <div class="io-row">
+      <input type="color" id="led-color" value="#000000" title="Pick colour">
+      <button onclick="setLed()">Set</button>
+      <button onclick="setLed('#000000')" style="background:#888">Off</button>
+    </div>
+    <p class="hint">Only effective when LED Mode is "IO device".</p>
+    <p style="font-size:.85rem;font-weight:600;color:#555;margin:1rem 0 .3rem">Buzzer</p>
+    <div class="io-row">
+      <label>Freq (Hz) <input type="number" id="buzz-freq" min="100" max="10000" value="440"></label>
+      <label>Duration (ms) <input type="number" id="buzz-dur" min="1" max="5000" value="200"></label>
+      <button onclick="testBuzzer()">Beep</button>
+    </div>
 
     <h2>MQTT Broker</h2>
     <label>Broker URL
@@ -175,6 +162,7 @@
       <tbody id="di-table"></tbody>
     </table>
     <p class="hint">Name: used as MQTT topic fragment instead of the number (max 20 chars, no <code>/</code>, unique). Invert: checked = active-low (GPIO low → <code>true</code>).</p>
+    <div id="di-grid" class="io-grid" style="margin-top:.6rem"></div>
 
     <h2>Digital Outputs</h2>
     <table>
@@ -182,6 +170,7 @@
       <tbody id="dout-table"></tbody>
     </table>
     <p class="hint">Name: used as MQTT topic fragment. Invert: checked = physical bit flipped relative to logical state.</p>
+    <div id="do-grid" class="io-grid" style="margin-top:.6rem"></div>
 
     <h2>CAN Bus</h2>
     <p class="hint">GPIO2 (TX) / GPIO3 (RX). Changes take effect after reboot.</p>
@@ -433,9 +422,8 @@
           if (name) name.value    = dout.name ?? '';
         });
 
-        /* Build IO panel with names from config, then start live polling */
+        /* Rebuild IO grids with current names, then start live polling */
         buildIoPanel(cfg);
-        document.getElementById('io-panel').style.display = '';
         startIoPoll();
 
       } catch (e) {
