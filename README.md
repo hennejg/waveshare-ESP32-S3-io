@@ -22,9 +22,25 @@ ESP-IDF v6 firmware for the [Waveshare ESP32-S3-POE-ETH-8DI-8DO](https://www.wav
 
 ### Connectivity
 
-- **WiFi provisioning** — on first boot the device opens a `Waveshare-Setup` access point with a captive portal to enter WiFi credentials. Hold the BOOT button (GPIO0) for ≥ 5 s to clear credentials and re-enter provisioning mode.
-- **Ethernet** — W5500 SPI Ethernet runs in parallel with WiFi; whichever interface gets an IP first starts services.
-- **DHCP hostname** — device registers under its configured name (default `Waveshare-ESP32`).
+- **WiFi provisioning** — on first boot the device opens a `Waveshare-Setup` access point. Connect to it on any device; a captive portal appears automatically to enter WiFi credentials. The LED blinks 30% blue while the portal is active.
+- **ETH-only mode** — if you have an Ethernet cable, tap **"Use Ethernet only →"** on the provisioning portal to skip WiFi entirely. The preference is stored and survives reboots.
+- **Ethernet** — W5500 SPI Ethernet always runs in parallel (or alone in ETH-only mode); whichever interface gets an IP first starts the services.
+- **DHCP hostname** — the device registers under its configured name (default `Waveshare-ESP32`).
+- **Return to WiFi provisioning** — hold the BOOT button (GPIO0) for ≥ 5 s at any time. This clears WiFi credentials, clears the ETH-only flag, and reboots into the provisioning portal.
+
+### Authentication
+
+The web UI and REST API are password-protected (CRA-compliant: no hardcoded default password).
+
+**Initial password setup:**
+1. Open `http://<device-ip>/` — a setup screen appears because no password has been set yet.
+2. Click **"Set up password…"** — the device LED blinks yellow rapidly.
+3. Briefly press the BOOT button on the device within 30 s to confirm physical access.
+4. Enter and confirm a password (min. 8 characters).
+
+**Subsequent logins:** the browser prompts for the password. Credentials are stored in `sessionStorage` (cleared when the tab is closed).
+
+**Password reset** (forgotten password): click **"Forgot password?"** on the login screen and repeat the BOOT button flow — no prior authentication required, physical access is sufficient.
 
 ### Web Configuration UI
 
@@ -43,9 +59,18 @@ The UI also provides **Save**, **Reboot**, and **Factory Reset** buttons.
 
 #### REST API
 
-`GET /api/config` and `POST /api/config` — JSON, same fields as UI.  
-`POST /api/reboot` — restart immediately.  
-`POST /api/factory-reset` — erase all NVS settings and restart.
+All endpoints except the auth flow require an `Authorization: Basic base64(:<password>)` header when a password is set.
+
+| Endpoint | Method | Auth required | Description |
+|----------|--------|--------------|-------------|
+| `/api/auth/status` | GET | No | `{"password_set": bool}` |
+| `/api/auth/begin` | POST | No | Start token flow (LED blinks, 30 s) |
+| `/api/auth/token?s=<id>` | GET | No | Poll: `waiting` / `ready` / `timeout` |
+| `/api/auth/set-password` | POST | No | `{"token":"…","password":"…"}` |
+| `/api/config` | GET | Yes | Read full configuration as JSON |
+| `/api/config` | POST | Yes | Update configuration from JSON |
+| `/api/reboot` | POST | Yes | Restart immediately |
+| `/api/factory-reset` | POST | Yes | Erase all settings and restart |
 
 ### MQTT
 
@@ -78,12 +103,7 @@ Three selectable modes:
 
 **Basic mode** — a compact 6-frame protocol covering DI state, DO set/echo (WRITE/SET/CLEAR/TOGGLE opcodes + bitmask), LED colour, buzzer, and a read-request trigger.
 
-**NMEA2000 mode** implements:
-- ISO address claiming with automatic conflict resolution
-- PGN 126993 Heartbeat
-- PGN 127501 Binary Switch Bank Status (DI on bank 0, DO on bank 1)
-- PGN 127502 Switch Bank Control (DO commands)
-- PGN 126720 Manufacturer Proprietary fast-packet (LED + buzzer)
+**NMEA2000 mode** implements ISO address claiming, PGN 126993 Heartbeat, PGN 127501/127502 Binary Switch Banks (DI bank 0, DO bank 1), and PGN 126720 Manufacturer Proprietary fast-packet (LED + buzzer).
 
 ### Modbus RTU
 
@@ -100,26 +120,27 @@ RS-485, configurable baud rate and slave address. Register map:
 
 ### LED Modes
 
-The WS2812 LED has two operating modes (configurable in the web UI):
+The WS2812 LED has two operating modes (configurable in the web UI). **Status feedback is the default.**
 
-**IO device mode** — controlled via MQTT `led/set`, Modbus HR 40001, and CAN base+3 / NMEA2000 PGN 126720.
+**IO device mode** — fully controlled via MQTT `led/set`, Modbus HR 40001, and CAN base+3 / NMEA2000 PGN 126720.
 
 **Status feedback mode** — automatic connectivity indicator:
 
-| LED state                | Meaning                    |
-|--------------------------|----------------------------|
-| 30% yellow               | Booted, no network yet     |
-| 30% green                | Network (WiFi or Ethernet) |
-| 30% purple               | MQTT broker connected      |
-| 100% red flash (100 ms)  | MQTT message received      |
-| 100% blue flash (100 ms) | MQTT message published     |
+| LED state                   | Meaning                              |
+|-----------------------------|--------------------------------------|
+| 30% yellow (solid)          | Booted, no network yet               |
+| 30% blue (slow blink)       | WiFi provisioning portal active      |
+| 30% green (solid)           | Network (WiFi or Ethernet) connected |
+| 30% purple (solid)          | MQTT broker connected                |
+| 100% red flash (100 ms)     | MQTT message received                |
+| 100% blue flash (100 ms)    | MQTT message published               |
 
-In Status mode all LED commands from MQTT, Modbus, and CAN are ignored.
+Transitions are evaluated automatically: losing MQTT falls back to green; losing the network falls back to yellow. In Status mode all LED commands from MQTT, Modbus, and CAN are ignored.
 
 ### Input / Output Details
 
 - **Invert flag** — each DI and DO has a configurable invert flag (web UI). Applied consistently across MQTT, Modbus, and CAN.
-- **Named channels** — each DI/DO can be given a name (up to 20 chars, no `/`) that replaces the index number in MQTT topics.
+- **Named channels** — each DI/DO can be given a name (up to 20 chars, no `/`, unique per type) that replaces the index number in MQTT topics.
 - **Debounce** — digital inputs have 10 ms software debounce.
 - **Unified state** — a DO write via any interface (MQTT, Modbus, CAN) is reflected immediately on all others. MQTT confirmation is published, Modbus coil is updated, CAN echoes the new state.
 
@@ -157,6 +178,12 @@ idf.py -p /dev/ttyUSBx app-flash
 idf.py -p /dev/ttyUSBx spiffs-flash
 ```
 
+### First boot after fresh flash
+
+1. Connect to the `Waveshare-Setup` WiFi AP (or plug in an Ethernet cable and tap "Use Ethernet only" on the portal).
+2. After getting an IP, open `http://<device-ip>/`.
+3. Follow the password setup flow: click "Set up password…", press BOOT button, set password.
+
 ---
 
 ## Project Structure
@@ -166,15 +193,16 @@ idf.py -p /dev/ttyUSBx spiffs-flash
 │   ├── main.c           Entry point, event/callback wiring
 │   ├── app_config.c/h   NVS-backed configuration store
 │   ├── app_mqtt.c/h     MQTT client wrapper
+│   ├── auth.c/h         Web UI authentication (password + BOOT button token flow)
+│   ├── button.c/h       BOOT button — long-press WiFi reset, short-press auth token
+│   ├── buzzer.c/h       Piezo buzzer (LEDC PWM) — single beep + sequences
 │   ├── can_server.c/h   CAN bus (Basic + NMEA2000 modes)
 │   ├── di.c/h           Digital inputs (GPIO interrupts + debounce)
 │   ├── dout.c/h         Digital outputs (TCA9554 I²C)
 │   ├── eth.c/h          W5500 Ethernet (SPI)
 │   ├── led.c/h          WS2812 LED (RMT) — IO and Status modes
-│   ├── buzzer.c/h       Piezo buzzer (LEDC PWM) — single beep + sequences
 │   ├── mb_server.c/h    Modbus RTU slave
-│   ├── button.c/h       BOOT button long-press WiFi reset
-│   └── web_server.c/h   HTTP config UI + REST API
+│   └── web_server.c/h   HTTP config UI + REST API + auth endpoints
 ├── www/
 │   └── index.html       Single-page web UI (served from SPIFFS)
 └── docs/

@@ -35,9 +35,10 @@ The client reconnects automatically with exponential backoff if the broker becom
 
 The board has 8 optocoupler-isolated digital inputs on GPIO4–GPIO11.
 
-- `true` = input active (current flowing through optocoupler, GPIO pulled low)
+- `true` = input active
 - `false` = input inactive
-- Edge detection with 10 ms hardware debounce
+- Edge detection with 10 ms software debounce
+- Default sense: active = GPIO high. Set the **invert flag** in the web UI to reverse (active = GPIO low).
 
 Each input can be given a **name** in the web UI config page (max 20 characters, no `/`, unique among all inputs). The name replaces the index number in the MQTT topic.
 
@@ -126,22 +127,23 @@ Single RGB LED on GPIO38. Operates in one of two modes set in the web UI:
 
 | Mode | Description |
 |------|-------------|
-| **IO device** *(default)* | Fully controlled via MQTT and Modbus HR 40001 |
-| **Status feedback** | Shows device connectivity state automatically (see below) |
+| **IO device** | Fully controlled via MQTT and Modbus HR 40001 |
+| **Status feedback** *(default)* | Shows device connectivity state automatically (see below) |
 
 ### Status feedback mode
 
-| State | Colour | Brightness |
-|-------|--------|-----------|
-| Boot / no network | Yellow | 30% |
-| Network (WiFi or Ethernet) | Green | 30% |
-| MQTT broker connected | Purple | 30% |
-| MQTT message received | Red flash | 100%, 100 ms |
-| MQTT message published | Blue flash | 100%, 100 ms |
+| State | Colour | Effect |
+|-------|--------|--------|
+| Boot / no network | Yellow | 30% solid |
+| WiFi provisioning portal active | Blue | 30% slow blink (800 ms period) |
+| Network (WiFi or Ethernet) | Green | 30% solid |
+| MQTT broker connected | Purple | 30% solid |
+| MQTT message received | Red | 100% flash, 100 ms |
+| MQTT message published | Blue | 100% flash, 100 ms |
 
-Transitions are evaluated automatically: losing MQTT falls back to green (if network is up) or yellow; losing the network falls back to yellow.
+Transitions are automatic: the AP blink stops and becomes solid green the moment an IP is obtained; losing MQTT falls back to green (if network is up) or yellow; losing the network falls back to yellow.
 
-In Status mode the MQTT and Modbus LED commands are ignored.
+In Status mode, LED commands from MQTT, Modbus, and CAN are ignored.
 
 ---
 
