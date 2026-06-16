@@ -197,6 +197,11 @@ esp_err_t led_set_rgb(uint8_t r, uint8_t g, uint8_t b)
     return ESP_OK;
 }
 
+void led_force_set(uint8_t r, uint8_t g, uint8_t b)
+{
+    hw_apply(r, g, b);   /* always applies, regardless of mode */
+}
+
 esp_err_t led_init(void)
 {
     led_strip_config_t strip_cfg = {

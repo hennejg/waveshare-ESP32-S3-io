@@ -30,9 +30,71 @@
     #status { margin-top: 0.8rem; font-size: 0.9rem; min-height: 1.2em; }
     .ok  { color: #2d7d46; }
     .err { color: #c0392b; }
+    /* Auth overlay */
+    #auth-overlay { position:fixed; inset:0; background:#fff; display:flex;
+                    align-items:center; justify-content:center; z-index:100; }
+    .auth-box { max-width:400px; width:100%; padding:2rem; border:1px solid #ddd;
+                border-radius:8px; box-shadow:0 2px 12px rgba(0,0,0,.1); }
+    .auth-box h2 { margin-top:0; }
+    .auth-box button { margin-top:1rem; width:100%; }
+    .auth-box .hint { margin-top:.5rem; }
+    .spinner { display:inline-block; width:1em; height:1em; border:2px solid #ddd;
+               border-top-color:#1a73e8; border-radius:50%; animation:spin .8s linear infinite;
+               vertical-align:middle; margin-right:.4em; }
+    @keyframes spin { to { transform:rotate(360deg); } }
   </style>
 </head>
 <body>
+
+  <!-- Auth overlay — hidden when authenticated -->
+  <div id="auth-overlay">
+    <div class="auth-box">
+
+      <!-- Screen: no password set -->
+      <div id="auth-no-pw">
+        <h2>First-time Setup</h2>
+        <p>No password has been set. To protect the configuration, you need to create one.</p>
+        <p class="hint">This requires physical access to the device.</p>
+        <button id="auth-begin-btn" onclick="beginSetup()">Set up password…</button>
+        <p id="auth-err" class="err" style="min-height:1.2em"></p>
+      </div>
+
+      <!-- Screen: waiting for button press -->
+      <div id="auth-waiting" style="display:none">
+        <h2>Press the BOOT button</h2>
+        <p><span class="spinner"></span> The LED on the device is blinking yellow.</p>
+        <p>Briefly press the <strong>BOOT button (GPIO0)</strong> on the device within <strong id="auth-countdown">30</strong> s to confirm.</p>
+        <p class="hint">Longer press (&ge; 5 s) will reset WiFi instead.</p>
+        <button onclick="cancelSetup()" style="background:#888">Cancel</button>
+      </div>
+
+      <!-- Screen: enter new password -->
+      <div id="auth-set-pw" style="display:none">
+        <h2>Create Password</h2>
+        <label>Password (min. 8 characters)
+          <input type="password" id="auth-pw1" minlength="8" autocomplete="new-password">
+        </label>
+        <label>Confirm password
+          <input type="password" id="auth-pw2" autocomplete="new-password">
+        </label>
+        <button onclick="submitPassword()">Save Password</button>
+        <p id="auth-pw-err" class="err" style="min-height:1.2em"></p>
+      </div>
+
+      <!-- Screen: login -->
+      <div id="auth-login" style="display:none">
+        <h2>Login</h2>
+        <label>Password
+          <input type="password" id="auth-login-pw" autocomplete="current-password">
+        </label>
+        <button onclick="doLogin()">Login</button>
+        <p id="auth-login-err" class="err" style="min-height:1.2em"></p>
+        <p class="hint"><a href="#" onclick="beginSetup();return false">Forgot password?</a> (requires physical button press)</p>
+      </div>
+
+    </div>
+  </div>
+
   <h1>Device Configuration</h1>
   <form id="form">
 
@@ -136,6 +198,139 @@
   <p id="status"></p>
 
   <script>
+    /* ---- Auth state machine ---- */
+    let authPassword = sessionStorage.getItem('auth_pw') || '';
+    let authToken    = '';
+    let pollTimer    = null;
+    let countdown    = 30;
+
+    function authHeaders() {
+      if (!authPassword) return {};
+      return { 'Authorization': 'Basic ' + btoa(':' + authPassword) };
+    }
+
+    async function apiFetch(url, opts = {}) {
+      opts.headers = { ...(opts.headers || {}), ...authHeaders() };
+      const r = await fetch(url, opts);
+      if (r.status === 401) { showLogin(); throw new Error('unauthorized'); }
+      return r;
+    }
+
+    function showScreen(id) {
+      ['auth-no-pw','auth-waiting','auth-set-pw','auth-login']
+        .forEach(s => document.getElementById(s).style.display = s === id ? '' : 'none');
+    }
+
+    function showOverlay(screen) {
+      document.getElementById('auth-overlay').style.display = 'flex';
+      showScreen(screen);
+    }
+
+    function hideOverlay() {
+      document.getElementById('auth-overlay').style.display = 'none';
+    }
+
+    function showLogin() { showOverlay('auth-login'); }
+
+    async function initAuth() {
+      const r  = await fetch('/api/auth/status');
+      const st = await r.json();
+      if (!st.password_set) { showOverlay('auth-no-pw'); return; }
+      if (!authPassword)    { showLogin(); return; }
+      /* Try saved password */
+      const tr = await fetch('/api/config', { headers: authHeaders() });
+      if (tr.ok) { hideOverlay(); load(); }
+      else        { authPassword = ''; sessionStorage.removeItem('auth_pw'); showLogin(); }
+    }
+
+    async function beginSetup() {
+      document.getElementById('auth-err').textContent = '';
+      document.getElementById('auth-begin-btn').disabled = true;
+      try {
+        const r = await fetch('/api/auth/begin', { method: 'POST' });
+        if (!r.ok) throw new Error('Failed (' + r.status + ')');
+        const d = await r.json();
+        startPolling(d.session);
+        showScreen('auth-waiting');
+        countdown = 30;
+        document.getElementById('auth-countdown').textContent = countdown;
+      } catch (e) {
+        document.getElementById('auth-err').textContent = e.message;
+        document.getElementById('auth-begin-btn').disabled = false;
+      }
+    }
+
+    function startPolling(session) {
+      stopPolling();
+      const tick = setInterval(async () => {
+        try {
+          const r = await fetch('/api/auth/token?s=' + session);
+          const d = await r.json();
+          if (d.status === 'ready') {
+            stopPolling();
+            authToken = d.token;
+            showScreen('auth-set-pw');
+          } else if (d.status === 'timeout') {
+            stopPolling();
+            document.getElementById('auth-err').textContent = 'Timed out. Try again.';
+            showScreen('auth-no-pw');
+            document.getElementById('auth-begin-btn').disabled = false;
+          } else {
+            countdown--;
+            document.getElementById('auth-countdown').textContent = Math.max(0, countdown);
+          }
+        } catch (_) {}
+      }, 1000);
+      pollTimer = tick;
+    }
+
+    function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+
+    function cancelSetup() {
+      stopPolling();
+      fetch('/api/auth/token?s=cancel');  /* let server timeout naturally */
+      showScreen('auth-no-pw');
+      document.getElementById('auth-begin-btn').disabled = false;
+    }
+
+    async function submitPassword() {
+      const p1 = document.getElementById('auth-pw1').value;
+      const p2 = document.getElementById('auth-pw2').value;
+      const err = document.getElementById('auth-pw-err');
+      err.textContent = '';
+      if (p1.length < 8) { err.textContent = 'Password must be at least 8 characters.'; return; }
+      if (p1 !== p2)     { err.textContent = 'Passwords do not match.'; return; }
+      try {
+        const r = await fetch('/api/auth/set-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: authToken, password: p1 }),
+        });
+        if (!r.ok) { const d = await r.json(); err.textContent = d.error || 'Error'; return; }
+        authPassword = p1;
+        sessionStorage.setItem('auth_pw', p1);
+        authToken = '';
+        hideOverlay();
+        load();
+      } catch (e) { err.textContent = e.message; }
+    }
+
+    async function doLogin() {
+      const pw  = document.getElementById('auth-login-pw').value;
+      const err = document.getElementById('auth-login-err');
+      err.textContent = '';
+      const r = await fetch('/api/config', {
+        headers: { 'Authorization': 'Basic ' + btoa(':' + pw) }
+      });
+      if (r.ok) {
+        authPassword = pw;
+        sessionStorage.setItem('auth_pw', pw);
+        hideOverlay();
+        load();
+      } else { err.textContent = 'Wrong password.'; }
+    }
+
+    /* ---- Config form ---- */
     const status = document.getElementById('status');
     const btn    = document.getElementById('btn');
     const diTbl   = document.getElementById('di-table');
@@ -159,7 +354,7 @@
 
     async function load() {
       try {
-        const r = await fetch('/api/config');
+        const r = await apiFetch('/api/config');
         if (!r.ok) throw new Error('HTTP ' + r.status);
         const cfg = await r.json();
         document.getElementById('device_name').value       = cfg.device_name ?? '';
@@ -241,7 +436,7 @@
           di,
           dout,
         };
-        const r = await fetch('/api/config', {
+        const r = await apiFetch('/api/config', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(cfg),
@@ -275,7 +470,7 @@
       if (!confirm('Reboot the device?')) return;
       status.className = 'ok';
       status.textContent = 'Rebooting…';
-      try { await fetch('/api/reboot', { method: 'POST' }); } catch (_) { /* expected */ }
+      try { await apiFetch('/api/reboot', { method: 'POST' }); } catch (_) { /* expected */ }
     });
 
     document.getElementById('factory-reset-btn').addEventListener('click', async () => {
@@ -288,10 +483,10 @@
         'Continue?')) return;
       status.className = 'ok';
       status.textContent = 'Resetting to factory defaults and rebooting…';
-      try { await fetch('/api/factory-reset', { method: 'POST' }); } catch (_) { /* expected */ }
+      try { await apiFetch('/api/factory-reset', { method: 'POST' }); } catch (_) { /* expected */ }
     });
 
-    load();
+    initAuth();
   </script>
 </body>
 </html>

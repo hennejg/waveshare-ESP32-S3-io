@@ -12,6 +12,10 @@
 #define POLL_MS      50
 #define HOLD_MS      5000
 
+static void (*s_short_press_cb)(void) = NULL;
+
+void button_on_short_press(void (*cb)(void)) { s_short_press_cb = cb; }
+
 static void button_task(void *arg)
 {
     gpio_config_t cfg = {
@@ -45,7 +49,10 @@ static void button_task(void *arg)
             }
         } else {
             if (held_ms > 0 && held_ms < HOLD_MS) {
-                ESP_LOGI(TAG, "Button released after %"PRIu32" ms — no reset", held_ms);
+                ESP_LOGI(TAG, "Button released after %"PRIu32" ms — short press", held_ms);
+                void (*cb)(void) = s_short_press_cb;
+                s_short_press_cb = NULL;   /* one-shot */
+                if (cb) cb();
             }
             held_ms  = 0;
             notified = false;

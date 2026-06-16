@@ -1,5 +1,6 @@
 #include "web_server.h"
 #include "app_config.h"
+#include "auth.h"
 #include "di.h"
 #include "dout.h"
 
@@ -14,6 +15,7 @@
 #include <esp_timer.h>
 #include <nvs_flash.h>
 #include "cJSON.h"
+#include "mbedtls/base64.h"
 
 #define TAG        "web_server"
 #define WWW_BASE   "/www"
@@ -73,10 +75,164 @@ static bool validate_names(const di_config_t *arr, int count, const char **err_m
     return true;
 }
 
+/* ------------------------------------------------------------------ auth check */
+
+/* Returns true if the request carries a valid password (or no password is set). */
+static bool check_auth(httpd_req_t *req)
+{
+    if (!auth_is_password_set()) return true;
+
+    char hdr[160] = "";
+    httpd_req_get_hdr_value_str(req, "Authorization", hdr, sizeof(hdr));
+    if (strncmp(hdr, "Basic ", 6) != 0) return false;
+
+    unsigned char decoded[128];
+    size_t decoded_len = 0;
+    if (mbedtls_base64_decode(decoded, sizeof(decoded) - 1, &decoded_len,
+                              (const unsigned char *)(hdr + 6),
+                              strlen(hdr + 6)) != 0) return false;
+    decoded[decoded_len] = '\0';
+
+    // HTTP Basic format is "user:password"; accept any username, check password only.
+    const char *pw = (const char *)decoded;
+    const char *colon = (const char *)memchr(decoded, ':', decoded_len);
+    if (colon) pw = colon + 1;
+
+    return auth_check_password(pw);
+}
+
+static esp_err_t send_401(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"Device\"");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"error\":\"unauthorized\"}");
+    return ESP_OK;
+}
+
+/* ------------------------------------------------------------------ auth endpoints */
+
+/* GET /api/auth/status — no auth required */
+static esp_err_t api_auth_status(httpd_req_t *req)
+{
+    char json[32];
+    snprintf(json, sizeof(json), "{\"password_set\":%s}",
+             auth_is_password_set() ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json);
+    return ESP_OK;
+}
+
+/* POST /api/auth/begin — start token flow; no auth required */
+static esp_err_t api_auth_begin(httpd_req_t *req)
+{
+    char session[9];
+    esp_err_t r = auth_token_begin(session);
+    if (r == ESP_ERR_INVALID_STATE) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"already_pending\"}");
+        return ESP_OK;
+    }
+    if (r != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Internal error");
+        return ESP_OK;
+    }
+    char json[48];
+    snprintf(json, sizeof(json), "{\"session\":\"%.8s\"}", session);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json);
+    return ESP_OK;
+}
+
+/* GET /api/auth/token?s=<session> — poll for token; no auth required */
+static esp_err_t api_auth_token(httpd_req_t *req)
+{
+    char query[16] = "";
+    httpd_req_get_url_query_str(req, query, sizeof(query));
+    char param[9] = "";
+    httpd_query_key_value(query, "s", param, sizeof(param));
+
+    char token[33] = "";
+    auth_tok_state_t state = auth_token_status(param, token);
+    httpd_resp_set_type(req, "application/json");
+    switch (state) {
+    case AUTH_TOK_WAITING:
+        httpd_resp_sendstr(req, "{\"status\":\"waiting\"}");
+        break;
+    case AUTH_TOK_READY: {
+        char json[64];
+        snprintf(json, sizeof(json), "{\"status\":\"ready\",\"token\":\"%.32s\"}", token);
+        httpd_resp_sendstr(req, json);
+        break;
+    }
+    case AUTH_TOK_TIMEOUT:
+        httpd_resp_set_status(req, "408 Request Timeout");
+        httpd_resp_sendstr(req, "{\"status\":\"timeout\"}");
+        break;
+    default:
+        httpd_resp_set_status(req, "404 Not Found");
+        httpd_resp_sendstr(req, "{\"status\":\"idle\"}");
+        break;
+    }
+    return ESP_OK;
+}
+
+/* POST /api/auth/set-password — set/change password using token; no prior auth needed */
+static esp_err_t api_auth_set_password(httpd_req_t *req)
+{
+    if (req->content_len > 256) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body too large");
+        return ESP_OK;
+    }
+    char *body = malloc(req->content_len + 1);
+    if (!body) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_OK; }
+    int n = httpd_req_recv(req, body, req->content_len);
+    if (n <= 0) { free(body); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
+    body[n] = '\0';
+
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
+
+    cJSON *token_j = cJSON_GetObjectItem(root, "token");
+    cJSON *pw_j    = cJSON_GetObjectItem(root, "password");
+
+    if (!cJSON_IsString(token_j) || !cJSON_IsString(pw_j)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing fields");
+        return ESP_OK;
+    }
+
+    if (!auth_token_consume(token_j->valuestring)) {
+        cJSON_Delete(root);
+        httpd_resp_set_status(req, "403 Forbidden");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"invalid_token\"}");
+        return ESP_OK;
+    }
+
+    if (strlen(pw_j->valuestring) < 8) {
+        cJSON_Delete(root);
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"password_too_short\"}");
+        return ESP_OK;
+    }
+
+    auth_set_password(pw_j->valuestring);
+    cJSON_Delete(root);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+    return ESP_OK;
+}
+
 /* ----------------------------------------------------------------- /api/config */
 
 static esp_err_t api_config_get(httpd_req_t *req)
 {
+    if (!check_auth(req)) return send_401(req);
     const app_config_t *cfg = app_config_get();
 
     cJSON *root = cJSON_CreateObject();
@@ -127,6 +283,7 @@ static esp_err_t api_config_get(httpd_req_t *req)
 
 static esp_err_t api_config_post(httpd_req_t *req)
 {
+    if (!check_auth(req)) return send_401(req);
     if (req->content_len > BODY_MAX) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body too large");
         return ESP_OK;
@@ -292,6 +449,7 @@ static void do_restart(void *arg) { esp_restart(); }
 
 static esp_err_t api_factory_reset(httpd_req_t *req)
 {
+    if (!check_auth(req)) return send_401(req);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"resetting\"}");
 
@@ -324,11 +482,15 @@ static esp_err_t api_reboot(httpd_req_t *req)
 /* -------------------------------------------------------------- start / stop */
 
 static const httpd_uri_t s_handlers[] = {
-    { .uri = "/api/config", .method = HTTP_GET,  .handler = api_config_get  },
-    { .uri = "/api/config", .method = HTTP_POST, .handler = api_config_post },
-    { .uri = "/api/reboot",        .method = HTTP_POST, .handler = api_reboot        },
-    { .uri = "/api/factory-reset", .method = HTTP_POST, .handler = api_factory_reset },
-    { .uri = "/*",          .method = HTTP_GET,  .handler = file_get        },
+    { .uri = "/api/auth/status",       .method = HTTP_GET,  .handler = api_auth_status       },
+    { .uri = "/api/auth/begin",        .method = HTTP_POST, .handler = api_auth_begin        },
+    { .uri = "/api/auth/token",        .method = HTTP_GET,  .handler = api_auth_token        },
+    { .uri = "/api/auth/set-password", .method = HTTP_POST, .handler = api_auth_set_password },
+    { .uri = "/api/config",            .method = HTTP_GET,  .handler = api_config_get        },
+    { .uri = "/api/config",            .method = HTTP_POST, .handler = api_config_post       },
+    { .uri = "/api/reboot",            .method = HTTP_POST, .handler = api_reboot            },
+    { .uri = "/api/factory-reset",     .method = HTTP_POST, .handler = api_factory_reset     },
+    { .uri = "/*",                     .method = HTTP_GET,  .handler = file_get              },
 };
 
 esp_err_t web_server_start(void)
@@ -337,7 +499,7 @@ esp_err_t web_server_start(void)
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn     = httpd_uri_match_wildcard;
-    cfg.max_uri_handlers = 8;
+    cfg.max_uri_handlers = 12;
     cfg.stack_size       = 8192;
 
     esp_err_t ret = httpd_start(&s_server, &cfg);

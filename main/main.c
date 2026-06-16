@@ -6,6 +6,7 @@
 #include <wifi_config.h>
 #include "app_config.h"
 #include "app_mqtt.h"
+#include "auth.h"
 #include "button.h"
 #include "buzzer.h"
 #include "di.h"
@@ -84,6 +85,7 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     ESP_ERROR_CHECK(app_config_init());
+    ESP_ERROR_CHECK(auth_init());
     button_init();
     ESP_ERROR_CHECK(di_init());
     ESP_ERROR_CHECK(dout_init());
