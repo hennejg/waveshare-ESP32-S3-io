@@ -26,6 +26,9 @@
 #define HB_PERIOD_MS 1000
 #define RX_QUEUE_DEPTH 32
 
+#define CAN_MODE_BASIC  1
+#define CAN_MODE_N2K    2
+
 /* ---------------------------------------------------------------- shared */
 
 static twai_node_handle_t s_node = NULL;
@@ -361,7 +364,10 @@ static void n2k_handle_rx(const rx_msg_t *m)
     }
 
     if (pgn == N2K_PGN_PROPRIETARY && m->dlc == 8) {
-        /* Fast-packet single frame only for now (fits our payloads) */
+        /* Only single-frame fast-packet messages are supported.
+         * LED (3 bytes) and buzzer (4 bytes) both fit in frame 0
+         * (6 payload bytes available). Multi-frame messages are
+         * silently discarded. */
         uint8_t fp_frame = m->data[0] & 0x1F;
         if (fp_frame != 0) return;   /* only first frame */
         /* data[1]=total len, data[2]=mfr_lo, data[3]=mfr_hi, data[4]=sub_fn ... */
@@ -385,8 +391,8 @@ static void can_rx_task(void *arg)
     rx_msg_t m;
     for (;;) {
         if (!xQueueReceive(s_rx_q, &m, portMAX_DELAY)) continue;
-        if (s_mode == 1 && !m.ide) basic_handle_rx(&m);
-        else if (s_mode == 2 &&  m.ide) n2k_handle_rx(&m);
+        if (s_mode == CAN_MODE_BASIC && !m.ide) basic_handle_rx(&m);
+        else if (s_mode == CAN_MODE_N2K &&  m.ide) n2k_handle_rx(&m);
     }
 }
 
@@ -401,7 +407,7 @@ static void can_tx_task(void *arg)
         TickType_t now = xTaskGetTickCount();
 
         /* ---- Basic mode ---- */
-        if (s_mode == 1) {
+        if (s_mode == CAN_MODE_BASIC) {
             if ((now - last_hb) >= pdMS_TO_TICKS(HB_PERIOD_MS)) {
                 basic_tx_heartbeat(); last_hb = now;
             }
@@ -414,7 +420,7 @@ static void can_tx_task(void *arg)
         }
 
         /* ---- NMEA2000 mode ---- */
-        if (s_mode == 2) {
+        if (s_mode == CAN_MODE_N2K) {
             /* Address claiming */
             if (s_ac_state == AC_CLAIMING &&
                 (now - s_claim_tick) >= pdMS_TO_TICKS(250)) {
@@ -449,7 +455,7 @@ esp_err_t can_server_init(void)
     s_mode = cfg->can.mode;
     if (s_mode == 0) { ESP_LOGI(TAG, "CAN disabled"); return ESP_OK; }
 
-    uint32_t bitrate = (s_mode == 2) ? 250000 : cfg->can.bitrate;
+    uint32_t bitrate = (s_mode == CAN_MODE_N2K) ? 250000 : cfg->can.bitrate;
 
     twai_timing_basic_config_t timing = { .bitrate = bitrate };
     twai_onchip_node_config_t node_cfg = {
@@ -468,7 +474,7 @@ esp_err_t can_server_init(void)
                         TAG, "register cbs");
     ESP_RETURN_ON_ERROR(twai_node_enable(s_node), TAG, "enable");
 
-    if (s_mode == 1) {
+    if (s_mode == CAN_MODE_BASIC) {
         s_base = cfg->can.base_id;
         ESP_LOGI(TAG, "Basic mode — base_id=0x%03x bitrate=%"PRIu32, s_base, bitrate);
     } else {

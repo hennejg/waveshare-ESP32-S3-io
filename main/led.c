@@ -131,6 +131,7 @@ static QueueHandle_t      s_flash_q;
 static bool               s_ap_mode      = false;
 static bool               s_ap_blink_on  = false;
 static esp_timer_handle_t s_ap_blink_t   = NULL;
+static portMUX_TYPE       s_mux          = portMUX_INITIALIZER_UNLOCKED;
 
 static void set_background(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -167,7 +168,11 @@ static void ap_blink_cb(void *arg)
 void led_status_set_ap_mode(bool up)
 {
     if (!s_status_mode) return;
+
+    taskENTER_CRITICAL(&s_mux);
     s_ap_mode = up;
+    taskEXIT_CRITICAL(&s_mux);
+
     if (up) {
         if (!s_ap_blink_t) {
             esp_timer_create_args_t a = { .callback = ap_blink_cb, .name = "ap_blink" };
@@ -184,26 +189,41 @@ void led_status_set_ap_mode(bool up)
 void led_status_set_network(bool up)
 {
     if (!s_status_mode) return;
+
+    bool do_ap_down = false;
+    bool do_refresh = false;
+
     if (up) {
         led_status_set_ap_mode(false);   /* AP done once we have an IP */
+        taskENTER_CRITICAL(&s_mux);
         s_net_count++;
-        if (s_net_level < 1) { s_net_level = 1; refresh_status(); }
+        if (s_net_level < 1) { s_net_level = 1; do_refresh = true; }
+        taskEXIT_CRITICAL(&s_mux);
     } else {
+        taskENTER_CRITICAL(&s_mux);
         if (--s_net_count <= 0) {
             s_net_count = 0;
-            if (s_net_level > 0) { s_net_level = 0; refresh_status(); }
+            if (s_net_level > 0) { s_net_level = 0; do_refresh = true; }
         }
+        taskEXIT_CRITICAL(&s_mux);
     }
+
+    (void)do_ap_down;
+    if (do_refresh) refresh_status();
 }
 
 void led_status_set_mqtt(bool up)
 {
     if (!s_status_mode) return;
+
+    taskENTER_CRITICAL(&s_mux);
     if (up) {
         s_net_level = 2;
     } else {
         s_net_level = (s_net_count > 0) ? 1 : 0;
     }
+    taskEXIT_CRITICAL(&s_mux);
+
     refresh_status();
 }
 

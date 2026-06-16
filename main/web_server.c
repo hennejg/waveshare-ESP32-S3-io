@@ -98,7 +98,9 @@ static bool check_auth(httpd_req_t *req)
     const char *colon = (const char *)memchr(decoded, ':', decoded_len);
     if (colon) pw = colon + 1;
 
-    return auth_check_password(pw);
+    bool ok = auth_check_password(pw);
+    memset(decoded, 0, sizeof(decoded));
+    return ok;
 }
 
 static esp_err_t send_401(httpd_req_t *req)

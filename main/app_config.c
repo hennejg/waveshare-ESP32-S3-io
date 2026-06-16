@@ -3,6 +3,9 @@
 #include <nvs_flash.h>
 #include <nvs.h>
 
+_Static_assert(sizeof(app_config_t) < 3000,
+               "app_config_t too large for NVS single-key storage");
+
 #define NVS_NS "app_config"
 
 /* NVS key names must be <= 15 chars. */

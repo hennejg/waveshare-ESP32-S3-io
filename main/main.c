@@ -145,7 +145,12 @@ void app_main(void)
         .max_files              = 8,
         .format_if_mount_failed = false,
     };
-    ESP_ERROR_CHECK(esp_vfs_spiffs_register(&spiffs));
+    esp_err_t spiffs_ret = esp_vfs_spiffs_register(&spiffs);
+    if (spiffs_ret != ESP_OK) {
+        ESP_LOGE(TAG, "SPIFFS mount failed (%s) — web UI unavailable; "
+                 "reflash storage partition to restore it",
+                 esp_err_to_name(spiffs_ret));
+    }
 
     bool eth_only = get_eth_only();
 
