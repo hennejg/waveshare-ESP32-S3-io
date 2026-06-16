@@ -23,9 +23,6 @@ jobs:
       - name: Fix git safe directory (Docker container runs as root)
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Init required submodules
-        run: git submodule update --init components/esp32-wifi-bootstrap
-
       - name: Cache managed components
         uses: actions/cache@v4
         with:
