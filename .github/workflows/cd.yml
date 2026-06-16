@@ -1,0 +1,78 @@
+name: CD
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # needed to create GitHub releases
+
+jobs:
+  release:
+    name: Build & release
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.0.1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Init required submodules
+        run: git submodule update --init components/esp32-wifi-bootstrap
+
+      - name: Cache managed components
+        uses: actions/cache@v4
+        with:
+          path: managed_components
+          key: managed-${{ hashFiles('main/idf_component.yml') }}
+          restore-keys: managed-
+
+      - name: Build
+        run: |
+          . "$IDF_PATH/export.sh"
+          idf.py build
+
+      - name: Stage release assets
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          mkdir release
+          cp build/waveshare_esp32s3.bin          "release/waveshare_esp32s3-${TAG}.bin"
+          cp build/storage.bin                    "release/storage-${TAG}.bin"
+          cp build/bootloader/bootloader.bin      "release/bootloader.bin"
+          cp build/partition_table/partition-table.bin "release/partition-table.bin"
+          cp build/flash_args                     "release/flash_args"
+          # All-in-one zip for full reflash
+          (cd release && zip "../waveshare-esp32s3-${TAG}-full-flash.zip" .)
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release/waveshare_esp32s3-*.bin
+            release/storage-*.bin
+            waveshare-esp32s3-*-full-flash.zip
+          body: |
+            ## Flash instructions
+
+            ### First install (full flash)
+            Download `waveshare-esp32s3-${{ github.ref_name }}-full-flash.zip`, unzip,
+            then from inside the extracted folder:
+            ```sh
+            python -m esptool --chip esp32s3 -p /dev/ttyUSBx -b 460800 \
+              --before default-reset --after hard-reset \
+              write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB \
+              @flash_args
+            ```
+
+            ### App update only (no web UI changes)
+            ```sh
+            python -m esptool --chip esp32s3 -p /dev/ttyUSBx -b 460800 \
+              --before default-reset --after hard-reset \
+              write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB \
+              0x10000 waveshare_esp32s3-${{ github.ref_name }}.bin
+            ```

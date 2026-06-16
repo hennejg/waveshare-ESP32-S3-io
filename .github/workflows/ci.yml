@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+    tags-ignore: ['**']   # CD handles tag builds
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  build:
+    name: Build firmware
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.0.1   # provides Xtensa toolchain + IDF v6.0.1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false   # skip the large esp-idf submodule; use container's IDF
+
+      - name: Init required submodules
+        run: git submodule update --init components/esp32-wifi-bootstrap
+
+      - name: Cache managed components
+        uses: actions/cache@v4
+        with:
+          path: managed_components
+          key: managed-${{ hashFiles('main/idf_component.yml') }}
+          restore-keys: managed-
+
+      - name: Build
+        run: |
+          . "$IDF_PATH/export.sh"
+          idf.py build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ github.sha }}
+          retention-days: 7
+          path: |
+            build/waveshare_esp32s3.bin
+            build/storage.bin
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
+            build/flash_args
