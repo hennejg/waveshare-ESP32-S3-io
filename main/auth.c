@@ -7,7 +7,7 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
-#include "psa/crypto.h"
+#include "mbedtls/md.h"
 #include <nvs.h>
 
 #define TAG    "auth"
@@ -15,24 +15,11 @@
 #define K_SALT "salt"
 #define K_HASH "hash"
 
-#define TOKEN_TIMEOUT_S 30
-#define BLINK_PERIOD_US 150000ULL   /* 150 ms → fast yellow blink */
-
 /* ---------------------------------------------------------------- password */
 
 static bool    s_pw_set  = false;
 static uint8_t s_pw_salt[16];
 static uint8_t s_pw_hash[32];   /* SHA-256(salt || password) */
-
-static void do_sha256(const uint8_t *salt, const char *pw, uint8_t *out)
-{
-    psa_hash_operation_t op = PSA_HASH_OPERATION_INIT;
-    psa_hash_setup(&op, PSA_ALG_SHA_256);
-    psa_hash_update(&op, salt, 16);
-    psa_hash_update(&op, (const uint8_t *)pw, strlen(pw));
-    size_t len = 0;
-    psa_hash_finish(&op, out, 32, &len);
-}
 
 static void to_hex(const uint8_t *b, size_t n, char *out)
 {
@@ -44,13 +31,26 @@ static void to_hex(const uint8_t *b, size_t n, char *out)
     out[n*2] = '\0';
 }
 
+/* SHA-256(salt || password) using the classic mbedTLS MD API.
+   This avoids PSA-layer constructors that disrupted the I2C peripheral. */
+static void compute_hash(const uint8_t *salt, const char *pw, uint8_t out[32])
+{
+    mbedtls_md_context_t ctx;
+    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx, info, 0);   /* 0 = no HMAC */
+    mbedtls_md_starts(&ctx);
+    mbedtls_md_update(&ctx, salt, 16);
+    mbedtls_md_update(&ctx, (const uint8_t *)pw, strlen(pw));
+    mbedtls_md_finish(&ctx, out);
+    mbedtls_md_free(&ctx);
+}
+
 esp_err_t auth_init(void)
 {
-    /* psa_crypto_init() is called automatically by IDF v6 at startup;
-       no explicit call needed here. */
     nvs_handle_t h;
     esp_err_t r = nvs_open(NVS_NS, NVS_READONLY, &h);
-    if (r == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;  /* no password set */
+    if (r == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
     if (r != ESP_OK) return r;
 
     size_t sz = sizeof(s_pw_salt);
@@ -69,14 +69,14 @@ bool auth_check_password(const char *pw)
 {
     if (!s_pw_set) return true;
     uint8_t test[32];
-    do_sha256(s_pw_salt, pw, test);
+    compute_hash(s_pw_salt, pw, test);
     return (memcmp(test, s_pw_hash, 32) == 0);
 }
 
 esp_err_t auth_set_password(const char *pw)
 {
     esp_fill_random(s_pw_salt, sizeof(s_pw_salt));
-    do_sha256(s_pw_salt, pw, s_pw_hash);
+    compute_hash(s_pw_salt, pw, s_pw_hash);
 
     nvs_handle_t h;
     esp_err_t r = nvs_open(NVS_NS, NVS_READWRITE, &h);
@@ -127,14 +127,13 @@ static void on_timeout(void *arg)
 static void on_blink(void *arg)
 {
     s_blink_on = !s_blink_on;
-    led_force_set(s_blink_on ? 100 : 0, s_blink_on ? 100 : 0, 0);   /* yellow */
+    led_force_set(s_blink_on ? 100 : 0, s_blink_on ? 100 : 0, 0);
 }
 
 esp_err_t auth_token_begin(char session_out[9])
 {
     if (s_state == AUTH_TOK_WAITING) return ESP_ERR_INVALID_STATE;
 
-    /* Generate random session id (4 bytes → 8 hex) and token (16 bytes → 32 hex) */
     uint8_t rnd[20];
     esp_fill_random(rnd, sizeof(rnd));
     to_hex(rnd,     4, s_session);
@@ -142,22 +141,18 @@ esp_err_t auth_token_begin(char session_out[9])
     memcpy(session_out, s_session, 9);
 
     s_state = AUTH_TOK_WAITING;
-    stop_timers();  /* clear any previous */
+    stop_timers();
 
-    /* Timeout timer */
     esp_timer_create_args_t ta = { .callback = on_timeout, .name = "auth_to" };
     esp_timer_create(&ta, &s_timeout_timer);
-    esp_timer_start_once(s_timeout_timer, (uint64_t)TOKEN_TIMEOUT_S * 1000000ULL);
+    esp_timer_start_once(s_timeout_timer, 30ULL * 1000000ULL);
 
-    /* Blink timer */
     esp_timer_create_args_t ba = { .callback = on_blink, .name = "auth_blink" };
     esp_timer_create(&ba, &s_blink_timer);
-    esp_timer_start_periodic(s_blink_timer, BLINK_PERIOD_US);
+    esp_timer_start_periodic(s_blink_timer, 150000ULL);
 
-    /* Register button callback */
     button_on_short_press(auth_on_button_press);
-
-    ESP_LOGI(TAG, "Token flow started — press BOOT button within %ds", TOKEN_TIMEOUT_S);
+    ESP_LOGI(TAG, "Token flow started — press BOOT button within 30 s");
     return ESP_OK;
 }
 
