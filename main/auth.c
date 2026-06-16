@@ -46,8 +46,8 @@ static void to_hex(const uint8_t *b, size_t n, char *out)
 
 esp_err_t auth_init(void)
 {
-    psa_crypto_init();   /* idempotent; required before any PSA hash operations */
-
+    /* psa_crypto_init() is called automatically by IDF v6 at startup;
+       no explicit call needed here. */
     nvs_handle_t h;
     esp_err_t r = nvs_open(NVS_NS, NVS_READONLY, &h);
     if (r == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;  /* no password set */
