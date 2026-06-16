@@ -6,6 +6,7 @@
 
 #include "cJSON.h"
 #include "led_strip.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -118,14 +119,18 @@ static void led_task(void *arg)
 #define STA_TX_R    0   /* 100% blue   */
 #define STA_TX_G    0
 #define STA_TX_B    255
-#define FLASH_MS    100
+#define FLASH_MS       100
+#define AP_BLINK_US    400000ULL   /* 400 ms half-period → slow blue pulse */
 
 typedef struct { uint8_t r, g, b; } flash_t;
 
-static uint8_t       s_bg_r, s_bg_g, s_bg_b;  /* current background colour  */
-static uint8_t       s_net_level;              /* 0=boot 1=network 2=mqtt    */
-static int           s_net_count;              /* # interfaces with an IP    */
-static QueueHandle_t s_flash_q;
+static uint8_t            s_bg_r, s_bg_g, s_bg_b;
+static uint8_t            s_net_level;
+static int                s_net_count;
+static QueueHandle_t      s_flash_q;
+static bool               s_ap_mode      = false;
+static bool               s_ap_blink_on  = false;
+static esp_timer_handle_t s_ap_blink_t   = NULL;
 
 static void set_background(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -153,10 +158,34 @@ static void flash_task(void *arg)
     }
 }
 
+static void ap_blink_cb(void *arg)
+{
+    s_ap_blink_on = !s_ap_blink_on;
+    hw_apply(0, 0, s_ap_blink_on ? 77 : 0);   /* 30% blue pulse */
+}
+
+void led_status_set_ap_mode(bool up)
+{
+    if (!s_status_mode) return;
+    s_ap_mode = up;
+    if (up) {
+        if (!s_ap_blink_t) {
+            esp_timer_create_args_t a = { .callback = ap_blink_cb, .name = "ap_blink" };
+            esp_timer_create(&a, &s_ap_blink_t);
+        }
+        esp_timer_start_periodic(s_ap_blink_t, AP_BLINK_US);
+        ESP_LOGI(TAG, "AP mode — LED blue blink");
+    } else {
+        if (s_ap_blink_t) { esp_timer_stop(s_ap_blink_t); }
+        refresh_status();
+    }
+}
+
 void led_status_set_network(bool up)
 {
     if (!s_status_mode) return;
     if (up) {
+        led_status_set_ap_mode(false);   /* AP done once we have an IP */
         s_net_count++;
         if (s_net_level < 1) { s_net_level = 1; refresh_status(); }
     } else {

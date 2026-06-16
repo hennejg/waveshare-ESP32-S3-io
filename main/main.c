@@ -3,6 +3,7 @@
 #include <esp_netif.h>
 #include <esp_spiffs.h>
 #include <esp_event.h>
+#include <esp_wifi.h>
 #include <wifi_config.h>
 #include "app_config.h"
 #include "app_mqtt.h"
@@ -73,6 +74,12 @@ static void on_ip_lost(void *arg, esp_event_base_t base,
     led_status_set_network(false);
 }
 
+static void on_wifi_ap(void *arg, esp_event_base_t base,
+                        int32_t id, void *data)
+{
+    led_status_set_ap_mode(true);
+}
+
 /* ------------------------------------------------------------ app_main -- */
 
 void app_main(void)
@@ -116,7 +123,7 @@ void app_main(void)
                  esp_err_to_name(eth_ret));
     }
 
-    /* Watch for IP loss so status LED falls back to green or yellow. */
-    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP,  on_ip_lost, NULL);
-    esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_LOST_IP,  on_ip_lost, NULL);
+    esp_event_handler_register(IP_EVENT,   IP_EVENT_STA_LOST_IP,  on_ip_lost,   NULL);
+    esp_event_handler_register(IP_EVENT,   IP_EVENT_ETH_LOST_IP,  on_ip_lost,   NULL);
+    esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START,   on_wifi_ap,   NULL);
 }

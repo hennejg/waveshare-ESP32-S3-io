@@ -17,6 +17,7 @@ void led_force_set(uint8_t r, uint8_t g, uint8_t b);
    Call from network / MQTT event handlers in main.c. */
 void led_status_set_network(bool up);   /* true once WiFi or ETH gets an IP */
 void led_status_set_mqtt(bool up);      /* true on broker connect */
+void led_status_set_ap_mode(bool up);   /* true while WiFi captive portal is active */
 void led_status_flash_rx(void);         /* 100 ms red flash on MQTT RX */
 void led_status_flash_tx(void);         /* 100 ms blue flash on MQTT TX */
 
