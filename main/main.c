@@ -1,4 +1,5 @@
 #include <nvs_flash.h>
+#include <nvs.h>
 #include <esp_log.h>
 #include <esp_netif.h>
 #include <esp_spiffs.h>
@@ -18,9 +19,35 @@
 #include "mb_server.h"
 #include "web_server.h"
 
-static const char *TAG = "main";
+#define TAG          "main"
+#define NVS_ETH_NS   "app_config"
+#define NVS_ETH_KEY  "eth_only"
 
-/* --------------------------------------------------------- MQTT callbacks -- */
+/* ---------------------------------------------------------------- helpers */
+
+static bool get_eth_only(void)
+{
+    uint8_t v = 0;
+    nvs_handle_t h;
+    if (nvs_open(NVS_ETH_NS, NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u8(h, NVS_ETH_KEY, &v);
+        nvs_close(h);
+    }
+    return v != 0;
+}
+
+static void set_eth_only(bool on)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_ETH_NS, NVS_READWRITE, &h) == ESP_OK) {
+        if (on) nvs_set_u8(h, NVS_ETH_KEY, 1);
+        else    nvs_erase_key(h, NVS_ETH_KEY);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+/* --------------------------------------------------------- MQTT callbacks */
 
 static void on_mqtt_connected(void)
 {
@@ -31,10 +58,7 @@ static void on_mqtt_connected(void)
     buzzer_on_mqtt_connected();
 }
 
-static void on_mqtt_disconnected(void)
-{
-    led_status_set_mqtt(false);
-}
+static void on_mqtt_disconnected(void) { led_status_set_mqtt(false); }
 
 static void on_mqtt_message(const char *topic, size_t tlen,
                              const char *data,  size_t dlen)
@@ -48,10 +72,8 @@ static void on_mqtt_message(const char *topic, size_t tlen,
 
 static void on_mqtt_publish(void) { led_status_flash_tx(); }
 
-/* --------------------------------------------------- network callbacks -- */
+/* ------------------------------------------------- network callbacks */
 
-/* Called when either WiFi or Ethernet obtains an IP.
-   Both web_server_start() and app_mqtt_start() are idempotent. */
 static void on_network_ready(const char *iface)
 {
     ESP_LOGI(TAG, "%s connected — starting services", iface);
@@ -67,20 +89,36 @@ static void on_network_ready(const char *iface)
 static void on_wifi_ready(void) { on_network_ready("WiFi"); }
 static void on_eth_ready(void)  { on_network_ready("Ethernet"); }
 
-/* Track IP loss so status LED can fall back to yellow/green. */
-static void on_ip_lost(void *arg, esp_event_base_t base,
-                        int32_t id, void *data)
+static void on_ip_lost(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     led_status_set_network(false);
 }
 
-static void on_wifi_ap(void *arg, esp_event_base_t base,
-                        int32_t id, void *data)
+static void on_wifi_ap(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     led_status_set_ap_mode(true);
 }
 
-/* ------------------------------------------------------------ app_main -- */
+/* Called by wifi-bootstrap when user taps "Use Ethernet only". */
+static void on_eth_only_requested(void)
+{
+    set_eth_only(true);
+    ESP_LOGI(TAG, "ETH-only mode saved — rebooting");
+}
+
+/* ------------------------------------------------------------ app_main */
+
+/* Custom HTML injected at the bottom of the WiFi provisioning page. */
+static const char s_portal_extra[] =
+    "<div style='margin-top:1.5rem;border-top:1px solid #ccc;padding-top:1rem;"
+    "font-family:sans-serif;font-size:.9rem;color:#555;text-align:center'>"
+    "<p>Have an Ethernet cable? You can skip WiFi entirely.</p>"
+    "<a href='/eth-only' style='display:inline-block;padding:.4rem 1rem;"
+    "background:#1a73e8;color:#fff;border-radius:4px;text-decoration:none'>"
+    "Use Ethernet only &rarr;</a>"
+    "<p style='margin-top:.8rem;color:#999;font-size:.8rem'>"
+    "To return to WiFi setup: hold the BOOT button for &ge;&nbsp;5&nbsp;s.</p>"
+    "</div>";
 
 void app_main(void)
 {
@@ -109,21 +147,28 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(esp_vfs_spiffs_register(&spiffs));
 
-    /* WiFi: captive portal on first boot, reconnects on subsequent boots. */
-    wifi_config_init("Waveshare-Setup", NULL, on_wifi_ready);
+    bool eth_only = get_eth_only();
 
-    /* Set WiFi STA hostname before DHCP starts. */
-    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (sta) esp_netif_set_hostname(sta, app_config_get()->device_name);
+    if (!eth_only) {
+        /* Normal: WiFi provisioning + STA. */
+        wifi_config_set_custom_html((char *)s_portal_extra);
+        wifi_config_set_eth_only_callback(on_eth_only_requested);
+        wifi_config_init("Waveshare-Setup", NULL, on_wifi_ready);
 
-    /* Ethernet: W5500 over SPI. Event loop is ready after wifi_config_init. */
-    esp_err_t eth_ret = eth_init(on_eth_ready);
-    if (eth_ret != ESP_OK) {
-        ESP_LOGW(TAG, "Ethernet init failed: %s (continuing without ETH)",
-                 esp_err_to_name(eth_ret));
+        esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (sta) esp_netif_set_hostname(sta, app_config_get()->device_name);
+    } else {
+        ESP_LOGI(TAG, "ETH-only mode — skipping WiFi");
     }
 
-    esp_event_handler_register(IP_EVENT,   IP_EVENT_STA_LOST_IP,  on_ip_lost,   NULL);
-    esp_event_handler_register(IP_EVENT,   IP_EVENT_ETH_LOST_IP,  on_ip_lost,   NULL);
-    esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START,   on_wifi_ap,   NULL);
+    /* Ethernet always. Event loop is ready after wifi_config_init (or immediately). */
+    if (eth_only) esp_netif_init(), esp_event_loop_create_default();
+    esp_err_t eth_ret = eth_init(on_eth_ready);
+    if (eth_ret != ESP_OK)
+        ESP_LOGW(TAG, "Ethernet init failed: %s", esp_err_to_name(eth_ret));
+
+    esp_event_handler_register(IP_EVENT,   IP_EVENT_STA_LOST_IP, on_ip_lost,  NULL);
+    esp_event_handler_register(IP_EVENT,   IP_EVENT_ETH_LOST_IP, on_ip_lost,  NULL);
+    if (!eth_only)
+        esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START, on_wifi_ap, NULL);
 }
