@@ -47,7 +47,7 @@ jobs:
           cp build/partition_table/partition-table.bin "release/partition-table.bin"
           cp build/flash_args                     "release/flash_args"
           # All-in-one zip for full reflash
-          (cd release && zip "../waveshare-esp32s3-${TAG}-full-flash.zip" .)
+          (cd release && zip "../waveshare-esp32s3-${TAG}-full-flash.zip" *)
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
