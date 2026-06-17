@@ -16,15 +16,15 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # WiFi
 CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
 
-# Ethernet — enable SPI Ethernet support (required for W5500)
+# Ethernet — enable built-in SPI Ethernet and W5500 driver
 CONFIG_ETH_USE_SPI_ETHERNET=y
+CONFIG_ETH_SPI_ETHERNET_W5500=y
 
 # Logging
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
-# Disable mbedTLS hardware acceleration — enabling it (when mbedtls was
-# temporarily in explicit REQUIRES) caused GDMA conflicts with the I2C driver.
+# Disable mbedTLS hardware acceleration to avoid GDMA conflicts with I2C.
+# RSA DS peripheral key only exists in IDF v6+, omitted here.
 CONFIG_MBEDTLS_HARDWARE_SHA=n
 CONFIG_MBEDTLS_HARDWARE_AES=n
 CONFIG_MBEDTLS_HARDWARE_MPI=n
-CONFIG_MBEDTLS_HARDWARE_RSA_DS_PERIPHERAL=n
