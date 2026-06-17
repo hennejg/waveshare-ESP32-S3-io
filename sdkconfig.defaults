@@ -47,5 +47,28 @@ CONFIG_LWIP_HOOK_ND6_GET_GW_DEFAULT=y
 # 8 DO + 8 DI + root endpoint = 17; add margin
 CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT=20
 
+# Stack sizes — Matter initialization runs on app_main's stack and is deep;
+# the CHIP task also needs more than the ESP-IDF default.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=10240
+CONFIG_CHIP_TASK_STACK_SIZE=15360
+CONFIG_BT_NIMBLE_TASK_STACK_SIZE=5120
+
+# PSRAM heap routing — Matter makes many large allocations that exhaust
+# internal DRAM (leaving none for httpd/mqtt task stacks).  Route any
+# allocation larger than 4 KiB to PSRAM when internal RAM is full.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+# Allow FreeRTOS tasks (httpd, mqtt, etc.) to allocate their stacks in PSRAM
+# when internal DRAM is exhausted.
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+
+# The on_wifi_ready callback runs in the FreeRTOS timer service task
+# (wifi-bootstrap fires it from a TimerHandle_t callback).  The default
+# 2048 bytes is far too small: httpd_start() + ESP_LOGE overflow it.
+CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=8192
+
+# httpd stack must be > SPIRAM_MALLOC_ALWAYSINTERNAL (4096) so it lands in
+# PSRAM when internal DRAM is exhausted by Matter.
+CONFIG_HTTPD_STACK_SIZE=6144
+
 # OTA requestor (needed by esp_matter_ota_provider component)
 CONFIG_ENABLE_OTA_REQUESTOR=y

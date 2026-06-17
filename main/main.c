@@ -79,12 +79,16 @@ static void on_network_ready(const char *iface)
 {
     ESP_LOGI(TAG, "%s connected — starting services", iface);
     led_status_set_network(true);
-    ESP_ERROR_CHECK(web_server_start());
+    esp_err_t ws_ret = web_server_start();
+    if (ws_ret != ESP_OK)
+        ESP_LOGE(TAG, "Web server start failed: %s", esp_err_to_name(ws_ret));
     app_mqtt_set_connected_callback(on_mqtt_connected);
     app_mqtt_set_disconnected_callback(on_mqtt_disconnected);
     app_mqtt_set_msg_callback(on_mqtt_message);
     app_mqtt_set_publish_callback(on_mqtt_publish);
-    ESP_ERROR_CHECK(app_mqtt_start());
+    esp_err_t mqtt_ret = app_mqtt_start();
+    if (mqtt_ret != ESP_OK)
+        ESP_LOGE(TAG, "MQTT start failed: %s", esp_err_to_name(mqtt_ret));
 }
 
 static void on_wifi_ready(void) { on_network_ready("WiFi"); }
