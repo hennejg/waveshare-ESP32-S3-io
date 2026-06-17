@@ -18,6 +18,7 @@
 #include "can_server.h"
 #include "mb_server.h"
 #include "web_server.h"
+#include "matter.h"
 
 #define TAG          "main"
 #define NVS_ETH_NS   "app_config"
@@ -176,4 +177,9 @@ void app_main(void)
     esp_event_handler_register(IP_EVENT,   IP_EVENT_ETH_LOST_IP, on_ip_lost,  NULL);
     if (!eth_only)
         esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START, on_wifi_ap, NULL);
+
+    /* Matter — initialise after network interfaces so the event loop is ready */
+    esp_err_t matter_ret = matter_init();
+    if (matter_ret != ESP_OK)
+        ESP_LOGW(TAG, "Matter init failed: %s", esp_err_to_name(matter_ret));
 }
