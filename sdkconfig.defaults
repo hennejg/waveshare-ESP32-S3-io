@@ -52,6 +52,10 @@ CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT=20
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=10240
 CONFIG_CHIP_TASK_STACK_SIZE=15360
 CONFIG_BT_NIMBLE_TASK_STACK_SIZE=5120
+# NimBLE MSYS pools are forced to internal DRAM by default; with Matter
+# consuming most internal DRAM, the malloc for advertising data fails.
+# DEFAULT mode falls back to PSRAM when internal DRAM is exhausted.
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_DEFAULT=y
 
 # PSRAM heap routing — Matter makes many large allocations that exhaust
 # internal DRAM (leaving none for httpd/mqtt task stacks).  Route any

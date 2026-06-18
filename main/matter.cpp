@@ -16,10 +16,14 @@ extern "C" {
 #include "app_config.h"
 }
 
+#include <esp_err.h>
 #include <esp_log.h>
 #include <esp_matter.h>
 #include <app-common/zap-generated/ids/Attributes.h>
 #include <app-common/zap-generated/ids/Clusters.h>
+
+/* Declared in esp-matter/data_model_provider/clusters/boolean_state/integration.cpp */
+esp_err_t esp_matter_boolean_state_set_value(chip::EndpointId endpoint_id, bool value);
 
 #define TAG "matter"
 #define NUM_CHANNELS 8
@@ -93,12 +97,12 @@ esp_err_t matter_init(void)
         return ESP_FAIL;
     }
 
-    /* Create 8 On/Off Light endpoints for digital outputs */
+    /* Create 8 On/Off Plug-In Unit endpoints for digital outputs */
     for (int i = 0; i < NUM_CHANNELS; i++) {
-        on_off_light::config_t cfg_do = {};
+        on_off_plug_in_unit::config_t cfg_do = {};
         cfg_do.on_off.on_off = dout_get((uint8_t)i);
 
-        endpoint_t *ep = on_off_light::create(node, &cfg_do, ENDPOINT_FLAG_NONE, (void *)(intptr_t)i);
+        endpoint_t *ep = on_off_plug_in_unit::create(node, &cfg_do, ENDPOINT_FLAG_NONE, (void *)(intptr_t)i);
         if (!ep) {
             ESP_LOGE(TAG, "Failed to create DO%d endpoint", i + 1);
             return ESP_FAIL;
@@ -143,13 +147,12 @@ void matter_di_update(uint8_t channel, bool active)
     uint16_t ep_id = s_di_ep[channel];
     if (ep_id == 0) return;  /* not initialised yet */
 
-    /* BooleanState::StateValue = true means "contact detected" (closed).
-       For a generic DI, active logical state maps to contact detected. */
-    esp_matter_attr_val_t val = esp_matter_bool(active);
-    attribute::update(ep_id,
-                      BooleanState::Id,
-                      BooleanState::Attributes::StateValue::Id,
-                      &val);
+    /* StateValue is owned by BooleanStateCluster (ATTRIBUTE_FLAG_MANAGED_INTERNALLY).
+       Must call SetStateValue() through the registered cluster, not attribute::update(). */
+    esp_err_t err = esp_matter_boolean_state_set_value(ep_id, active);
+    if (err != ESP_OK && err != ESP_ERR_NOT_FINISHED) {
+        ESP_LOGE(TAG, "DI%d state update failed: %s", channel + 1, esp_err_to_name(err));
+    }
 }
 
 void matter_do_update(uint8_t channel, bool state)
