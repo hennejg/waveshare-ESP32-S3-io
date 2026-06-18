@@ -448,6 +448,26 @@ static esp_err_t file_get(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* --------------------------------------------------------- /api/matter/decommission */
+
+static esp_err_t api_matter_decommission(httpd_req_t *req)
+{
+    if (!check_auth(req)) return send_401(req);
+
+    if (!matter_is_commissioned()) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"not_commissioned\"}");
+        return ESP_OK;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"decommissioning\"}");
+
+    matter_decommission();
+    return ESP_OK;
+}
+
 /* --------------------------------------------------------------- /api/matter/pairing */
 
 static esp_err_t api_matter_pairing(httpd_req_t *req)
@@ -660,7 +680,8 @@ static const httpd_uri_t s_handlers[] = {
     { .uri = "/api/io/output",         .method = HTTP_POST, .handler = api_io_output         },
     { .uri = "/api/io/led",            .method = HTTP_POST, .handler = api_io_led            },
     { .uri = "/api/io/buzzer",         .method = HTTP_POST, .handler = api_io_buzzer         },
-    { .uri = "/api/matter/pairing",    .method = HTTP_GET,  .handler = api_matter_pairing   },
+    { .uri = "/api/matter/pairing",       .method = HTTP_GET,  .handler = api_matter_pairing      },
+    { .uri = "/api/matter/decommission", .method = HTTP_POST, .handler = api_matter_decommission },
     { .uri = "/api/reboot",            .method = HTTP_POST, .handler = api_reboot            },
     { .uri = "/api/factory-reset",     .method = HTTP_POST, .handler = api_factory_reset     },
     { .uri = "/*",                     .method = HTTP_GET,  .handler = file_get              },

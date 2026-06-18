@@ -305,6 +305,38 @@ void matter_di_update(uint8_t channel, bool active)
     }
 }
 
+void matter_decommission(void)
+{
+    /* ScheduleWork posts to the CHIP task queue — safe to call from any thread */
+    CHIP_ERROR err = chip::DeviceLayer::PlatformMgr().ScheduleWork([](intptr_t) {
+        ESP_LOGI(TAG, "Decommission: removing all Matter fabrics");
+
+        /* Remove fabrics and send Leave events to any active controllers */
+        chip::Server::GetInstance().GetFabricTable().DeleteAllFabrics();
+        chip::DeviceLayer::PlatformMgr().HandleServerShuttingDown();
+
+        /* Erase Matter operational NVS namespaces.
+         * chip-factory (our passcode/discriminator) is intentionally left intact.
+         * WiFi credentials (managed by esp32-wifi-bootstrap) are also preserved. */
+        static const char * const kMatterNS[] = { "chip-config", "chip-counters", "CHIP_KVS" };
+        for (size_t i = 0; i < sizeof(kMatterNS) / sizeof(kMatterNS[0]); i++) {
+            nvs_handle_t h;
+            if (nvs_open_from_partition("nvs", kMatterNS[i], NVS_READWRITE, &h) == ESP_OK) {
+                nvs_erase_all(h);
+                nvs_commit(h);
+                nvs_close(h);
+            }
+        }
+
+        ESP_LOGI(TAG, "Decommission complete — rebooting");
+        esp_restart();
+    });
+
+    if (err != CHIP_NO_ERROR) {
+        ESP_LOGE(TAG, "matter_decommission: ScheduleWork failed");
+    }
+}
+
 void matter_do_update(uint8_t channel, bool state)
 {
     if (channel >= NUM_CHANNELS) return;

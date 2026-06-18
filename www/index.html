@@ -232,8 +232,13 @@
   <div id="matter-section" style="display:none">
     <h2 style="font-size:1rem;color:#555;border-bottom:1px solid #ddd;padding-bottom:.3rem;margin:1.8rem 0 .8rem">Matter Commissioning</h2>
     <div id="matter-commissioned-msg" style="display:none">
-      <p style="color:#2d7d46;font-size:.9rem">Device is already commissioned into a Matter fabric.<br>
-      To commission again, perform a factory reset first.</p>
+      <p style="color:#2d7d46;font-size:.9rem;margin:.3rem 0">Device is commissioned into a Matter fabric.</p>
+      <button type="button" id="matter-decommission-btn" onclick="matterDecommission()"
+              style="margin-top:.6rem;background:#b0413e;padding:.45rem 1.2rem;font-size:.9rem">
+        Remove from Home
+      </button>
+      <p class="hint" style="margin-top:.4rem">Removes the device from all Matter fabrics and reboots. Your WiFi,
+      MQTT config, and pairing code are preserved — you can recommission immediately after reboot.</p>
     </div>
     <div id="matter-pair-info">
       <p style="font-size:.85rem;color:#555;margin:.3rem 0">Scan this code with Apple Home, Google Home, or Home Assistant:</p>
@@ -630,6 +635,23 @@
     initAuth();
 
     /* ---- Matter pairing info ---- */
+    async function matterDecommission() {
+      if (!confirm(
+        'Remove this device from all Matter fabrics?\n\n' +
+        'The device will reboot. Your WiFi and MQTT settings are preserved, ' +
+        'and the pairing code stays the same — you can recommission immediately after reboot.')) return;
+      const btn = document.getElementById('matter-decommission-btn');
+      btn.disabled = true;
+      btn.textContent = 'Removing…';
+      try {
+        await apiFetch('/api/matter/decommission', { method: 'POST' });
+        btn.textContent = 'Rebooting…';
+      } catch (_) {
+        btn.disabled = false;
+        btn.textContent = 'Remove from Home';
+      }
+    }
+
     async function loadMatterPairing() {
       try {
         const r = await apiFetch('/api/matter/pairing');
