@@ -27,6 +27,17 @@ extern "C" {
 /* Declared in esp-matter/data_model_provider/clusters/boolean_state/integration.cpp */
 esp_err_t esp_matter_boolean_state_set_value(chip::EndpointId endpoint_id, bool value);
 
+/* Stored after matter_init() succeeds — read-only from web_server task */
+static char s_qr_code[128];
+static char s_manual_code[32];
+static bool s_commissioned;
+
+extern "C" {
+const char *matter_get_qr_code(void)     { return s_qr_code; }
+const char *matter_get_manual_code(void) { return s_manual_code; }
+bool        matter_is_commissioned(void) { return s_commissioned; }
+}
+
 #define TAG "matter"
 #define NUM_CHANNELS 8
 
@@ -141,13 +152,26 @@ esp_err_t matter_init(void)
 
     ESP_LOGI(TAG, "Matter stack started — %d DO + %d DI endpoints", NUM_CHANNELS, NUM_CHANNELS);
 
-    bool commissioned = chip::Server::GetInstance().GetFabricTable().FabricCount() > 0;
-    if (commissioned) {
+    s_commissioned = chip::Server::GetInstance().GetFabricTable().FabricCount() > 0;
+    if (s_commissioned) {
         ESP_LOGI(TAG, "Device already commissioned — showing codes for re-commissioning after factory reset");
     } else {
         ESP_LOGI(TAG, "Device not yet commissioned — scan QR code or enter manual code to pair");
     }
-    PrintOnboardingCodes(chip::RendezvousInformationFlags(chip::RendezvousInformationFlag::kBLE));
+
+    chip::RendezvousInformationFlags rvFlags(chip::RendezvousInformationFlag::kBLE);
+
+    chip::MutableCharSpan qr_span(s_qr_code, sizeof(s_qr_code) - 1);
+    if (GetQRCode(qr_span, rvFlags) == CHIP_NO_ERROR) {
+        s_qr_code[qr_span.size()] = '\0';
+    }
+
+    chip::MutableCharSpan man_span(s_manual_code, sizeof(s_manual_code) - 1);
+    if (GetManualPairingCode(man_span, rvFlags) == CHIP_NO_ERROR) {
+        s_manual_code[man_span.size()] = '\0';
+    }
+
+    PrintOnboardingCodes(rvFlags);
 
     return ESP_OK;
 }

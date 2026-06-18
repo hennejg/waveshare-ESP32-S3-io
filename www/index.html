@@ -228,6 +228,25 @@
   </form>
   <p id="status"></p>
 
+  <!-- Matter pairing section — shown only when Matter is enabled in firmware -->
+  <div id="matter-section" style="display:none">
+    <h2 style="font-size:1rem;color:#555;border-bottom:1px solid #ddd;padding-bottom:.3rem;margin:1.8rem 0 .8rem">Matter Commissioning</h2>
+    <div id="matter-commissioned-msg" style="display:none">
+      <p style="color:#2d7d46;font-size:.9rem">Device is already commissioned into a Matter fabric.<br>
+      To commission again, perform a factory reset first.</p>
+    </div>
+    <div id="matter-pair-info">
+      <p style="font-size:.85rem;color:#555;margin:.3rem 0">Scan this code with Apple Home, Google Home, or Home Assistant:</p>
+      <div id="matter-qr-canvas" style="display:flex;justify-content:center;margin:.8rem 0"></div>
+      <p style="font-size:.78rem;color:#888;text-align:center;margin:.2rem 0">
+        No QR? <a id="matter-qr-link" href="#" target="_blank" rel="noopener">Open in browser</a>
+      </p>
+      <label style="display:block;margin-top:.8rem;font-size:.85rem;font-weight:600;color:#555">Manual Pairing Code</label>
+      <code id="matter-manual-code" style="display:block;font-size:1.5rem;text-align:center;letter-spacing:.25em;padding:.5rem;border:1px solid #ddd;border-radius:4px;margin-top:.3rem;background:#f9f9f9"></code>
+      <p class="hint" style="margin-top:.4rem">Enter this code in your home automation app if QR scanning is unavailable.</p>
+    </div>
+  </div>
+
   <script>
     /* ---- Auth state machine ---- */
     let authPassword = sessionStorage.getItem('auth_pw') || '';
@@ -609,6 +628,40 @@
     }
 
     initAuth();
+
+    /* ---- Matter pairing info ---- */
+    async function loadMatterPairing() {
+      try {
+        const r = await apiFetch('/api/matter/pairing');
+        if (!r.ok) return;  /* Matter not compiled in */
+        const d = await r.json();
+        if (!d.qr_code) return;
+
+        document.getElementById('matter-section').style.display = '';
+
+        const url = 'https://project-chip.github.io/connectedhomeip/qrcode.html?data='
+                    + encodeURIComponent(d.qr_code);
+        document.getElementById('matter-qr-link').href = url;
+        document.getElementById('matter-manual-code').textContent = d.manual_code || '';
+
+        if (d.commissioned) {
+          document.getElementById('matter-commissioned-msg').style.display = '';
+          document.getElementById('matter-pair-info').style.display = 'none';
+          return;
+        }
+
+        /* Render QR code if library loaded */
+        if (typeof QRCode !== 'undefined') {
+          new QRCode(document.getElementById('matter-qr-canvas'), {
+            text: d.qr_code, width: 200, height: 200,
+            colorDark: '#000000', colorLight: '#ffffff',
+          });
+        }
+      } catch (_) {}
+    }
   </script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"
+          crossorigin="anonymous" referrerpolicy="no-referrer"
+          onload="loadMatterPairing()" onerror="loadMatterPairing()"></script>
 </body>
 </html>

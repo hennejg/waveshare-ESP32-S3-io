@@ -5,6 +5,7 @@
 #include "di.h"
 #include "dout.h"
 #include "led.h"
+#include "matter.h"
 
 #include <stdio.h>
 #include <stdbool.h>
@@ -447,6 +448,35 @@ static esp_err_t file_get(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* --------------------------------------------------------------- /api/matter/pairing */
+
+static esp_err_t api_matter_pairing(httpd_req_t *req)
+{
+    if (!check_auth(req)) return send_401(req);
+
+    const char *qr  = matter_get_qr_code();
+    const char *man = matter_get_manual_code();
+
+    if (!qr || !qr[0]) {
+        httpd_resp_set_status(req, "404 Not Found");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"matter_not_enabled\"}");
+        return ESP_OK;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "qr_code",      qr);
+    cJSON_AddStringToObject(root, "manual_code",  man ? man : "");
+    cJSON_AddBoolToObject  (root, "commissioned", matter_is_commissioned());
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json ? json : "{}");
+    cJSON_free(json);
+    return ESP_OK;
+}
+
 /* ------------------------------------------------------------------ /api/reboot */
 
 static void do_restart(void *arg) { esp_restart(); }
@@ -630,6 +660,7 @@ static const httpd_uri_t s_handlers[] = {
     { .uri = "/api/io/output",         .method = HTTP_POST, .handler = api_io_output         },
     { .uri = "/api/io/led",            .method = HTTP_POST, .handler = api_io_led            },
     { .uri = "/api/io/buzzer",         .method = HTTP_POST, .handler = api_io_buzzer         },
+    { .uri = "/api/matter/pairing",    .method = HTTP_GET,  .handler = api_matter_pairing   },
     { .uri = "/api/reboot",            .method = HTTP_POST, .handler = api_reboot            },
     { .uri = "/api/factory-reset",     .method = HTTP_POST, .handler = api_factory_reset     },
     { .uri = "/*",                     .method = HTTP_GET,  .handler = file_get              },
