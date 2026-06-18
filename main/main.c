@@ -182,8 +182,10 @@ void app_main(void)
     if (!eth_only)
         esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START, on_wifi_ap, NULL);
 
+#ifdef CONFIG_APP_MATTER_ENABLE
     /* Matter — initialise after network interfaces so the event loop is ready */
     esp_err_t matter_ret = matter_init();
     if (matter_ret != ESP_OK)
         ESP_LOGW(TAG, "Matter init failed: %s", esp_err_to_name(matter_ret));
+#endif
 }

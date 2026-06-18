@@ -21,6 +21,8 @@ extern "C" {
 #include <esp_matter.h>
 #include <app-common/zap-generated/ids/Attributes.h>
 #include <app-common/zap-generated/ids/Clusters.h>
+#include <app/server/Server.h>
+#include <setup_payload/OnboardingCodesUtil.h>
 
 /* Declared in esp-matter/data_model_provider/clusters/boolean_state/integration.cpp */
 esp_err_t esp_matter_boolean_state_set_value(chip::EndpointId endpoint_id, bool value);
@@ -138,6 +140,15 @@ esp_err_t matter_init(void)
     }
 
     ESP_LOGI(TAG, "Matter stack started — %d DO + %d DI endpoints", NUM_CHANNELS, NUM_CHANNELS);
+
+    bool commissioned = chip::Server::GetInstance().GetFabricTable().FabricCount() > 0;
+    if (commissioned) {
+        ESP_LOGI(TAG, "Device already commissioned — showing codes for re-commissioning after factory reset");
+    } else {
+        ESP_LOGI(TAG, "Device not yet commissioned — scan QR code or enter manual code to pair");
+    }
+    PrintOnboardingCodes(chip::RendezvousInformationFlags(chip::RendezvousInformationFlag::kBLE));
+
     return ESP_OK;
 }
 
