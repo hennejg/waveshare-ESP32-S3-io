@@ -222,12 +222,6 @@
       </select>
     </label>
 
-    <button type="submit" id="btn">Save</button>
-    <button type="button" id="reboot-btn">Reboot</button>
-    <button type="button" id="factory-reset-btn">Factory Reset</button>
-  </form>
-  <p id="status"></p>
-
   <!-- Matter pairing section — shown only when Matter is enabled in firmware -->
   <div id="matter-section" style="display:none">
     <h2 style="font-size:1rem;color:#555;border-bottom:1px solid #ddd;padding-bottom:.3rem;margin:1.8rem 0 .8rem">Matter Commissioning</h2>
@@ -251,6 +245,12 @@
       <p class="hint" style="margin-top:.4rem">Enter this code in your home automation app if QR scanning is unavailable.</p>
     </div>
   </div>
+
+    <button type="submit" id="btn">Save</button>
+    <button type="button" id="reboot-btn">Reboot</button>
+    <button type="button" id="factory-reset-btn">Factory Reset</button>
+  </form>
+  <p id="status"></p>
 
   <script>
     /* ---- Auth state machine ---- */
