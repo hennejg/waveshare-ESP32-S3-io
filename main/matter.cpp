@@ -19,9 +19,14 @@ extern "C" {
 #include <esp_err.h>
 #include <esp_log.h>
 #include <esp_matter.h>
+#include <esp_random.h>
+#include <nvs.h>
+#include <inttypes.h>
 #include <app-common/zap-generated/ids/Attributes.h>
 #include <app-common/zap-generated/ids/Clusters.h>
 #include <app/server/Server.h>
+#include <crypto/CHIPCryptoPAL.h>
+#include <lib/support/Base64.h>
 #include <setup_payload/OnboardingCodesUtil.h>
 
 /* Declared in esp-matter/data_model_provider/clusters/boolean_state/integration.cpp */
@@ -98,8 +103,118 @@ static void event_cb(const ChipDeviceEvent *event, intptr_t arg)
     }
 }
 
+/* Matter spec §5.1.6.1 — passcodes that are trivially guessable are forbidden. */
+static const uint32_t kForbiddenPasscodes[] = {
+    0u, 11111111u, 22222222u, 33333333u, 44444444u,
+    55555555u, 66666666u, 77777777u, 88888888u, 99999999u,
+    12345678u, 87654321u,
+};
+
+static bool passcode_is_forbidden(uint32_t code)
+{
+    for (size_t i = 0; i < sizeof(kForbiddenPasscodes) / sizeof(kForbiddenPasscodes[0]); i++) {
+        if (code == kForbiddenPasscodes[i]) return true;
+    }
+    return false;
+}
+
+/* Generate and persist unique commissioning credentials on first boot.
+ *
+ * Writes to the "chip-factory" namespace in the default NVS partition.
+ * LegacyTemporaryCommissionableDataProvider reads these keys at stack startup
+ * (falls back to the Kconfig test values when any key is absent).
+ *
+ * Must be called BEFORE esp_matter::start() so the provider sees the new
+ * values when it initialises.
+ */
+static esp_err_t matter_provision_if_needed(void)
+{
+    /* Already provisioned? */
+    {
+        nvs_handle_t h;
+        bool done = false;
+        if (nvs_open_from_partition("nvs", "chip-factory", NVS_READONLY, &h) == ESP_OK) {
+            uint32_t v;
+            done = (nvs_get_u32(h, "pin-code", &v) == ESP_OK);
+            nvs_close(h);
+        }
+        if (done) {
+            ESP_LOGI(TAG, "Matter credentials already provisioned");
+            return ESP_OK;
+        }
+    }
+
+    /* Random passcode: 1–99999998, not a spec-forbidden value */
+    uint32_t passcode;
+    do {
+        passcode = (esp_random() % 99999998u) + 1u;
+    } while (passcode_is_forbidden(passcode));
+
+    /* Random 12-bit discriminator */
+    uint32_t discriminator = esp_random() & 0xFFFu;
+
+    /* Random 16-byte PBKDF2 salt */
+    uint8_t salt[chip::Crypto::kSpake2p_Min_PBKDF_Salt_Length];
+    esp_fill_random(salt, sizeof(salt));
+
+    /* Compute SPAKE2+ verifier.
+     * Iteration count must match what the stack reads on the next boot.
+     * LegacyTemporaryCommissionableDataProvider falls back to
+     * CHIP_DEVICE_CONFIG_USE_TEST_SPAKE2P_ITERATION_COUNT = 1000. */
+    static constexpr uint32_t kIter = 1000;
+    chip::Crypto::Spake2pVerifier verifier;
+    if (verifier.Generate(kIter, chip::ByteSpan(salt, sizeof(salt)), passcode) != CHIP_NO_ERROR) {
+        ESP_LOGE(TAG, "SPAKE2+ verifier generation failed");
+        return ESP_FAIL;
+    }
+
+    chip::Crypto::Spake2pVerifierSerialized verifier_bytes;
+    chip::MutableByteSpan verifier_span(verifier_bytes);
+    if (verifier.Serialize(verifier_span) != CHIP_NO_ERROR) {
+        ESP_LOGE(TAG, "SPAKE2+ verifier serialization failed");
+        return ESP_FAIL;
+    }
+
+    /* Base64-encode salt and verifier — format expected by ReadConfigValueStr */
+    char salt_b64[BASE64_ENCODED_LEN(sizeof(salt)) + 1];
+    uint32_t salt_b64_len = chip::Base64Encode32(salt, sizeof(salt), salt_b64);
+    salt_b64[salt_b64_len] = '\0';
+
+    char ver_b64[BASE64_ENCODED_LEN(chip::Crypto::kSpake2p_VerifierSerialized_Length) + 1];
+    uint32_t ver_b64_len = chip::Base64Encode32(
+        verifier_bytes, chip::Crypto::kSpake2p_VerifierSerialized_Length, ver_b64);
+    ver_b64[ver_b64_len] = '\0';
+
+    /* Persist */
+    nvs_handle_t h;
+    esp_err_t err = nvs_open_from_partition("nvs", "chip-factory", NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open chip-factory NVS: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    if ((err = nvs_set_u32(h, "pin-code",     passcode))      != ESP_OK ||
+        (err = nvs_set_u32(h, "discriminator", discriminator)) != ESP_OK ||
+        (err = nvs_set_str(h, "salt",          salt_b64))      != ESP_OK ||
+        (err = nvs_set_str(h, "verifier",      ver_b64))       != ESP_OK ||
+        (err = nvs_commit(h))                                   != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to write Matter credentials: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "Matter: generated passcode=%" PRIu32 " discriminator=0x%03" PRIx32,
+                 passcode, discriminator);
+    }
+
+    nvs_close(h);
+    return err;
+}
+
 esp_err_t matter_init(void)
 {
+    /* Provision unique credentials on first boot before starting the stack */
+    if (matter_provision_if_needed() != ESP_OK) {
+        ESP_LOGW(TAG, "Provisioning failed — falling back to default test credentials");
+    }
+
     const app_config_t *cfg = app_config_get();
 
     /* Create the root node */
