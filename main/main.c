@@ -5,6 +5,7 @@
 #include <esp_spiffs.h>
 #include <esp_event.h>
 #include <esp_wifi.h>
+#include <esp_coexist.h>
 #include <wifi_config.h>
 #include "app_config.h"
 #include "app_mqtt.h"
@@ -18,6 +19,7 @@
 #include "can_server.h"
 #include "mb_server.h"
 #include "web_server.h"
+#include "matter.h"
 
 #define TAG          "main"
 #define NVS_ETH_NS   "app_config"
@@ -78,12 +80,16 @@ static void on_network_ready(const char *iface)
 {
     ESP_LOGI(TAG, "%s connected — starting services", iface);
     led_status_set_network(true);
-    ESP_ERROR_CHECK(web_server_start());
+    esp_err_t ws_ret = web_server_start();
+    if (ws_ret != ESP_OK)
+        ESP_LOGE(TAG, "Web server start failed: %s", esp_err_to_name(ws_ret));
     app_mqtt_set_connected_callback(on_mqtt_connected);
     app_mqtt_set_disconnected_callback(on_mqtt_disconnected);
     app_mqtt_set_msg_callback(on_mqtt_message);
     app_mqtt_set_publish_callback(on_mqtt_publish);
-    ESP_ERROR_CHECK(app_mqtt_start());
+    esp_err_t mqtt_ret = app_mqtt_start();
+    if (mqtt_ret != ESP_OK)
+        ESP_LOGE(TAG, "MQTT start failed: %s", esp_err_to_name(mqtt_ret));
 }
 
 static void on_wifi_ready(void) { on_network_ready("WiFi"); }
@@ -176,4 +182,16 @@ void app_main(void)
     esp_event_handler_register(IP_EVENT,   IP_EVENT_ETH_LOST_IP, on_ip_lost,  NULL);
     if (!eth_only)
         esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START, on_wifi_ap, NULL);
+
+#ifdef CONFIG_APP_MATTER_ENABLE
+    /* Give WiFi priority over BLE in the coexistence driver.  Matter BLE
+     * advertising is still active for commissioning, but WiFi traffic
+     * (HTTP, MQTT) no longer stalls behind BLE slots. */
+    esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+
+    /* Matter — initialise after network interfaces so the event loop is ready */
+    esp_err_t matter_ret = matter_init();
+    if (matter_ret != ESP_OK)
+        ESP_LOGW(TAG, "Matter init failed: %s", esp_err_to_name(matter_ret));
+#endif
 }

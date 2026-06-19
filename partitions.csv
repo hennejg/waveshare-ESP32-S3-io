@@ -1,5 +1,14 @@
-# Name,   Type, SubType, Offset,   Size,  Flags
-nvs,      data, nvs,     0x9000,   0x6000,
-phy_init, data, phy,     0xf000,   0x1000,
-factory,  app,  factory, 0x10000,  0x300000,
-storage,  data, spiffs,  ,         0xCF0000,
+# 16MB flash — Waveshare ESP32-S3-POE-ETH-8DI-8DO
+# Partition table at default 0x8000.
+#
+# Matter requires ~30-40KB NVS for fabric credentials; the standard esp-matter
+# example layout uses 0xC000 (48KB).  The fctry partition holds device
+# attestation credentials (DAC/PAI) provisioned at manufacturing time; during
+# development esp-matter uses compiled-in test certificates.
+#
+# Name,   Type, SubType, Offset,   Size,    Flags
+nvs,      data, nvs,     0x9000,   0xC000,
+phy_init, data, phy,     0x15000,  0x1000,
+factory,  app,  factory, 0x20000,  0x300000,
+fctry,    data, nvs,     0x320000, 0x6000,
+storage,  data, spiffs,  0x326000, 0xCDA000,

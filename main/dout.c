@@ -115,10 +115,17 @@ esp_err_t dout_init(void)
     ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(s_bus, &dev_cfg, &s_dev),
                         TAG, "TCA9554 device add");
 
-    /* Configure all 8 pins as outputs (config register = 0x00) */
+    /* Configure all 8 pins as outputs (config register = 0x00).
+     * After a software reset mid-transaction the TCA9554 may hold SDA low.
+     * i2c_master_bus_reset() clocks 9 SCL pulses + STOP to release it. */
     uint8_t cfg_cmd[2] = {REG_CONFIG, 0x00};
-    ESP_RETURN_ON_ERROR(i2c_master_transmit(s_dev, cfg_cmd, sizeof(cfg_cmd), 10),
-                        TAG, "TCA9554 config");
+    esp_err_t cfg_err = i2c_master_transmit(s_dev, cfg_cmd, sizeof(cfg_cmd), 10);
+    if (cfg_err == ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "I2C bus stuck — attempting recovery");
+        i2c_master_bus_reset(s_bus);
+        cfg_err = i2c_master_transmit(s_dev, cfg_cmd, sizeof(cfg_cmd), 10);
+    }
+    ESP_RETURN_ON_ERROR(cfg_err, TAG, "TCA9554 config");
 
     /* Drive all outputs to their initial (off) state */
     ESP_RETURN_ON_ERROR(write_outputs(), TAG, "initial write");

@@ -2,3 +2,6 @@
 	path = esp-idf
 	url = https://github.com/espressif/esp-idf.git
 	branch = release/v6.0
+[submodule "esp-matter"]
+	path = esp-matter
+	url = https://github.com/espressif/esp-matter.git

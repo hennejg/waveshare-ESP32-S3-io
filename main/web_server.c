@@ -5,11 +5,13 @@
 #include "di.h"
 #include "dout.h"
 #include "led.h"
+#include "matter.h"
 
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <lwip/sockets.h>
 
 #include <esp_http_server.h>
 #include <esp_log.h>
@@ -411,11 +413,38 @@ static esp_err_t file_get(httpd_req_t *req)
         return ESP_OK;
     }
 
-    /* WWW_BASE(4) + uri(max 120) + NUL = 125 bytes — fits in path[128].
-       Use %.120s so GCC's -Wformat-truncation can verify the bound statically. */
-    char path[128];
     const char *file = (strcmp(uri, "/") == 0) ? "/index.html" : uri;
-    snprintf(path, sizeof(path), "%s%.120s", WWW_BASE, file);
+
+    /* Disable Nagle's algorithm for this connection.  Without TCP_NODELAY, lwIP
+     * buffers the first file chunk waiting for an ACK of the HTTP headers —
+     * which can take seconds when BLE coexistence delays WiFi ACKs. */
+    int fd = httpd_req_to_sockfd(req);
+    int nodelay = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+    /* Check if the client accepts gzip.  All modern browsers do; this lets us
+     * serve pre-compressed files (index.html.gz, qrcode.min.js.gz) which are
+     * small enough to fit in the TCP send buffer without waiting for ACKs —
+     * critical when BLE coexistence delays WiFi ACKs. */
+    char accept_enc[64] = "";
+    httpd_req_get_hdr_value_str(req, "Accept-Encoding", accept_enc, sizeof(accept_enc));
+    bool accept_gzip = strstr(accept_enc, "gzip") != NULL;
+
+    /* WWW_BASE(4) + file(max 120) + ".gz"(3) + NUL = 128 bytes — fits in path[132]. */
+    char path[132];
+    bool serving_gz = false;
+
+    if (accept_gzip) {
+        snprintf(path, sizeof(path), "%s%.120s.gz", WWW_BASE, file);
+        FILE *probe = fopen(path, "r");
+        if (probe) {
+            fclose(probe);
+            serving_gz = true;
+        }
+    }
+
+    if (!serving_gz)
+        snprintf(path, sizeof(path), "%s%.120s", WWW_BASE, file);
 
     FILE *f = fopen(path, "r");
     if (!f) {
@@ -424,7 +453,20 @@ static esp_err_t file_get(httpd_req_t *req)
         return ESP_OK;
     }
 
-    httpd_resp_set_type(req, mime_type(path));
+    /* MIME type is determined by the logical file extension, not the .gz suffix. */
+    httpd_resp_set_type(req, mime_type(file));
+
+    /* index.html must not be cached — it changes with every firmware flash.
+     * Other static assets (JS, SVG) are versioned by flash and can be cached. */
+    if (strcmp(file, "/index.html") == 0)
+        httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    else
+        httpd_resp_set_hdr(req, "Cache-Control", "max-age=86400");
+
+    if (serving_gz) {
+        httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+        httpd_resp_set_hdr(req, "Vary", "Accept-Encoding");
+    }
 
     char *chunk = malloc(CHUNK_SIZE);
     if (!chunk) {
@@ -444,6 +486,57 @@ static esp_err_t file_get(httpd_req_t *req)
 
     free(chunk);
     fclose(f);
+    return ESP_OK;
+}
+
+/* --------------------------------------------------------- /api/matter/decommission */
+
+static esp_err_t api_matter_decommission(httpd_req_t *req)
+{
+    if (!check_auth(req)) return send_401(req);
+
+    if (!matter_is_commissioned()) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"not_commissioned\"}");
+        return ESP_OK;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"decommissioning\"}");
+
+    matter_decommission();
+    return ESP_OK;
+}
+
+/* --------------------------------------------------------------- /api/matter/pairing */
+
+static esp_err_t api_matter_pairing(httpd_req_t *req)
+{
+    if (!check_auth(req)) return send_401(req);
+
+    const char *qr  = matter_get_qr_code();
+    const char *man = matter_get_manual_code();
+    bool commissioned = matter_is_commissioned();
+
+    /* Return 404 only when Matter is truly inactive (no QR code AND not commissioned). */
+    if ((!qr || !qr[0]) && !commissioned) {
+        httpd_resp_set_status(req, "404 Not Found");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"matter_not_enabled\"}");
+        return ESP_OK;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "qr_code",      (qr && qr[0]) ? qr : "");
+    cJSON_AddStringToObject(root, "manual_code",  (man && man[0]) ? man : "");
+    cJSON_AddBoolToObject  (root, "commissioned", commissioned);
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json ? json : "{}");
+    cJSON_free(json);
     return ESP_OK;
 }
 
@@ -630,6 +723,8 @@ static const httpd_uri_t s_handlers[] = {
     { .uri = "/api/io/output",         .method = HTTP_POST, .handler = api_io_output         },
     { .uri = "/api/io/led",            .method = HTTP_POST, .handler = api_io_led            },
     { .uri = "/api/io/buzzer",         .method = HTTP_POST, .handler = api_io_buzzer         },
+    { .uri = "/api/matter/pairing",       .method = HTTP_GET,  .handler = api_matter_pairing      },
+    { .uri = "/api/matter/decommission", .method = HTTP_POST, .handler = api_matter_decommission },
     { .uri = "/api/reboot",            .method = HTTP_POST, .handler = api_reboot            },
     { .uri = "/api/factory-reset",     .method = HTTP_POST, .handler = api_factory_reset     },
     { .uri = "/*",                     .method = HTTP_GET,  .handler = file_get              },
@@ -643,6 +738,7 @@ esp_err_t web_server_start(void)
     cfg.uri_match_fn     = httpd_uri_match_wildcard;
     cfg.max_uri_handlers = 16;
     cfg.stack_size       = 8192;
+    cfg.send_wait_timeout = 10;   /* seconds; default 5 is too tight with Matter on WiFi */
 
     esp_err_t ret = httpd_start(&s_server, &cfg);
     if (ret != ESP_OK) {

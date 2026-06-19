@@ -1,0 +1,3 @@
+# Disable Matter when the esp-matter submodule is not initialised (e.g. CI).
+# CMakeLists.txt appends this file to SDKCONFIG_DEFAULTS automatically.
+CONFIG_APP_MATTER_ENABLE=n

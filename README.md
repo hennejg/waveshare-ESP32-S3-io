@@ -17,17 +17,18 @@ come in handy.
 
 ## Hardware
 
-|                     |                                                                                  |
-|---------------------|----------------------------------------------------------------------------------|
-| **MCU**             | ESP32-S3-WROOM-1U-N16R8 (dual-core Xtensa LX7, 240 MHz, 16 MB Flash, 8 MB PSRAM) |
-| **Ethernet**        | W5500 SPI (10/100 Mbit)                                                          |
-| **Digital inputs**  | 8 × optocoupler-isolated (DI1–DI8, GPIO4–GPIO11)                                 |
-| **Digital outputs** | 8 × optocoupler-isolated Darlington (DO1–DO8, via TCA9554 I²C expander)          |
-| **CAN bus**         | ESP32-S3 TWAI peripheral (GPIO2 TX, GPIO3 RX)                                    |
-| **RS-485**          | Half-duplex UART (GPIO17 TX, GPIO18 RX)                                          |
-| **LED**             | WS2812 RGB (GPIO38)                                                              |
-| **Buzzer**          | Piezo, LEDC PWM (GPIO46)                                                         |
-| **Power**           | 7–36 V DC or USB-C                                                               |
+|                     |                                                                                                         |
+|---------------------|---------------------------------------------------------------------------------------------------------|
+| **MCU**             | ESP32-S3-WROOM-1U-N16R8 (dual-core Xtensa LX7, 240 MHz, 16 MB Flash, 8 MB PSRAM)                        |
+| **Ethernet**        | W5500 SPI (10/100 Mbit)                                                                                 |
+| **Digital inputs**  | 8 × optocoupler-isolated (DI1–DI8, GPIO4–GPIO11)                                                        |
+| **Digital outputs** | (ESP32-S3-POE-ETH-8DI-8DO only) 8 × optocoupler-isolated Darlington (DO1–DO8, via TCA9554 I²C expander) |
+| **Relay outputs**   | (ESP32-S3-POE-ETH-8DI-8RO only) 8 × 1NO 1NC; ≤10A 250V AC or ≤10A 30V DC                                |
+| **CAN bus**         | ESP32-S3 TWAI peripheral (GPIO2 TX, GPIO3 RX)                                                           |
+| **RS-485**          | Half-duplex UART (GPIO17 TX, GPIO18 RX)                                                                 |
+| **LED**             | WS2812 RGB (GPIO38)                                                                                     |
+| **Buzzer**          | Piezo, LEDC PWM (GPIO46)                                                                                |
+| **Power**           | 7–36 V DC or USB-C                                                                                      |
 
 ---
 
@@ -81,16 +82,18 @@ The UI also provides **Save**, **Reboot**, and **Factory Reset** buttons.
 
 All endpoints except the auth flow require an `Authorization: Basic base64(:<password>)` header when a password is set.
 
-| Endpoint                 | Method | Auth required | Description                           |
-|--------------------------|--------|---------------|---------------------------------------|
-| `/api/auth/status`       | GET    | No            | `{"password_set": bool}`              |
-| `/api/auth/begin`        | POST   | No            | Start token flow (LED blinks, 30 s)   |
-| `/api/auth/token?s=<id>` | GET    | No            | Poll: `waiting` / `ready` / `timeout` |
-| `/api/auth/set-password` | POST   | No            | `{"token":"…","password":"…"}`        |
-| `/api/config`            | GET    | Yes           | Read full configuration as JSON       |
-| `/api/config`            | POST   | Yes           | Update configuration from JSON        |
-| `/api/reboot`            | POST   | Yes           | Restart immediately                   |
-| `/api/factory-reset`     | POST   | Yes           | Erase all settings and restart        |
+| Endpoint                   | Method | Auth required | Description                                             |
+|----------------------------|--------|---------------|---------------------------------------------------------|
+| `/api/auth/status`         | GET    | No            | `{"password_set": bool}`                                |
+| `/api/auth/begin`          | POST   | No            | Start token flow (LED blinks, 30 s)                     |
+| `/api/auth/token?s=<id>`   | GET    | No            | Poll: `waiting` / `ready` / `timeout`                   |
+| `/api/auth/set-password`   | POST   | No            | `{"token":"…","password":"…"}`                          |
+| `/api/config`              | GET    | Yes           | Read full configuration as JSON                         |
+| `/api/config`              | POST   | Yes           | Update configuration from JSON                          |
+| `/api/reboot`              | POST   | Yes           | Restart immediately                                     |
+| `/api/factory-reset`       | POST   | Yes           | Erase all settings and restart                          |
+| `/api/matter/pairing`      | GET    | Yes           | `{"qr_code":"…","manual_code":"…","commissioned":bool}` |
+| `/api/matter/decommission` | POST   | Yes           | Remove all fabrics, erase Matter state, reboot          |
 
 ### MQTT
 
@@ -126,6 +129,26 @@ LED colour, buzzer, and a read-request trigger.
 
 **NMEA2000 mode** implements ISO address claiming, PGN 126993 Heartbeat, PGN 127501/127502 Binary Switch Banks (DI bank
 0, DO bank 1), and PGN 126720 Manufacturer Proprietary fast-packet (LED + buzzer).
+
+### Matter (Apple Home / Google Home / Home Assistant)
+
+Full details in [`docs/matter.md`](docs/matter.md).
+
+The firmware includes optional Matter-over-Wi-Fi support (compiled in by default via `esp-matter`).
+
+| Feature               | Description                                                                               |
+|-----------------------|-------------------------------------------------------------------------------------------|
+| **8 Digital Outputs** | Exposed as *On/Off Plug-in Unit* endpoints (controllable)                                 |
+| **8 Digital Inputs**  | Exposed as *Contact Sensor* endpoints (read-only state)                                   |
+| **Pairing code**      | Unique passcode + discriminator generated on first boot; survives reboot and decommission |
+| **QR code**           | Shown in the web UI under "Matter"; scan with your home app to pair                       |
+| **Decommission**      | "Remove from Home" button erases all fabric data and reboots cleanly                      |
+| **Identify**          | LED blinks cyan at 1 Hz when any endpoint's Identify cluster is triggered                 |
+
+**Important — Contact Sensor = Door/Window in most home apps.** Home Assistant, HomeKit, and Google Home all render
+Contact Sensor endpoints as door or window sensors (open/closed), not as generic binary sensors. This is correct per the
+Matter spec but can look surprising. See [`docs/matter.md`](docs/matter.md) for details on renaming endpoints and
+alternative device types.
 
 ### Modbus RTU
 
@@ -227,12 +250,14 @@ idf.py -p /dev/ttyUSBx spiffs-flash
 │   ├── dout.c/h         Digital outputs (TCA9554 I²C)
 │   ├── eth.c/h          W5500 Ethernet (SPI)
 │   ├── led.c/h          WS2812 LED (RMT) — IO and Status modes
+│   ├── matter.cpp/h     Matter integration (esp-matter, 8 DO + 8 DI endpoints)
 │   ├── mb_server.c/h    Modbus RTU slave
 │   └── web_server.c/h   HTTP config UI + REST API + auth endpoints
 ├── www/
 │   └── index.html       Single-page web UI (served from SPIFFS)
 └── docs/
     ├── can.md           CAN bus API (Basic and NMEA2000 modes)
+    ├── matter.md        Matter integration — device model, commissioning, known quirks
     ├── mqtt.md          MQTT API reference
     └── modbus.md        Modbus RTU register map
 ```
@@ -249,3 +274,4 @@ idf.py -p /dev/ttyUSBx spiffs-flash
 | `espressif/cjson *`           | Component Registry            | JSON parsing                     |
 | `espressif/w5500 ^1.0.1`      | Component Registry            | W5500 Ethernet PHY               |
 | `esp32-wifi-bootstrap`        | Git submodule (`components/`) | WiFi captive-portal provisioning |
+| `esp-matter`                  | Git submodule (`esp-matter/`) | Matter SDK (connectedhomeip)     |

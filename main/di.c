@@ -1,6 +1,7 @@
 #include "di.h"
 #include "app_mqtt.h"
 #include "app_config.h"
+#include "matter.h"
 
 #include <string.h>
 
@@ -39,11 +40,18 @@ static void publish_one(uint8_t n, bool state)
     app_mqtt_publish(topic, state ? "true" : "false", -1, 0, false);
 }
 
+static void notify_one(uint8_t n, bool state)
+{
+    if (app_mqtt_is_connected())
+        publish_one(n, state);
+    matter_di_update(n, state);
+}
+
 void di_publish_all(void)
 {
     for (uint8_t i = 0; i < NUM_DI; i++) {
         s_state[i] = read_pin(i);   /* refresh from hardware before publishing */
-        publish_one(i, s_state[i]);
+        notify_one(i, s_state[i]);
     }
 }
 
@@ -68,13 +76,11 @@ static void di_task(void *arg)
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS));
 
-        if (!app_mqtt_is_connected()) continue;
-
         for (uint8_t i = 0; i < NUM_DI; i++) {
             bool cur = read_pin(i);
             if (cur != s_state[i]) {
                 s_state[i] = cur;
-                publish_one(i, cur);
+                notify_one(i, cur);
             }
         }
     }
