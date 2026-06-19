@@ -47,7 +47,7 @@ jobs:
     needs: tag
     runs-on: ubuntu-latest
     container:
-      image: espressif/idf:v6.0.1
+      image: espressif/idf:v5.5.4   # must match esp-idf submodule version
 
     steps:
       - name: Checkout
