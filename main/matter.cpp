@@ -1,8 +1,8 @@
 /* Matter integration for Waveshare ESP32-S3-POE-ETH-8DI-8DO
  *
  * Device model:
- *   Endpoints 1–8  : On/Off Light  (DO1–DO8, logical output state)
- *   Endpoints 9–16 : Contact Sensor (DI1–DI8, logical input state)
+ *   Endpoints 1–8  : On/Off Plug-in Unit (DO1–DO8, logical output state)
+ *   Endpoints 9–16 : Contact Sensor       (DI1–DI8, logical input state)
  *
  * Commissioning: Bluetooth LE PASE (standard Matter over Wi-Fi).
  * The existing Wi-Fi / Ethernet provisioning runs in parallel; Matter
@@ -14,6 +14,8 @@
 extern "C" {
 #include "dout.h"
 #include "app_config.h"
+#include "led.h"
+#include <esp_timer.h>
 }
 
 #include <esp_err.h>
@@ -28,9 +30,6 @@ extern "C" {
 #include <crypto/CHIPCryptoPAL.h>
 #include <lib/support/Base64.h>
 #include <setup_payload/OnboardingCodesUtil.h>
-
-/* Declared in esp-matter/data_model_provider/clusters/boolean_state/integration.cpp */
-esp_err_t esp_matter_boolean_state_set_value(chip::EndpointId endpoint_id, bool value);
 
 /* Stored after matter_init() succeeds — read-only from web_server task */
 static char s_qr_code[128];
@@ -50,6 +49,11 @@ using namespace esp_matter;
 using namespace esp_matter::attribute;
 using namespace esp_matter::endpoint;
 using namespace chip::app::Clusters;
+
+/* BooleanState cluster state update — the cluster is a LazyRegisteredServerCluster
+ * so attribute::update() no longer reaches it; use the integration helper directly.
+ * No public header in this esp-matter version, so forward-declare it. */
+esp_err_t esp_matter_boolean_state_set_value(chip::EndpointId endpoint_id, bool value);
 
 /* Endpoint IDs assigned after node creation — index 0 = channel 1 */
 static uint16_t s_do_ep[NUM_CHANNELS];
@@ -79,13 +83,36 @@ static esp_err_t attr_update_cb(attribute::callback_type_t type,
     return ESP_OK;
 }
 
+static esp_timer_handle_t s_identify_timer = nullptr;
+
+static void identify_blink_cb(void *)
+{
+    static bool on = false;
+    on = !on;
+    led_force_set(0, on ? 128 : 0, on ? 128 : 0);
+}
+
 static esp_err_t identification_cb(identification::callback_type_t type,
                                    uint16_t endpoint_id,
                                    uint8_t effect_id,
                                    uint8_t effect_variant,
                                    void *priv_data)
 {
-    ESP_LOGI(TAG, "Identify callback: endpoint %u effect %u", endpoint_id, effect_id);
+    if (type == identification::callback_type_t::START) {
+        if (!s_identify_timer) {
+            esp_timer_create_args_t ta = {};
+            ta.callback = identify_blink_cb;
+            ta.name = "matter_id";
+            esp_timer_create(&ta, &s_identify_timer);
+        }
+        esp_timer_stop(s_identify_timer);
+        esp_timer_start_periodic(s_identify_timer, 500 * 1000);
+    } else {
+        if (s_identify_timer) esp_timer_stop(s_identify_timer);
+        led_force_set(0, 0, 0);
+    }
+    ESP_LOGI(TAG, "Identify %s on endpoint %u",
+             type == identification::callback_type_t::START ? "start" : "stop", endpoint_id);
     return ESP_OK;
 }
 
@@ -244,7 +271,6 @@ esp_err_t matter_init(void)
     /* Create 8 Contact Sensor endpoints for digital inputs */
     for (int i = 0; i < NUM_CHANNELS; i++) {
         contact_sensor::config_t cfg_di = {};
-        /* BooleanState StateValue: true = contact (closed), false = open */
         cfg_di.boolean_state.state_value = false;
 
         endpoint_t *ep = contact_sensor::create(node, &cfg_di, ENDPOINT_FLAG_NONE, (void *)(intptr_t)(NUM_CHANNELS + i));
@@ -297,10 +323,8 @@ void matter_di_update(uint8_t channel, bool active)
     uint16_t ep_id = s_di_ep[channel];
     if (ep_id == 0) return;  /* not initialised yet */
 
-    /* StateValue is owned by BooleanStateCluster (ATTRIBUTE_FLAG_MANAGED_INTERNALLY).
-       Must call SetStateValue() through the registered cluster, not attribute::update(). */
     esp_err_t err = esp_matter_boolean_state_set_value(ep_id, active);
-    if (err != ESP_OK && err != ESP_ERR_NOT_FINISHED) {
+    if (err != ESP_OK) {
         ESP_LOGE(TAG, "DI%d state update failed: %s", channel + 1, esp_err_to_name(err));
     }
 }
@@ -318,7 +342,11 @@ void matter_decommission(void)
         /* Erase Matter operational NVS namespaces.
          * chip-factory (our passcode/discriminator) is intentionally left intact.
          * WiFi credentials (managed by esp32-wifi-bootstrap) are also preserved. */
-        static const char * const kMatterNS[] = { "chip-config", "chip-counters", "CHIP_KVS" };
+        static const char * const kMatterNS[] = {
+            "chip-config", "chip-counters", "CHIP_KVS",
+            "esp_matter_kvs",   /* esp-matter KVS (attribute persistence, etc.) */
+            "node",             /* esp-matter data model node state */
+        };
         for (size_t i = 0; i < sizeof(kMatterNS) / sizeof(kMatterNS[0]); i++) {
             nvs_handle_t h;
             if (nvs_open_from_partition("nvs", kMatterNS[i], NVS_READWRITE, &h) == ESP_OK) {

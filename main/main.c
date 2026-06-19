@@ -5,6 +5,7 @@
 #include <esp_spiffs.h>
 #include <esp_event.h>
 #include <esp_wifi.h>
+#include <esp_coexist.h>
 #include <wifi_config.h>
 #include "app_config.h"
 #include "app_mqtt.h"
@@ -183,6 +184,11 @@ void app_main(void)
         esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START, on_wifi_ap, NULL);
 
 #ifdef CONFIG_APP_MATTER_ENABLE
+    /* Give WiFi priority over BLE in the coexistence driver.  Matter BLE
+     * advertising is still active for commissioning, but WiFi traffic
+     * (HTTP, MQTT) no longer stalls behind BLE slots. */
+    esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+
     /* Matter — initialise after network interfaces so the event loop is ready */
     esp_err_t matter_ret = matter_init();
     if (matter_ret != ESP_OK)
