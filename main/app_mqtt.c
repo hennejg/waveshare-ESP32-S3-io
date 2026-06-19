@@ -5,13 +5,16 @@
 #include <inttypes.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "mqtt_client.h"
 
-#define TAG          "app_mqtt"
-#define TOPIC_MAXLEN  256   /* prefix(63) + '/'(1) + topic(191) + NUL */
+#define TAG                  "app_mqtt"
+#define TOPIC_MAXLEN          256   /* prefix(63) + '/'(1) + topic(191) + NUL */
+#define HEALTH_INTERVAL_US   (60LL * 1000 * 1000)
 
-static esp_mqtt_client_handle_t s_client    = NULL;
-static volatile bool            s_connected = false;
+static esp_mqtt_client_handle_t s_client       = NULL;
+static volatile bool            s_connected    = false;
+static esp_timer_handle_t       s_health_timer = NULL;
 static app_mqtt_connected_cb_t  s_on_connected    = NULL;
 static app_mqtt_msg_cb_t        s_on_msg          = NULL;
 static void                   (*s_on_disconnected)(void) = NULL;
@@ -31,6 +34,26 @@ static void make_topic(const char *topic, char *buf, size_t buf_len)
     }
 }
 
+/* ------------------------------------------------------------------ health */
+
+static void publish_health(void)
+{
+    if (!s_client || !s_connected) return;
+    const app_config_t *cfg = app_config_get();
+    if (!cfg->mqtt_topic_prefix[0]) return;
+
+    char payload[128];
+    int64_t uptime_s = esp_timer_get_time() / 1000000LL;
+    snprintf(payload, sizeof(payload),
+             "{\"online\":true,\"device\":\"%s\",\"uptime_s\":%" PRId64 "}",
+             cfg->device_name, uptime_s);
+
+    esp_mqtt_client_publish(s_client, cfg->mqtt_topic_prefix,
+                            payload, 0, /*qos*/1, /*retain*/1);
+}
+
+static void health_timer_cb(void *arg) { publish_health(); }
+
 /* ------------------------------------------------------------------ events */
 
 static void mqtt_event_handler(void *arg, esp_event_base_t base,
@@ -43,12 +66,18 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "Connected to broker");
         s_connected = true;
+        publish_health();
+        if (s_health_timer) {
+            esp_timer_stop(s_health_timer);   /* no-op if not running */
+            esp_timer_start_periodic(s_health_timer, HEALTH_INTERVAL_US);
+        }
         if (s_on_connected) s_on_connected();
         break;
 
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "Disconnected from broker");
         s_connected = false;
+        if (s_health_timer) esp_timer_stop(s_health_timer);
         if (s_on_disconnected) s_on_disconnected();
         break;
 
@@ -108,12 +137,25 @@ esp_err_t app_mqtt_start(void)
     if (cfg->mqtt_password[0]) {
         mqtt_cfg.credentials.authentication.password = cfg->mqtt_password;
     }
+    if (cfg->mqtt_topic_prefix[0]) {
+        mqtt_cfg.session.last_will.topic   = cfg->mqtt_topic_prefix;
+        mqtt_cfg.session.last_will.msg     = "{\"online\":false}";
+        mqtt_cfg.session.last_will.msg_len = 0;   /* null-terminated */
+        mqtt_cfg.session.last_will.qos     = 1;
+        mqtt_cfg.session.last_will.retain  = 1;
+    }
 
     s_client = esp_mqtt_client_init(&mqtt_cfg);
     if (!s_client) {
         ESP_LOGE(TAG, "Failed to create MQTT client");
         return ESP_FAIL;
     }
+
+    esp_timer_create_args_t timer_args = {
+        .callback = health_timer_cb,
+        .name     = "mqtt_health",
+    };
+    esp_timer_create(&timer_args, &s_health_timer);
 
     esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID,
                                    mqtt_event_handler, NULL);
@@ -132,6 +174,11 @@ esp_err_t app_mqtt_start(void)
 void app_mqtt_stop(void)
 {
     if (!s_client) return;
+    if (s_health_timer) {
+        esp_timer_stop(s_health_timer);
+        esp_timer_delete(s_health_timer);
+        s_health_timer = NULL;
+    }
     esp_mqtt_client_stop(s_client);
     esp_mqtt_client_destroy(s_client);
     s_client    = NULL;
