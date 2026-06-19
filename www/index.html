@@ -8,11 +8,15 @@
   <style>
     *, *::before, *::after { box-sizing: border-box; }
     body { font-family: system-ui, sans-serif; max-width: 560px; margin: 2rem auto; padding: 0 1rem; color: #222; }
-    h1 { font-size: 1.4rem; margin-bottom: 0.5rem; }
-    h2 { font-size: 1rem; color: #555; border-bottom: 1px solid #ddd; padding-bottom: 0.3rem; margin: 1.8rem 0 0.8rem; }
+    h1 { font-size: 1.3rem; margin: 0 0 .9rem; }
+    h2 { font-size: .95rem; color: #555; border-bottom: 1px solid #e8e8e8; padding-bottom: .25rem; margin: 1.5rem 0 .6rem; }
     label { display: block; margin-top: 1rem; font-size: 0.85rem; font-weight: 600; color: #555; }
     input[type="text"], input[type="password"] {
       width: 100%; margin-top: 0.3rem; padding: 0.5rem 0.6rem;
+      border: 1px solid #ccc; border-radius: 4px; font-size: 1rem;
+    }
+    select {
+      width: 100%; margin-top: .3rem; padding: .5rem .6rem;
       border: 1px solid #ccc; border-radius: 4px; font-size: 1rem;
     }
     table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; font-size: 0.9rem; }
@@ -21,13 +25,11 @@
     td:last-child { text-align: center; }
     .hint { font-size: 0.78rem; color: #888; margin-top: 0.25rem; }
     button {
-      margin-top: 1.8rem; padding: 0.6rem 1.6rem;
+      padding: 0.6rem 1.6rem; margin-top: 0;
       background: #1a73e8; color: #fff; border: none; border-radius: 4px;
       font-size: 1rem; cursor: pointer;
     }
     button:disabled { background: #aaa; cursor: default; }
-    #reboot-btn        { background: #b0413e; margin-left: .5rem; }
-    #factory-reset-btn { background: #7a1e1e; margin-left: .5rem; }
     #status { margin-top: 0.8rem; font-size: 0.9rem; min-height: 1.2em; }
     .ok  { color: #2d7d46; }
     .err { color: #c0392b; }
@@ -56,7 +58,20 @@
     .io-row { display:flex; align-items:center; gap:.6rem; margin:.5rem 0; flex-wrap:wrap; }
     .io-row label { margin-top:0; font-weight:normal; }
     .io-row input[type="number"] { width:5rem; margin-top:0; padding:.3rem .5rem; font-size:.9rem; }
-    .io-row button { margin-top:0; padding:.35rem 1rem; font-size:.9rem; }
+    .io-row button { padding:.35rem 1rem; font-size:.9rem; }
+    /* Tabs */
+    .tab-bar { display:flex; flex-wrap:wrap; border-bottom:2px solid #e0e0e0; margin:0 0 1.2rem; padding:0; }
+    .tab-btn { background:none; border:none; border-bottom:3px solid transparent; margin-bottom:-2px;
+               padding:.45rem .85rem; font-size:.88rem; font-weight:500; color:#666;
+               cursor:pointer; border-radius:4px 4px 0 0; }
+    .tab-btn:hover:not(.active) { color:#333; background:#f5f5f5; }
+    .tab-btn.active { color:#1a73e8; border-bottom-color:#1a73e8; font-weight:600; }
+    .tab-pane { display:none; }
+    .tab-pane.active { display:block; }
+    /* Action button row */
+    .btn-row { margin-top:1.8rem; display:flex; gap:.5rem; flex-wrap:wrap; }
+    #reboot-btn        { background:#b0413e; }
+    #factory-reset-btn { background:#7a1e1e; }
   </style>
 </head>
 <body>
@@ -80,7 +95,7 @@
         <p><span class="spinner"></span> The LED on the device is blinking yellow.</p>
         <p>Briefly press the <strong>BOOT button (GPIO0)</strong> on the device within <strong id="auth-countdown">30</strong> s to confirm.</p>
         <p class="hint">Longer press (&ge; 5 s) will reset WiFi instead.</p>
-        <button onclick="cancelSetup()" style="background:#888">Cancel</button>
+        <button type="button" onclick="cancelSetup()" style="background:#888">Cancel</button>
       </div>
 
       <!-- Screen: enter new password -->
@@ -92,7 +107,7 @@
         <label>Confirm password
           <input type="password" id="auth-pw2" autocomplete="new-password">
         </label>
-        <button onclick="submitPassword()">Save Password</button>
+        <button type="button" onclick="submitPassword()">Save Password</button>
         <p id="auth-pw-err" class="err" style="min-height:1.2em"></p>
       </div>
 
@@ -102,7 +117,7 @@
         <label>Password
           <input type="password" id="auth-login-pw" autocomplete="current-password">
         </label>
-        <button onclick="doLogin()">Login</button>
+        <button type="button" onclick="doLogin()">Login</button>
         <p id="auth-login-err" class="err" style="min-height:1.2em"></p>
         <p class="hint"><a href="#" onclick="beginSetup();return false">Forgot password?</a> (requires physical button press)</p>
       </div>
@@ -110,149 +125,193 @@
     </div>
   </div>
 
-  <h1>Device Configuration</h1>
+  <h1 id="page-title">Device Configuration</h1>
 
-  <form id="form">
+  <nav class="tab-bar">
+    <button type="button" class="tab-btn" data-tab="device"  onclick="switchTab('device')">Device</button>
+    <button type="button" class="tab-btn" data-tab="mqtt"    onclick="switchTab('mqtt')">MQTT</button>
+    <button type="button" class="tab-btn" data-tab="inputs"  onclick="switchTab('inputs')">Inputs</button>
+    <button type="button" class="tab-btn" data-tab="outputs" onclick="switchTab('outputs')">Outputs</button>
+    <button type="button" class="tab-btn" data-tab="can"     onclick="switchTab('can')">CAN Bus</button>
+    <button type="button" class="tab-btn" data-tab="modbus"  onclick="switchTab('modbus')">Modbus</button>
+    <button type="button" class="tab-btn" data-tab="matter"  onclick="switchTab('matter')" id="tab-btn-matter" style="display:none">Matter</button>
+  </nav>
 
-    <h2>Device</h2>
-    <label>Device Name
-      <input type="text" id="device_name" maxlength="31" required>
-    </label>
-    <p class="hint">Used as DHCP hostname. Alphanumeric and hyphens only.</p>
-    <label>LED Mode
-      <select id="led_mode" style="width:100%;margin-top:.3rem;padding:.5rem .6rem;border:1px solid #ccc;border-radius:4px;font-size:1rem">
-        <option value="0">IO device — controlled via MQTT / Modbus</option>
-        <option value="1">Status feedback — shows connectivity state</option>
-      </select>
-    </label>
-    <p class="hint">Status mode: 50% yellow = alive, 50% green = network, 50% purple = MQTT. Red/blue flashes = RX/TX traffic. Takes effect after reboot.</p>
-    <p style="font-size:.85rem;font-weight:600;color:#555;margin:1rem 0 .3rem">LED Colour</p>
-    <div class="io-row">
-      <input type="color" id="led-color" value="#000000" title="Pick colour">
-      <button onclick="setLed()">Set</button>
-      <button onclick="setLed('#000000')" style="background:#888">Off</button>
+  <form id="form" novalidate>
+
+    <!-- ── Device ── -->
+    <div id="tab-device" class="tab-pane">
+      <label>Device Name
+        <input type="text" id="device_name" maxlength="31">
+      </label>
+      <p class="hint">Used as DHCP hostname. Alphanumeric and hyphens only.</p>
+      <label>LED Mode
+        <select id="led_mode">
+          <option value="0">IO device — controlled via MQTT / Modbus</option>
+          <option value="1">Status feedback — shows connectivity state</option>
+        </select>
+      </label>
+      <p class="hint">Status mode: 50% yellow = alive, 50% green = network, 50% purple = MQTT. Red/blue flashes = RX/TX traffic. Takes effect after reboot.</p>
+
+      <h2>LED Colour</h2>
+      <div class="io-row">
+        <input type="color" id="led-color" value="#000000" title="Pick colour">
+        <button type="button" onclick="setLed()">Set</button>
+        <button type="button" onclick="setLed('#000000')" style="background:#888">Off</button>
+      </div>
+      <p class="hint">Only effective when LED Mode is "IO device".</p>
+
+      <h2>Buzzer</h2>
+      <div class="io-row">
+        <label>Freq (Hz) <input type="number" id="buzz-freq" min="100" max="10000" value="440"></label>
+        <label>Duration (ms) <input type="number" id="buzz-dur" min="1" max="5000" value="200"></label>
+        <button type="button" onclick="testBuzzer()">Beep</button>
+      </div>
     </div>
-    <p class="hint">Only effective when LED Mode is "IO device".</p>
-    <p style="font-size:.85rem;font-weight:600;color:#555;margin:1rem 0 .3rem">Buzzer</p>
-    <div class="io-row">
-      <label>Freq (Hz) <input type="number" id="buzz-freq" min="100" max="10000" value="440"></label>
-      <label>Duration (ms) <input type="number" id="buzz-dur" min="1" max="5000" value="200"></label>
-      <button onclick="testBuzzer()">Beep</button>
+
+    <!-- ── MQTT ── -->
+    <div id="tab-mqtt" class="tab-pane">
+      <label>Broker URL
+        <input type="text" id="mqtt_url" maxlength="127" placeholder="mqtt://broker.example.com:1883">
+      </label>
+      <label>Username
+        <input type="text" id="mqtt_user" maxlength="63" autocomplete="username">
+      </label>
+      <label>Password
+        <input type="password" id="mqtt_password" maxlength="63" autocomplete="current-password"
+               placeholder="(leave blank to keep current)">
+      </label>
+      <p class="hint" id="pass_hint"></p>
+      <label>Topic Prefix
+        <input type="text" id="mqtt_topic_prefix" maxlength="63" placeholder="home/boat">
+      </label>
     </div>
 
-    <h2>MQTT Broker</h2>
-    <label>Broker URL
-      <input type="text" id="mqtt_url" maxlength="127" placeholder="mqtt://broker.example.com:1883">
-    </label>
-    <label>Username
-      <input type="text" id="mqtt_user" maxlength="63" autocomplete="username">
-    </label>
-    <label>Password
-      <input type="password" id="mqtt_password" maxlength="63" autocomplete="current-password"
-             placeholder="(leave blank to keep current)">
-    </label>
-    <p class="hint" id="pass_hint"></p>
-    <label>Topic Prefix
-      <input type="text" id="mqtt_topic_prefix" maxlength="63" placeholder="home/boat">
-    </label>
-
-    <h2>Digital Inputs</h2>
-    <table>
-      <thead><tr><th>Input</th><th>Name</th><th>Invert</th></tr></thead>
-      <tbody id="di-table"></tbody>
-    </table>
-    <p class="hint">Name: used as MQTT topic fragment instead of the number (max 20 chars, no <code>/</code>, unique). Invert: checked = active-low (GPIO low → <code>true</code>).</p>
-    <div id="di-grid" class="io-grid" style="margin-top:.6rem"></div>
-
-    <h2>Digital Outputs</h2>
-    <table>
-      <thead><tr><th>Output</th><th>Name</th><th>Invert</th></tr></thead>
-      <tbody id="dout-table"></tbody>
-    </table>
-    <p class="hint">Name: used as MQTT topic fragment. Invert: checked = physical bit flipped relative to logical state.</p>
-    <div id="do-grid" class="io-grid" style="margin-top:.6rem"></div>
-
-    <h2>CAN Bus</h2>
-    <p class="hint">GPIO2 (TX) / GPIO3 (RX). Changes take effect after reboot.</p>
-    <label>Mode
-      <select id="can_mode" style="width:100%;margin-top:.3rem;padding:.5rem .6rem;border:1px solid #ccc;border-radius:4px;font-size:1rem" onchange="updateCanFields()">
-        <option value="0">Off</option>
-        <option value="1">Basic (11-bit standard frames)</option>
-        <option value="2">NMEA2000 (29-bit extended, 250 kbit/s)</option>
-      </select>
-    </label>
-    <div id="can_basic_fields">
-    <label>Base CAN ID (hex, 0x000–0x7FF)
-      <input type="text" id="can_base_id" maxlength="5" placeholder="0x100">
-    </label>
+    <!-- ── Inputs ── -->
+    <div id="tab-inputs" class="tab-pane">
+      <table>
+        <thead><tr><th>Input</th><th>Name</th><th>Invert</th></tr></thead>
+        <tbody id="di-table"></tbody>
+      </table>
+      <p class="hint">Name: used as MQTT topic fragment instead of the number (max 20 chars, no <code>/</code>, unique). Invert: checked = active-low (GPIO low → <code>true</code>).</p>
+      <div id="di-grid" class="io-grid" style="margin-top:.6rem"></div>
     </div>
-    <div id="can_n2k_fields">
-    <label>Preferred Source Address (1–251)
-      <input type="number" id="can_n2k_addr" min="1" max="251" value="80">
-    </label>
-    <p class="hint">If already taken on the bus, the device will claim the next free address automatically.</p>
-    </div>
-    <label>Bit Rate
-      <select id="can_bitrate" style="width:100%;margin-top:.3rem;padding:.5rem .6rem;border:1px solid #ccc;border-radius:4px;font-size:1rem">
-        <option value="125000">125 kbit/s</option>
-        <option value="250000">250 kbit/s (NMEA2000)</option>
-        <option value="500000">500 kbit/s</option>
-        <option value="1000000">1 Mbit/s</option>
-      </select>
-    </label>
-    <label>Periodic DI TX interval (ms, 0 = on-change only)
-      <input type="number" id="can_tx_interval" min="0" max="60000" value="1000">
-    </label>
 
-    <h2>Modbus RTU</h2>
-    <label style="display:flex;align-items:center;gap:.5rem;font-weight:600;color:#555;margin-top:1rem">
-      <input type="checkbox" id="mb_enable"> Enable Modbus RTU server
-    </label>
-    <p class="hint">RS485 on GPIO17/18. Changes take effect after reboot.</p>
-    <label>Slave Address (1–247)
-      <input type="number" id="mb_address" min="1" max="247" value="1">
-    </label>
-    <label>Baudrate
-      <select id="mb_baudrate" style="width:100%;margin-top:.3rem;padding:.5rem .6rem;border:1px solid #ccc;border-radius:4px;font-size:1rem">
-        <option value="9600">9600</option>
-        <option value="19200">19200</option>
-        <option value="38400">38400</option>
-        <option value="57600">57600</option>
-        <option value="115200">115200</option>
-      </select>
-    </label>
-
-  <!-- Matter pairing section — shown only when Matter is enabled in firmware -->
-  <div id="matter-section" style="display:none">
-    <h2 style="font-size:1rem;color:#555;border-bottom:1px solid #ddd;padding-bottom:.3rem;margin:1.8rem 0 .8rem">Matter Commissioning</h2>
-    <div id="matter-commissioned-msg" style="display:none">
-      <p style="color:#2d7d46;font-size:.9rem;margin:.3rem 0">Device is commissioned into a Matter fabric.</p>
-      <button type="button" id="matter-decommission-btn" onclick="matterDecommission()"
-              style="margin-top:.6rem;background:#b0413e;padding:.45rem 1.2rem;font-size:.9rem">
-        Remove from Home
-      </button>
-      <p class="hint" style="margin-top:.4rem">Removes the device from all Matter fabrics and reboots. Your WiFi,
-      MQTT config, and pairing code are preserved — you can recommission immediately after reboot.</p>
+    <!-- ── Outputs ── -->
+    <div id="tab-outputs" class="tab-pane">
+      <table>
+        <thead><tr><th>Output</th><th>Name</th><th>Invert</th></tr></thead>
+        <tbody id="dout-table"></tbody>
+      </table>
+      <p class="hint">Name: used as MQTT topic fragment. Invert: checked = physical bit flipped relative to logical state.</p>
+      <div id="do-grid" class="io-grid" style="margin-top:.6rem"></div>
     </div>
-    <div id="matter-pair-info">
-      <p style="font-size:.85rem;color:#555;margin:.3rem 0">Scan this code with Apple Home, Google Home, or Home Assistant:</p>
-      <div id="matter-qr-canvas" style="display:flex;justify-content:center;margin:.8rem 0"></div>
-      <p style="font-size:.78rem;color:#888;text-align:center;margin:.2rem 0">
-        No QR? <a id="matter-qr-link" href="#" target="_blank" rel="noopener">Open in browser</a>
-      </p>
-      <label style="display:block;margin-top:.8rem;font-size:.85rem;font-weight:600;color:#555">Manual Pairing Code</label>
-      <code id="matter-manual-code" style="display:block;font-size:1.5rem;text-align:center;letter-spacing:.25em;padding:.5rem;border:1px solid #ddd;border-radius:4px;margin-top:.3rem;background:#f9f9f9"></code>
-      <p class="hint" style="margin-top:.4rem">Enter this code in your home automation app if QR scanning is unavailable.</p>
-    </div>
-  </div>
 
-    <button type="submit" id="btn">Save</button>
-    <button type="button" id="reboot-btn">Reboot</button>
-    <button type="button" id="factory-reset-btn">Factory Reset</button>
+    <!-- ── CAN Bus / NMEA2000 ── -->
+    <div id="tab-can" class="tab-pane">
+      <p class="hint" style="margin-top:.5rem">GPIO2 (TX) / GPIO3 (RX). Changes take effect after reboot.</p>
+      <label>Mode
+        <select id="can_mode" onchange="updateCanFields()">
+          <option value="0">Off</option>
+          <option value="1">Basic (11-bit standard frames)</option>
+          <option value="2">NMEA2000 (29-bit extended, 250 kbit/s)</option>
+        </select>
+      </label>
+      <div id="can_basic_fields">
+        <label>Base CAN ID (hex, 0x000–0x7FF)
+          <input type="text" id="can_base_id" maxlength="5" placeholder="0x100">
+        </label>
+      </div>
+      <div id="can_n2k_fields">
+        <label>Preferred Source Address (1–251)
+          <input type="number" id="can_n2k_addr" min="1" max="251" value="80">
+        </label>
+        <p class="hint">If already taken on the bus, the device will claim the next free address automatically.</p>
+      </div>
+      <label>Bit Rate
+        <select id="can_bitrate">
+          <option value="125000">125 kbit/s</option>
+          <option value="250000">250 kbit/s (NMEA2000)</option>
+          <option value="500000">500 kbit/s</option>
+          <option value="1000000">1 Mbit/s</option>
+        </select>
+      </label>
+      <label>Periodic DI TX interval (ms, 0 = on-change only)
+        <input type="number" id="can_tx_interval" min="0" max="60000" value="1000">
+      </label>
+    </div>
+
+    <!-- ── Modbus ── -->
+    <div id="tab-modbus" class="tab-pane">
+      <label style="display:flex;align-items:center;gap:.5rem;font-weight:600;color:#555;margin-top:1rem">
+        <input type="checkbox" id="mb_enable"> Enable Modbus RTU server
+      </label>
+      <p class="hint">RS485 on GPIO17/18. Changes take effect after reboot.</p>
+      <label>Slave Address (1–247)
+        <input type="number" id="mb_address" min="1" max="247" value="1">
+      </label>
+      <label>Baudrate
+        <select id="mb_baudrate">
+          <option value="9600">9600</option>
+          <option value="19200">19200</option>
+          <option value="38400">38400</option>
+          <option value="57600">57600</option>
+          <option value="115200">115200</option>
+        </select>
+      </label>
+    </div>
+
+    <!-- ── Matter ── -->
+    <div id="tab-matter" class="tab-pane">
+      <div id="matter-commissioned-msg" style="display:none">
+        <p style="color:#2d7d46;font-size:.9rem;margin:.3rem 0">Device is commissioned into a Matter fabric.</p>
+        <button type="button" id="matter-decommission-btn" onclick="matterDecommission()"
+                style="background:#b0413e;padding:.45rem 1.2rem;font-size:.9rem;margin-top:.6rem">
+          Remove from Home
+        </button>
+        <p class="hint" style="margin-top:.4rem">Removes the device from all Matter fabrics and reboots. Your WiFi,
+        MQTT config, and pairing code are preserved — you can recommission immediately after reboot.</p>
+      </div>
+      <div id="matter-pair-info">
+        <p style="font-size:.85rem;color:#555;margin:.3rem 0">Scan this code with Apple Home, Google Home, or Home Assistant:</p>
+        <div id="matter-qr-canvas" style="display:flex;justify-content:center;margin:.8rem 0"></div>
+        <p style="font-size:.78rem;color:#888;text-align:center;margin:.2rem 0">
+          No QR? <a id="matter-qr-link" href="#" target="_blank" rel="noopener">Open in browser</a>
+        </p>
+        <label style="display:block;margin-top:.8rem;font-size:.85rem;font-weight:600;color:#555">Manual Pairing Code</label>
+        <code id="matter-manual-code" style="display:block;font-size:1.5rem;text-align:center;letter-spacing:.25em;padding:.5rem;border:1px solid #ddd;border-radius:4px;margin-top:.3rem;background:#f9f9f9"></code>
+        <p class="hint" style="margin-top:.4rem">Enter this code in your home automation app if QR scanning is unavailable.</p>
+      </div>
+    </div>
+
+    <div class="btn-row">
+      <button type="submit" id="btn">Save</button>
+      <button type="button" id="reboot-btn">Reboot</button>
+      <button type="button" id="factory-reset-btn">Factory Reset</button>
+    </div>
   </form>
   <p id="status"></p>
 
   <script>
+    /* ---- Tab switching ---- */
+    function switchTab(name) {
+      document.querySelectorAll('.tab-btn').forEach(b =>
+        b.classList.toggle('active', b.dataset.tab === name));
+      document.querySelectorAll('.tab-pane').forEach(p =>
+        p.classList.toggle('active', p.id === 'tab-' + name));
+      try { localStorage.setItem('active_tab', name); } catch (_) {}
+    }
+
+    (function initTabs() {
+      let saved;
+      try { saved = localStorage.getItem('active_tab'); } catch (_) {}
+      if (saved) {
+        const el = document.querySelector('.tab-btn[data-tab="' + saved + '"]');
+        if (!el || el.style.display === 'none') saved = null;
+      }
+      switchTab(saved || 'device');
+    })();
+
     /* ---- Auth state machine ---- */
     let authPassword = sessionStorage.getItem('auth_pw') || '';
     let authToken    = '';
@@ -414,7 +473,10 @@
         if (!r.ok) throw new Error('HTTP ' + r.status);
         const cfg = await r.json();
         document.getElementById('device_name').value       = cfg.device_name ?? '';
-        if (cfg.device_name) document.title = cfg.device_name;
+        if (cfg.device_name) {
+          document.title = cfg.device_name;
+          document.getElementById('page-title').textContent = cfg.device_name;
+        }
         document.getElementById('led_mode').value          = cfg.led_mode ?? 0;
         document.getElementById('mqtt_url').value          = cfg.mqtt_url ?? '';
         document.getElementById('mqtt_user').value         = cfg.mqtt_user ?? '';
@@ -424,7 +486,7 @@
           document.getElementById('can_n2k_addr').value     = cfg.can.n2k_addr ?? 80;
           document.getElementById('can_base_id').value      = '0x' + (cfg.can.base_id ?? 0x100).toString(16).toUpperCase();
           document.getElementById('can_bitrate').value      = cfg.can.bitrate ?? 250000;
-          document.getElementById('can_tx_interval').value = cfg.can.tx_interval_ms ?? 1000;
+          document.getElementById('can_tx_interval').value  = cfg.can.tx_interval_ms ?? 1000;
           updateCanFields();
         }
         if (cfg.modbus) {
@@ -432,19 +494,19 @@
           document.getElementById('mb_address').value   = cfg.modbus.address  ?? 1;
           document.getElementById('mb_baudrate').value  = cfg.modbus.baudrate ?? 9600;
         }
-        document.getElementById('pass_hint').textContent   =
+        document.getElementById('pass_hint').textContent =
           cfg.mqtt_password_set ? 'Password is set.' : 'No password stored.';
         (cfg.di ?? []).forEach((di, i) => {
           const inv  = document.getElementById(`di_${i}_invert`);
           const name = document.getElementById(`di_${i}_name`);
-          if (inv)  inv.checked   = !!di.invert;
-          if (name) name.value    = di.name ?? '';
+          if (inv)  inv.checked = !!di.invert;
+          if (name) name.value  = di.name ?? '';
         });
         (cfg.dout ?? []).forEach((dout, i) => {
           const inv  = document.getElementById(`dout_${i}_invert`);
           const name = document.getElementById(`dout_${i}_name`);
-          if (inv)  inv.checked   = !!dout.invert;
-          if (name) name.value    = dout.name ?? '';
+          if (inv)  inv.checked = !!dout.invert;
+          if (name) name.value  = dout.name ?? '';
         });
 
         /* Rebuild IO grids with current names, then start live polling */
@@ -460,6 +522,14 @@
 
     document.getElementById('form').addEventListener('submit', async e => {
       e.preventDefault();
+      const devName = document.getElementById('device_name').value.trim();
+      if (!devName) {
+        switchTab('device');
+        document.getElementById('device_name').focus();
+        status.className = 'err';
+        status.textContent = 'Device name is required.';
+        return;
+      }
       btn.disabled = true;
       status.textContent = '';
       try {
@@ -478,7 +548,7 @@
           });
         }
         const cfg = {
-          device_name:       document.getElementById('device_name').value.trim(),
+          device_name:       devName,
           led_mode:          parseInt(document.getElementById('led_mode').value, 10),
           mqtt_url:          document.getElementById('mqtt_url').value.trim(),
           mqtt_user:         document.getElementById('mqtt_user').value,
@@ -592,8 +662,8 @@
       for (let i = 0; i < 8; i++) {
         const n = cfg.dout?.[i]?.name || `DO${i + 1}`;
         doG.insertAdjacentHTML('beforeend',
-          `<div class="io-cell"><button id="do-btn-${i}" class="io-toggle" title="Click to toggle ${n}"` +
-          ` onclick="toggleOutput(${i})">${n}</button></div>`);
+          `<div class="io-cell"><button type="button" id="do-btn-${i}" class="io-toggle"` +
+          ` title="Click to toggle ${n}" onclick="toggleOutput(${i})">${n}</button></div>`);
       }
     }
 
@@ -693,7 +763,7 @@
         const d = await r.json();
         if (!d.qr_code && !d.commissioned) return;
 
-        document.getElementById('matter-section').style.display = '';
+        document.getElementById('tab-btn-matter').style.display = '';
 
         if (d.commissioned) {
           document.getElementById('matter-commissioned-msg').style.display = '';
