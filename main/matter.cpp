@@ -27,7 +27,9 @@ extern "C" {
 #include <app-common/zap-generated/ids/Attributes.h>
 #include <app-common/zap-generated/ids/Clusters.h>
 #include <app/server/Server.h>
+#include <app/clusters/boolean-state-server/BooleanStateCluster.h>
 #include <crypto/CHIPCryptoPAL.h>
+#include <data_model_provider/esp_matter_data_model_provider.h>
 #include <lib/support/Base64.h>
 #include <setup_payload/OnboardingCodesUtil.h>
 
@@ -50,10 +52,19 @@ using namespace esp_matter::attribute;
 using namespace esp_matter::endpoint;
 using namespace chip::app::Clusters;
 
-/* BooleanState cluster state update — the cluster is a LazyRegisteredServerCluster
- * so attribute::update() no longer reaches it; use the integration helper directly.
- * No public header in this esp-matter version, so forward-declare it. */
-esp_err_t esp_matter_boolean_state_set_value(chip::EndpointId endpoint_id, bool value);
+/* BooleanState is a LazyRegisteredServerCluster — attribute::update() no longer
+ * reaches it.  Look up the cluster server via the data model provider registry
+ * and call SetStateValue() directly, avoiding any modification to esp-matter. */
+static esp_err_t boolean_state_set_value(chip::EndpointId endpoint_id, bool value)
+{
+    using chip::app::Clusters::BooleanStateCluster;
+    chip::app::ConcreteClusterPath path(endpoint_id, BooleanState::Id);
+    auto *iface = esp_matter::data_model::provider::get_instance().registry().Get(path);
+    if (!iface) return ESP_ERR_NOT_FOUND;
+    auto *cluster = static_cast<BooleanStateCluster *>(iface);
+    esp_matter::lock::ScopedChipStackLock lock(portMAX_DELAY);
+    return cluster->SetStateValue(value).has_value() ? ESP_OK : ESP_ERR_NOT_FINISHED;
+}
 
 /* Endpoint IDs assigned after node creation — index 0 = channel 1 */
 static uint16_t s_do_ep[NUM_CHANNELS];
@@ -323,7 +334,7 @@ void matter_di_update(uint8_t channel, bool active)
     uint16_t ep_id = s_di_ep[channel];
     if (ep_id == 0) return;  /* not initialised yet */
 
-    esp_err_t err = esp_matter_boolean_state_set_value(ep_id, active);
+    esp_err_t err = boolean_state_set_value(ep_id, active);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "DI%d state update failed: %s", channel + 1, esp_err_to_name(err));
     }
