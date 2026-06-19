@@ -414,6 +414,7 @@
         if (!r.ok) throw new Error('HTTP ' + r.status);
         const cfg = await r.json();
         document.getElementById('device_name').value       = cfg.device_name ?? '';
+        if (cfg.device_name) document.title = cfg.device_name;
         document.getElementById('led_mode').value          = cfg.led_mode ?? 0;
         document.getElementById('mqtt_url').value          = cfg.mqtt_url ?? '';
         document.getElementById('mqtt_user').value         = cfg.mqtt_user ?? '';
@@ -449,6 +450,7 @@
         /* Rebuild IO grids with current names, then start live polling */
         buildIoPanel(cfg);
         startIoPoll();
+        loadMatterPairing();
 
       } catch (e) {
         status.className = 'err';
@@ -527,11 +529,37 @@
     }
     updateCanFields();
 
+    /* Poll until the device responds again, then reload.
+     * factoryReset=true means WiFi creds were wiped so the device may come
+     * back in AP mode — show a hint if it doesn't respond within the timeout. */
+    async function waitForReboot(label, factoryReset = false) {
+      status.className = 'ok';
+      status.textContent = label;
+      await new Promise(r => setTimeout(r, 3000));
+      const deadline = Date.now() + (factoryReset ? 60000 : 30000);
+      while (Date.now() < deadline) {
+        try {
+          const r = await fetch('/api/auth/status', { cache: 'no-store' });
+          if (r.ok) {
+            status.textContent = 'Back online — reloading…';
+            setTimeout(() => location.reload(), 400);
+            return;
+          }
+        } catch (_) {}
+        status.textContent = 'Waiting for device… ' +
+          Math.max(0, Math.round((deadline - Date.now()) / 1000)) + 's';
+        await new Promise(r => setTimeout(r, 1500));
+      }
+      status.className = 'error';
+      status.textContent = factoryReset
+        ? 'Device not responding — it may be in WiFi setup mode. Connect to the setup AP to continue.'
+        : 'Device not responding — try reloading manually.';
+    }
+
     document.getElementById('reboot-btn').addEventListener('click', async () => {
       if (!confirm('Reboot the device?')) return;
-      status.className = 'ok';
-      status.textContent = 'Rebooting…';
-      try { await apiFetch('/api/reboot', { method: 'POST' }); } catch (_) { /* expected */ }
+      try { await apiFetch('/api/reboot', { method: 'POST' }); } catch (_) {}
+      waitForReboot('Rebooting…');
     });
 
     document.getElementById('factory-reset-btn').addEventListener('click', async () => {
@@ -542,13 +570,13 @@
         '  • IO names and invert flags\n' +
         '  • Modbus configuration\n\n' +
         'Continue?')) return;
-      status.className = 'ok';
-      status.textContent = 'Resetting to factory defaults and rebooting…';
-      try { await apiFetch('/api/factory-reset', { method: 'POST' }); } catch (_) { /* expected */ }
+      try { await apiFetch('/api/factory-reset', { method: 'POST' }); } catch (_) {}
+      waitForReboot('Resetting to factory defaults…', true);
     });
 
     /* ---- IO monitor & control ---- */
-    let ioPollTimer = null;
+    let ioPollTimer  = null;
+    let ioPollActive = false;
 
     function buildIoPanel(cfg) {
       const diG = document.getElementById('di-grid');
@@ -570,13 +598,22 @@
     }
 
     function startIoPoll() {
-      if (ioPollTimer) return;
-      updateIoState();
-      ioPollTimer = setInterval(updateIoState, 500);
+      if (ioPollActive) return;
+      ioPollActive = true;
+      schedulePoll();
+    }
+
+    function schedulePoll() {
+      ioPollTimer = setTimeout(async () => {
+        if (!ioPollActive) return;
+        await updateIoState();
+        if (ioPollActive) schedulePoll();
+      }, 2000);
     }
 
     function stopIoPoll() {
-      if (ioPollTimer) { clearInterval(ioPollTimer); ioPollTimer = null; }
+      ioPollActive = false;
+      if (ioPollTimer) { clearTimeout(ioPollTimer); ioPollTimer = null; }
     }
 
     async function updateIoState() {
@@ -645,11 +682,8 @@
       btn.textContent = 'Removing…';
       try {
         await apiFetch('/api/matter/decommission', { method: 'POST' });
-        btn.textContent = 'Rebooting…';
-      } catch (_) {
-        btn.disabled = false;
-        btn.textContent = 'Remove from Home';
-      }
+      } catch (_) {}
+      waitForReboot('Decommissioning — rebooting…');
     }
 
     async function loadMatterPairing() {
@@ -657,14 +691,9 @@
         const r = await apiFetch('/api/matter/pairing');
         if (!r.ok) return;  /* Matter not compiled in */
         const d = await r.json();
-        if (!d.qr_code) return;
+        if (!d.qr_code && !d.commissioned) return;
 
         document.getElementById('matter-section').style.display = '';
-
-        const url = 'https://project-chip.github.io/connectedhomeip/qrcode.html?data='
-                    + encodeURIComponent(d.qr_code);
-        document.getElementById('matter-qr-link').href = url;
-        document.getElementById('matter-manual-code').textContent = d.manual_code || '';
 
         if (d.commissioned) {
           document.getElementById('matter-commissioned-msg').style.display = '';
@@ -672,18 +701,22 @@
           return;
         }
 
-        /* Render QR code if library loaded */
-        if (typeof QRCode !== 'undefined') {
-          new QRCode(document.getElementById('matter-qr-canvas'), {
-            text: d.qr_code, width: 200, height: 200,
-            colorDark: '#000000', colorLight: '#ffffff',
-          });
+        if (d.qr_code) {
+          const url = 'https://project-chip.github.io/connectedhomeip/qrcode.html?data='
+                      + encodeURIComponent(d.qr_code);
+          document.getElementById('matter-qr-link').href = url;
+          document.getElementById('matter-manual-code').textContent = d.manual_code || '';
+
+          if (typeof QRCode !== 'undefined') {
+            new QRCode(document.getElementById('matter-qr-canvas'), {
+              text: d.qr_code, width: 200, height: 200,
+              colorDark: '#000000', colorLight: '#ffffff',
+            });
+          }
         }
       } catch (_) {}
     }
   </script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"
-          crossorigin="anonymous" referrerpolicy="no-referrer"
-          onload="loadMatterPairing()" onerror="loadMatterPairing()"></script>
+  <script src="/qrcode.min.js" defer></script>
 </body>
 </html>
