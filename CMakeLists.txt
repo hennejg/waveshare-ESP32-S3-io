@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.16)
 # esp-matter is optional: only enabled when the nested connectedhomeip submodule
 # is checked out.  Without it the build proceeds with CONFIG_APP_MATTER_ENABLE=n
 # (e.g. in CI where only the esp-idf container image is available).
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/esp-matter/connectedhomeip/connectedhomeip/CMakeLists.txt")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/esp-matter/connectedhomeip/connectedhomeip/BUILD.gn")
     get_filename_component(ESP_MATTER_PATH
         ${CMAKE_CURRENT_SOURCE_DIR}/esp-matter REALPATH)
     set(ENV{ESP_MATTER_PATH} ${ESP_MATTER_PATH})

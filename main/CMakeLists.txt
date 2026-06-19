@@ -19,4 +19,19 @@ if(CONFIG_APP_MATTER_ENABLE)
     idf_component_optional_requires(PRIVATE esp_matter)
 endif()
 
-spiffs_create_partition_image(storage ${CMAKE_SOURCE_DIR}/www FLASH_IN_PROJECT)
+set(_WWW ${CMAKE_SOURCE_DIR}/www)
+foreach(_f index.html qrcode.min.js)
+    add_custom_command(
+        OUTPUT  ${_WWW}/${_f}.gz
+        COMMAND gzip -k -f ${_WWW}/${_f}
+        DEPENDS ${_WWW}/${_f}
+        COMMENT "Compressing www/${_f}"
+    )
+endforeach()
+
+add_custom_target(www_compress DEPENDS
+    ${_WWW}/index.html.gz
+    ${_WWW}/qrcode.min.js.gz
+)
+
+spiffs_create_partition_image(storage ${CMAKE_SOURCE_DIR}/www FLASH_IN_PROJECT DEPENDS www_compress)

@@ -199,7 +199,7 @@ Status mode all LED commands from MQTT, Modbus, and CAN are ignored.
 
 ### Prerequisites
 
-- ESP-IDF v6.0.1 installed as a git submodule under `esp-idf/`
+- ESP-IDF v5.5.4 installed as a git submodule under `esp-idf/`
 
 ```sh
 # First-time setup (after clone)
