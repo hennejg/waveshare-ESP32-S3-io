@@ -2,15 +2,49 @@ name: CD
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - master
+    paths-ignore:
+      - '**.md'
+      - '.claude/**'
+      - 'docs/**'
+
+concurrency: single
 
 permissions:
-  contents: write   # needed to create GitHub releases
+  contents: write
 
 jobs:
+  tag:
+    name: Bump version
+    runs-on: ubuntu-latest
+    outputs:
+      new_tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Compute & push next patch tag
+        id: version
+        run: |
+          git fetch --tags
+          LATEST=$(git tag --list 'v*' --sort=-version:refname | head -1)
+          if [ -z "$LATEST" ]; then
+            NEXT="v1.0.0"
+          else
+            IFS='.' read -r MAJOR MINOR PATCH <<< "${LATEST#v}"
+            NEXT="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$NEXT"
+          git push origin "$NEXT"
+          echo "tag=$NEXT" >> "$GITHUB_OUTPUT"
+
   release:
     name: Build & release
+    needs: tag
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v6.0.1
@@ -38,20 +72,21 @@ jobs:
           idf.py build
 
       - name: Stage release assets
+        env:
+          TAG: ${{ needs.tag.outputs.new_tag }}
         run: |
-          TAG="${GITHUB_REF_NAME}"
           mkdir release
-          cp build/waveshare_esp32s3.bin          "release/waveshare_esp32s3-${TAG}.bin"
-          cp build/storage.bin                    "release/storage-${TAG}.bin"
-          cp build/bootloader/bootloader.bin      "release/bootloader.bin"
+          cp build/waveshare_esp32s3.bin               "release/waveshare_esp32s3-${TAG}.bin"
+          cp build/storage.bin                         "release/storage-${TAG}.bin"
+          cp build/bootloader/bootloader.bin           "release/bootloader.bin"
           cp build/partition_table/partition-table.bin "release/partition-table.bin"
-          cp build/flash_args                     "release/flash_args"
-          # All-in-one zip for full reflash
+          cp build/flash_args                          "release/flash_args"
           (cd release && zip "../waveshare-esp32s3-${TAG}-full-flash.zip" *)
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ needs.tag.outputs.new_tag }}
           generate_release_notes: true
           files: |
             release/waveshare_esp32s3-*.bin
@@ -61,7 +96,7 @@ jobs:
             ## Flash instructions
 
             ### First install (full flash)
-            Download `waveshare-esp32s3-${{ github.ref_name }}-full-flash.zip`, unzip,
+            Download `waveshare-esp32s3-${{ needs.tag.outputs.new_tag }}-full-flash.zip`, unzip,
             then from inside the extracted folder:
             ```sh
             python -m esptool --chip esp32s3 -p /dev/ttyUSBx -b 460800 \
@@ -75,5 +110,5 @@ jobs:
             python -m esptool --chip esp32s3 -p /dev/ttyUSBx -b 460800 \
               --before default-reset --after hard-reset \
               write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB \
-              0x10000 waveshare_esp32s3-${{ github.ref_name }}.bin
+              0x10000 waveshare_esp32s3-${{ needs.tag.outputs.new_tag }}.bin
             ```
