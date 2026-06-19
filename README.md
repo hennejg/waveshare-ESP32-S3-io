@@ -91,6 +91,8 @@ All endpoints except the auth flow require an `Authorization: Basic base64(:<pas
 | `/api/config`            | POST   | Yes           | Update configuration from JSON        |
 | `/api/reboot`            | POST   | Yes           | Restart immediately                   |
 | `/api/factory-reset`     | POST   | Yes           | Erase all settings and restart        |
+| `/api/matter/pairing`    | GET    | Yes           | `{"qr_code":"…","manual_code":"…","commissioned":bool}` |
+| `/api/matter/decommission` | POST | Yes           | Remove all fabrics, erase Matter state, reboot |
 
 ### MQTT
 
@@ -126,6 +128,23 @@ LED colour, buzzer, and a read-request trigger.
 
 **NMEA2000 mode** implements ISO address claiming, PGN 126993 Heartbeat, PGN 127501/127502 Binary Switch Banks (DI bank
 0, DO bank 1), and PGN 126720 Manufacturer Proprietary fast-packet (LED + buzzer).
+
+### Matter (Apple Home / Google Home / Home Assistant)
+
+Full details in [`docs/matter.md`](docs/matter.md).
+
+The firmware includes optional Matter-over-Wi-Fi support (compiled in by default via `esp-matter`).
+
+| Feature                        | Description                                                             |
+|--------------------------------|-------------------------------------------------------------------------|
+| **8 Digital Outputs**          | Exposed as *On/Off Plug-in Unit* endpoints (controllable)               |
+| **8 Digital Inputs**           | Exposed as *Contact Sensor* endpoints (read-only state)                 |
+| **Pairing code**               | Unique passcode + discriminator generated on first boot; survives reboot and decommission |
+| **QR code**                    | Shown in the web UI under "Matter"; scan with your home app to pair     |
+| **Decommission**               | "Remove from Home" button erases all fabric data and reboots cleanly    |
+| **Identify**                   | LED blinks cyan at 1 Hz when any endpoint's Identify cluster is triggered |
+
+**Important — Contact Sensor = Door/Window in most home apps.** Home Assistant, HomeKit, and Google Home all render Contact Sensor endpoints as door or window sensors (open/closed), not as generic binary sensors. This is correct per the Matter spec but can look surprising. See [`docs/matter.md`](docs/matter.md) for details on renaming endpoints and alternative device types.
 
 ### Modbus RTU
 
@@ -227,12 +246,14 @@ idf.py -p /dev/ttyUSBx spiffs-flash
 │   ├── dout.c/h         Digital outputs (TCA9554 I²C)
 │   ├── eth.c/h          W5500 Ethernet (SPI)
 │   ├── led.c/h          WS2812 LED (RMT) — IO and Status modes
+│   ├── matter.cpp/h     Matter integration (esp-matter, 8 DO + 8 DI endpoints)
 │   ├── mb_server.c/h    Modbus RTU slave
 │   └── web_server.c/h   HTTP config UI + REST API + auth endpoints
 ├── www/
 │   └── index.html       Single-page web UI (served from SPIFFS)
 └── docs/
     ├── can.md           CAN bus API (Basic and NMEA2000 modes)
+    ├── matter.md        Matter integration — device model, commissioning, known quirks
     ├── mqtt.md          MQTT API reference
     └── modbus.md        Modbus RTU register map
 ```
@@ -249,3 +270,4 @@ idf.py -p /dev/ttyUSBx spiffs-flash
 | `espressif/cjson *`           | Component Registry            | JSON parsing                     |
 | `espressif/w5500 ^1.0.1`      | Component Registry            | W5500 Ethernet PHY               |
 | `esp32-wifi-bootstrap`        | Git submodule (`components/`) | WiFi captive-portal provisioning |
+| `esp-matter`                  | Git submodule (`esp-matter/`) | Matter SDK (connectedhomeip)     |
