@@ -70,6 +70,20 @@ static void apply_json_item(cJSON *item, uint8_t n)
     }
 }
 
+/* i2c_master_transmit wrapper: on ESP_ERR_INVALID_STATE (bus stuck) clocks
+ * 9 SCL pulses to release SDA and retries once.  Handles both a mid-reset
+ * stuck bus and the TCA9554 power-on edge case on a never-flashed device. */
+static esp_err_t i2c_transmit_safe(const uint8_t *buf, size_t len)
+{
+    esp_err_t ret = i2c_master_transmit(s_dev, buf, len, 10);
+    if (ret == ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "I2C bus stuck — recovering");
+        i2c_master_bus_reset(s_bus);
+        ret = i2c_master_transmit(s_dev, buf, len, 10);
+    }
+    return ret;
+}
+
 /* Build the physical output byte and write it to the TCA9554. */
 static esp_err_t write_outputs(void)
 {
@@ -81,7 +95,7 @@ static esp_err_t write_outputs(void)
         if (physical) byte |= (1u << i);
     }
     uint8_t buf[2] = {REG_OUTPUT, byte};
-    return i2c_master_transmit(s_dev, buf, sizeof(buf), 10);
+    return i2c_transmit_safe(buf, sizeof(buf));
 }
 
 static void publish_one(uint8_t n)
@@ -115,19 +129,10 @@ esp_err_t dout_init(void)
     ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(s_bus, &dev_cfg, &s_dev),
                         TAG, "TCA9554 device add");
 
-    /* Configure all 8 pins as outputs (config register = 0x00).
-     * After a software reset mid-transaction the TCA9554 may hold SDA low.
-     * i2c_master_bus_reset() clocks 9 SCL pulses + STOP to release it. */
+    /* Configure all 8 pins as outputs, then drive them all off.
+     * i2c_transmit_safe recovers from a stuck bus on either write. */
     uint8_t cfg_cmd[2] = {REG_CONFIG, 0x00};
-    esp_err_t cfg_err = i2c_master_transmit(s_dev, cfg_cmd, sizeof(cfg_cmd), 10);
-    if (cfg_err == ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "I2C bus stuck — attempting recovery");
-        i2c_master_bus_reset(s_bus);
-        cfg_err = i2c_master_transmit(s_dev, cfg_cmd, sizeof(cfg_cmd), 10);
-    }
-    ESP_RETURN_ON_ERROR(cfg_err, TAG, "TCA9554 config");
-
-    /* Drive all outputs to their initial (off) state */
+    ESP_RETURN_ON_ERROR(i2c_transmit_safe(cfg_cmd, sizeof(cfg_cmd)), TAG, "TCA9554 config");
     ESP_RETURN_ON_ERROR(write_outputs(), TAG, "initial write");
 
     ESP_LOGI(TAG, "Initialized %d outputs via TCA9554 (I2C addr 0x%02X)", NUM_DO, TCA9554_ADDR);
