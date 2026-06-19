@@ -33,10 +33,17 @@ CONFIG_MBEDTLS_HARDWARE_MPI=n
 # HKDF is required by the CHIP crypto PAL
 CONFIG_MBEDTLS_HKDF_C=y
 
-# BLE is required for Matter commissioning (PASE over BLE)
+# BLE stack kept for Matter stack compatibility; advertising is disabled at
+# runtime so the device uses mDNS/OnNetwork commissioning. This avoids the
+# WiFi/BLE coexistence problem that stalls TCP connections on the HTTP server.
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLE_CONN_REATTEMPT=n
+
+# TCP send/receive buffers — default 5760 bytes is too small to serve static
+# files without EAGAIN when the WiFi radio is intermittently busy.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384
+CONFIG_LWIP_TCP_WND_DEFAULT=16384
 
 # IPv6 — Matter needs link-local + per-fabric ULAs
 CONFIG_LWIP_IPV6_AUTOCONFIG=y
@@ -57,6 +64,12 @@ CONFIG_BT_NIMBLE_TASK_STACK_SIZE=5120
 # DEFAULT mode falls back to PSRAM when internal DRAM is exhausted.
 CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_DEFAULT=y
 
+# mbedTLS BIGNUM/ECC workspace exhausts internal DRAM during NOC chain
+# verification (AddNOC step of Matter commissioning).  DEFAULT mode falls
+# back to PSRAM when internal DRAM is exhausted.  BIGNUM/ECC operations are
+# pure CPU — no DMA — so PSRAM is safe here.
+CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC=y
+
 # PSRAM heap routing — Matter makes many large allocations that exhaust
 # internal DRAM (leaving none for httpd/mqtt task stacks).  Route any
 # allocation larger than 4 KiB to PSRAM when internal RAM is full.
@@ -76,3 +89,6 @@ CONFIG_HTTPD_STACK_SIZE=6144
 
 # OTA requestor (needed by esp_matter_ota_provider component)
 CONFIG_ENABLE_OTA_REQUESTOR=y
+
+# Matter device identification strings (VendorID 0xFFF1 is the CSA test VID)
+CONFIG_CHIP_PROJECT_CONFIG="main/CHIPProjectConfig.h"
