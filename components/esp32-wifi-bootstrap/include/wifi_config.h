@@ -18,4 +18,10 @@ void wifi_config_set_custom_html(char *html);
    in the provisioning portal. Use it to persist the preference before reboot. */
 void wifi_config_set_eth_only_callback(void (*cb)(void));
 
+/** Optional: register a predicate called at page-render time to decide whether
+ *  to show the "ETH only — skip WiFi" option on the provisioning page.  When
+ *  omitted the option is hidden.  Typically returns true when the Ethernet
+ *  interface has an IP address. */
+void wifi_config_set_eth_available_fn(bool (*fn)(void));
+
 esp_err_t safe_set_auto_connect(bool enable);

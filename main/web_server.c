@@ -18,6 +18,8 @@
 #include <esp_system.h>
 #include <esp_timer.h>
 #include <nvs_flash.h>
+#include <nvs.h>
+#include <esp_netif.h>
 #include "cJSON.h"
 #include "mbedtls/base64.h"
 
@@ -25,6 +27,9 @@
 #define WWW_BASE   "/www"
 #define CHUNK_SIZE  4096
 #define BODY_MAX    2048  /* names add ~768 bytes to the di/dout arrays */
+
+#define NVS_ETH_NS  "app_config"
+#define NVS_ETH_KEY "eth_only"
 
 static httpd_handle_t s_server = NULL;
 
@@ -277,6 +282,18 @@ static esp_err_t api_config_get(httpd_req_t *req)
         cJSON_AddStringToObject(item, "name",   cfg->dout[i].name);
         cJSON_AddItemToArray(dout, item);
     }
+
+    uint8_t eth_only_val = 0;
+    nvs_handle_t nvs_h;
+    if (nvs_open(NVS_ETH_NS, NVS_READONLY, &nvs_h) == ESP_OK) {
+        nvs_get_u8(nvs_h, NVS_ETH_KEY, &eth_only_val);
+        nvs_close(nvs_h);
+    }
+    cJSON_AddBoolToObject(root, "eth_only", eth_only_val != 0);
+
+    esp_netif_t *eth_if = esp_netif_get_handle_from_ifkey("ETH_DEF");
+    cJSON_AddBoolToObject(root, "eth_connected",
+                          eth_if != NULL && esp_netif_is_netif_up(eth_if));
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -540,6 +557,59 @@ static esp_err_t api_matter_pairing(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* --------------------------------------------------------------- /api/eth-only */
+
+static void do_restart(void *arg);  /* defined below in /api/reboot section */
+
+static esp_err_t api_eth_only(httpd_req_t *req)
+{
+    if (!check_auth(req)) return send_401(req);
+    if (req->content_len > 64) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body too large");
+        return ESP_OK;
+    }
+
+    char body[65] = {};
+    int received = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (received <= 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv failed");
+        return ESP_OK;
+    }
+
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_OK;
+    }
+
+    cJSON *enabled = cJSON_GetObjectItem(root, "enabled");
+    if (!cJSON_IsBool(enabled)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing 'enabled'");
+        return ESP_OK;
+    }
+    bool want_eth_only = cJSON_IsTrue(enabled);
+    cJSON_Delete(root);
+
+    nvs_handle_t nvs_h;
+    if (nvs_open(NVS_ETH_NS, NVS_READWRITE, &nvs_h) == ESP_OK) {
+        if (want_eth_only) nvs_set_u8(nvs_h, NVS_ETH_KEY, 1);
+        else               nvs_erase_key(nvs_h, NVS_ETH_KEY);
+        nvs_commit(nvs_h);
+        nvs_close(nvs_h);
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"rebooting\"}");
+
+    esp_timer_handle_t t;
+    esp_timer_create(&(esp_timer_create_args_t){
+        .callback = do_restart, .name = "eth_only"
+    }, &t);
+    esp_timer_start_once(t, 200 * 1000);
+    return ESP_OK;
+}
+
 /* ------------------------------------------------------------------ /api/reboot */
 
 static void do_restart(void *arg) { esp_restart(); }
@@ -725,6 +795,7 @@ static const httpd_uri_t s_handlers[] = {
     { .uri = "/api/io/buzzer",         .method = HTTP_POST, .handler = api_io_buzzer         },
     { .uri = "/api/matter/pairing",       .method = HTTP_GET,  .handler = api_matter_pairing      },
     { .uri = "/api/matter/decommission", .method = HTTP_POST, .handler = api_matter_decommission },
+    { .uri = "/api/eth-only",          .method = HTTP_POST, .handler = api_eth_only          },
     { .uri = "/api/reboot",            .method = HTTP_POST, .handler = api_reboot            },
     { .uri = "/api/factory-reset",     .method = HTTP_POST, .handler = api_factory_reset     },
     { .uri = "/*",                     .method = HTTP_GET,  .handler = file_get              },
@@ -737,7 +808,10 @@ esp_err_t web_server_start(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn     = httpd_uri_match_wildcard;
     cfg.max_uri_handlers = 16;
-    cfg.stack_size       = 8192;
+    /* Default (4096) fits within the ~7936 B largest contiguous internal DRAM
+     * block available at T≈12s when WiFi AP mode starts alongside Matter+BLE.
+     * File I/O buffers are heap-allocated (CHUNK_SIZE malloc), not stack. */
+    cfg.stack_size       = 4096;
     cfg.send_wait_timeout = 10;   /* seconds; default 5 is too tight with Matter on WiFi */
 
     esp_err_t ret = httpd_start(&s_server, &cfg);

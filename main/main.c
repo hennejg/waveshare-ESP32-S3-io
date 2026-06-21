@@ -76,13 +76,18 @@ static void on_mqtt_publish(void) { led_status_flash_tx(); }
 
 /* ------------------------------------------------- network callbacks */
 
+static bool s_web_server_start_failed = false;
+
 static void on_network_ready(const char *iface)
 {
     ESP_LOGI(TAG, "%s connected — starting services", iface);
     led_status_set_network(true);
     esp_err_t ws_ret = web_server_start();
-    if (ws_ret != ESP_OK)
-        ESP_LOGE(TAG, "Web server start failed: %s", esp_err_to_name(ws_ret));
+    if (ws_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Web server start failed (%s) — will retry when WiFi AP mode starts",
+                 esp_err_to_name(ws_ret));
+        s_web_server_start_failed = true;
+    }
     app_mqtt_set_connected_callback(on_mqtt_connected);
     app_mqtt_set_disconnected_callback(on_mqtt_disconnected);
     app_mqtt_set_msg_callback(on_mqtt_message);
@@ -92,11 +97,21 @@ static void on_network_ready(const char *iface)
         ESP_LOGE(TAG, "MQTT start failed: %s", esp_err_to_name(mqtt_ret));
 }
 
+static bool s_eth_connected = false;
+
+static bool is_eth_connected(void) { return s_eth_connected; }
+
 static void on_wifi_ready(void) { on_network_ready("WiFi"); }
-static void on_eth_ready(void)  { on_network_ready("Ethernet"); }
+
+static void on_eth_ready(void)
+{
+    s_eth_connected = true;
+    on_network_ready("Ethernet");
+}
 
 static void on_ip_lost(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
+    if (id == IP_EVENT_ETH_LOST_IP) s_eth_connected = false;
     led_status_set_network(false);
     web_server_stop();   /* free port 80 before wifi-bootstrap may restart the AP HTTP server */
 }
@@ -104,6 +119,15 @@ static void on_ip_lost(void *arg, esp_event_base_t base, int32_t id, void *data)
 static void on_wifi_ap(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     led_status_set_ap_mode(true);
+    /* WiFi AP mode means the provisioning stack has finished initialising and
+     * freed its temporary buffers.  If web_server_start() failed earlier due
+     * to an internal-DRAM shortage during WiFi init, retry now. */
+    if (s_web_server_start_failed) {
+        s_web_server_start_failed = false;
+        esp_err_t ret = web_server_start();
+        if (ret != ESP_OK)
+            ESP_LOGE(TAG, "Web server start (AP retry) failed: %s", esp_err_to_name(ret));
+    }
 }
 
 /* Called by wifi-bootstrap when user taps "Use Ethernet only". */
@@ -114,18 +138,6 @@ static void on_eth_only_requested(void)
 }
 
 /* ------------------------------------------------------------ app_main */
-
-/* Custom HTML injected at the bottom of the WiFi provisioning page. */
-static const char s_portal_extra[] =
-    "<div style='margin-top:1.5rem;border-top:1px solid #ccc;padding-top:1rem;"
-    "font-family:sans-serif;font-size:.9rem;color:#555;text-align:center'>"
-    "<p>Have an Ethernet cable? You can skip WiFi entirely.</p>"
-    "<a href='/eth-only' style='display:inline-block;padding:.4rem 1rem;"
-    "background:#1a73e8;color:#fff;border-radius:4px;text-decoration:none'>"
-    "Use Ethernet only &rarr;</a>"
-    "<p style='margin-top:.8rem;color:#999;font-size:.8rem'>"
-    "To return to WiFi setup: hold the BOOT button for &ge;&nbsp;5&nbsp;s.</p>"
-    "</div>";
 
 void app_main(void)
 {
@@ -163,8 +175,8 @@ void app_main(void)
 
     if (!eth_only) {
         /* Normal: WiFi provisioning + STA. */
-        wifi_config_set_custom_html((char *)s_portal_extra);
         wifi_config_set_eth_only_callback(on_eth_only_requested);
+        wifi_config_set_eth_available_fn(is_eth_connected);
         wifi_config_init("Waveshare (192.168.4.1)", NULL, on_wifi_ready);
 
         esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");

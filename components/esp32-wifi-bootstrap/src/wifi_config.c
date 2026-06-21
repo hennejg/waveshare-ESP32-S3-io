@@ -203,6 +203,9 @@ typedef enum {
 static void (*s_eth_only_cb)(void) = NULL;
 void wifi_config_set_eth_only_callback(void (*cb)(void)) { s_eth_only_cb = cb; }
 
+static bool (*s_eth_available_fn)(void) = NULL;
+void wifi_config_set_eth_available_fn(bool (*fn)(void)) { s_eth_available_fn = fn; }
+
 
 typedef struct {
         char *ssid_prefix;
@@ -418,6 +421,21 @@ static void wifi_config_server_on_settings(client_t *client) {
         }
 
         client_send_chunk(client, html_settings_footer);
+
+        if (s_eth_available_fn && s_eth_available_fn()) {
+                static const char eth_section[] =
+                        "<div style='margin-top:1.5rem;border-top:1px solid #ccc;padding-top:1rem;"
+                        "font-family:sans-serif;font-size:.9rem;color:#555;text-align:center'>"
+                        "<p>Ethernet is connected. You can skip WiFi entirely.</p>"
+                        "<a href='/eth-only' style='display:inline-block;padding:.4rem 1rem;"
+                        "background:#1a73e8;color:#fff;border-radius:4px;text-decoration:none'>"
+                        "ETH only &mdash; disable WiFi &rarr;</a>"
+                        "<p style='margin-top:.8rem;color:#999;font-size:.8rem'>"
+                        "To return to WiFi setup: hold the BOOT button for &ge;&nbsp;5&nbsp;s.</p>"
+                        "</div>";
+                client_send_chunk(client, eth_section);
+        }
+
         client_send_chunk(client, "");
 }
 
@@ -683,7 +701,9 @@ static void http_task(void *arg) {
         struct sockaddr_in serv_addr;
         memset(&serv_addr, 0, sizeof(serv_addr));
         serv_addr.sin_family = AF_INET;
-        serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        /* Bind only to the AP interface IP so that web_server.c (on the ETH
+         * interface) can hold INADDR_ANY:80 simultaneously. */
+        serv_addr.sin_addr.s_addr = inet_addr("192.168.4.1");
         serv_addr.sin_port = htons(WIFI_CONFIG_SERVER_PORT);
 
         if (bind(listenfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
