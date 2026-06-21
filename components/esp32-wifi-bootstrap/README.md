@@ -22,6 +22,21 @@ ESP32 WiFi Bootstrap makes network provisioning seamless. Whether you're deployi
 - Fully compatible with **ESP-IDF 5.4+**    
 
 
+## Captive portal compatibility
+
+The automatic "Sign in to network" notification depends on the OS and its network monitor implementation.
+
+| Platform | Behaviour |
+|---|---|
+| **iOS / macOS** | Works automatically. CNA probes `http://captive.apple.com/hotspot-detect.html`; a 302 redirect triggers the notification. |
+| **Android (AOSP, most OEMs, Android ≤ 12)** | Works automatically when HTTP fallback is active. The OS probes `http://connectivitycheck.gstatic.com/generate_204`; a 302 redirect triggers the notification. |
+| **Samsung Android 16 (One UI 8)** | **Does not work automatically.** NetworkMonitor sends only an HTTPS probe to `connectivitycheck.gstatic.com`. Because the TLS handshake fails against our self-signed certificate (Android's CA store does not trust it), the OS classifies the network as *no internet* rather than *captive portal*, and no notification is shown. DHCP option 114 (RFC 8910) is also ignored. |
+
+### Workaround for Samsung Android 16 and similar
+
+The provisioning AP SSID includes the gateway IP (`Waveshare (192.168.4.1)-XXXXXX` by default). After connecting, the user opens any browser and navigates to **http://192.168.4.1** — the DNS server redirects every hostname to the portal, so any URL works.
+
+
 
 ## Example App
 

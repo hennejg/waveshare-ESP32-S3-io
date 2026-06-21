@@ -42,7 +42,6 @@
 #include <nvs.h>
 
 #include <http_parser.h>
-
 #include "wifi_config.h"
 #include "form_urlencoded.h"
 
@@ -294,8 +293,11 @@ static void client_send_chunk(client_t *client, const char *payload) {
 
 static void client_send_redirect(client_t *client, int code, const char *redirect_url) {
         DEBUG("Redirecting to %s", redirect_url);
+        const char *reason = (code == 301) ? "Moved Permanently" : "Found";
         char buffer[128];
-        size_t len = snprintf(buffer, sizeof(buffer), "HTTP/1.1 %d \r\nLocation: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", code, redirect_url);
+        size_t len = snprintf(buffer, sizeof(buffer),
+                "HTTP/1.1 %d %s\r\nLocation: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                code, reason, redirect_url);
         client_send(client, buffer, len);
 }
 
@@ -503,8 +505,8 @@ static int wifi_config_server_on_message_complete(http_parser *parser) {
 
         switch(client->endpoint) {
         case ENDPOINT_INDEX: {
-                DEBUG("GET / -> redirecting to /settings");
-                client_send_redirect(client, 301, "/settings");
+                INFO("GET / -> 302 http://192.168.4.1/settings");
+                client_send_redirect(client, 302, "http://192.168.4.1/settings");
                 break;
         }
         case ENDPOINT_SETTINGS: {
@@ -536,7 +538,7 @@ static int wifi_config_server_on_message_complete(http_parser *parser) {
                 break;
         }
         case ENDPOINT_UNKNOWN: {
-                DEBUG("Unknown endpoint -> redirecting to http://192.168.4.1/settings");
+                INFO("Captive portal probe -> 302 http://192.168.4.1/settings");
                 client_send_redirect(client, 302, "http://192.168.4.1/settings");
                 break;
         }
@@ -548,12 +550,111 @@ static int wifi_config_server_on_message_complete(http_parser *parser) {
                 client->body_length = 0;
         }
 
+        client->disconnected = true;   /* signal read loop to exit after response is sent */
+
         return 0;
 }
 
 
+/* Direct GET handler — bypasses http_parser entirely for GET requests.
+ * Returns true if the request was handled (connection should close).
+ * http_parser state machine proved unreliable for Android's Connection:close
+ * GET probes, so we route GET requests with a simple inline parser. */
+static bool handle_get_request(client_t *client, const char *data, int len) {
+        /* Require complete headers (\r\n\r\n) and a GET request line */
+        bool eoh = false;
+        for (int i = 0; i <= len - 4; i++) {
+                if (data[i]=='\r' && data[i+1]=='\n' && data[i+2]=='\r' && data[i+3]=='\n') {
+                        eoh = true;
+                        break;
+                }
+        }
+        if (!eoh || len < 5 || memcmp(data, "GET ", 4) != 0)
+                return false;
+
+        const char *url_start = data + 4;
+        const char *url_end = (const char *)memchr(url_start, ' ', len - 4);
+        if (!url_end)
+                return false;
+
+        int ulen = url_end - url_start;
+        char url[64];
+        if (ulen >= (int)sizeof(url))
+                ulen = sizeof(url) - 1;
+        memcpy(url, url_start, ulen);
+        url[ulen] = '\0';
+
+        if (strcmp(url, "/settings") == 0) {
+                INFO("GET /settings");
+                wifi_config_server_on_settings(client);
+        } else if (strcmp(url, "/eth-only") == 0) {
+                static const char html[] =
+                        "HTTP/1.1 200 \r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
+                        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                        "<title>Ethernet-only mode</title></head>"
+                        "<body style='font-family:sans-serif;text-align:center;padding:2rem'>"
+                        "<h2>Switching to Ethernet-only mode</h2>"
+                        "<p>Rebooting now &mdash; connect via Ethernet cable.</p>"
+                        "<p style='color:#888;font-size:.85rem'>"
+                        "To return to WiFi setup: hold the BOOT button for &ge;&nbsp;5&nbsp;s.</p>"
+                        "</body></html>";
+                write(client->fd, html, sizeof(html) - 1);
+                if (s_eth_only_cb) s_eth_only_cb();
+                vTaskDelay(pdMS_TO_TICKS(400));
+                esp_restart();
+        } else if (strcmp(url, "/captive-portal") == 0) {
+                /* RFC 8910 Captive Portal API endpoint — advertised via DHCP option 114.
+                 * RFC 8910 clients probe this with Accept: application/captive+json.
+                 * NOTE: tested Samsung Android 16 (SM-G990B2 / One UI 8) does NOT probe
+                 * this endpoint even when option 114 is present in the DHCP offer. */
+                INFO("GET /captive-portal -> RFC 8910 response");
+                static const char capport_resp[] =
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/captive+json\r\n"
+                        "Content-Length: 64\r\n"
+                        "Cache-Control: no-store\r\n"
+                        "Connection: close\r\n\r\n"
+                        "{\"captive\":true,\"user-portal-url\":\"http://192.168.4.1/settings\"}";
+                write(client->fd, capport_resp, sizeof(capport_resp) - 1);
+        } else {
+                /* Redirect everything else to the settings page.  This covers:
+                 *   - AOSP Android: GET /generate_204  Host: connectivitycheck.gstatic.com
+                 *   - iOS/macOS:    GET /hotspot-detect.html  Host: captive.apple.com
+                 *   - Windows:      GET /ncsi.txt  Host: www.msftncsi.com
+                 * All receive a 302 redirect; a non-204 response signals captive portal
+                 * to these OS network monitors.
+                 *
+                 * KNOWN LIMITATION — Samsung Android 16 (One UI 8):
+                 *   NetworkMonitor sends only an HTTPS probe to connectivitycheck.gstatic.com.
+                 *   When that probe fails (TLS alert — untrusted self-signed cert), the OS
+                 *   marks the network NO_INTERNET rather than CAPTIVE_PORTAL and never shows
+                 *   the "Sign in to network" notification.  No HTTP fallback is issued.
+                 *   Users must open a browser manually and navigate to http://192.168.4.1. */
+                if (strcmp(url, "/generate_204") == 0 ||
+                    strcmp(url, "/hotspot-detect.html") == 0 ||
+                    strcmp(url, "/ncsi.txt") == 0 ||
+                    strcmp(url, "/canonical.html") == 0) {
+                        INFO("GET %s -> captive portal probe, 302 to settings", url);
+                } else {
+                        INFO("GET %s -> 302 http://192.168.4.1/settings", url);
+                }
+                client_send_redirect(client, 302, "http://192.168.4.1/settings");
+        }
+
+        client->disconnected = true;
+        return true;
+}
+
+/* Return 1 for GET requests so http_parser sets F_SKIPBODY — kept as a
+ * belt-and-suspenders fallback in case handle_get_request ever misses. */
+static int wifi_config_server_on_headers_complete(http_parser *parser) {
+        return (parser->method == HTTP_GET) ? 1 : 0;
+}
+
 static http_parser_settings wifi_config_http_parser_settings = {
         .on_url = wifi_config_server_on_url,
+        .on_headers_complete = wifi_config_server_on_headers_complete,
         .on_body = wifi_config_server_on_body,
         .on_message_complete = wifi_config_server_on_message_complete,
 };
@@ -562,149 +663,89 @@ static http_parser_settings wifi_config_http_parser_settings = {
 static void http_task(void *arg) {
         INFO("Starting HTTP server");
 
-        struct sockaddr_in serv_addr;
         int listenfd = socket(AF_INET, SOCK_STREAM, 0);
-        memset(&serv_addr, '0', sizeof(serv_addr));
+        if (listenfd < 0) {
+                ERROR("HTTP socket() failed");
+                vTaskDelete(NULL);
+                return;
+        }
+
+        const int reuse = 1;
+        setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+        /* 1-second accept() timeout — allows periodic stop-notification checks.
+         * Deliberately NOT using O_NONBLOCK: accepted sockets inherit the flag in
+         * lwIP and then SO_RCVTIMEO is ignored (non-blocking wins), which causes
+         * lwip_read to return EAGAIN before Android's HTTP GET arrives. */
+        const struct timeval accept_to = { 1, 0 };
+        setsockopt(listenfd, SOL_SOCKET, SO_RCVTIMEO, &accept_to, sizeof(accept_to));
+
+        struct sockaddr_in serv_addr;
+        memset(&serv_addr, 0, sizeof(serv_addr));
         serv_addr.sin_family = AF_INET;
         serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
         serv_addr.sin_port = htons(WIFI_CONFIG_SERVER_PORT);
-        int flags;
-        if ((flags = lwip_fcntl(listenfd, F_GETFL, 0)) < 0) {
-                ERROR("Failed to get HTTP socket flags");
-                lwip_close(listenfd);
-                vTaskDelete(NULL);
-                return;
-        };
-        if (lwip_fcntl(listenfd, F_SETFL, flags | O_NONBLOCK) < 0) {
-                ERROR("Failed to set HTTP socket flags");
+
+        if (bind(listenfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+                ERROR("HTTP bind() failed — port %d in use?", WIFI_CONFIG_SERVER_PORT);
                 lwip_close(listenfd);
                 vTaskDelete(NULL);
                 return;
         }
-        bind(listenfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr));
-        listen(listenfd, 2);
+        if (listen(listenfd, 4) < 0) {
+                ERROR("HTTP listen() failed");
+                lwip_close(listenfd);
+                vTaskDelete(NULL);
+                return;
+        }
 
-        client_t *clients = NULL;
+        char data[256];
 
-        fd_set fds;
-        int max_fd = listenfd;
-
-        FD_SET(listenfd, &fds);
-
-        char data[64];
-
-        bool running = true;
-        while (running) {
+        while (true) {
                 uint32_t task_value = 0;
-                if (xTaskNotifyWait(0, 1, &task_value, 0) == pdTRUE) {
-                        if (task_value) {
-                                running = false;
+                if (xTaskNotifyWait(0, 1, &task_value, 0) == pdTRUE && task_value)
+                        break;
+
+                int fd = accept(listenfd, NULL, NULL);
+                if (fd < 0)
+                        continue;   /* timeout (EAGAIN) or error — recheck stop notification */
+
+                INFO("HTTP: client connected, fd=%d", fd);
+
+                const struct timeval client_to = { 5, 0 };
+                setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &client_to, sizeof(client_to));
+
+                client_t *client = client_new();
+                client->fd = fd;
+
+                while (true) {
+                        int len = lwip_read(fd, data, sizeof(data) - 1);
+                        if (len > 0) {
+                                data[len] = '\0';
+                                INFO("HTTP rx fd=%d len=%d [%.*s]", fd, len, len, data);
+                                if (!client->disconnected) {
+                                        if (!handle_get_request(client, data, len)) {
+                                                /* Not a complete GET — run http_parser (handles POST body) */
+                                                size_t nparsed = http_parser_execute(&client->parser, &wifi_config_http_parser_settings, data, len);
+                                                if ((int)nparsed != len || HTTP_PARSER_ERRNO(&client->parser) != HPE_OK)
+                                                        INFO("HTTP parser: consumed %d/%d errno=%s", (int)nparsed, len,
+                                                             http_errno_name(HTTP_PARSER_ERRNO(&client->parser)));
+                                        }
+                                }
+                                if (client->disconnected)
+                                        break;
+                        } else {
+                                /* len==0: client closed (ACKed our response); len<0: timeout/error */
+                                INFO("HTTP rx fd=%d close len=%d errno=%d", fd, len, errno);
                                 break;
                         }
                 }
 
-                fd_set read_fds;
-                memcpy(&read_fds, &fds, sizeof(read_fds));
-
-                struct timeval timeout = { 1, 0 }; // 1 second timeout
-                int triggered_nfds = lwip_select(max_fd + 1, &read_fds, NULL, NULL, &timeout);
-
-                if (triggered_nfds <= 0)
-                        continue;
-
-                if (FD_ISSET(listenfd, &read_fds)) {
-                        int fd = accept(listenfd, (struct sockaddr *)NULL, (socklen_t *)NULL);
-                        if (fd > 0) {
-                                const struct timeval timeout = { 2, 0 }; /* 2 second timeout */
-                                setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-
-                                const int yes = 1; /* enable sending keepalive probes for socket */
-                                setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
-
-                                const int interval = 5; /* 30 sec between probes */
-                                setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
-
-                                const int maxpkt = 4; /* Drop connection after 4 probes without response */
-                                setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &maxpkt, sizeof(maxpkt));
-
-                                client_t *client = client_new();
-                                client->fd = fd;
-                                client->next = clients;
-
-                                clients = client;
-
-                                FD_SET(fd, &fds);
-                                if (fd > max_fd)
-                                        max_fd = fd;
-                        }
-
-                        triggered_nfds--;
-                }
-
-                client_t *c = clients;
-                while (c && triggered_nfds) {
-                        if (FD_ISSET(c->fd, &read_fds)) {
-                                triggered_nfds--;
-
-                                int data_len = lwip_read(c->fd, data, sizeof(data));
-                                if (data_len <= 0) {
-                                        DEBUG("Client %d disconnected", c->fd);
-                                        c->disconnected = true;
-                                } else {
-                                        DEBUG("Client %d got %d incomming data", c->fd, data_len);
-                                        http_parser_execute(
-                                                &c->parser, &wifi_config_http_parser_settings,
-                                                data, data_len
-                                                );
-                                }
-                        }
-
-                        c = c->next;
-                }
-
-                while (clients && clients->disconnected) {
-                        c = clients;
-                        clients = clients->next;
-
-                        FD_CLR(c->fd, &fds);
-                        lwip_close(c->fd);
-                        client_free(c);
-                }
-                if (clients) {
-                        c = clients;
-
-                        max_fd = listenfd;
-                        if (c->fd > max_fd)
-                                max_fd = c->fd;
-
-                        while (c->next) {
-                                if (c->next->fd > max_fd)
-                                        max_fd = c->next->fd;
-
-                                if (c->next->disconnected) {
-                                        client_t *tmp = c->next;
-                                        c->next = tmp->next;
-
-                                        FD_CLR(tmp->fd, &fds);
-                                        lwip_close(tmp->fd);
-                                        client_free(tmp);
-                                } else {
-                                        c = c->next;
-                                }
-                        }
-                }
+                lwip_close(fd);
+                client_free(client);
         }
 
         INFO("Stopping HTTP server");
-
-        while (clients) {
-                client_t *c = clients;
-                clients = c->next;
-
-                lwip_close(c->fd);
-                client_free(c);
-        }
-
         lwip_close(listenfd);
         vTaskDelete(NULL);
 }
@@ -720,6 +761,7 @@ static void http_stop() {
                 return;
 
         xTaskNotify(context->http_task_handle, 1, eSetValueWithOverwrite);
+        context->http_task_handle = NULL;
 }
 
 
@@ -732,12 +774,22 @@ static void dns_task(void *arg)
 
         struct sockaddr_in serv_addr;
         int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (fd < 0) {
+                ERROR("DNS socket() failed");
+                vTaskDelete(NULL);
+                return;
+        }
 
-        memset(&serv_addr, '0', sizeof(serv_addr));
+        memset(&serv_addr, 0, sizeof(serv_addr));
         serv_addr.sin_family = AF_INET;
         serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
         serv_addr.sin_port = htons(53);
-        bind(fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr));
+        if (bind(fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
+                ERROR("DNS bind() failed — port 53 in use?");
+                lwip_close(fd);
+                vTaskDelete(NULL);
+                return;
+        }
 
         const struct timeval timeout = { 2, 0 }; /* 2 second timeout */
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
@@ -752,42 +804,67 @@ static void dns_task(void *arg)
                 /* Drop messages that are too small or too large to build a valid response */
                 if (count > 12 && count <= sizeof(buffer) - 16 && src_addr.sa_family == AF_INET) {
                         size_t qname_len = strlen(buffer + 12) + 1;
-                        uint32_t reply_len = 2 + 10 + qname_len + 16 + 4;
+
+                        /* Read QTYPE before overwriting the buffer */
+                        uint8_t qtype_hi = (uint8_t)buffer[12 + qname_len];
+                        uint8_t qtype_lo = (uint8_t)buffer[12 + qname_len + 1];
+                        /* Answer with an A record for A (0x0001) and ANY (0x00FF) queries */
+                        int send_a = (qtype_hi == 0x00 && (qtype_lo == 0x01 || qtype_lo == 0xFF));
 
                         char *head = buffer + 2;
-                        *head++ = 0x80; // Flags
+                        /* QR=1, copy RD from query, AA/TC=0 */
+                        *head++ = (char)(0x80 | (buffer[2] & 0x01));
+                        /* RA=1, RCODE=0 */
+                        *head++ = (char)0x80;
+                        *head++ = 0x00; /* QDCOUNT = 1 */
+                        *head++ = 0x01;
+                        *head++ = 0x00; /* ANCOUNT */
+                        *head++ = send_a ? 0x01 : 0x00;
+                        *head++ = 0x00; /* NSCOUNT = 0 */
                         *head++ = 0x00;
-                        *head++ = 0x00; // Q count
-                        *head++ = 0x01;
-                        *head++ = 0x00; // A count
-                        *head++ = 0x01;
-                        *head++ = 0x00; // Auth count
+                        *head++ = 0x00; /* ARCOUNT = 0 */
                         *head++ = 0x00;
-                        *head++ = 0x00; // Add count
-                        *head++ = 0x00;
-                        head += qname_len;
-                        *head++ = 0x00; // Q type
+                        head += qname_len; /* skip QNAME (kept verbatim) */
+                        /* Echo original QTYPE and QCLASS in the question section */
+                        *head++ = qtype_hi;
+                        *head++ = qtype_lo;
+                        *head++ = 0x00; /* QCLASS IN */
                         *head++ = 0x01;
-                        *head++ = 0x00; // Q class
-                        *head++ = 0x01;
-                        *head++ = 0xC0; // LBL offs
-                        *head++ = 0x0C;
-                        *head++ = 0x00; // Type
-                        *head++ = 0x01;
-                        *head++ = 0x00; // Class
-                        *head++ = 0x01;
-                        *head++ = 0x00; // TTL
-                        *head++ = 0x00;
-                        *head++ = 0x00;
-                        *head++ = 0x78;
-                        *head++ = 0x00; // RD len
-                        *head++ = 0x04;
-                        *head++ = ip4_addr1(&server_addr);
-                        *head++ = ip4_addr2(&server_addr);
-                        *head++ = ip4_addr3(&server_addr);
-                        *head++ = ip4_addr4(&server_addr);
 
-                        INFO("Got DNS query, sending response");
+                        uint32_t reply_len = 2 + 10 + qname_len + 4;
+
+                        if (send_a) {
+                                *head++ = 0xC0; /* name = pointer to offset 12 */
+                                *head++ = 0x0C;
+                                *head++ = 0x00; /* TYPE A */
+                                *head++ = 0x01;
+                                *head++ = 0x00; /* CLASS IN */
+                                *head++ = 0x01;
+                                *head++ = 0x00; /* TTL = 120 s */
+                                *head++ = 0x00;
+                                *head++ = 0x00;
+                                *head++ = 0x78;
+                                *head++ = 0x00; /* RDLENGTH = 4 */
+                                *head++ = 0x04;
+                                *head++ = ip4_addr1(&server_addr);
+                                *head++ = ip4_addr2(&server_addr);
+                                *head++ = ip4_addr3(&server_addr);
+                                *head++ = ip4_addr4(&server_addr);
+                                reply_len += 16;
+                        }
+
+                        /* Decode DNS label-encoded QNAME for diagnostics */
+                        char domain[128] = "";
+                        const char *p = buffer + 12;
+                        int dlen = 0;
+                        while (*p && dlen < (int)sizeof(domain) - 2) {
+                                int llen = (unsigned char)*p++;
+                                if (dlen) domain[dlen++] = '.';
+                                while (llen-- && dlen < (int)sizeof(domain) - 1)
+                                        domain[dlen++] = *p++;
+                        }
+                        domain[dlen] = '\0';
+                        INFO("DNS query: %s type=0x%02X -> %s", domain, qtype_lo, send_a ? "A 192.168.4.1" : "NOERROR/empty");
                         sendto(fd, buffer, reply_len, 0, &src_addr, src_addr_len);
                 }
 
@@ -816,6 +893,7 @@ static void dns_stop() {
                 return;
 
         xTaskNotify(context->dns_task_handle, 1, eSetValueWithOverwrite);
+        context->dns_task_handle = NULL;
 }
 
 
@@ -847,6 +925,24 @@ static void wifi_config_softap_start() {
         DEBUG("Starting AP SSID=%s", ap_cfg.ap.ssid);
 
         sdk_wifi_softap_set_config(&ap_cfg);
+
+        /* DHCP option 114 (RFC 8910): advertise the captive portal API URI.
+         * Clients that implement RFC 8910 will probe this URL with
+         * Accept: application/captive+json instead of using HTTPS connectivity checks.
+         * NOTE: Samsung Android 16 (One UI 8) ignores this option entirely. */
+        esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+        INFO("AP netif handle: %p", (void *)ap_netif);
+        if (ap_netif) {
+                static const char portal_uri[] = "http://192.168.4.1/captive-portal";
+                esp_err_t err;
+                err = esp_netif_dhcps_stop(ap_netif);
+                INFO("DHCP stop: %s", esp_err_to_name(err));
+                err = esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET,
+                        ESP_NETIF_CAPTIVEPORTAL_URI, (void *)portal_uri, sizeof(portal_uri) - 1);
+                INFO("DHCP captive portal option set: %s (uri=%s)", esp_err_to_name(err), portal_uri);
+                err = esp_netif_dhcps_start(ap_netif);
+                INFO("DHCP start: %s", esp_err_to_name(err));
+        }
 
         wifi_networks_mutex = xSemaphoreCreateBinary();
         xSemaphoreGive(wifi_networks_mutex);

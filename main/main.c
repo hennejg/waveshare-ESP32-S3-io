@@ -98,6 +98,7 @@ static void on_eth_ready(void)  { on_network_ready("Ethernet"); }
 static void on_ip_lost(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     led_status_set_network(false);
+    web_server_stop();   /* free port 80 before wifi-bootstrap may restart the AP HTTP server */
 }
 
 static void on_wifi_ap(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -164,7 +165,7 @@ void app_main(void)
         /* Normal: WiFi provisioning + STA. */
         wifi_config_set_custom_html((char *)s_portal_extra);
         wifi_config_set_eth_only_callback(on_eth_only_requested);
-        wifi_config_init("Waveshare-Setup", NULL, on_wifi_ready);
+        wifi_config_init("Waveshare (192.168.4.1)", NULL, on_wifi_ready);
 
         esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
         if (sta) esp_netif_set_hostname(sta, app_config_get()->device_name);
