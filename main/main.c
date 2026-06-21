@@ -76,18 +76,13 @@ static void on_mqtt_publish(void) { led_status_flash_tx(); }
 
 /* ------------------------------------------------- network callbacks */
 
-static bool s_web_server_start_failed = false;
-
 static void on_network_ready(const char *iface)
 {
     ESP_LOGI(TAG, "%s connected — starting services", iface);
     led_status_set_network(true);
     esp_err_t ws_ret = web_server_start();
-    if (ws_ret != ESP_OK) {
-        ESP_LOGW(TAG, "Web server start failed (%s) — will retry when WiFi AP mode starts",
-                 esp_err_to_name(ws_ret));
-        s_web_server_start_failed = true;
-    }
+    if (ws_ret != ESP_OK)
+        ESP_LOGW(TAG, "Web server start failed: %s", esp_err_to_name(ws_ret));
     app_mqtt_set_connected_callback(on_mqtt_connected);
     app_mqtt_set_disconnected_callback(on_mqtt_disconnected);
     app_mqtt_set_msg_callback(on_mqtt_message);
@@ -119,15 +114,11 @@ static void on_ip_lost(void *arg, esp_event_base_t base, int32_t id, void *data)
 static void on_wifi_ap(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     led_status_set_ap_mode(true);
-    /* WiFi AP mode means the provisioning stack has finished initialising and
-     * freed its temporary buffers.  If web_server_start() failed earlier due
-     * to an internal-DRAM shortage during WiFi init, retry now. */
-    if (s_web_server_start_failed) {
-        s_web_server_start_failed = false;
-        esp_err_t ret = web_server_start();
-        if (ret != ESP_OK)
-            ESP_LOGE(TAG, "Web server start (AP retry) failed: %s", esp_err_to_name(ret));
-    }
+    /* wifi_config's captive-portal HTTP server binds to 192.168.4.1:80.
+     * web_server (INADDR_ANY:80) must yield port 80 first — otherwise the
+     * phone's captive-portal probe hits our auth wall instead of the portal.
+     * web_server restarts in on_wifi_ready once provisioning completes. */
+    web_server_stop();
 }
 
 /* Called by wifi-bootstrap when user taps "Use Ethernet only". */
