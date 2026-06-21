@@ -114,11 +114,10 @@ static void on_ip_lost(void *arg, esp_event_base_t base, int32_t id, void *data)
 static void on_wifi_ap(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     led_status_set_ap_mode(true);
-    /* wifi_config's captive-portal HTTP server binds to 192.168.4.1:80.
-     * web_server (INADDR_ANY:80) must yield port 80 first — otherwise the
-     * phone's captive-portal probe hits our auth wall instead of the portal.
-     * web_server restarts in on_wifi_ready once provisioning completes. */
-    web_server_stop();
+    /* web_server (INADDR_ANY:80) and wifi_config's captive-portal server
+     * (192.168.4.1:80) coexist: both sockets have SO_REUSEADDR, which lwIP
+     * allows (CONFIG_LWIP_SO_REUSE=y).  lwIP routes 192.168.4.1 connections
+     * to the specific binding and ETH-IP connections to the wildcard. */
 }
 
 /* Called by wifi-bootstrap when user taps "Use Ethernet only". */
