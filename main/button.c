@@ -70,5 +70,5 @@ static void button_task(void *arg)
 
 void button_init(void)
 {
-    xTaskCreate(button_task, "button", 2048, NULL, 5, NULL);
+    xTaskCreate(button_task, "button", 4096, NULL, 5, NULL);
 }

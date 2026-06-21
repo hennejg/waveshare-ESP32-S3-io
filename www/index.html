@@ -390,6 +390,11 @@
             document.getElementById('auth-err').textContent = 'Timed out. Try again.';
             showScreen('auth-no-pw');
             document.getElementById('auth-begin-btn').disabled = false;
+          } else if (d.status === 'idle') {
+            stopPolling();
+            document.getElementById('auth-err').textContent = 'Session lost — try again.';
+            showScreen('auth-no-pw');
+            document.getElementById('auth-begin-btn').disabled = false;
           } else {
             countdown--;
             document.getElementById('auth-countdown').textContent = Math.max(0, countdown);

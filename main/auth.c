@@ -132,7 +132,8 @@ static void on_blink(void *arg)
 
 esp_err_t auth_token_begin(char session_out[9])
 {
-    if (s_state == AUTH_TOK_WAITING) return ESP_ERR_INVALID_STATE;
+    if (s_state == AUTH_TOK_WAITING || s_state == AUTH_TOK_READY)
+        return ESP_ERR_INVALID_STATE;
 
     uint8_t rnd[20];
     esp_fill_random(rnd, sizeof(rnd));
