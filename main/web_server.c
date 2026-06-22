@@ -808,10 +808,11 @@ esp_err_t web_server_start(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn     = httpd_uri_match_wildcard;
     cfg.max_uri_handlers = 16;
-    /* Default (4096) fits within the ~7936 B largest contiguous internal DRAM
-     * block available at T≈12s when WiFi AP mode starts alongside Matter+BLE.
-     * File I/O buffers are heap-allocated (CHUNK_SIZE malloc), not stack. */
-    cfg.stack_size       = 4096;
+    /* Force the httpd task stack into PSRAM.  After BLE+Matter init, pvPortMalloc
+     * (INTERNAL-only, no PSRAM fallback) has only ~1.5 KB left — not enough for the
+     * 4096-byte default stack.  MALLOC_CAP_SPIRAM puts the stack in PSRAM while the
+     * TCB stays in INTERNAL (pvPortMalloc inside xTaskCreatePinnedToCoreWithCaps). */
+    cfg.task_caps        = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
     cfg.send_wait_timeout = 10;   /* seconds; default 5 is too tight with Matter on WiFi */
 
     esp_err_t ret = httpd_start(&s_server, &cfg);

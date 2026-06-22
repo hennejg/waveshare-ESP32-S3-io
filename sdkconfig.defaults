@@ -15,6 +15,17 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # WiFi
 CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
+# Reduce WiFi static TX buffer count from 16 (default) to 8.  Each static TX
+# buffer is ~1600 B allocated from DIRAM (MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA).
+# BLE controller falls back to the 32 KB DMA pool for its 4 KiB EMI region
+# (the DMA pool is untouched by WiFi TX buffers).
+# 6 buffers caused SoftAP auth frame drops (wifi:m f auth) under concurrent BLE.
+# 10 buffers exhausted the pvPortMalloc (INTERNAL-only) budget during NimBLE
+# host init, crashing at ble_gap_init() mutex creation.  8 is the compromise:
+# enough TX capacity to avoid auth drops, enough DRAM headroom for NimBLE —
+# especially when combined with CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y.
+# (Dynamic TX buffers are Kconfig-forbidden when SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y)
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8
 
 # Ethernet — enable built-in SPI Ethernet and W5500 driver
 CONFIG_ETH_USE_SPI_ETHERNET=y
@@ -59,10 +70,13 @@ CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT=20
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=10240
 CONFIG_CHIP_TASK_STACK_SIZE=15360
 CONFIG_BT_NIMBLE_TASK_STACK_SIZE=5120
-# NimBLE MSYS pools are forced to internal DRAM by default; with Matter
-# consuming most internal DRAM, the malloc for advertising data fails.
-# DEFAULT mode falls back to PSRAM when internal DRAM is exhausted.
-CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_DEFAULT=y
+# NimBLE host pool buffers (event queues, callouts, mutexes, semaphores) go to
+# PSRAM with EXTERNAL mode, freeing ~5-10 KiB of internal DRAM for FreeRTOS
+# Queue_t / Timer_t objects (pvPortMalloc = INTERNAL-only, no PSRAM fallback).
+# With SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y the INTERNAL budget is tight; EXTERNAL
+# mode is what gives 8 WiFi TX buffers enough headroom to coexist with BLE.
+# BLE controller uses bt_osi_mem_calloc_internal which ignores this setting.
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
 
 # mbedTLS BIGNUM/ECC workspace exhausts internal DRAM during NOC chain
 # verification (AddNOC step of Matter commissioning).  DEFAULT mode falls
@@ -77,6 +91,11 @@ CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 # Allow FreeRTOS tasks (httpd, mqtt, etc.) to allocate their stacks in PSRAM
 # when internal DRAM is exhausted.
 CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+# Move WiFi static RX buffers (~16 KB) and the lwIP pbuf pool to PSRAM.
+# Without this, those pools sit in internal DRAM and fragment it so severely
+# that the W5500 SPI driver can no longer allocate its ~1500-byte DMA bounce
+# buffers (MALLOC_CAP_INTERNAL|DMA) — causing continuous TX errors under load.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 
 # The on_wifi_ready callback runs in the FreeRTOS timer service task
 # (wifi-bootstrap fires it from a TimerHandle_t callback).  The default

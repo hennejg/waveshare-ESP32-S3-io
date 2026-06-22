@@ -1,4 +1,5 @@
 #include <nvs_flash.h>
+#include <esp_heap_caps.h>
 #include <nvs.h>
 #include <esp_log.h>
 #include <esp_netif.h>
@@ -192,9 +193,19 @@ void app_main(void)
      * (HTTP, MQTT) no longer stalls behind BLE slots. */
     esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
 
+    /* Diagnostic: show DMA-capable heap state before BLE controller init */
+    ESP_LOGI(TAG, "heap before matter_init: free=%u DMA_free=%u DMA_largest=%u",
+             esp_get_free_heap_size(),
+             heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+             heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+
     /* Matter — initialise after network interfaces so the event loop is ready */
     esp_err_t matter_ret = matter_init();
     if (matter_ret != ESP_OK)
         ESP_LOGW(TAG, "Matter init failed: %s", esp_err_to_name(matter_ret));
+    ESP_LOGI(TAG, "heap after matter_init: free=%u internal_free=%u internal_largest=%u",
+             esp_get_free_heap_size(),
+             heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 #endif
 }
