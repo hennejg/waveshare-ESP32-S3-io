@@ -5,3 +5,6 @@
 [submodule "esp-matter"]
 	path = esp-matter
 	url = https://github.com/espressif/esp-matter.git
+[submodule "components/quickjs/extern/quickjs"]
+	path = components/quickjs/extern/quickjs
+	url = https://github.com/bellard/quickjs.git

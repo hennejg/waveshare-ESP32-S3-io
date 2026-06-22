@@ -12,7 +12,7 @@ idf_component_register(
     INCLUDE_DIRS "."
     REQUIRES esp32-wifi-bootstrap nvs_flash spiffs esp_http_server esp_driver_gpio
              esp_netif esp_driver_i2c esp_driver_ledc esp_eth esp_driver_spi
-             esp_driver_twai esp_wifi esp_coex
+             esp_driver_twai esp_wifi esp_coex scripting
 )
 
 if(CONFIG_APP_MATTER_ENABLE)
