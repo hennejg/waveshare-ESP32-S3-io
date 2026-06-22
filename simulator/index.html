@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Rule Engine Simulator</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #12121e; --surface: #1a1a2e; --surface2: #16213e; --border: #0f3460;
+  --accent: #e94560; --green: #4caf50; --blue: #42a5f5; --warn: #ffa726;
+  --text: #e0e0e0; --text2: #aaaaaa; --text3: #555566;
+}
+body { font-family: system-ui, sans-serif; font-size: 14px; background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+header { padding: .45rem 1rem; background: var(--surface2); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: .8rem; flex-shrink: 0; }
+header h1 { font-size: .9rem; font-weight: 700; color: var(--accent); letter-spacing: .03em; }
+header .sub { font-size: .75rem; color: var(--text3); }
+.prefix-group { margin-left: auto; display: flex; align-items: center; gap: .4rem; font-size: .75rem; color: var(--text3); }
+.prefix-group input { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: .2rem .45rem; border-radius: 3px; width: 140px; font-size: .75rem; font-family: monospace; }
+
+.workspace { display: grid; grid-template-columns: 185px 1fr 265px; flex: 1; min-height: 0; }
+
+.panel { border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
+.panel:last-child { border-right: none; }
+.panel-hd { padding: .32rem .7rem; background: var(--surface2); font-size: .68rem; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; color: var(--accent); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+.panel-body { flex: 1; min-height: 0; overflow-y: auto; padding: .6rem; display: flex; flex-direction: column; gap: .45rem; }
+
+/* I/O panel */
+.io-group-label { font-size: .66rem; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; color: var(--text3); padding-bottom: .2rem; border-bottom: 1px solid var(--border); }
+.io-row { display: flex; align-items: center; gap: .45rem; padding: .12rem 0; }
+.io-lbl { width: 36px; font-size: .75rem; font-family: monospace; color: var(--text2); }
+.di-btn { padding: .18rem .5rem; font-size: .7rem; font-family: monospace; border-radius: 3px; border: 1px solid var(--border); background: var(--surface); color: var(--text3); cursor: pointer; min-width: 42px; text-align: center; transition: all .1s; }
+.di-btn:hover { border-color: var(--accent); color: var(--text); }
+.di-btn.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.do-led { width: 11px; height: 11px; border-radius: 50%; background: #222233; border: 2px solid #444; flex-shrink: 0; transition: all .15s; }
+.do-led.on { background: var(--green); border-color: #81c784; box-shadow: 0 0 5px var(--green); }
+.do-val { font-size: .7rem; font-family: monospace; color: var(--text3); }
+
+/* Editor panel */
+.script-ta { flex: 1; min-height: 100px; resize: none; background: #0c0c18; color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: .5rem; font-family: 'Cascadia Code', 'Fira Code', 'Menlo', monospace; font-size: .75rem; line-height: 1.55; tab-size: 2; }
+.script-ta:focus { outline: none; border-color: var(--accent); }
+.btn-row { display: flex; gap: .35rem; flex-wrap: wrap; flex-shrink: 0; }
+button { padding: .26rem .6rem; border-radius: 4px; border: none; cursor: pointer; font-size: .76rem; font-weight: 600; transition: all .1s; }
+.btn-p { background: var(--accent); color: #fff; }
+.btn-p:hover { background: #c73652; }
+.btn-s { background: var(--surface2); color: var(--text2); border: 1px solid var(--border); }
+.btn-s:hover { background: var(--border); color: var(--text); }
+
+.rules-display { flex-shrink: 0; }
+.rules-hd { font-size: .68rem; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; color: var(--text3); margin-bottom: .3rem; }
+.rule-entry { margin-bottom: .35rem; }
+.rule-name { font-size: .76rem; font-family: monospace; color: var(--text); display: flex; align-items: center; gap: .35rem; }
+.rbadge { width: 8px; height: 8px; border-radius: 50%; background: var(--text3); flex-shrink: 0; }
+.rbadge.fired { background: var(--green); }
+.fire-count { font-size: .65rem; color: var(--green); }
+.cond-row { font-size: .7rem; font-family: monospace; padding-left: .9rem; color: var(--text3); display: flex; align-items: center; gap: .3rem; line-height: 1.6; }
+.cok { color: var(--green); }
+.cfail { color: var(--accent); }
+.cunknown { color: var(--warn); }
+
+/* MQTT panel */
+.mqtt-form { display: flex; flex-direction: column; gap: .35rem; flex-shrink: 0; }
+.mqtt-form label { font-size: .7rem; color: var(--text3); }
+.mqtt-form input { background: #0c0c18; border: 1px solid var(--border); color: var(--text); padding: .26rem .45rem; border-radius: 3px; font-size: .76rem; font-family: monospace; width: 100%; }
+.mqtt-form input:focus { outline: none; border-color: var(--accent); }
+.presets { display: flex; flex-wrap: wrap; gap: .22rem; }
+.preset-btn { padding: .1rem .35rem; font-size: .68rem; background: var(--surface2); color: var(--text3); border: 1px solid var(--border); border-radius: 3px; cursor: pointer; font-family: monospace; }
+.preset-btn:hover { background: var(--border); color: var(--text); }
+.sep { border: none; border-top: 1px solid var(--border); flex-shrink: 0; }
+.msg-log { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
+.msg-row { display: flex; gap: .4rem; padding: .09rem .1rem; border-radius: 2px; font-family: monospace; font-size: .7rem; }
+.msg-row:hover { background: var(--surface2); }
+.msg-ts { color: var(--text3); flex-shrink: 0; }
+.msg-dir { flex-shrink: 0; width: 1.1em; }
+.msg-body { color: var(--text2); word-break: break-all; }
+.msg-in .msg-dir { color: var(--blue); }
+.msg-in .msg-body { color: var(--text); }
+.msg-do .msg-dir, .msg-do .msg-body { color: var(--green); }
+.msg-fire .msg-dir, .msg-fire .msg-body { color: var(--warn); }
+.msg-err .msg-dir, .msg-err .msg-body { color: var(--accent); }
+
+/* Console */
+.console { height: 150px; flex-shrink: 0; border-top: 2px solid var(--border); display: flex; flex-direction: column; }
+.console-hd { padding: .28rem .7rem; background: var(--surface2); font-size: .68rem; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; color: var(--accent); border-bottom: 1px solid var(--border); flex-shrink: 0; display: flex; align-items: center; gap: .6rem; }
+.console-body { flex: 1; overflow-y: auto; padding: .3rem .7rem; font-family: monospace; font-size: .7rem; line-height: 1.65; }
+.log-row { display: flex; gap: .45rem; }
+.log-ts { color: var(--text3); flex-shrink: 0; font-size: .66rem; padding-top: .1rem; }
+.log-tag { flex-shrink: 0; padding: .02rem .28rem; border-radius: 2px; font-size: .62rem; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; height: fit-content; margin-top: .08rem; }
+.tag-print { background: #1a3a1a; color: #81c784; }
+.tag-rule  { background: #3a2a10; color: var(--warn); }
+.tag-error { background: #3a1010; color: var(--accent); }
+.tag-info  { background: #102030; color: var(--blue); }
+.log-body { color: var(--text2); word-break: break-all; }
+.log-error .log-body { color: var(--accent); }
+.log-rule  .log-body { color: var(--warn); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Rule Engine Simulator</h1>
+  <span class="sub">DSL loaded live from firmware source · <span id="dsl-status" style="color:var(--warn)">loading…</span></span>
+  <div class="prefix-group">
+    MQTT prefix
+    <input id="topic-prefix" placeholder="(none)" title="Prepended to published topics">
+  </div>
+</header>
+
+<div class="workspace">
+
+  <!-- ── Left: I/O ── -->
+  <div class="panel">
+    <div class="panel-hd">Digital I/O</div>
+    <div class="panel-body">
+      <div class="io-group-label">Inputs (DI)</div>
+      <div id="di-panel"></div>
+      <div class="io-group-label" style="margin-top:.2rem">Outputs (DO)</div>
+      <div id="do-panel"></div>
+    </div>
+  </div>
+
+  <!-- ── Center: Script ── -->
+  <div class="panel">
+    <div class="panel-hd">Rule Script  <span style="font-size:.6rem;color:var(--text3);font-weight:400;text-transform:none;letter-spacing:0">Ctrl+Enter to apply</span></div>
+    <div class="panel-body">
+      <textarea id="script" class="script-ta" spellcheck="false"></textarea>
+      <div class="btn-row">
+        <button class="btn-p" onclick="applyRules()">Apply Rules</button>
+        <button class="btn-s" onclick="loadDemo()">Load Demo</button>
+        <button class="btn-s" onclick="clearAll()">Clear Log</button>
+      </div>
+      <div id="rules-display" class="rules-display"></div>
+    </div>
+  </div>
+
+  <!-- ── Right: MQTT ── -->
+  <div class="panel">
+    <div class="panel-hd">MQTT</div>
+    <div class="panel-body">
+      <div class="mqtt-form">
+        <label>Topic</label>
+        <input id="mqtt-topic" value="rules/trigger" placeholder="rules/trigger" onkeydown="if(event.key==='Enter')publishMQTT()">
+        <label>Payload</label>
+        <input id="mqtt-payload" value="ON" placeholder="ON" onkeydown="if(event.key==='Enter')publishMQTT()">
+        <div class="btn-row">
+          <button class="btn-p" onclick="publishMQTT()">Publish →</button>
+        </div>
+        <label>Quick presets</label>
+        <div class="presets" id="presets"></div>
+      </div>
+      <hr class="sep">
+      <div style="font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--accent);flex-shrink:0">Message log</div>
+      <div id="mqtt-log" class="msg-log"></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ── Console ── -->
+<div class="console">
+  <div class="console-hd">
+    Console
+    <button class="btn-s" style="font-size:.64rem;padding:.08rem .3rem" onclick="clearAll()">Clear</button>
+  </div>
+  <div id="console-body" class="console-body"></div>
+</div>
+
+<script>
+// ── Firmware DSL status (checked in DOMContentLoaded after dsl.js executes) ──
+
+// ── Hardware state ────────────────────────────────────────────────────────────
+var diState   = [false,false,false,false,false,false,false,false];
+var doutState = [false,false,false,false,false,false,false,false];
+
+// Bindings — called by DSL when rules fire
+function _di_get(ch)   { return !!diState[ch]; }
+function _dout_get(ch) { return !!doutState[ch]; }
+function _dout_set(ch, v) {
+  var was = doutState[ch];
+  doutState[ch] = !!v;
+  updateDO(ch);
+  if (was !== doutState[ch])
+    logMsg('do', '↑', 'DO' + ch + ' → ' + (doutState[ch] ? 'ON' : 'OFF'));
+}
+function print() {
+  logConsole('print', Array.prototype.slice.call(arguments).join(' '));
+}
+
+// ── Engine ────────────────────────────────────────────────────────────────────
+var firedCounts = {};
+
+function applyRules() {
+  var script = document.getElementById('script').value;
+  if (!script.trim()) { logConsole('error', 'Script is empty'); return; }
+
+  // Reset — mirrors EVT_RELOAD on the device. _reset_rules() also cancels any
+  // in-flight .after()/.heldFor() timers from the previous rule set.
+  if (typeof _reset_rules === 'function') _reset_rules(); else _rules = [];
+  firedCounts = {};
+  for (var i = 0; i < 8; i++) { doutState[i] = false; updateDO(i); }
+
+  try {
+    eval(script);
+    // Wrap actions to log firings without modifying the DSL
+    _rules.forEach(function(r) {
+      var orig = r.action;
+      r.action = function() {
+        firedCounts[r.name] = (firedCounts[r.name] || 0) + 1;
+        logMsg('fire', '✓', 'rule "' + r.name + '" fired');
+        logConsole('rule', '"' + r.name + '" fired');
+        orig.call(this);
+        renderRuleList();
+      };
+    });
+    logConsole('info', 'Applied: ' + _rules.length + ' rule(s) registered');
+    renderRuleList();
+  } catch(e) {
+    logConsole('error', 'Script error: ' + e.message);
+  }
+}
+
+function loadDemo() {
+  document.getElementById('script').value = DEMO_SCRIPT;
+  applyRules();
+}
+
+// ── UI helpers ────────────────────────────────────────────────────────────────
+function ts() { return new Date().toTimeString().slice(0, 8); }
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function logMsg(type, dir, body) {
+  var div = document.getElementById('mqtt-log');
+  var e = document.createElement('div');
+  e.className = 'msg-row msg-' + type;
+  e.innerHTML = '<span class="msg-ts">' + ts() + '</span>'
+    + '<span class="msg-dir">' + esc(dir) + '</span>'
+    + '<span class="msg-body">' + esc(body) + '</span>';
+  div.appendChild(e);
+  div.scrollTop = div.scrollHeight;
+}
+
+function logConsole(type, text) {
+  var div = document.getElementById('console-body');
+  var e = document.createElement('div');
+  e.className = 'log-row log-' + type;
+  var tags = { print:'PRINT', rule:'RULE', error:'ERROR', info:'INFO' };
+  e.innerHTML = '<span class="log-ts">' + ts() + '</span>'
+    + '<span class="log-tag tag-' + type + '">' + (tags[type] || type) + '</span>'
+    + '<span class="log-body">' + esc(text) + '</span>';
+  div.appendChild(e);
+  div.scrollTop = div.scrollHeight;
+}
+
+function clearAll() {
+  document.getElementById('console-body').innerHTML = '';
+  document.getElementById('mqtt-log').innerHTML = '';
+}
+
+function updateDO(ch) {
+  var led = document.getElementById('do-led-' + ch);
+  var lbl = document.getElementById('do-lbl-' + ch);
+  if (led) led.classList.toggle('on', !!doutState[ch]);
+  if (lbl) {
+    lbl.textContent = 'DO' + ch + (doutState[ch] ? ' ON' : ' OFF');
+    lbl.style.color = doutState[ch] ? 'var(--green)' : '';
+  }
+}
+
+function renderRuleList() {
+  var div = document.getElementById('rules-display');
+  if (!_rules || !_rules.length) {
+    div.innerHTML = '<div style="color:var(--text3);font-size:.73rem;margin-top:.25rem">No rules registered yet.</div>';
+    return;
+  }
+  var html = '<div class="rules-hd">Active rules (' + _rules.length + ')</div>';
+  _rules.forEach(function(r) {
+    var fc = firedCounts[r.name] || 0;
+    var timing = '';
+    if (r.heldFor) timing += ' <span class="cunknown">held ' + r.heldFor + 'ms' + (r._timer != null ? ' (arming…)' : '') + '</span>';
+    if (r.steps && r.steps.length > 1) timing += ' <span class="cunknown">+' + (r.steps.length - 1) + ' delayed</span>';
+    html += '<div class="rule-entry">'
+      + '<div class="rule-name"><span class="rbadge' + (fc ? ' fired' : '') + '"></span>'
+      + esc(r.name)
+      + (fc ? ' <span class="fire-count">fired ×' + fc + '</span>' : '')
+      + timing
+      + '</div>';
+
+    r.conditions.forEach(function(c) {
+      var ok = false;
+      try { ok = c._check(); } catch(e) {}
+      var desc, status;
+      if (c instanceof MqttCondition) {
+        desc = "mqtt('" + c.topic + "')" + (c._once ? '.once()' : '');
+        if (!c._seen) {
+          status = '<span class="cunknown">waiting for message</span>';
+        } else if (c._once) {
+          // edge condition: only momentarily true on arrival, so show last value, not ✓/✗
+          status = '<span class="cunknown">edge</span> last=' + esc(JSON.stringify(c.value));
+        } else {
+          status = (ok ? '<span class="cok">✓</span>' : '<span class="cfail">✗</span>')
+                 + ' value=' + esc(JSON.stringify(c.value));
+        }
+      } else if (c instanceof InputCondition) {
+        desc = 'input(' + c.channel + ').is(' + c._expected + ')';
+        status = (ok ? '<span class="cok">✓</span>' : '<span class="cfail">✗</span>')
+               + ' DI' + c.channel + '=' + (diState[c.channel] ? 'ON' : 'OFF');
+      } else {
+        desc = '(condition)';
+        status = ok ? '<span class="cok">✓</span>' : '<span class="cfail">✗</span>';
+      }
+      html += '<div class="cond-row">' + esc(desc) + '  ' + status + '</div>';
+    });
+
+    var allOk = r.conditions.length > 0 && r.conditions.every(function(c) {
+      try { return c._check(); } catch(e) { return false; }
+    });
+    html += '<div class="cond-row" style="padding-left:0;margin-top:.05rem">'
+      + (allOk ? '<span class="cok">→ all conditions met</span>' : '<span style="color:var(--text3)">→ waiting</span>')
+      + '</div>'
+      + '</div>';
+  });
+  div.innerHTML = html;
+}
+
+// ── MQTT simulation ───────────────────────────────────────────────────────────
+function publishMQTT() {
+  var topic   = document.getElementById('mqtt-topic').value.trim();
+  var payload = document.getElementById('mqtt-payload').value;
+  var prefix  = document.getElementById('topic-prefix').value.trim();
+  if (!topic) { logConsole('error', 'Topic is required'); return; }
+  var full = prefix ? prefix + topic : topic;
+  logMsg('in', '→', full + '  ' + payload);
+  if (!_rules || !_rules.length) { logConsole('error', 'No rules loaded — click Apply Rules first'); return; }
+  try { _on_mqtt(full, payload); } catch(e) { logConsole('error', e.message); }
+  renderRuleList();
+}
+
+// ── DI simulation ─────────────────────────────────────────────────────────────
+function toggleDI(ch) {
+  diState[ch] = !diState[ch];
+  var btn = document.getElementById('di-btn-' + ch);
+  btn.textContent = diState[ch] ? 'ON' : 'OFF';
+  btn.classList.toggle('on', diState[ch]);
+  logConsole('info', 'DI' + ch + ' → ' + (diState[ch] ? 'ON' : 'OFF'));
+  if (_rules && _rules.length) {
+    try { _on_input(ch, diState[ch]); } catch(e) { logConsole('error', e.message); }
+  }
+  renderRuleList();
+}
+
+// ── Demo script (mirrors main/main.c DEMO_SCRIPT) ─────────────────────────────
+var DEMO_SCRIPT = [
+  "// Fire when MQTT 'rules/trigger' = 'ON' AND digital input 0 is inactive.",
+  "// Try: publish  rules/trigger  ON  (use the MQTT panel →)",
+  "",
+  "var trig = mqtt('rules/trigger').is(function(m) { return m === 'ON'; });",
+  "",
+  "rule('demo')",
+  "  .when(trig, input(0).is(false))",
+  "  .then(function() {",
+  "    print('Demo rule fired! payload=' + trig.value);",
+  "    output(0).set(true);",
+  "  });"
+].join('\n');
+
+var PRESETS = [
+  { topic: 'rules/trigger', payload: 'ON'  },
+  { topic: 'rules/trigger', payload: 'OFF' },
+  { topic: 'rules/reset',   payload: '1'   },
+];
+
+// ── Init (called once dsl.js is confirmed loaded) ─────────────────────────────
+function init() {
+  var diPanel = document.getElementById('di-panel');
+  for (var i = 0; i < 8; i++) {
+    (function(ch) {
+      var row = document.createElement('div');
+      row.className = 'io-row';
+      row.innerHTML = '<span class="io-lbl">DI' + ch + '</span>'
+        + '<button class="di-btn" id="di-btn-' + ch + '" onclick="toggleDI(' + ch + ')">OFF</button>';
+      diPanel.appendChild(row);
+    })(i);
+  }
+
+  var doPanel = document.getElementById('do-panel');
+  for (var i = 0; i < 8; i++) {
+    var row = document.createElement('div');
+    row.className = 'io-row';
+    row.innerHTML = '<span class="io-lbl do-val" id="do-lbl-' + i + '">DO' + i + ' OFF</span>'
+      + '<div class="do-led" id="do-led-' + i + '"></div>';
+    doPanel.appendChild(row);
+  }
+
+  var presetsDiv = document.getElementById('presets');
+  PRESETS.forEach(function(p) {
+    var btn = document.createElement('button');
+    btn.className = 'preset-btn';
+    btn.textContent = p.topic + ' / ' + p.payload;
+    btn.onclick = function() {
+      document.getElementById('mqtt-topic').value = p.topic;
+      document.getElementById('mqtt-payload').value = p.payload;
+      publishMQTT();
+    };
+    presetsDiv.appendChild(btn);
+  });
+
+  document.getElementById('script').addEventListener('keydown', function(e) {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); applyRules(); }
+  });
+
+  document.getElementById('script').value = DEMO_SCRIPT;
+  renderRuleList();
+  logConsole('info', 'DSL loaded from firmware source. Click "Apply Rules" or press Ctrl+Enter.');
+  logConsole('info', 'Demo: keep DI0 OFF, publish rules/trigger = ON → DO0 should light up.');
+}
+
+// DOMContentLoaded runs after both this inline script AND dsl.js have executed
+// (dsl.js is a classic sync script placed after this block — see below).
+document.addEventListener('DOMContentLoaded', function() {
+  if (typeof _rules !== 'undefined' && typeof _on_mqtt !== 'undefined') {
+    document.getElementById('dsl-status').textContent = 'dsl.js loaded';
+    document.getElementById('dsl-status').style.color = 'var(--green)';
+    init();
+  } else {
+    document.getElementById('dsl-status').textContent = 'dsl.js failed to load — is the server running?';
+    document.getElementById('dsl-status').style.color = 'var(--accent)';
+    logConsole('error', 'Could not load /dsl.js. Run: cd simulator && npm start');
+  }
+});
+</script>
+
+<!--
+  DSL script comes AFTER the inline script so all simulator functions
+  (bindings, logConsole, etc.) are defined before dsl.js executes.
+  DOMContentLoaded above fires once both scripts have run.
+-->
+<script src="/dsl.js"></script>
+</body>
+</html>
