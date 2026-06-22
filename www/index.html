@@ -299,7 +299,7 @@
     <!-- ── Rules ── -->
     <div id="tab-rules" class="tab-pane">
       <h2>Automation Rules</h2>
-      <p class="hint">JavaScript rule script — changes are saved to the device and applied immediately without reboot. Leave empty and save to revert to the built-in demo.</p>
+      <p class="hint">JavaScript rule script — changes are saved to the device and applied immediately without reboot. Leave empty and save to revert to the built-in demo. See the <a href="https://github.com/hennejg/waveshare-ESP32-S3-io/blob/master/components/scripting/RULES.md" target="_blank" rel="noopener">rule language reference</a>.</p>
       <textarea id="rules-script" class="rules-editor" spellcheck="false" maxlength="3900"></textarea>
       <p id="rules-status"></p>
       <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.4rem">
@@ -321,6 +321,7 @@ rule('my-rule')
     output(0).set(true);      // set digital output 0
     print('fired!');          // logs to the ESP console
   });</pre>
+        <p style="font-size:.78rem;margin:.5rem 0 0"><a href="https://github.com/hennejg/waveshare-ESP32-S3-io/blob/master/components/scripting/RULES.md" target="_blank" rel="noopener">Full rule language reference ↗</a></p>
       </details>
     </div>
 

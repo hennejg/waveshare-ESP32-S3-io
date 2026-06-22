@@ -1,0 +1,454 @@
+# Rule Engine Language
+
+A small, declarative language for wiring digital inputs, digital outputs, and MQTT
+messages together into automation rules. Rules are written in JavaScript and
+evaluated once at startup; the engine then reacts to events (input changes, MQTT
+messages, timers) and runs the matching rules.
+
+The same language runs in two places:
+
+- **On the device** — inside the firmware's scripting runtime.
+- **In the browser simulator** (`simulator/`) — which loads the *live* engine source
+  (`components/scripting/dsl.js`) so what you test is what runs.
+
+The model is deliberately **Drools-like**: a rule has a *when* part (facts that must
+match) and a *then* part (what to do). A bare fact pattern matches by existence;
+adding constraints narrows it.
+
+---
+
+## Table of contents
+
+1. [Rule structure](#1-rule-structure)
+2. [Facts and helpers](#2-facts-and-helpers)
+   - [`input(ch)`](#inputch--digital-input)
+   - [`output(ch)`](#outputch--digital-output)
+   - [`mqtt(topic)`](#mqtttopic--mqtt-message)
+   - [How events reach rules (the fact model)](#how-events-reach-rules-the-fact-model)
+3. [Time-based rules](#3-time-based-rules)
+4. [Rule chaining](#4-rule-chaining)
+5. [Quick reference](#5-quick-reference)
+6. [Gotchas](#6-gotchas)
+
+---
+
+## 1. Rule structure
+
+Every rule has the same shape:
+
+```js
+rule(name)
+  .when(/* one or more conditions */)
+  .then(function () { /* action */ });
+```
+
+- **`rule(name)`** — starts a rule. `name` is a string used in logs and the
+  simulator's rule panel.
+- **`.when(...)`** — the conditions. **All of them must match** for the rule to fire
+  (logical AND). Conditions are facts (`input`, `mqtt`) or plain predicates.
+- **`.then(fn)`** — the action to run when the rule fires.
+
+### Minimal example
+
+```js
+// Edge action: when DI0 goes high, turn DO0 on (and leave it on).
+rule('DO0 on when DI0 goes high')
+  .when(input(0).isOn())
+  .then(function () {
+    output(0).on();
+  });
+```
+
+The rule above only ever turns DO0 *on* — it fires when DI0 becomes high and does
+nothing when DI0 goes low. If instead you want DO0 to **follow** DI0 exactly (a true
+mirror), gate on the **bare** input — which fires on every change of that input — and
+copy the level into the output:
+
+```js
+// Mirror: DO0 tracks DI0 in both directions.
+rule('DO0 mirrors DI0')
+  .when(input(0))                       // bare pattern → fires on any DI0 change
+  .then(function () {
+    output(0).set(input(0).value);      // DO0 := DI0
+  });
+```
+
+### Multiple conditions are AND-ed
+
+```js
+// Fire only when a trigger message arrives AND DI0 is off.
+var trig = mqtt('rules/trigger').is(function (m) { return m === 'ON'; });
+
+rule('guarded start')
+  .when(trig, input(0).isOff())
+  .then(function () {
+    output(0).on();
+  });
+```
+
+> **Tip — arrow functions.** The rule language is JavaScript, so predicates and actions
+> can use the shorter arrow syntax, which often reads better:
+> ```js
+> var trig = mqtt('rules/trigger').is(m => m === 'ON');
+>
+> rule('guarded start')
+>   .when(trig, input(0).isOff())
+>   .then(() => output(0).on());
+> ```
+> The examples here use `function () { … }` for clarity, but `=>` works anywhere a
+> function is accepted (`.is(...)`, `.when(...)` predicates, `.then(...)`).
+
+### OR — use a predicate, or two rules
+
+There is no `or()` combinator. Express OR either with a predicate function …
+
+```js
+rule('any door open')
+  .when(function () { return input(0).value || input(1).value; })
+  .then(function () { output(7).on(); });
+```
+
+A change on **either** `input(0)` or `input(1)` runs this rule — but for a subtle
+reason worth understanding: because the condition is a predicate function, the engine
+can't see which inputs it reads, so the rule is **wildcard** and re-evaluated on
+*every* event. That makes the OR work, at the cost of also running on unrelated events.
+For targeted dispatch, the two-rules form is leaner:
+
+```js
+rule('door 0 open').when(input(0).isOn()).then(function () { output(7).on(); });
+rule('door 1 open').when(input(1).isOn()).then(function () { output(7).on(); });
+```
+
+See [the fact model](#how-events-reach-rules-the-fact-model) for the wildcard trade-off.
+
+### Predicates and booleans in `when()`
+
+`when()` also accepts a plain function (used as a predicate) or a boolean constant:
+
+```js
+rule('complex gate')
+  .when(function () { return input(0).value && !output(1).value; })
+  .then(function () { output(1).on(); });
+```
+
+This fires when DI0 is high and DO1 is still low (so it latches DO1 on once). Because
+the condition is a predicate function, the rule is **wildcard**: it is re-evaluated on
+every event, and reads `input(0)`/`output(1)` live each time. See
+[the fact model](#how-events-reach-rules-the-fact-model) for the trade-off.
+
+---
+
+## 2. Facts and helpers
+
+There are three fact sources. `input` and `mqtt` are **conditions** (usable in
+`when()`); `output` is for **actions and reading state** in `then()`.
+
+> **Conditions are immutable.** `input()` / `mqtt()` build a *base pattern*, and every
+> constraint method (`.is()`, `.isOn()`, `.isOff()`, `.once()`) returns a **new**
+> narrowed pattern — the base is never mutated. This means you can safely branch a
+> base:
+> ```js
+> var di5 = input(5);
+> rule('on').when(di5.isOn()).then(...);   // independent
+> rule('off').when(di5.isOff()).then(...);  // independent
+> // di5 itself stays unconstrained, still usable for di5.value / di5.get()
+> ```
+
+### `input(ch)` — digital input
+
+`ch` is the channel number (0–7).
+
+| Form | Meaning |
+|------|---------|
+| `input(ch)` | **bare pattern** — always matches (a digital input always exists) |
+| `input(ch).is(bool)` | matches when the input equals `bool` |
+| `input(ch).isOn()` | alias for `.is(true)` |
+| `input(ch).isOff()` | alias for `.is(false)` |
+| `input(ch).value` | live level as a property (read in `then()`) |
+| `input(ch).get()` | live level as a method (same as `.value`) |
+
+```js
+// Gate on a specific level
+rule('start on DI2 high')
+  .when(input(2).isOn())
+  .then(function () { output(2).on(); });
+
+// Use a bare input as the trigger, read its value in the action
+var di3 = input(3);
+rule('copy DI3 inverted to DO3')
+  .when(di3)
+  .then(function () {
+    output(3).set(!di3.get());          // DO3 = NOT DI3
+  });
+```
+
+A **bare** `input(ch)` is always true — it is a *trigger/value source*, not a gate.
+To gate, add `.is(...)` / `.isOn()` / `.isOff()`.
+
+### `output(ch)` — digital output
+
+`output(ch)` returns an object for driving and reading an output. It is **not** a
+condition.
+
+| Method | Effect | Returns |
+|--------|--------|---------|
+| `output(ch).set(bool)` | set to `bool` | resulting level |
+| `output(ch).on()` | set high | resulting level (`true`) |
+| `output(ch).off()` | set low | resulting level (`false`) |
+| `output(ch).toggle()` | invert current level | resulting level |
+| `output(ch).get()` | read current level | level |
+| `output(ch).value` | read current level (property) | level |
+
+The mutators return the resulting level, which is handy for logging:
+
+```js
+rule('toggle DO0 on trigger')
+  .when(mqtt('rules/trigger').is(function (m) { return m === 'ON'; }))
+  .then(function () {
+    print('DO0 is now: ' + output(0).toggle());   // logs true/false
+  });
+```
+
+To **gate on an output's state**, wrap it in a predicate (an `output` object is not a
+condition):
+
+```js
+// CORRECT: read output state via a predicate
+rule('latch once')
+  .when(input(0).isOn(), function () { return !output(0).value; })
+  .then(function () { output(0).on(); });
+
+// WRONG: output(0) is a truthy object, so this always matches
+// rule('bad').when(output(0)).then(...)
+```
+
+### `mqtt(topic)` — MQTT message
+
+| Form | Meaning |
+|------|---------|
+| `mqtt(topic)` | matches once **any** message has arrived on `topic` (level/held) |
+| `mqtt(topic).is(fn)` | matches when `fn(payload)` is truthy |
+| `mqtt(topic).once()` | **edge** — matches only on each message arrival, not while held |
+| `mqtt(topic).value` | last received payload (read in `then()`) |
+
+`.is(fn)` receives the raw payload string:
+
+```js
+var trig = mqtt('rules/trigger').is(function (m) { return m === 'ON'; });
+
+rule('on command')
+  .when(trig)
+  .then(function () {
+    print('payload was: ' + trig.value);
+    output(0).on();
+  });
+```
+
+#### Level vs. edge
+
+By default an `mqtt` condition is **level-triggered**: once a matching message has
+arrived, the condition stays satisfied (it holds the last payload). The rule may then
+re-fire on later events while that payload still matches.
+
+`.once()` makes it **edge-triggered**: it is satisfied only during the evaluation pass
+caused by the message itself. Use it for "do this once per command":
+
+```js
+// Toggles DO0 exactly once per matching message, even if other inputs change
+rule('toggle per command')
+  .when(mqtt('rules/trigger').is(function (m) { return m === 'ON'; }).once(),
+        input(0).isOff())
+  .then(function () { output(0).toggle(); });
+```
+
+`.once()` is a true edge: if the rule's other conditions are not met at the instant the
+message arrives, the edge is **missed**, not queued.
+
+### How events reach rules (the fact model)
+
+Each `input(ch)` and each `mqtt(topic)` is a **distinct fact**. When something happens,
+the engine only re-evaluates the rules that reference the *changed* fact:
+
+- A change on **DI4** re-evaluates only rules whose conditions mention `input(4)`.
+  A rule gated on `input(7)` is **not** touched.
+- An **MQTT message** on `topic` re-evaluates only rules referencing `mqtt(topic)`.
+
+This is why toggling one input never accidentally fires a rule about another input.
+
+**Wildcard rules.** If a rule has an *opaque* condition — a predicate function, a bare
+value, or one that reads `output(n).value` — the engine cannot tell which facts it
+depends on, so the rule is treated as **wildcard** and re-evaluated on *every* event.
+Prefer `input()` / `mqtt()` conditions when you want the targeted behavior.
+
+**Outputs are readable, not event sources.** Setting an output does not emit an event,
+so a rule that reads an output's state only re-evaluates when some input/MQTT event (or
+its wildcard status) causes it to.
+
+---
+
+## 3. Time-based rules
+
+Two builder methods add timing. They are **different** and not interchangeable.
+
+| Method | Reads as | Semantics | If conditions break during the wait |
+|--------|----------|-----------|--------------------------------------|
+| `.heldFor(ms)` | "conditions held for `ms`, then …" | **sustained gate** (delay-on / debounce) | the pending fire is **cancelled** |
+| `.after(ms)` | "do this, then `ms` later do that" | **scheduled follow-up** (timeline delay) | the follow-up **still runs** (fire-and-forget) |
+
+### `.heldFor(ms)` — sustained gate / debounce
+
+Place it **before** `.then()`. The action fires only if the `when()` conditions stay
+true continuously for `ms` milliseconds. If they break first, the timer is cancelled.
+It fires **once per sustained period** (it re-arms after the conditions drop and rise
+again).
+
+```js
+// DO5 turns on only after DI5 has been high continuously for 5 seconds.
+rule('DI5 held 5s -> DO5 on')
+  .when(input(5).isOn())
+  .heldFor(5000)
+  .then(function () { output(5).on(); });
+
+// Pair it with a release rule:
+rule('DI5 off -> DO5 off')
+  .when(input(5).isOff())
+  .then(function () { output(5).off(); });
+```
+
+Typical uses: debouncing a noisy input, "long press" detection, delay-on timers.
+
+### `.after(ms)` — scheduled follow-up
+
+Place it **between** two `.then()` steps. The next step runs `ms` after the previous
+one, **regardless** of whether the conditions still hold. This is for pulses and
+sequences.
+
+```js
+// Pulse: DO4 on now, off 5 seconds later.
+rule('DI4 pulses DO4 for 5s')
+  .when(input(4).isOn())
+  .then(function () { output(4).on(); })
+  .after(5000)
+  .then(function () { output(4).off(); });
+```
+
+If DI4 drops within the 5 seconds, the `off` step **still runs** — that's the point of a
+fire-and-forget pulse (otherwise the output could latch on forever).
+
+---
+
+## 4. Rule chaining
+
+"Chaining" comes in two flavors: chaining **actions** within one rule, and composing
+**multiple rules** into a behavior.
+
+### Chaining actions (a timeline)
+
+`.then()` returns the rule, so you can keep chaining `.after(ms).then(...)` to build a
+timeline of steps. Step 0 runs immediately (or after `heldFor`); each subsequent step
+runs after its `.after()` delay relative to the previous one.
+
+```js
+// Blink DO6 three times (on/off/on/off/on/off), 200 ms apart.
+rule('blink DO6 thrice')
+  .when(mqtt('cmd/blink').once())
+  .then(function () { output(6).on();  })
+  .after(200).then(function () { output(6).off(); })
+  .after(200).then(function () { output(6).on();  })
+  .after(200).then(function () { output(6).off(); })
+  .after(200).then(function () { output(6).on();  })
+  .after(200).then(function () { output(6).off(); });
+```
+
+Each `.after(ms)` is relative to the previous step, so the steps above land at
+0 / 200 / 400 / 600 / 800 / 1000 ms.
+
+### Composing rules (a small state machine)
+
+Several rules sharing facts cooperate to implement behavior. This is the common way to
+build something stateful — each rule handles one transition.
+
+```js
+// A trigger topic that means ON/OFF, plus DI0 as a mode selector.
+var trig = mqtt('rules/trigger').is(function (m) { return m === 'ON'; });
+
+// ON + DI0 low  -> toggle DO0
+rule('toggle')
+  .when(trig, input(0).isOff())
+  .then(function () { print('toggle: ' + output(0).toggle()); });
+
+// ON + DI0 high -> copy DI1 into DO0 (latch from DI1)
+rule('latch from DI1')
+  .when(trig, input(0).isOn())
+  .then(function () { print('latch: ' + output(0).set(input(1).get())); });
+
+// OFF -> force DO0 off
+rule('turn off')
+  .when(mqtt('rules/trigger').is(function (m) { return m === 'OFF'; }))
+  .then(function () { output(0).off(); });
+```
+
+> **Chaining via state has limits.** Because outputs are not event sources (see the
+> [fact model](#how-events-reach-rules-the-fact-model)), one rule writing `output(n)`
+> will **not** automatically trigger another rule that reads it. To chain rules through
+> state, drive them off shared *inputs* or *MQTT* facts, or accept the wildcard
+> re-evaluation that comes with reading output state in a predicate.
+
+---
+
+## 5. Quick reference
+
+```js
+// ── Rule ──────────────────────────────────────────────────────────────────
+rule(name).when(cond, cond, …).then(fn)      // AND of conditions
+          .heldFor(ms).then(fn)              // fire after conditions held ms
+          .then(a).after(ms).then(b)         // a now, b ms later (timeline)
+
+// ── input(ch) — condition + live value ─────────────────────────────────────
+input(ch)                 // bare: always matches
+input(ch).is(bool)        // matches when level == bool
+input(ch).isOn()          // .is(true)
+input(ch).isOff()         // .is(false)
+input(ch).value           // live level (property)
+input(ch).get()           // live level (method)
+
+// ── output(ch) — action + state (NOT a condition) ──────────────────────────
+output(ch).set(bool)      // → resulting level
+output(ch).on()           // → true
+output(ch).off()          // → false
+output(ch).toggle()       // → resulting level
+output(ch).get()          // current level
+output(ch).value          // current level (property)
+
+// ── mqtt(topic) — condition + last payload ─────────────────────────────────
+mqtt(topic)               // matches once any message arrived (level/held)
+mqtt(topic).is(fn)        // matches when fn(payload) is truthy
+mqtt(topic).once()        // edge: matches only on each arrival
+mqtt(topic).value         // last payload
+
+// ── in then() bodies ───────────────────────────────────────────────────────
+print(…)                  // log to the console (args joined by space)
+```
+
+---
+
+## 6. Gotchas
+
+- **`when()` is AND-only.** Use a predicate function or multiple rules for OR.
+- **Bare `input(ch)` always matches** — it is a value source, not a gate. Add
+  `.is()/.isOn()/.isOff()` to gate.
+- **`output(ch)` is not a condition.** `.when(output(0))` always matches (truthy
+  object). Gate on output state with a predicate: `function () { return output(0).value; }`.
+- **`mqtt(topic)` is held by default.** Once a message arrives it stays matched; use
+  `.once()` for per-message edge behavior.
+- **`.heldFor()` vs `.after()`** are different: `heldFor` cancels if conditions drop;
+  `after` fires regardless. Don't swap them.
+- **Edges can be missed.** A `.once()` edge fires only if the rule's other conditions
+  are met at the instant the message arrives; it is not queued.
+- **Reload resets everything.** Reloading the rule set (device `EVT_RELOAD`, simulator
+  "Apply Rules") clears all rules and cancels any pending `.after()` / `.heldFor()`
+  timers.
+
+> **Simulator note:** the simulator loads the engine (`dsl.js`) once at page load.
+> Editing your *script* and clicking **Apply Rules** re-runs the script, but editing the
+> *engine* requires a full **page reload** to take effect.
