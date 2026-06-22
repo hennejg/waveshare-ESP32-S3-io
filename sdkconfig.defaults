@@ -26,6 +26,10 @@ CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
 # especially when combined with CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y.
 # (Dynamic TX buffers are Kconfig-forbidden when SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y)
 CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8
+# SPIRAM_TRY_ALLOCATE_WIFI_LWIP changes the RX buffer default from 10 to 16.
+# 16 × 1600 B = 25.6 KB of INTERNAL|DMA, which leaves the DMA pool ~9.6 KB
+# shorter for BLE controller allocations.  Pin it back to 10.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
 
 # Ethernet — enable built-in SPI Ethernet and W5500 driver
 CONFIG_ETH_USE_SPI_ETHERNET=y
