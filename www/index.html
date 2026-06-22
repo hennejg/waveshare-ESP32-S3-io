@@ -167,6 +167,13 @@
         <label>Duration (ms) <input type="number" id="buzz-dur" min="1" max="5000" value="200"></label>
         <button type="button" onclick="testBuzzer()">Beep</button>
       </div>
+
+      <div id="network-mode" style="display:none;margin-top:1.5rem;border-top:1px solid #ccc;padding-top:1rem;font-size:.9rem;color:#555">
+        <h2 style="margin:0 0 .5rem">Network Mode</h2>
+        <p id="network-mode-msg"></p>
+        <button type="button" id="network-mode-btn" style="padding:.4rem 1.2rem;background:#1a73e8;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:.9rem"></button>
+        <p id="network-mode-hint" style="margin-top:.8rem;color:#999;font-size:.8rem"></p>
+      </div>
     </div>
 
     <!-- ── MQTT ── -->
@@ -390,6 +397,11 @@
             document.getElementById('auth-err').textContent = 'Timed out. Try again.';
             showScreen('auth-no-pw');
             document.getElementById('auth-begin-btn').disabled = false;
+          } else if (d.status === 'idle') {
+            stopPolling();
+            document.getElementById('auth-err').textContent = 'Session lost — try again.';
+            showScreen('auth-no-pw');
+            document.getElementById('auth-begin-btn').disabled = false;
           } else {
             countdown--;
             document.getElementById('auth-countdown').textContent = Math.max(0, countdown);
@@ -514,6 +526,27 @@
         startIoPoll();
         loadMatterPairing();
 
+        /* Network mode section */
+        const nmDiv  = document.getElementById('network-mode');
+        const nmMsg  = document.getElementById('network-mode-msg');
+        const nmBtn  = document.getElementById('network-mode-btn');
+        const nmHint = document.getElementById('network-mode-hint');
+        if (cfg.eth_only) {
+          nmDiv.style.display = '';
+          nmMsg.textContent  = 'WiFi is disabled. Device runs on Ethernet only.';
+          nmBtn.textContent  = 'Enable WiFi';
+          nmHint.textContent = '';
+          nmBtn.onclick = () => setEthOnly(false);
+        } else if (cfg.eth_connected) {
+          nmDiv.style.display = '';
+          nmMsg.textContent  = 'Ethernet is connected.';
+          nmBtn.textContent  = 'Use ETH only — disable WiFi';
+          nmHint.textContent = 'To re-enable WiFi later, open this page over Ethernet.';
+          nmBtn.onclick = () => setEthOnly(true);
+        } else {
+          nmDiv.style.display = 'none';
+        }
+
       } catch (e) {
         status.className = 'err';
         status.textContent = 'Failed to load config: ' + e.message;
@@ -631,6 +664,26 @@
       try { await apiFetch('/api/reboot', { method: 'POST' }); } catch (_) {}
       waitForReboot('Rebooting…');
     });
+
+    async function setEthOnly(enabled) {
+      const msg = enabled
+        ? 'Disable WiFi and use Ethernet only?\nThe device will reboot. Re-open this page over Ethernet to undo.'
+        : 'Re-enable WiFi?\nThe device will reboot and start WiFi provisioning if no credentials are stored.';
+      if (!confirm(msg)) return;
+      try {
+        const r = await apiFetch('/api/eth-only', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled }),
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+      } catch (e) {
+        status.className = 'err';
+        status.textContent = 'Error: ' + e.message;
+        return;
+      }
+      waitForReboot(enabled ? 'Switching to ETH-only mode — rebooting…' : 'Enabling WiFi — rebooting…');
+    }
 
     document.getElementById('factory-reset-btn').addEventListener('click', async () => {
       if (!confirm(

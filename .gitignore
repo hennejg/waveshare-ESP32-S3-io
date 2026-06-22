@@ -1,7 +1,10 @@
 build/
 sdkconfig
 sdkconfig.old
-managed_components/
+managed_components/*
+!managed_components/espressif__mqtt/
+managed_components/espressif__mqtt/*
+!managed_components/espressif__mqtt/mqtt_client.c
 dependencies.lock
 *.zip
 .idea/

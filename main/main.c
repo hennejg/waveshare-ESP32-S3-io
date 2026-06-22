@@ -1,4 +1,5 @@
 #include <nvs_flash.h>
+#include <esp_heap_caps.h>
 #include <nvs.h>
 #include <esp_log.h>
 #include <esp_netif.h>
@@ -82,7 +83,7 @@ static void on_network_ready(const char *iface)
     led_status_set_network(true);
     esp_err_t ws_ret = web_server_start();
     if (ws_ret != ESP_OK)
-        ESP_LOGE(TAG, "Web server start failed: %s", esp_err_to_name(ws_ret));
+        ESP_LOGW(TAG, "Web server start failed: %s", esp_err_to_name(ws_ret));
     app_mqtt_set_connected_callback(on_mqtt_connected);
     app_mqtt_set_disconnected_callback(on_mqtt_disconnected);
     app_mqtt_set_msg_callback(on_mqtt_message);
@@ -92,17 +93,32 @@ static void on_network_ready(const char *iface)
         ESP_LOGE(TAG, "MQTT start failed: %s", esp_err_to_name(mqtt_ret));
 }
 
+static bool s_eth_connected = false;
+
+static bool is_eth_connected(void) { return s_eth_connected; }
+
 static void on_wifi_ready(void) { on_network_ready("WiFi"); }
-static void on_eth_ready(void)  { on_network_ready("Ethernet"); }
+
+static void on_eth_ready(void)
+{
+    s_eth_connected = true;
+    on_network_ready("Ethernet");
+}
 
 static void on_ip_lost(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
+    if (id == IP_EVENT_ETH_LOST_IP) s_eth_connected = false;
     led_status_set_network(false);
+    web_server_stop();   /* free port 80 before wifi-bootstrap may restart the AP HTTP server */
 }
 
 static void on_wifi_ap(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     led_status_set_ap_mode(true);
+    /* web_server (INADDR_ANY:80) and wifi_config's captive-portal server
+     * (192.168.4.1:80) coexist: both sockets have SO_REUSEADDR, which lwIP
+     * allows (CONFIG_LWIP_SO_REUSE=y).  lwIP routes 192.168.4.1 connections
+     * to the specific binding and ETH-IP connections to the wildcard. */
 }
 
 /* Called by wifi-bootstrap when user taps "Use Ethernet only". */
@@ -113,18 +129,6 @@ static void on_eth_only_requested(void)
 }
 
 /* ------------------------------------------------------------ app_main */
-
-/* Custom HTML injected at the bottom of the WiFi provisioning page. */
-static const char s_portal_extra[] =
-    "<div style='margin-top:1.5rem;border-top:1px solid #ccc;padding-top:1rem;"
-    "font-family:sans-serif;font-size:.9rem;color:#555;text-align:center'>"
-    "<p>Have an Ethernet cable? You can skip WiFi entirely.</p>"
-    "<a href='/eth-only' style='display:inline-block;padding:.4rem 1rem;"
-    "background:#1a73e8;color:#fff;border-radius:4px;text-decoration:none'>"
-    "Use Ethernet only &rarr;</a>"
-    "<p style='margin-top:.8rem;color:#999;font-size:.8rem'>"
-    "To return to WiFi setup: hold the BOOT button for &ge;&nbsp;5&nbsp;s.</p>"
-    "</div>";
 
 void app_main(void)
 {
@@ -162,9 +166,9 @@ void app_main(void)
 
     if (!eth_only) {
         /* Normal: WiFi provisioning + STA. */
-        wifi_config_set_custom_html((char *)s_portal_extra);
         wifi_config_set_eth_only_callback(on_eth_only_requested);
-        wifi_config_init("Waveshare-Setup", NULL, on_wifi_ready);
+        wifi_config_set_eth_available_fn(is_eth_connected);
+        wifi_config_init("Waveshare (192.168.4.1)", NULL, on_wifi_ready);
 
         esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
         if (sta) esp_netif_set_hostname(sta, app_config_get()->device_name);
@@ -189,9 +193,19 @@ void app_main(void)
      * (HTTP, MQTT) no longer stalls behind BLE slots. */
     esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
 
+    /* Diagnostic: show DMA-capable heap state before BLE controller init */
+    ESP_LOGI(TAG, "heap before matter_init: free=%u DMA_free=%u DMA_largest=%u",
+             esp_get_free_heap_size(),
+             heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+             heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+
     /* Matter — initialise after network interfaces so the event loop is ready */
     esp_err_t matter_ret = matter_init();
     if (matter_ret != ESP_OK)
         ESP_LOGW(TAG, "Matter init failed: %s", esp_err_to_name(matter_ret));
+    ESP_LOGI(TAG, "heap after matter_init: free=%u internal_free=%u internal_largest=%u",
+             esp_get_free_heap_size(),
+             heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 #endif
 }
