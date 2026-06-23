@@ -21,7 +21,8 @@ if(CONFIG_APP_MATTER_ENABLE)
 endif()
 
 set(_WWW ${CMAKE_SOURCE_DIR}/www)
-foreach(_f index.html qrcode.min.js)
+foreach(_f index.html qrcode.min.js
+           codemirror.min.js codemirror.min.css codemirror-javascript.min.js)
     add_custom_command(
         OUTPUT  ${_WWW}/${_f}.gz
         COMMAND gzip -k -f ${_WWW}/${_f}
@@ -33,6 +34,9 @@ endforeach()
 add_custom_target(www_compress DEPENDS
     ${_WWW}/index.html.gz
     ${_WWW}/qrcode.min.js.gz
+    ${_WWW}/codemirror.min.js.gz
+    ${_WWW}/codemirror.min.css.gz
+    ${_WWW}/codemirror-javascript.min.js.gz
 )
 
 spiffs_create_partition_image(storage ${CMAKE_SOURCE_DIR}/www FLASH_IN_PROJECT DEPENDS www_compress)

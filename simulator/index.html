@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <title>Rule Engine Simulator</title>
+<link rel="stylesheet" href="/codemirror.min.css">
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 :root {
@@ -39,6 +40,23 @@ header .sub { font-size: .75rem; color: var(--text3); }
 /* Editor panel */
 .script-ta { flex: 1; min-height: 100px; resize: none; background: #0c0c18; color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: .5rem; font-family: 'Cascadia Code', 'Fira Code', 'Menlo', monospace; font-size: .75rem; line-height: 1.55; tab-size: 2; }
 .script-ta:focus { outline: none; border-color: var(--accent); }
+/* CodeMirror — fills the script panel and themed to match the dark UI */
+.panel-body .CodeMirror { flex: 1; min-height: 100px; height: auto;
+  background: #0c0c18; color: var(--text); border: 1px solid var(--border); border-radius: 4px;
+  font-family: 'Cascadia Code','Fira Code','Menlo',monospace; font-size: .75rem; line-height: 1.55; }
+.CodeMirror-gutters { background: #0c0c18; border-right: 1px solid var(--border); }
+.CodeMirror-linenumber { color: var(--text3); }
+.CodeMirror-cursor { border-left: 1px solid var(--text); }
+.CodeMirror-selected { background: #2a2a44 !important; }
+.cm-s-default .cm-keyword  { color: #c792ea; }
+.cm-s-default .cm-string   { color: #c3e88d; }
+.cm-s-default .cm-number   { color: #f78c6c; }
+.cm-s-default .cm-atom     { color: #f78c6c; }
+.cm-s-default .cm-comment  { color: #546e7a; font-style: italic; }
+.cm-s-default .cm-def,
+.cm-s-default .cm-variable,
+.cm-s-default .cm-property { color: #82aaff; }
+.cm-s-default .cm-operator { color: #89ddff; }
 .btn-row { display: flex; gap: .35rem; flex-wrap: wrap; flex-shrink: 0; }
 button { padding: .26rem .6rem; border-radius: 4px; border: none; cursor: pointer; font-size: .76rem; font-weight: 600; transition: all .1s; }
 .btn-p { background: var(--accent); color: #fff; }
@@ -166,6 +184,10 @@ button { padding: .26rem .6rem; border-radius: 4px; border: none; cursor: pointe
   <div id="console-body" class="console-body"></div>
 </div>
 
+<!-- CodeMirror 5 (served from ../www by server.js) — editor for the rule script. -->
+<script src="/codemirror.min.js"></script>
+<script src="/codemirror-javascript.min.js"></script>
+
 <script>
 // ── Firmware DSL status (checked in DOMContentLoaded after dsl.js executes) ──
 
@@ -190,8 +212,12 @@ function print() {
 // ── Engine ────────────────────────────────────────────────────────────────────
 var firedCounts = {};
 
+var scriptCM = null;   // CodeMirror instance for the rule script (null until init / if CM absent)
+function scriptText() { return scriptCM ? scriptCM.getValue() : document.getElementById('script').value; }
+function setScript(s) { if (scriptCM) scriptCM.setValue(s); else document.getElementById('script').value = s; }
+
 function applyRules() {
-  var script = document.getElementById('script').value;
+  var script = scriptText();
   if (!script.trim()) { logConsole('error', 'Script is empty'); return; }
 
   // Reset — mirrors EVT_RELOAD on the device. _reset_rules() also cancels any
@@ -221,7 +247,7 @@ function applyRules() {
 }
 
 function loadDemo() {
-  document.getElementById('script').value = DEMO_SCRIPT;
+  setScript(DEMO_SCRIPT);
   applyRules();
 }
 
@@ -426,11 +452,19 @@ function init() {
     presetsDiv.appendChild(btn);
   });
 
-  document.getElementById('script').addEventListener('keydown', function(e) {
-    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); applyRules(); }
-  });
+  // Upgrade the textarea to CodeMirror (falls back to the plain textarea if CM is absent).
+  if (typeof CodeMirror !== 'undefined') {
+    scriptCM = CodeMirror.fromTextArea(document.getElementById('script'), {
+      mode: 'javascript', lineNumbers: true, lineWrapping: true, tabSize: 2, indentUnit: 2,
+      extraKeys: { 'Ctrl-Enter': applyRules, 'Cmd-Enter': applyRules },
+    });
+  } else {
+    document.getElementById('script').addEventListener('keydown', function (e) {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); applyRules(); }
+    });
+  }
 
-  document.getElementById('script').value = DEMO_SCRIPT;
+  setScript(DEMO_SCRIPT);
   renderRuleList();
   logConsole('info', 'DSL loaded from firmware source. Click "Apply Rules" or press Ctrl+Enter.');
   logConsole('info', 'Demo: keep DI0 OFF, publish rules/trigger = ON → DO0 should light up.');

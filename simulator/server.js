@@ -12,9 +12,13 @@ const PORT = process.env.PORT || 3000;
 const ROUTES = {
   '/':        path.join(__dirname, 'index.html'),
   '/dsl.js':  path.join(ROOT, 'components/scripting/dsl.js'),
+  // CodeMirror editor assets — served from the same self-hosted files the firmware ships.
+  '/codemirror.min.js':            path.join(ROOT, 'www/codemirror.min.js'),
+  '/codemirror.min.css':           path.join(ROOT, 'www/codemirror.min.css'),
+  '/codemirror-javascript.min.js': path.join(ROOT, 'www/codemirror-javascript.min.js'),
 };
 
-const MIME = { '.html': 'text/html', '.js': 'application/javascript' };
+const MIME = { '.html': 'text/html', '.js': 'application/javascript', '.css': 'text/css' };
 
 http.createServer((req, res) => {
   const file = ROUTES[req.url];
