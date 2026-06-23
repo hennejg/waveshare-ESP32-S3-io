@@ -343,6 +343,7 @@ changes) so rules gating on it re-evaluate.
 | `f.get()` / `f.value` | read the current value |
 | `f.is(fn)` | condition: matches when `fn(value)` is truthy |
 | `f.is(x)` | condition: matches when `value === x` |
+| `f.isTrue()` / `f.isFalse()` | condition: matches when `value` is truthy / falsy |
 
 ```js
 var sunElevation = fact(0);
@@ -580,6 +581,7 @@ f.set(v)                  // set (emits on change) → new value
 f.get() / f.value         // read
 f.is(fn)                  // condition: fn(value) is truthy
 f.is(x)                   // condition: value === x
+f.isTrue() / f.isFalse()  // condition: value truthy / falsy
 
 // ── in then() bodies ───────────────────────────────────────────────────────
 print(…)                  // log to the console (args joined by space)

@@ -30,6 +30,29 @@ test('.is(predicate) gates a rule on the fact value', () => {
   assert.equal(e.output(0), true);
 });
 
+test('.isTrue() / .isFalse() gate on truthiness', () => {
+  const e = createEngine();
+  e.load(`
+    var enabled = fact(false);
+    rule('on').when(enabled.isTrue()).then(function(){ T.on = (T.on||0)+1; });
+    rule('off').when(enabled.isFalse()).then(function(){ T.off = (T.off||0)+1; });
+    rule('flip').when(input(0)).then(function(){ enabled.set(input(0).value); });
+  `);
+  e.input(0, true);  assert.equal(e.T.on, 1);    // enabled=true → isTrue
+  e.input(0, false); assert.equal(e.T.off, 1);   // enabled=false → isFalse
+});
+
+test('.isTrue() treats any truthy value as true', () => {
+  const e = createEngine();
+  e.load(`
+    var f = fact(0);
+    rule('t').when(f.isTrue()).then(function(){ T.n = (T.n||0)+1; });
+    rule('s').when(input(0).isOn()).then(function(){ f.set('ready'); });
+  `);
+  e.input(0, true);
+  assert.equal(e.T.n, 1);   // 'ready' is truthy
+});
+
 test('.is(constant) matches by equality', () => {
   const e = createEngine();
   e.load(`

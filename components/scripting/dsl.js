@@ -16,7 +16,8 @@
 //   every(ms)            → time trigger: an edge event every ms (other when()-conditions gate it)
 //   cron("m h dom mon dow") → time trigger on a 5-field cron schedule (evaluated in UTC)
 //   fact(initial)        → synthetic value: .set(v) in then(), .is(fn|value) in when()
-//                          (calculated by some rules, gated on by others)
+//                          (calculated by some rules, gated on by others);
+//                          .isTrue()/.isFalse() gate on truthiness
 //   mqtt(topic).is(fn)   → MqttCondition   (condition + value holder)
 //   input(ch).is(bool)   → InputCondition  (.value / .get() read the live level)
 //   output(ch)           → actuator { set(bool), on(), off(), toggle(), get(), value }
@@ -363,6 +364,9 @@ Fact.prototype.set = function(v) {
 Fact.prototype._check = function() { return true; };                    // bare fact always matches
 // .is(matcher): matcher is a predicate (fn of the value) or a constant to equal.
 Fact.prototype.is = function(matcher) { return new FactCondition(this, matcher); };
+// Truthiness shortcuts for boolean-ish facts (any truthy/falsy value, not just true/false).
+Fact.prototype.isTrue  = function() { return this.is(function(v) { return !!v; }); };
+Fact.prototype.isFalse = function() { return this.is(function(v) { return !v;  }); };
 
 function FactCondition(src, matcher) {
     this._src     = src;             // the underlying Fact (live value lives here)
