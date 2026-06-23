@@ -316,11 +316,14 @@ rule('morning')
 is `0`–`6` with Sunday `0` (`7` also accepted). When **both** day-of-month and day-of-week
 are restricted, a day matches if **either** does (Vixie semantics).
 
-> **Cron runs in UTC, and needs a synced clock.** Fields are currently evaluated in
-> **UTC** (local-time / timezone support is a follow-up). And cron is only as good as
-> the device's clock: until the firmware has SNTP-synced wall-clock time, cron computes
-> against an unset clock and will fire at the wrong moments. `every(ms)` has no such
-> dependency — it uses a relative timer.
+> **Cron runs in UTC against the device clock — which is currently boot-relative.**
+> Fields are evaluated in **UTC** (local-time / timezone support is a follow-up). The
+> device has no RTC or SNTP yet, so its clock **starts at the Unix epoch (1970-01-01) on
+> every reboot and counts up from there** — wiring in real wall-clock time is a separate,
+> planned change. Until then, cron effectively schedules **relative to boot** (e.g.
+> `0 7 * * *` first fires ~7 h after start-up, then every 24 h), and that boot-relative
+> time is treated as authoritative. `every(ms)` is unaffected — it uses a purely relative
+> timer.
 
 Each `every`/`cron` is its own fact, so its tick only re-evaluates the rules that use it,
 and reloading the rules cancels the timers.
@@ -526,7 +529,7 @@ mqtt(topic).value         // last payload
 
 // ── time triggers (edge; gate with other conditions) ───────────────────────
 every(ms)                 // fires every ms
-cron('m h dom mon dow')   // 5-field cron schedule (UTC; needs a synced clock)
+cron('m h dom mon dow')   // 5-field cron schedule (UTC; clock is boot-relative for now)
 
 // ── in then() bodies ───────────────────────────────────────────────────────
 print(…)                  // log to the console (args joined by space)

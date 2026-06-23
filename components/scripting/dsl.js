@@ -227,9 +227,10 @@ OutputCondition.prototype._check = function() {
 // _reset_rules (it runs through _schedule, so _cancel_all_timers covers it).
 var _timeSeq = 0;
 
-// Wall-clock epoch ms. Prefers a host _now() binding (mockable in tests / synced on
-// device); falls back to Date.now(). NOTE: until the device's clock is SNTP-synced,
-// cron evaluates against an unset clock — see RULES.md.
+// Wall-clock epoch ms. Prefers a host _now() binding (mockable in tests); falls back to
+// Date.now(). NOTE: the device has no RTC/SNTP yet, so on-device this is time-since-boot
+// (the clock starts at the Unix epoch each reboot) — real wall-clock is a separate,
+// planned change; cron schedules are boot-relative until then. See RULES.md.
 function _now_ms() {
     if (typeof _now === 'function') return _now();
     if (typeof Date !== 'undefined' && Date.now) return Date.now();
