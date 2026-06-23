@@ -19,6 +19,7 @@ _Static_assert(sizeof(app_config_t) < 3000,
 #define K_MODBUS_CFG    "mb_cfg"
 #define K_LED_MODE      "led_mode"
 #define K_CAN_CFG       "can_cfg"
+#define K_SNTP_CFG      "sntp_cfg"
 
 static app_config_t s_cfg = {
     .device_name       = "Waveshare-ESP32",
@@ -31,6 +32,7 @@ static app_config_t s_cfg = {
     .modbus = { .enable = 0, .address = 1, .baudrate = 9600 },
     .can    = { .mode = 0, .n2k_addr = 0x50, .base_id = 0x100,
                 .bitrate = 250000, .tx_interval_ms = 1000 },
+    .sntp   = { .enable = 1, .server = "pool.ntp.org" },
 };
 
 #define NVS_GET_STR(h, key, dst) \
@@ -62,6 +64,8 @@ esp_err_t app_config_init(void)
     s_cfg.led_mode = led_mode_val;
     sz = sizeof(s_cfg.can);
     nvs_get_blob(h, K_CAN_CFG, &s_cfg.can, &sz);
+    sz = sizeof(s_cfg.sntp);
+    nvs_get_blob(h, K_SNTP_CFG, &s_cfg.sntp, &sz);
 
     nvs_close(h);
     return ESP_OK;
@@ -90,6 +94,7 @@ esp_err_t app_config_update(const app_config_t *cfg)
     nvs_set_blob(h, K_MODBUS_CFG, &s_cfg.modbus, sizeof(s_cfg.modbus));
     nvs_set_u8(h, K_LED_MODE, s_cfg.led_mode);
     nvs_set_blob(h, K_CAN_CFG, &s_cfg.can, sizeof(s_cfg.can));
+    nvs_set_blob(h, K_SNTP_CFG, &s_cfg.sntp, sizeof(s_cfg.sntp));
 
     nvs_commit(h);
     nvs_close(h);

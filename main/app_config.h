@@ -8,6 +8,7 @@
 #define APP_CFG_MQTT_USER_LEN     64
 #define APP_CFG_MQTT_PASS_LEN     64
 #define APP_CFG_MQTT_TOPIC_LEN    64
+#define APP_CFG_SNTP_SERVER_LEN   64
 #define APP_CFG_DI_COUNT           8
 #define APP_CFG_DO_COUNT           8
 #define APP_CFG_IO_NAME_MAX        20   /* max visible chars; empty = use index number */
@@ -55,6 +56,13 @@ typedef struct {
         uint8_t  _pad[2];
         uint32_t baudrate;   /* 9600 / 19200 / 38400 / 57600 / 115200 */
     } modbus;
+
+    /* SNTP time synchronisation */
+    struct {
+        uint8_t enable;                          /* 1 = enabled (default) */
+        uint8_t _pad[3];
+        char    server[APP_CFG_SNTP_SERVER_LEN]; /* NTP server hostname */
+    } sntp;
 } app_config_t;
 
 esp_err_t           app_config_init(void);

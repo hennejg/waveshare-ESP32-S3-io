@@ -138,6 +138,7 @@
     <button type="button" class="tab-btn" data-tab="outputs" onclick="switchTab('outputs')">Outputs</button>
     <button type="button" class="tab-btn" data-tab="can"     onclick="switchTab('can')">CAN Bus</button>
     <button type="button" class="tab-btn" data-tab="modbus"  onclick="switchTab('modbus')">Modbus</button>
+    <button type="button" class="tab-btn" data-tab="time"    onclick="switchTab('time')">Time</button>
     <button type="button" class="tab-btn" data-tab="matter"  onclick="switchTab('matter')" id="tab-btn-matter" style="display:none">Matter</button>
     <button type="button" class="tab-btn" data-tab="rules"   onclick="switchTab('rules')">Rules</button>
   </nav>
@@ -271,6 +272,34 @@
           <option value="115200">115200</option>
         </select>
       </label>
+    </div>
+
+    <!-- ── Time (SNTP / RTC) ── -->
+    <div id="tab-time" class="tab-pane">
+      <h2 style="margin-top:.5rem">Network time (SNTP)</h2>
+      <label style="display:flex;align-items:center;gap:.5rem;font-weight:600;color:#555">
+        <input type="checkbox" id="sntp_enable"> Sync clock from an NTP server
+      </label>
+      <label>NTP server
+        <input type="text" id="sntp_server" maxlength="63" placeholder="pool.ntp.org">
+      </label>
+      <p class="hint">When enabled, the system clock is synced from this server and mirrored to the
+      battery-backed RTC. NTP takes precedence over the RTC. Saved with the rest of the configuration.</p>
+
+      <h2>Device clock</h2>
+      <table style="width:auto">
+        <tr><td style="padding:.2rem .8rem .2rem 0;color:#555">System time (UTC)</td>
+            <td id="time_system" style="font-variant-numeric:tabular-nums">—</td></tr>
+        <tr><td style="padding:.2rem .8rem .2rem 0;color:#555">RTC chip</td>
+            <td id="time_rtc">—</td></tr>
+      </table>
+      <p class="hint">All times are UTC; cron-style rules in the rule engine also run on UTC.</p>
+      <div class="io-row" style="margin-top:.6rem">
+        <button type="button" onclick="refreshTime()">Refresh</button>
+        <button type="button" onclick="setDeviceTime()">Set from this browser</button>
+      </div>
+      <p class="hint">"Set from this browser" writes your computer's current time to the device clock and the
+      RTC. Useful when there is no network time source.</p>
     </div>
 
     <!-- ── Matter ── -->
@@ -541,6 +570,11 @@ rule('my-rule')
           document.getElementById('mb_address').value   = cfg.modbus.address  ?? 1;
           document.getElementById('mb_baudrate').value  = cfg.modbus.baudrate ?? 9600;
         }
+        if (cfg.sntp) {
+          document.getElementById('sntp_enable').checked = !!cfg.sntp.enable;
+          document.getElementById('sntp_server').value   = cfg.sntp.server ?? '';
+        }
+        refreshTime();
         document.getElementById('pass_hint').textContent =
           cfg.mqtt_password_set ? 'Password is set.' : 'No password stored.';
         (cfg.di ?? []).forEach((di, i) => {
@@ -634,6 +668,10 @@ rule('my-rule')
             address:  parseInt(document.getElementById('mb_address').value, 10),
             baudrate: parseInt(document.getElementById('mb_baudrate').value, 10),
           },
+          sntp: {
+            enable: document.getElementById('sntp_enable').checked,
+            server: document.getElementById('sntp_server').value.trim(),
+          },
           di,
           dout,
         };
@@ -666,6 +704,47 @@ rule('my-rule')
       document.getElementById('can_n2k_fields').style.display   = mode === 2 ? '' : 'none';
     }
     updateCanFields();
+
+    /* ── Time / RTC ── */
+    async function refreshTime() {
+      const sysEl = document.getElementById('time_system');
+      const rtcEl = document.getElementById('time_rtc');
+      try {
+        const r = await apiFetch('/api/time');
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const t = await r.json();
+        sysEl.textContent = t.utc ?? '—';
+        if (!t.rtc_present)      rtcEl.textContent = 'not detected';
+        else if (!t.rtc_valid)   rtcEl.textContent = 'present, time invalid (lost power)';
+        else                     rtcEl.textContent = t.rtc_utc ?? 'present';
+      } catch (e) {
+        sysEl.textContent = 'unavailable';
+        rtcEl.textContent = '—';
+      }
+    }
+
+    async function setDeviceTime() {
+      try {
+        const epoch = Math.floor(Date.now() / 1000);
+        const r = await apiFetch('/api/time', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ epoch }),
+        });
+        const res = await r.json();
+        if (res.status === 'ok') {
+          status.className = 'ok';
+          status.textContent = 'Device clock set' + (res.rtc_updated ? ' (RTC updated).' : '.');
+        } else {
+          status.className = 'err';
+          status.textContent = 'Error: ' + JSON.stringify(res);
+        }
+      } catch (e) {
+        status.className = 'err';
+        status.textContent = 'Set time failed: ' + e.message;
+      }
+      refreshTime();
+    }
 
     /* Poll until the device responds again, then reload.
      * factoryReset=true means WiFi creds were wiped so the device may come

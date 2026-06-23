@@ -9,12 +9,11 @@
 #include "driver/i2c_master.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "i2c_bus.h"
 
 #define TAG          "dout"
 #define NUM_DO       8
 #define TCA9554_ADDR 0x20
-#define I2C_SDA_PIN  GPIO_NUM_42
-#define I2C_SCL_PIN  GPIO_NUM_41
 
 /* TCA9554 register map */
 #define REG_OUTPUT   0x01
@@ -111,15 +110,8 @@ static void publish_one(uint8_t n)
 
 esp_err_t dout_init(void)
 {
-    i2c_master_bus_config_t bus_cfg = {
-        .i2c_port          = -1,          /* auto-select */
-        .sda_io_num        = I2C_SDA_PIN,
-        .scl_io_num        = I2C_SCL_PIN,
-        .clk_source        = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_cfg, &s_bus), TAG, "I2C bus init");
+    ESP_RETURN_ON_ERROR(i2c_bus_init(), TAG, "I2C bus init");
+    s_bus = i2c_bus_handle();   /* shared with the PCF85063 RTC */
 
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
