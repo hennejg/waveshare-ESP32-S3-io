@@ -320,7 +320,8 @@ are restricted, a day matches if **either** does (Vixie semantics).
 > Fields are evaluated in **UTC** (local-time / timezone support is a follow-up). The
 > device has no RTC or SNTP yet, so its clock **starts at the Unix epoch (1970-01-01) on
 > every reboot and counts up from there** — wiring in real wall-clock time is a separate,
-> planned change. Until then, cron effectively schedules **relative to boot** (e.g.
+> planned change (see [TIME_SOURCE_TODO.md](TIME_SOURCE_TODO.md)). Until then, cron
+> effectively schedules **relative to boot** (e.g.
 > `0 7 * * *` first fires ~7 h after start-up, then every 24 h), and that boot-relative
 > time is treated as authoritative. `every(ms)` is unaffected — it uses a purely relative
 > timer.
