@@ -305,6 +305,10 @@ function renderRuleList() {
         desc = 'input(' + c.channel + ').is(' + c._expected + ')';
         status = (ok ? '<span class="cok">✓</span>' : '<span class="cfail">✗</span>')
                + ' DI' + c.channel + '=' + (diState[c.channel] ? 'ON' : 'OFF');
+      } else if (c instanceof OutputCondition) {
+        desc = 'output(' + c.channel + ').is(' + c._expected + ')';
+        status = (ok ? '<span class="cok">✓</span>' : '<span class="cfail">✗</span>')
+               + ' DO' + c.channel + '=' + (doutState[c.channel] ? 'ON' : 'OFF');
       } else {
         desc = '(condition)';
         status = ok ? '<span class="cok">✓</span>' : '<span class="cfail">✗</span>';

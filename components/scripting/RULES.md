@@ -136,6 +136,15 @@ the condition is a predicate function, the rule is **wildcard**: it is re-evalua
 every event, and reads `input(0)`/`output(1)` live each time. See
 [the fact model](#how-events-reach-rules-the-fact-model) for the trade-off.
 
+Since `input` and `output` are both facts, this particular gate is better written
+declaratively — targeted dispatch, no wildcard:
+
+```js
+rule('complex gate')
+  .when(input(0).isOn(), output(1).isOff())
+  .then(function () { output(1).on(); });
+```
+
 ---
 
 ## 2. Facts and helpers
@@ -187,8 +196,10 @@ To gate, add `.is(...)` / `.isOn()` / `.isOff()`.
 
 ### `output(ch)` — digital output
 
-`output(ch)` returns an object for driving and reading an output. It is **not** a
-condition.
+`output(ch)` is **dual-purpose**: an *actuator* (drive/read the output, used in
+`then()`) **and** a *fact* (gate on the output's state, used in `when()`).
+
+**Actuator** (in `then()`):
 
 | Method | Effect | Returns |
 |--------|--------|---------|
@@ -209,18 +220,30 @@ rule('toggle DO0 on trigger')
   });
 ```
 
-To **gate on an output's state**, wrap it in a predicate (an `output` object is not a
-condition):
+**Fact** (in `when()`) — `output(ch)` is a condition, just like `input`:
+
+| Form | Meaning |
+|------|---------|
+| `output(ch)` | bare pattern — always matches |
+| `output(ch).is(bool)` | matches when the output equals `bool` |
+| `output(ch).isOn()` | alias for `.is(true)` |
+| `output(ch).isOff()` | alias for `.is(false)` |
+
+Writing an output that **changes** its level is itself an event, so a rule gated on an
+output re-evaluates when that output changes — which lets you chain outputs:
 
 ```js
-// CORRECT: read output state via a predicate
-rule('latch once')
-  .when(input(0).isOn(), function () { return !output(0).value; })
-  .then(function () { output(0).on(); });
-
-// WRONG: output(0) is a truthy object, so this always matches
-// rule('bad').when(output(0)).then(...)
+// When DO0 turns on, also turn DO1 on.
+rule('DO1 follows DO0')
+  .when(output(0).isOn())
+  .then(function () { output(1).on(); });
 ```
+
+> **Feedback loops are bounded.** Because outputs are written *by* rules, output→output
+> chains can feed back on themselves. The engine caps the cascade at **16 hops per
+> triggering event**; if exceeded it logs a warning and stops, so a runaway loop can't
+> wedge the engine (or trip the device watchdog). Writing an output to the value it
+> already holds is a no-op and emits no event.
 
 ### `mqtt(topic)` — MQTT message
 
@@ -266,23 +289,26 @@ message arrives, the edge is **missed**, not queued.
 
 ### How events reach rules (the fact model)
 
-Each `input(ch)` and each `mqtt(topic)` is a **distinct fact**. When something happens,
-the engine only re-evaluates the rules that reference the *changed* fact:
+Each `input(ch)`, `output(ch)`, and `mqtt(topic)` is a **distinct fact**. When something
+happens, the engine only re-evaluates the rules that reference the *changed* fact:
 
 - A change on **DI4** re-evaluates only rules whose conditions mention `input(4)`.
   A rule gated on `input(7)` is **not** touched.
 - An **MQTT message** on `topic` re-evaluates only rules referencing `mqtt(topic)`.
+- Writing **DO0** to a new level re-evaluates only rules referencing `output(0)`.
 
 This is why toggling one input never accidentally fires a rule about another input.
 
-**Wildcard rules.** If a rule has an *opaque* condition — a predicate function, a bare
-value, or one that reads `output(n).value` — the engine cannot tell which facts it
-depends on, so the rule is treated as **wildcard** and re-evaluated on *every* event.
-Prefer `input()` / `mqtt()` conditions when you want the targeted behavior.
+**Outputs are event sources too.** Writing an output that changes its level emits an
+`output:ch` event, so rules gated on it re-evaluate (this is what enables output→output
+chaining). Because outputs are written by rules, a per-event **cascade cap (16 hops)**
+bounds the chain so a feedback loop can't run away — see
+[`output(ch)`](#outputch--digital-output). An idempotent write (same value) emits nothing.
 
-**Outputs are readable, not event sources.** Setting an output does not emit an event,
-so a rule that reads an output's state only re-evaluates when some input/MQTT event (or
-its wildcard status) causes it to.
+**Wildcard rules.** If a rule has an *opaque* condition — a predicate function or a bare
+value — the engine cannot tell which facts it depends on, so the rule is treated as
+**wildcard** and re-evaluated on *every* event. Prefer `input()` / `output()` / `mqtt()`
+conditions when you want the targeted behavior.
 
 ---
 
@@ -388,11 +414,20 @@ rule('turn off')
   .then(function () { output(0).off(); });
 ```
 
-> **Chaining via state has limits.** Because outputs are not event sources (see the
-> [fact model](#how-events-reach-rules-the-fact-model)), one rule writing `output(n)`
-> will **not** automatically trigger another rule that reads it. To chain rules through
-> state, drive them off shared *inputs* or *MQTT* facts, or accept the wildcard
-> re-evaluation that comes with reading output state in a predicate.
+Rules can also chain **through output state**: because writing an output is an event
+(see the [fact model](#how-events-reach-rules-the-fact-model)), one rule writing
+`output(n)` re-evaluates another rule gated on `output(n).isOn()`. For example, a fault
+output can fan out to several reactions:
+
+```js
+rule('fault -> alarm') .when(output(7).isOn()).then(function () { output(6).on(); });
+rule('fault -> shed')  .when(output(7).isOn()).then(function () { output(0).off(); });
+```
+
+> **Mind the feedback loop.** Output→output chains can cycle (A writes DO0 → B writes DO1
+> → A …). The engine caps the cascade at 16 hops per triggering event and logs a warning
+> if exceeded, but a rule that *fights itself* (e.g. toggles an output it gates on) will
+> burn the budget every event — keep chains acyclic.
 
 ---
 
@@ -412,13 +447,17 @@ input(ch).isOff()         // .is(false)
 input(ch).value           // live level (property)
 input(ch).get()           // live level (method)
 
-// ── output(ch) — action + state (NOT a condition) ──────────────────────────
-output(ch).set(bool)      // → resulting level
+// ── output(ch) — actuator AND fact ─────────────────────────────────────────
+output(ch).set(bool)      // → resulting level   (a value change emits an event)
 output(ch).on()           // → true
 output(ch).off()          // → false
 output(ch).toggle()       // → resulting level
 output(ch).get()          // current level
 output(ch).value          // current level (property)
+output(ch)                // condition: bare → always matches
+output(ch).is(bool)       // condition: matches when level == bool
+output(ch).isOn()         // .is(true)
+output(ch).isOff()        // .is(false)
 
 // ── mqtt(topic) — condition + last payload ─────────────────────────────────
 mqtt(topic)               // matches once any message arrived (level/held)
@@ -437,8 +476,10 @@ print(…)                  // log to the console (args joined by space)
 - **`when()` is AND-only.** Use a predicate function or multiple rules for OR.
 - **Bare `input(ch)` always matches** — it is a value source, not a gate. Add
   `.is()/.isOn()/.isOff()` to gate.
-- **`output(ch)` is not a condition.** `.when(output(0))` always matches (truthy
-  object). Gate on output state with a predicate: `function () { return output(0).value; }`.
+- **`output(ch)` is both an actuator and a fact.** Gate on it with `output(0).isOn()` /
+  `.isOff()`; a bare `output(0)` always matches. Writing an output that changes value is
+  an event, so output→output chains work — but they can cycle, so the engine caps the
+  cascade at 16 hops per event. Keep chains acyclic.
 - **`mqtt(topic)` is held by default.** Once a message arrives it stays matched; use
   `.once()` for per-message edge behavior.
 - **`.heldFor()` vs `.after()`** are different: `heldFor` cancels if conditions drop;

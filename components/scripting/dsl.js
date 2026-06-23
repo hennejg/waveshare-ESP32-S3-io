@@ -13,8 +13,9 @@
 //                                                      hold continuously for ms
 //   mqtt(topic).is(fn)   → MqttCondition   (condition + value holder)
 //   input(ch).is(bool)   → InputCondition  (.value / .get() read the live level)
-//   output(ch)           → { set(bool), get(), on(), off(), toggle(), value }
-//                          set/on/off/toggle return the resulting level
+//   output(ch)           → actuator { set(bool), on(), off(), toggle(), get(), value }
+//                          (set/on/off/toggle return the resulting level) AND a fact
+//                          { is(bool), isOn(), isOff() } usable in when()
 //
 // Condition semantics (Drools-like — a bare pattern matches, .is() narrows it):
 //   input(ch)            → always matches; use input(ch).value in then()
@@ -31,10 +32,13 @@
 // — var di = input(5); di.isOn() and di.isOff() are independent, di stays unconstrained
 // (and usable for di.value / di.get()).
 //
-// Dispatch: each input(ch) / mqtt(topic) is a distinct fact. An event re-evaluates
-// only the rules referencing that fact (so changing input(7) never re-fires a rule
-// gated on input(4)). Rules with an opaque condition (predicate fn / bare value /
-// output state) are treated as wildcard and re-evaluated on every event.
+// Dispatch: each input(ch), output(ch) and mqtt(topic) is a distinct fact. An event
+// re-evaluates only the rules referencing that fact (so changing input(7) never
+// re-fires a rule gated on input(4)). Writing an output that changes value is itself
+// an event, so rules can chain off outputs; because outputs are written by rules, a
+// per-trigger cascade budget bounds the chain so a feedback loop can't run away.
+// Rules with an opaque condition (predicate fn / bare value) are treated as wildcard
+// and re-evaluated on every event.
 
 'use strict';
 
@@ -51,6 +55,7 @@ function _schedule(ms, fn) {
     var wrapped = function() {
         var k = _pending.indexOf(id);
         if (k >= 0) _pending.splice(k, 1);
+        _resetCascade();   // a timer firing is a fresh trigger → fresh cascade budget
         fn();
     };
     if (typeof _set_timer === 'function')      id = _set_timer(ms, wrapped);
@@ -67,11 +72,49 @@ function _unschedule(id) {
 }
 function _cancel_all_timers() { while (_pending.length) _unschedule(_pending[0]); }
 
+// ── Output as a fact + cascade guard ──────────────────────────────────────────
+// Writing an output that actually changes emits an 'output:ch' event, so rules gated
+// on the output re-evaluate. Outputs are driven BY rules, so this can feed back on
+// itself; a per-trigger cascade budget bounds the chain (each external event or timer
+// firing resets it). When the budget is exhausted the cascade stops with a logged
+// warning instead of looping forever — important on-device, where an unbounded loop
+// would block the scripting task and trip the watchdog.
+var CASCADE_CAP = 16;
+var _cascade = 0;
+var _cascadeWarned = false;
+var _watchOutputs = false;   // does any rule reference an output fact / is wildcard?
+
+function _resetCascade() { _cascade = 0; _cascadeWarned = false; }
+
+function _emit(factKey) {
+    if (_cascade >= CASCADE_CAP) {
+        if (!_cascadeWarned) {
+            _cascadeWarned = true;
+            print('[rules] cascade limit (' + CASCADE_CAP + ') reached — stopping (output feedback loop?)');
+        }
+        return;
+    }
+    _cascade++;
+    _fire_matching(factKey, true);   // cascade pass — does NOT reset the budget
+}
+
+// Drive an output through the host binding; emit only on an actual change, and only
+// when some rule is watching outputs (keeps the common no-watcher case free of cost).
+function _drive_output(ch, v) {
+    var before = _dout_get(ch);
+    _dout_set(ch, v);
+    var after = _dout_get(ch);
+    if (after !== before && _watchOutputs) _emit('output:' + ch);
+    return after;
+}
+
 // Called on rule reload (EVT_RELOAD / simulator "Apply") — drop the rule set and
 // any in-flight timers so stale callbacks can't fire against the old rules.
 function _reset_rules() {
     _cancel_all_timers();
     _rules = [];
+    _watchOutputs = false;
+    _resetCascade();
 }
 
 // ── MqttCondition ────────────────────────────────────────────────────────────
@@ -138,23 +181,43 @@ Object.defineProperty(InputCondition.prototype, 'value', {
 });
 InputCondition.prototype.get = function() { return _di_get(this.channel); };
 
+// ── OutputCondition ──────────────────────────────────────────────────────────
+// output(ch) is dual-purpose: an actuator (set/on/off/toggle/get/value, used in
+// then()) AND a fact (is/isOn/isOff/_check, used in when()). Writing it through
+// _drive_output emits an 'output:ch' event so rules gated on the output re-evaluate.
+
+function OutputCondition(ch) {
+    this.channel = ch;
+    this._expected = undefined;
+}
+// actuator side — mutators return the resulting level, e.g. print(output(0).toggle())
+OutputCondition.prototype.set    = function(v) { return _drive_output(this.channel, !!v); };
+OutputCondition.prototype.on     = function()  { return _drive_output(this.channel, true); };
+OutputCondition.prototype.off    = function()  { return _drive_output(this.channel, false); };
+OutputCondition.prototype.toggle = function()  { return _drive_output(this.channel, !_dout_get(this.channel)); };
+OutputCondition.prototype.get    = function()  { return _dout_get(this.channel); };
+Object.defineProperty(OutputCondition.prototype, 'value', {
+    get: function() { return _dout_get(this.channel); }
+});
+// condition side — copy-on-write, like InputCondition
+OutputCondition.prototype.is    = function(expected) {
+    var c = new OutputCondition(this.channel);
+    c._expected = expected;
+    return c;
+};
+OutputCondition.prototype.isOn  = function() { return this.is(true);  };
+OutputCondition.prototype.isOff = function() { return this.is(false); };
+OutputCondition.prototype._check = function() {
+    var cur = _dout_get(this.channel);
+    if (this._expected === undefined) return true;
+    return cur === this._expected;
+};
+
 // ── Public factory functions ─────────────────────────────────────────────────
 
 function mqtt(topic)  { return new MqttCondition(topic); }
 function input(ch)    { return new InputCondition(ch); }
-function output(ch) {
-    return {
-        // mutators return the resulting level, e.g. print(output(0).toggle())
-        set:    function(v) { _dout_set(ch, !!v);            return _dout_get(ch); },
-        on:     function()  { _dout_set(ch, true);           return _dout_get(ch); },
-        off:    function()  { _dout_set(ch, false);          return _dout_get(ch); },
-        toggle: function()  { _dout_set(ch, !_dout_get(ch)); return _dout_get(ch); },
-        get:    function()  { return _dout_get(ch); },
-        // Current output level — readable as a fact, e.g.
-        //   .when(function(){ return !output(0).value; })
-        get value() { return _dout_get(ch); }
-    };
-}
+function output(ch)   { return new OutputCondition(ch); }
 
 // ── Rule builder (fluent API) ────────────────────────────────────────────────
 
@@ -183,9 +246,10 @@ function _ruleFacts(conditions) {
     var facts = {}, wildcard = false;
     for (var i = 0; i < conditions.length; i++) {
         var c = conditions[i];
-        if      (c instanceof InputCondition) facts['input:' + c.channel] = true;
-        else if (c instanceof MqttCondition)  facts['mqtt:'  + c.topic]   = true;
-        else                                  wildcard = true;
+        if      (c instanceof InputCondition)  facts['input:'  + c.channel] = true;
+        else if (c instanceof OutputCondition) facts['output:' + c.channel] = true;
+        else if (c instanceof MqttCondition)   facts['mqtt:'   + c.topic]   = true;
+        else                                   wildcard = true;
     }
     return { facts: facts, wildcard: wildcard };
 }
@@ -222,6 +286,9 @@ RuleBuilder.prototype.then = function(fn) {
     this._nextDelay = 0;
     if (!this._rule) {
         var f = _ruleFacts(this._conditions);
+        // A rule "watches" outputs if it gates on one, or is wildcard (may read one).
+        if (f.wildcard) _watchOutputs = true;
+        else for (var fk in f.facts) { if (fk.indexOf('output:') === 0) { _watchOutputs = true; break; } }
         var ref = this._rule = {
             name:       this.name,
             conditions: this._conditions,
@@ -298,7 +365,8 @@ function _rule_matches(r) {
 // Only rules that reference that fact — or wildcard rules — are evaluated; a rule
 // gated solely on a different fact keeps its state untouched. factKey null/omitted
 // evaluates every rule.
-function _fire_matching(factKey) {
+function _fire_matching(factKey, _isCascade) {
+    if (!_isCascade) _resetCascade();   // a root event/timer starts a fresh cascade budget
     for (var i = 0; i < _rules.length; i++) {
         var r = _rules[i];
         if (factKey != null && !r._wildcard && !r._facts[factKey]) continue;
