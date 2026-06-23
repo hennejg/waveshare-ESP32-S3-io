@@ -117,6 +117,22 @@ button { padding: .26rem .6rem; border-radius: 4px; border: none; cursor: pointe
       <div id="di-panel"></div>
       <div class="io-group-label" style="margin-top:.2rem">Outputs (DO)</div>
       <div id="do-panel"></div>
+
+      <div class="io-group-label" style="margin-top:.4rem">Components</div>
+      <div class="io-row">
+        <span class="io-lbl" id="sim-led-lbl">LED off</span>
+        <div id="sim-led-swatch" style="width:1.15rem;height:1.15rem;border-radius:3px;border:1px solid #555;background:#000"></div>
+      </div>
+      <div class="io-row">
+        <span class="io-lbl" id="sim-buzzer-lbl">Buzzer off</span>
+        <div class="do-led" id="sim-buzzer-dot"></div>
+      </div>
+
+      <div class="io-group-label" style="margin-top:.4rem">Fieldbus command health</div>
+      <div class="btn-row" style="padding-top:.2rem">
+        <button class="btn-s" onclick="simActivity('modbus')">MODBUS cmd</button>
+        <button class="btn-s" onclick="simActivity('can')">CAN cmd</button>
+      </div>
     </div>
   </div>
 
@@ -185,6 +201,23 @@ function _dout_set(ch, v) {
 }
 function print() {
   logConsole('print', Array.prototype.slice.call(arguments).join(' '));
+}
+function hex2(n) { n = Math.max(0, Math.min(255, n | 0)); return (n < 16 ? '0' : '') + n.toString(16); }
+function _led_set(r, g, b) {
+  r = r | 0; g = g | 0; b = b | 0;
+  var sw = document.getElementById('sim-led-swatch');
+  var lbl = document.getElementById('sim-led-lbl');
+  if (sw) sw.style.background = 'rgb(' + r + ',' + g + ',' + b + ')';
+  if (lbl) lbl.textContent = (r || g || b) ? ('LED #' + hex2(r) + hex2(g) + hex2(b)) : 'LED off';
+  logConsole('info', 'LED → rgb(' + r + ',' + g + ',' + b + ')');
+}
+function _buzzer_set(freq) {
+  freq = freq | 0;
+  var dot = document.getElementById('sim-buzzer-dot');
+  var lbl = document.getElementById('sim-buzzer-lbl');
+  if (dot) dot.classList.toggle('on', freq > 0);
+  if (lbl) lbl.textContent = freq > 0 ? ('Buzzer ' + freq + ' Hz') : 'Buzzer off';
+  logConsole('info', freq > 0 ? ('Buzzer → ' + freq + ' Hz') : 'Buzzer off');
 }
 
 // ── Engine ────────────────────────────────────────────────────────────────────
@@ -315,7 +348,7 @@ function renderRuleList() {
         status = '<span class="cunknown">timer · ticks every ' + c.ms + 'ms</span>';
       } else if (c instanceof CronCondition) {
         desc = "cron('" + c.expr + "')";
-        status = '<span class="cunknown">timer · UTC schedule</span>';
+        status = '<span class="cunknown">timer · local-time schedule</span>';
       } else if (c instanceof FactCondition) {
         desc = 'fact.is(' + (typeof c._matcher === 'function' ? 'fn' : JSON.stringify(c._matcher)) + ')';
         status = (ok ? '<span class="cok">✓</span>' : '<span class="cfail">✗</span>')
@@ -354,6 +387,15 @@ function publishMQTT() {
   logMsg('in', '→', full + '  ' + payload);
   if (!_rules || !_rules.length) { logConsole('error', 'No rules loaded — click Apply Rules first'); return; }
   try { _on_mqtt(full, payload); } catch(e) { logConsole('error', e.message); }
+  renderRuleList();
+}
+
+// ── Fieldbus command activity (feeds modbus()/can() health watchdogs) ──────────
+function simActivity(key) {
+  if (typeof _on_activity !== 'function') { logConsole('error', '_on_activity unavailable'); return; }
+  try { _on_activity(key); } catch(e) { logConsole('error', e.message); }
+  logMsg('in', '↯', key.toUpperCase() + ' command');
+  logConsole('info', key + ' command received');
   renderRuleList();
 }
 

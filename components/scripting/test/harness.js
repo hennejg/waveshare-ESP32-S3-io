@@ -30,10 +30,15 @@ function createEngine(opts) {
   // real. Defaults true (legacy behaviour); pass { timeValid: false } to test suppression.
   let timeValid = opts.timeValid !== undefined ? !!opts.timeValid : true;
 
+  let ledState   = { r: 0, g: 0, b: 0 };   // last led().set(...)
+  let buzzerFreq = 0;                       // last buzzer().set(...) Hz (0 = off)
+
   const sandbox = {
     _di_get(ch)        { return !!di[ch]; },
     _dout_set(ch, v)   { dout[ch] = !!v; },
     _dout_get(ch)      { return !!dout[ch]; },
+    _led_set(r, g, b)  { ledState = { r: r | 0, g: g | 0, b: b | 0 }; },
+    _buzzer_set(freq)  { buzzerFreq = freq | 0; },
     print(...a)        { prints.push(a.join(' ')); },
     _set_timer(ms, fn) { const id = nextId++; timers.set(id, { at: now + (ms | 0), fn }); return id; },
     _clear_timer(id)   { timers.delete(id); },
@@ -90,6 +95,10 @@ function createEngine(opts) {
     // (scripting_on_time_sync → _on_time_sync). Call after an SNTP-style clock step.
     timeSync()     { timeValid = true; sandbox._on_time_sync(); },
     setTimeValid(v){ timeValid = !!v; },
+    // Component observation + fieldbus activity injection (mirror the device hooks).
+    ledState()     { return ledState; },     // { r, g, b } of the last led().set
+    buzzerFreq()   { return buzzerFreq; },    // Hz of the last buzzer().set (0 = off)
+    activity(key)  { sandbox._on_activity(key); },   // 'modbus' | 'can'
   };
 }
 

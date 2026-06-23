@@ -107,8 +107,9 @@ with a small JavaScript DSL. Rules are edited in the **Rules** tab of the web UI
 See the **[Rule Language Reference](components/scripting/RULES.md)** for the full syntax —
 rule structure, the `input` / `output` / `mqtt` facts and their helpers, time-based rules
 (`.heldFor` / `.after`), and rule chaining, with examples throughout. You can prototype and
-test rules in the browser with the simulator in [`simulator/`](simulator/), which runs the
-live engine source.
+test rules in the browser with the simulator in [`simulator/`](simulator/) — run
+`cd simulator && npm start` and open <http://localhost:3000> (see
+[`simulator/README.md`](simulator/README.md)). It runs the live engine source.
 
 ### MQTT
 

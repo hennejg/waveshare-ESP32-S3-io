@@ -10,12 +10,16 @@ typedef bool      (*scripting_di_get_fn_t)(uint8_t ch);
 typedef esp_err_t (*scripting_dout_set_fn_t)(uint8_t ch, bool state);
 typedef bool      (*scripting_dout_get_fn_t)(uint8_t ch);
 typedef int       (*scripting_mqtt_subscribe_fn_t)(const char *topic, int qos);
+typedef esp_err_t (*scripting_led_set_fn_t)(uint8_t r, uint8_t g, uint8_t b);
+typedef void      (*scripting_buzzer_set_fn_t)(uint32_t freq_hz);   /* 0 = off */
 
 typedef struct {
     scripting_di_get_fn_t         di_get;
     scripting_dout_set_fn_t       dout_set;
     scripting_dout_get_fn_t       dout_get;
     scripting_mqtt_subscribe_fn_t mqtt_subscribe;
+    scripting_led_set_fn_t        led_set;      /* drive the RGB LED (IO mode only) */
+    scripting_buzzer_set_fn_t     buzzer_set;   /* continuous tone; 0 Hz = off */
 } scripting_io_t;
 
 // Initialize the scripting engine and start the rule evaluation task.
@@ -50,3 +54,10 @@ void scripting_set_time_valid(void);
 // step that occurs when SNTP jumps the clock from boot-relative to real time.
 // Safe to call from any task (e.g. the SNTP sync callback).
 void scripting_on_time_sync(void);
+
+// Notify the engine that an upstream command arrived on a fieldbus — feeds the
+// corresponding command-health source (modbus()/can() in the DSL). Call on each inbound
+// MODBUS coil/holding-register write, and each CAN/NMEA2000 control write, respectively.
+// Safe to call from any task (e.g. the Modbus/CAN RX tasks).
+void scripting_on_modbus_activity(void);
+void scripting_on_can_activity(void);

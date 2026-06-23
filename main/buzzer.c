@@ -70,6 +70,7 @@ static void buzzer_task(void *arg)
     bseq_t seq;
     for (;;) {
         xQueueReceive(s_queue, &seq, portMAX_DELAY);
+        bool sustain = false;
         for (int i = 0; i < seq.count; i++) {
             if (seq.steps[i].freq_hz > 0) {
                 ledc_set_freq(LEDC_MODE, LEDC_TIMER, seq.steps[i].freq_hz);
@@ -78,13 +79,18 @@ static void buzzer_task(void *arg)
                 ledc_set_duty(LEDC_MODE, LEDC_CHAN, 0);  /* silence */
             }
             ledc_update_duty(LEDC_MODE, LEDC_CHAN);
+            /* dur_ms == 0 means "hold this tone until the next command" (continuous tone
+               from buzzer_set_tone — MQTT sequences always clamp duration to >= 1 ms). */
+            if (seq.steps[i].dur_ms == 0) { sustain = true; break; }
             vTaskDelay(pdMS_TO_TICKS(seq.steps[i].dur_ms));
             /* Preempt remaining steps if a newer sequence has arrived. */
             if (uxQueueMessagesWaiting(s_queue)) break;
         }
-        /* Always silence after sequence ends or is preempted. */
-        ledc_set_duty(LEDC_MODE, LEDC_CHAN, 0);
-        ledc_update_duty(LEDC_MODE, LEDC_CHAN);
+        /* Silence after a sequence ends or is preempted — but not for a held tone. */
+        if (!sustain) {
+            ledc_set_duty(LEDC_MODE, LEDC_CHAN, 0);
+            ledc_update_duty(LEDC_MODE, LEDC_CHAN);
+        }
     }
 }
 
@@ -99,6 +105,19 @@ void buzzer_beep_once(uint32_t freq_hz, uint32_t dur_ms)
     bseq_t seq = { .count = 1 };
     seq.steps[0].freq_hz = freq_hz;
     seq.steps[0].dur_ms  = dur_ms;
+    xQueueOverwrite(s_queue, &seq);
+}
+
+void buzzer_set_tone(uint32_t freq_hz)
+{
+    if (freq_hz > 0) {
+        if (freq_hz < FREQ_MIN) freq_hz = FREQ_MIN;
+        if (freq_hz > FREQ_MAX) freq_hz = FREQ_MAX;
+    }
+    /* dur_ms = 0 → the task holds the tone (or silence, if freq 0) until the next command. */
+    bseq_t seq = { .count = 1 };
+    seq.steps[0].freq_hz = freq_hz;
+    seq.steps[0].dur_ms  = 0;
     xQueueOverwrite(s_queue, &seq);
 }
 

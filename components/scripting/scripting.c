@@ -36,7 +36,12 @@ extern const char dsl_js_start[] asm("_binary_dsl_js_start");
 
 /* ── Event queue ─────────────────────────────────────────────────────────── */
 
-typedef enum { EVT_MQTT, EVT_INPUT_CHANGE, EVT_RELOAD, EVT_TIMER, EVT_TIME_SYNC } evt_type_t;
+typedef enum { EVT_MQTT, EVT_INPUT_CHANGE, EVT_RELOAD, EVT_TIMER, EVT_TIME_SYNC,
+               EVT_ACTIVITY } evt_type_t;
+
+// Fieldbus command-activity sources (DSL _on_activity key); see scripting_on_*_activity.
+#define ACT_MODBUS 0
+#define ACT_CAN    1
 
 typedef struct {
     evt_type_t type;
@@ -45,6 +50,7 @@ typedef struct {
         struct { uint8_t channel; bool state; } input;
         struct { char *script; } reload;  // heap-allocated; task frees after eval
         struct { uint32_t id; } timer;     // a rule timer fired (see _set_timer)
+        struct { uint8_t source; } activity;  // ACT_MODBUS / ACT_CAN
     };
 } scripting_evt_t;
 
@@ -254,6 +260,7 @@ static void scripting_task(void *arg)
     JSValue on_mqtt      = JS_GetPropertyStr(ctx, global, "_on_mqtt");
     JSValue on_input     = JS_GetPropertyStr(ctx, global, "_on_input");
     JSValue on_time_sync = JS_GetPropertyStr(ctx, global, "_on_time_sync");
+    JSValue on_activity  = JS_GetPropertyStr(ctx, global, "_on_activity");
     JS_FreeValue(ctx, global);
 
     ESP_LOGI(TAG, "Rule engine ready. Free heap: %lu B  SPIRAM: %lu B",
@@ -316,6 +323,12 @@ static void scripting_task(void *arg)
                     JS_FreeValue(ctx, r);
                 }
                 break;
+            case EVT_ACTIVITY: {
+                // A fieldbus command arrived → feed the matching DSL command-health source.
+                const char *src = (ev.activity.source == ACT_CAN) ? "can" : "modbus";
+                call2(ctx, on_activity, JS_NewString(ctx, src), JS_UNDEFINED);
+                break;
+            }
             }
             drain_jobs(rt);
         }
@@ -401,6 +414,18 @@ void scripting_on_time_sync(void)
     if (xQueueSend(s_queue, &ev, 0) != pdTRUE)
         ESP_LOGW(TAG, "scripting_on_time_sync: queue full");
 }
+
+static void post_activity(uint8_t source)
+{
+    if (!s_queue) return;
+    scripting_evt_t ev = { .type = EVT_ACTIVITY, .activity = { .source = source } };
+    // Drop silently if the queue is full — a missed health feed only risks a spurious
+    // "stale" edge, and flooding the log from a busy RX task would be worse.
+    xQueueSend(s_queue, &ev, 0);
+}
+
+void scripting_on_modbus_activity(void) { post_activity(ACT_MODBUS); }
+void scripting_on_can_activity(void)    { post_activity(ACT_CAN); }
 
 void scripting_on_input_change(uint8_t channel, bool state)
 {
