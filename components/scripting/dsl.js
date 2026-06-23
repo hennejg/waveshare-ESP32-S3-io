@@ -13,6 +13,8 @@
 //                                                      hold continuously for ms
 //   rule(name).when(...).noLoop().then(fn)           → rule won't re-fire from its own
 //                                                      consequence (Drools-style no-loop)
+//   every(ms)            → time trigger: an edge event every ms (other when()-conditions gate it)
+//   cron("m h dom mon dow") → time trigger on a 5-field cron schedule (evaluated in UTC)
 //   mqtt(topic).is(fn)   → MqttCondition   (condition + value holder)
 //   input(ch).is(bool)   → InputCondition  (.value / .get() read the live level)
 //   output(ch)           → actuator { set(bool), on(), off(), toggle(), get(), value }
@@ -215,11 +217,135 @@ OutputCondition.prototype._check = function() {
     return cur === this._expected;
 };
 
+// ── Time triggers (every / cron) ──────────────────────────────────────────────
+// Unlike .after()/.heldFor() (which time a rule's *action*), these are trigger
+// *sources*: the engine fires its own event on a schedule. Each is an edge — armed
+// only during its own tick — so other when()-conditions act as gates:
+//   .when(every(5000), input(0).isOn())  → every 5 s, fire if DI0 is on.
+// Each instance gets a unique fact key (time:N) so dispatch only re-evaluates the
+// rules referencing it; the timer is armed when the rule registers and cancelled by
+// _reset_rules (it runs through _schedule, so _cancel_all_timers covers it).
+var _timeSeq = 0;
+
+// Wall-clock epoch ms. Prefers a host _now() binding (mockable in tests / synced on
+// device); falls back to Date.now(). NOTE: until the device's clock is SNTP-synced,
+// cron evaluates against an unset clock — see RULES.md.
+function _now_ms() {
+    if (typeof _now === 'function') return _now();
+    if (typeof Date !== 'undefined' && Date.now) return Date.now();
+    return 0;
+}
+
+// ── IntervalCondition: every(ms) ──
+function IntervalCondition(ms) {
+    this.ms       = ms;
+    this._timeFact = 'time:' + (++_timeSeq);
+    this._armed   = false;
+    this._timer   = null;
+}
+IntervalCondition.prototype._check = function() { return this._armed; };
+IntervalCondition.prototype._arm = function() {
+    if (this._timer != null) return;          // already armed (shared across rules)
+    var self = this;
+    self._timer = _schedule(self.ms, function() {
+        self._timer = null;
+        self._armed = true;
+        _fire_matching(self._timeFact);
+        self._armed = false;
+        self._arm();                          // re-arm for the next period
+    });
+};
+
+// ── Cron: cron("min hour dom month dow") — standard 5-field, evaluated in UTC ──
+// Supports *, lists (a,b), ranges (a-b), and steps (*/n, a-b/n). Day-of-month and
+// day-of-week follow Vixie semantics: if both are restricted the match is OR.
+function _cronField(spec, min, max) {
+    var set = {};
+    var parts = String(spec).split(',');
+    for (var i = 0; i < parts.length; i++) {
+        var p = parts[i], step = 1, slash = p.indexOf('/');
+        if (slash >= 0) {
+            step = parseInt(p.slice(slash + 1), 10);
+            p = p.slice(0, slash);
+            if (!(step >= 1)) throw new Error('cron: bad step in "' + spec + '"');
+        }
+        var lo, hi;
+        if (p === '*') { lo = min; hi = max; }
+        else if (p.indexOf('-') >= 0) { var r = p.split('-'); lo = parseInt(r[0], 10); hi = parseInt(r[1], 10); }
+        else { lo = hi = parseInt(p, 10); }
+        if (!(lo >= min && hi <= max && lo <= hi)) throw new Error('cron: out of range in "' + spec + '"');
+        for (var v = lo; v <= hi; v += step) set[v] = true;
+    }
+    return set;
+}
+function _parseCron(expr) {
+    var f = String(expr).trim().split(/\s+/);
+    if (f.length !== 5) throw new Error('cron: expected 5 fields in "' + expr + '"');
+    var dow = _cronField(f[4], 0, 7);
+    if (dow[7]) { dow[0] = true; delete dow[7]; }   // 7 and 0 both mean Sunday
+    return {
+        minute: _cronField(f[0], 0, 59),
+        hour:   _cronField(f[1], 0, 23),
+        dom:    _cronField(f[2], 1, 31),
+        month:  _cronField(f[3], 1, 12),
+        dow:    dow,
+        domR:   f[2] !== '*',
+        dowR:   f[4] !== '*'
+    };
+}
+function _cronDayOk(f, d) {
+    var domOk = f.dom[d.getUTCDate()] === true;
+    var dowOk = f.dow[d.getUTCDay()] === true;
+    if (f.domR && f.dowR) return domOk || dowOk;   // Vixie OR
+    if (f.domR) return domOk;
+    if (f.dowR) return dowOk;
+    return true;
+}
+// Next epoch ms strictly after fromMs matching the cron fields (UTC); -1 if none in ~5y.
+function _cronNext(f, fromMs) {
+    var d = new Date(fromMs);
+    d.setUTCSeconds(0, 0);
+    d.setUTCMinutes(d.getUTCMinutes() + 1);        // minute granularity, strictly after
+    var capYear = new Date(fromMs).getUTCFullYear() + 5;
+    while (d.getUTCFullYear() <= capYear) {
+        if (f.month[d.getUTCMonth() + 1] !== true) { d.setUTCMonth(d.getUTCMonth() + 1, 1); d.setUTCHours(0, 0, 0, 0); continue; }
+        if (!_cronDayOk(f, d))                       { d.setUTCDate(d.getUTCDate() + 1);     d.setUTCHours(0, 0, 0, 0); continue; }
+        if (f.hour[d.getUTCHours()] !== true)        { d.setUTCHours(d.getUTCHours() + 1, 0, 0, 0); continue; }
+        if (f.minute[d.getUTCMinutes()] !== true)    { d.setUTCMinutes(d.getUTCMinutes() + 1, 0, 0); continue; }
+        return d.getTime();
+    }
+    return -1;
+}
+function CronCondition(expr) {
+    this.expr      = expr;
+    this._fields   = _parseCron(expr);    // throws on a malformed expression
+    this._timeFact = 'time:' + (++_timeSeq);
+    this._armed    = false;
+    this._timer    = null;
+}
+CronCondition.prototype._check = function() { return this._armed; };
+CronCondition.prototype._arm = function() {
+    if (this._timer != null) return;
+    var self = this;
+    var now  = _now_ms();
+    var next = _cronNext(self._fields, now);
+    if (next < 0) { print('[rules] cron "' + self.expr + '" has no upcoming match'); return; }
+    self._timer = _schedule(next - now, function() {
+        self._timer = null;
+        self._armed = true;
+        _fire_matching(self._timeFact);
+        self._armed = false;
+        self._arm();                       // schedule the following occurrence
+    });
+};
+
 // ── Public factory functions ─────────────────────────────────────────────────
 
 function mqtt(topic)  { return new MqttCondition(topic); }
 function input(ch)    { return new InputCondition(ch); }
 function output(ch)   { return new OutputCondition(ch); }
+function every(ms)    { return new IntervalCondition(ms); }
+function cron(expr)   { return new CronCondition(expr); }
 
 // ── Rule builder (fluent API) ────────────────────────────────────────────────
 
@@ -251,6 +377,7 @@ function _ruleFacts(conditions) {
         if      (c instanceof InputCondition)  facts['input:'  + c.channel] = true;
         else if (c instanceof OutputCondition) facts['output:' + c.channel] = true;
         else if (c instanceof MqttCondition)   facts['mqtt:'   + c.topic]   = true;
+        else if (c && c._timeFact)             facts[c._timeFact]           = true;  // every()/cron()
         else                                   wildcard = true;
     }
     return { facts: facts, wildcard: wildcard };
@@ -315,6 +442,12 @@ RuleBuilder.prototype.then = function(fn) {
         };
         this._rule.action = function() { _run_steps(ref, 0); };
         _rules.push(this._rule);
+        // Arm any time triggers (every/cron) now that the rule is live. Idempotent,
+        // so a trigger shared across rules is armed once; _reset_rules cancels them.
+        for (var ci = 0; ci < this._conditions.length; ci++) {
+            var tc = this._conditions[ci];
+            if (tc && typeof tc._arm === 'function') tc._arm();
+        }
     }
     return this;   // allow .after().then() chaining
 };

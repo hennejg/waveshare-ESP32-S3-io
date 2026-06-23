@@ -287,6 +287,44 @@ rule('toggle per command')
 `.once()` is a true edge: if the rule's other conditions are not met at the instant the
 message arrives, the edge is **missed**, not queued.
 
+### Time triggers — `every(ms)` and `cron(...)`
+
+`input`/`output`/`mqtt` react to *external* changes. Time triggers are the opposite —
+the engine fires its own event on a **schedule**. They are conditions you put in
+`when()`, and they are **edges** (satisfied only during their own tick), so any other
+conditions act as gates.
+
+| Form | Fires |
+|------|-------|
+| `every(ms)` | every `ms` milliseconds (first tick one period after the rule loads) |
+| `cron("m h dom mon dow")` | on a standard 5-field cron schedule |
+
+```js
+// Poll a sensor every 5 s, but only while enabled (DI0 high)
+rule('poll')
+  .when(every(5000), input(0).isOn())
+  .then(function () { output(0).toggle(); });
+
+// Every day at 07:00, turn DO1 on
+rule('morning')
+  .when(cron('0 7 * * *'))
+  .then(function () { output(1).on(); });
+```
+
+**Cron syntax** is the standard five fields — `minute hour day-of-month month day-of-week`
+— supporting `*`, lists (`a,b`), ranges (`a-b`), and steps (`*/n`, `a-b/n`). Day-of-week
+is `0`–`6` with Sunday `0` (`7` also accepted). When **both** day-of-month and day-of-week
+are restricted, a day matches if **either** does (Vixie semantics).
+
+> **Cron runs in UTC, and needs a synced clock.** Fields are currently evaluated in
+> **UTC** (local-time / timezone support is a follow-up). And cron is only as good as
+> the device's clock: until the firmware has SNTP-synced wall-clock time, cron computes
+> against an unset clock and will fire at the wrong moments. `every(ms)` has no such
+> dependency — it uses a relative timer.
+
+Each `every`/`cron` is its own fact, so its tick only re-evaluates the rules that use it,
+and reloading the rules cancels the timers.
+
 ### How events reach rules (the fact model)
 
 Each `input(ch)`, `output(ch)`, and `mqtt(topic)` is a **distinct fact**. When something
@@ -296,6 +334,7 @@ happens, the engine only re-evaluates the rules that reference the *changed* fac
   A rule gated on `input(7)` is **not** touched.
 - An **MQTT message** on `topic` re-evaluates only rules referencing `mqtt(topic)`.
 - Writing **DO0** to a new level re-evaluates only rules referencing `output(0)`.
+- An **`every`/`cron` tick** re-evaluates only the rules using that specific trigger.
 
 This is why toggling one input never accidentally fires a rule about another input.
 
@@ -484,6 +523,10 @@ mqtt(topic)               // matches once any message arrived (level/held)
 mqtt(topic).is(fn)        // matches when fn(payload) is truthy
 mqtt(topic).once()        // edge: matches only on each arrival
 mqtt(topic).value         // last payload
+
+// ── time triggers (edge; gate with other conditions) ───────────────────────
+every(ms)                 // fires every ms
+cron('m h dom mon dow')   // 5-field cron schedule (UTC; needs a synced clock)
 
 // ── in then() bodies ───────────────────────────────────────────────────────
 print(…)                  // log to the console (args joined by space)

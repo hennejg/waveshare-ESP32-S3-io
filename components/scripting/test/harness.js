@@ -32,6 +32,7 @@ function createEngine() {
     print(...a)        { prints.push(a.join(' ')); },
     _set_timer(ms, fn) { const id = nextId++; timers.set(id, { at: now + (ms | 0), fn }); return id; },
     _clear_timer(id)   { timers.delete(id); },
+    _now()             { return now; },   // virtual wall-clock (epoch ms) for cron
     T,
   };
 
@@ -78,6 +79,7 @@ function createEngine() {
     pendingTimers() { return timers.size; },
     advance,
     now() { return now; },
+    setClock(ms) { now = ms; },   // set the virtual epoch (call before loading cron rules)
   };
 }
 
