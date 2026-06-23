@@ -6,6 +6,13 @@
 #include "dout.h"
 #include "led.h"
 #include "matter.h"
+#include "scripting.h"
+
+extern const char DEMO_SCRIPT[];
+
+#define RULES_NVS_NS  "scripting"
+#define RULES_NVS_KEY "script"
+#define RULES_MAX_LEN 3900
 
 #include <stdio.h>
 #include <stdbool.h>
@@ -780,6 +787,83 @@ static esp_err_t api_io_buzzer(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ------------------------------------------------------------ rules endpoints */
+
+/* GET /api/rules — returns {"script":"..."} from NVS, or the demo script if unset */
+static esp_err_t api_rules_get(httpd_req_t *req)
+{
+    if (!check_auth(req)) return send_401(req);
+
+    char *buf = malloc(RULES_MAX_LEN + 1);
+    if (!buf) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_OK; }
+
+    const char *script = DEMO_SCRIPT;
+    nvs_handle_t h;
+    size_t len = RULES_MAX_LEN + 1;
+    if (nvs_open(RULES_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_str(h, RULES_NVS_KEY, buf, &len) == ESP_OK)
+            script = buf;
+        nvs_close(h);
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "script", script);
+    free(buf);
+
+    char *body = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, body);
+    free(body);
+    return ESP_OK;
+}
+
+/* POST /api/rules — {"script":"..."} saves to NVS and hot-reloads the engine */
+static esp_err_t api_rules_post(httpd_req_t *req)
+{
+    if (!check_auth(req)) return send_401(req);
+    if (req->content_len == 0 || req->content_len > RULES_MAX_LEN + 100) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body too large");
+        return ESP_OK;
+    }
+
+    char *body = malloc(req->content_len + 1);
+    if (!body) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_OK; }
+
+    int n = httpd_req_recv(req, body, req->content_len);
+    if (n <= 0) { free(body); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
+    body[n] = '\0';
+
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
+
+    cJSON *script_j = cJSON_GetObjectItemCaseSensitive(root, "script");
+    if (!cJSON_IsString(script_j)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing 'script' field");
+        return ESP_OK;
+    }
+
+    const char *script = script_j->valuestring;
+    nvs_handle_t h;
+    if (nvs_open(RULES_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        if (script[0] == '\0')
+            nvs_erase_key(h, RULES_NVS_KEY);
+        else
+            nvs_set_str(h, RULES_NVS_KEY, script);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+
+    scripting_reload(script[0] ? script : DEMO_SCRIPT);
+
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+    return ESP_OK;
+}
+
 /* -------------------------------------------------------------- start / stop */
 
 static const httpd_uri_t s_handlers[] = {
@@ -798,6 +882,8 @@ static const httpd_uri_t s_handlers[] = {
     { .uri = "/api/eth-only",          .method = HTTP_POST, .handler = api_eth_only          },
     { .uri = "/api/reboot",            .method = HTTP_POST, .handler = api_reboot            },
     { .uri = "/api/factory-reset",     .method = HTTP_POST, .handler = api_factory_reset     },
+    { .uri = "/api/rules",             .method = HTTP_GET,  .handler = api_rules_get         },
+    { .uri = "/api/rules",             .method = HTTP_POST, .handler = api_rules_post        },
     { .uri = "/*",                     .method = HTTP_GET,  .handler = file_get              },
 };
 
@@ -807,12 +893,15 @@ esp_err_t web_server_start(void)
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn     = httpd_uri_match_wildcard;
-    cfg.max_uri_handlers = 16;
-    /* Force the httpd task stack into PSRAM.  After BLE+Matter init, pvPortMalloc
-     * (INTERNAL-only, no PSRAM fallback) has only ~1.5 KB left — not enough for the
-     * 4096-byte default stack.  MALLOC_CAP_SPIRAM puts the stack in PSRAM while the
-     * TCB stays in INTERNAL (pvPortMalloc inside xTaskCreatePinnedToCoreWithCaps). */
-    cfg.task_caps        = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    cfg.max_uri_handlers = 18;
+    /* Allocate the httpd task stack from the reserved internal DMA pool
+     * (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT), not from PSRAM.
+     * PSRAM stacks fail the esp_ptr_in_dram() check inside the SPI-flash driver,
+     * which asserts before every NVS write.  After Matter init the general internal
+     * heap is nearly exhausted (~1.5 KB), but CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL
+     * keeps 32 KB of DMA-capable internal RAM aside for exactly this kind of request,
+     * and the DMA pool still has ~29 KB free at that point. */
+    cfg.task_caps        = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
     cfg.send_wait_timeout = 10;   /* seconds; default 5 is too tight with Matter on WiFi */
 
     esp_err_t ret = httpd_start(&s_server, &cfg);

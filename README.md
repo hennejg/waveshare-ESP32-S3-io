@@ -75,6 +75,7 @@ Served at `http://<device-ip>/` on port 80. Settings include:
 | Digital Outputs | Per-output name and invert flag                  |
 | CAN Bus         | Mode (Off / Basic / NMEA2000), address, bit rate |
 | Modbus RTU      | Enable/disable, slave address, baudrate          |
+| Automation Rules | JavaScript rule script (see [Automation Rules](#automation-rules)) |
 
 The UI also provides **Save**, **Reboot**, and **Factory Reset** buttons.
 
@@ -94,6 +95,20 @@ All endpoints except the auth flow require an `Authorization: Basic base64(:<pas
 | `/api/factory-reset`       | POST   | Yes           | Erase all settings and restart                          |
 | `/api/matter/pairing`      | GET    | Yes           | `{"qr_code":"…","manual_code":"…","commissioned":bool}` |
 | `/api/matter/decommission` | POST   | Yes           | Remove all fabrics, erase Matter state, reboot          |
+| `/api/rules`               | GET    | Yes           | Read the current rule script as `{"script":"…"}`        |
+| `/api/rules`               | POST   | Yes           | Save + hot-reload rules from `{"script":"…"}`           |
+
+### Automation Rules
+
+A built-in rule engine wires digital inputs, digital outputs, and MQTT messages together
+with a small JavaScript DSL. Rules are edited in the **Rules** tab of the web UI (or via
+`POST /api/rules`), saved to NVS, and hot-reloaded without a reboot.
+
+See the **[Rule Language Reference](components/scripting/RULES.md)** for the full syntax —
+rule structure, the `input` / `output` / `mqtt` facts and their helpers, time-based rules
+(`.heldFor` / `.after`), and rule chaining, with examples throughout. You can prototype and
+test rules in the browser with the simulator in [`simulator/`](simulator/), which runs the
+live engine source.
 
 ### MQTT
 

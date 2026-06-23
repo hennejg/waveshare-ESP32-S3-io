@@ -1,0 +1,10 @@
+{
+  "name": "rule-simulator",
+  "description": "Browser simulator for the ESP32 rule engine DSL",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}

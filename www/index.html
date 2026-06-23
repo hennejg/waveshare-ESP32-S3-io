@@ -72,6 +72,10 @@
     .btn-row { margin-top:3rem; display:flex; gap:.5rem; flex-wrap:wrap; }
     #reboot-btn        { background:#b0413e; }
     #factory-reset-btn { background:#7a1e1e; }
+    /* Rules editor */
+    .rules-editor { width:100%; font-family:monospace; font-size:.82rem; padding:.5rem .6rem;
+                    border:1px solid #ccc; border-radius:4px; resize:vertical; min-height:14rem; }
+    #rules-status { font-size:.82rem; min-height:1.2em; margin:.4rem 0; }
   </style>
 </head>
 <body>
@@ -135,6 +139,7 @@
     <button type="button" class="tab-btn" data-tab="can"     onclick="switchTab('can')">CAN Bus</button>
     <button type="button" class="tab-btn" data-tab="modbus"  onclick="switchTab('modbus')">Modbus</button>
     <button type="button" class="tab-btn" data-tab="matter"  onclick="switchTab('matter')" id="tab-btn-matter" style="display:none">Matter</button>
+    <button type="button" class="tab-btn" data-tab="rules"   onclick="switchTab('rules')">Rules</button>
   </nav>
 
   <form id="form" novalidate>
@@ -291,6 +296,35 @@
       </div>
     </div>
 
+    <!-- ── Rules ── -->
+    <div id="tab-rules" class="tab-pane">
+      <h2>Automation Rules</h2>
+      <p class="hint">JavaScript rule script — changes are saved to the device and applied immediately without reboot. Leave empty and save to revert to the built-in demo. See the <a href="https://github.com/hennejg/waveshare-ESP32-S3-io/blob/master/components/scripting/RULES.md" target="_blank" rel="noopener">rule language reference</a>.</p>
+      <textarea id="rules-script" class="rules-editor" spellcheck="false" maxlength="3900"></textarea>
+      <p id="rules-status"></p>
+      <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.4rem">
+        <button type="button" onclick="saveRules()">Save Rules</button>
+        <button type="button" onclick="clearRules()" style="background:#888">Clear (restore demo)</button>
+      </div>
+      <details style="margin-top:1.5rem">
+        <summary style="font-size:.82rem;color:#888;cursor:pointer">DSL reference</summary>
+        <pre style="font-size:.75rem;background:#f6f6f6;padding:.7rem;border-radius:4px;overflow-x:auto;white-space:pre-wrap;margin-top:.5rem">// Subscribe to an MQTT topic:
+var t = mqtt('rules/trigger').is(function(m) { return m === 'ON'; });
+
+// Read a digital input state:
+var di0 = input(0).is(false);   // true when DI0 is open (not conducting)
+
+// Define a rule:
+rule('my-rule')
+  .when(t, di0)               // all conditions must be true
+  .then(function() {
+    output(0).set(true);      // set digital output 0
+    print('fired!');          // logs to the ESP console
+  });</pre>
+        <p style="font-size:.78rem;margin:.5rem 0 0"><a href="https://github.com/hennejg/waveshare-ESP32-S3-io/blob/master/components/scripting/RULES.md" target="_blank" rel="noopener">Full rule language reference ↗</a></p>
+      </details>
+    </div>
+
     <div class="btn-row">
       <button type="submit" id="btn">Save</button>
       <button type="button" id="reboot-btn">Reboot</button>
@@ -307,6 +341,7 @@
       document.querySelectorAll('.tab-pane').forEach(p =>
         p.classList.toggle('active', p.id === 'tab-' + name));
       try { localStorage.setItem('active_tab', name); } catch (_) {}
+      if (name === 'rules') loadRules();
     }
 
     (function initTabs() {
@@ -790,6 +825,56 @@
           body: JSON.stringify({ freq, duration: dur }),
         });
       } catch (_) {}
+    }
+
+    /* ---- Rules editor ---- */
+    let rulesLoaded = false;
+
+    async function loadRules() {
+      if (rulesLoaded) return;
+      try {
+        const r = await apiFetch('/api/rules');
+        if (!r.ok) return;
+        const d = await r.json();
+        document.getElementById('rules-script').value = d.script || '';
+        rulesLoaded = true;
+      } catch (_) {}
+    }
+
+    async function postRules(script, successMsg) {
+      const st = document.getElementById('rules-status');
+      st.className = '';
+      st.textContent = 'Saving…';
+      try {
+        const r = await apiFetch('/api/rules', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ script }),
+        });
+        const d = await r.json();
+        if (d.status === 'ok') {
+          st.className = 'ok';
+          st.textContent = successMsg;
+          rulesLoaded = false;
+          await loadRules();
+        } else {
+          st.className = 'err';
+          st.textContent = 'Error: ' + JSON.stringify(d);
+        }
+      } catch (e) {
+        st.className = 'err';
+        st.textContent = 'Save failed: ' + e.message;
+      }
+    }
+
+    function saveRules() {
+      const script = document.getElementById('rules-script').value.trim();
+      return postRules(script, 'Saved and applied.');
+    }
+
+    async function clearRules() {
+      if (!confirm('Reset to built-in demo rules? Your custom script will be erased.')) return;
+      return postRules('', 'Demo restored.');
     }
 
     initAuth();

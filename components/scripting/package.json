@@ -1,0 +1,10 @@
+{
+  "name": "rule-engine-tests",
+  "description": "Test suite for the ESP32 rule engine DSL (components/scripting/dsl.js)",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

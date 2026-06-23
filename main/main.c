@@ -1,3 +1,4 @@
+#include <string.h>
 #include <nvs_flash.h>
 #include <esp_heap_caps.h>
 #include <nvs.h>
@@ -21,8 +22,28 @@
 #include "mb_server.h"
 #include "web_server.h"
 #include "matter.h"
+#include "scripting.h"
 
 #define TAG          "main"
+
+// ── Demo rule script ─────────────────────────────────────────────────────────
+// Publish "ON" to <prefix>/rules/trigger (or /rules/trigger for absolute) to fire it.
+// The rule also requires digital input 0 to be inactive (not conducting).
+const char DEMO_SCRIPT[] =
+    "var trig = mqtt('rules/trigger').is(function(m) { return m === 'ON'; });\n"
+    "rule('demo')\n"
+    "  .when(trig, input(0).is(false))\n"
+    "  .then(function() {\n"
+    "    print('Demo rule fired! payload=' + trig.value);\n"
+    "    output(0).set(true);\n"
+    "  });\n";
+
+static const scripting_io_t s_scripting_io = {
+    .di_get        = di_get,
+    .dout_set      = dout_set,
+    .dout_get      = dout_get,
+    .mqtt_subscribe = app_mqtt_subscribe,
+};
 #define NVS_ETH_NS   "app_config"
 #define NVS_ETH_KEY  "eth_only"
 
@@ -52,6 +73,14 @@ static void set_eth_only(bool on)
 
 /* --------------------------------------------------------- MQTT callbacks */
 
+/* Feed the rule engine the broker connection state as an internal '$sys/mqtt'
+ * message ("up"/"down"), so rules can gate on mqttConnected()/mqttDown(). Injected
+ * locally via the normal message path — never published to or read from the broker. */
+static void scripting_feed_mqtt_state(const char *state)
+{
+    scripting_on_mqtt_message("$sys/mqtt", 9, state, strlen(state));
+}
+
 static void on_mqtt_connected(void)
 {
     led_status_set_mqtt(true);
@@ -59,9 +88,15 @@ static void on_mqtt_connected(void)
     dout_on_mqtt_connected();
     led_on_mqtt_connected();
     buzzer_on_mqtt_connected();
+    scripting_on_mqtt_connected();
+    scripting_feed_mqtt_state("up");
 }
 
-static void on_mqtt_disconnected(void) { led_status_set_mqtt(false); }
+static void on_mqtt_disconnected(void)
+{
+    led_status_set_mqtt(false);
+    scripting_feed_mqtt_state("down");
+}
 
 static void on_mqtt_message(const char *topic, size_t tlen,
                              const char *data,  size_t dlen)
@@ -71,6 +106,7 @@ static void on_mqtt_message(const char *topic, size_t tlen,
     dout_on_mqtt_message(topic, tlen, data, dlen);
     led_on_mqtt_message(topic, tlen, data, dlen);
     buzzer_on_mqtt_message(topic, tlen, data, dlen);
+    scripting_on_mqtt_message(topic, tlen, data, dlen);
 }
 
 static void on_mqtt_publish(void) { led_status_flash_tx(); }
@@ -144,6 +180,20 @@ void app_main(void)
     button_init();
     ESP_ERROR_CHECK(di_init());
     ESP_ERROR_CHECK(dout_init());
+
+    /* Load user script from NVS; fall back to built-in demo if none stored. */
+    const char *startup_script = DEMO_SCRIPT;
+    static char s_nvs_script_buf[4096];
+    {
+        nvs_handle_t h;
+        size_t len = sizeof(s_nvs_script_buf);
+        if (nvs_open("scripting", NVS_READONLY, &h) == ESP_OK) {
+            if (nvs_get_str(h, "script", s_nvs_script_buf, &len) == ESP_OK)
+                startup_script = s_nvs_script_buf;
+            nvs_close(h);
+        }
+    }
+    ESP_ERROR_CHECK(scripting_init(startup_script, &s_scripting_io));
     ESP_ERROR_CHECK(led_init());
     ESP_ERROR_CHECK(buzzer_init());
     ESP_ERROR_CHECK(mb_server_init());

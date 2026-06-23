@@ -20,6 +20,13 @@ jobs:
       - name: Fix git safe directory (Docker container runs as root)
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
+      # Only QuickJS is required (the rule engine); esp-idf comes from the container
+      # and esp-matter is optional (Matter is disabled when its submodule is absent).
+      - name: Check out the QuickJS submodule
+        run: |
+          git config --global --add safe.directory '*'
+          git submodule update --init components/quickjs/extern/quickjs
+
       - name: Cache managed components
         uses: actions/cache@v5
         with:
@@ -44,3 +51,22 @@ jobs:
             build/bootloader/bootloader.bin
             build/partition_table/partition-table.bin
             build/flash_args
+
+  rule-engine-tests:
+    name: Rule engine tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: false   # the DSL test suite is self-contained (no submodules)
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Zero-dependency suite (Node's built-in test runner) — no install step needed.
+      - name: Run the DSL test suite
+        working-directory: components/scripting
+        run: npm test
