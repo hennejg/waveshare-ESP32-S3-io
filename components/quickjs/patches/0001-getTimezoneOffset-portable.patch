@@ -1,0 +1,15 @@
+diff --git a/quickjs.c b/quickjs.c
+index e3716a4..f065580 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -47478,7 +47478,9 @@ static int getTimezoneOffset(int64_t time)
+         }
+     }
+     ti = time;
+-#if defined(_WIN32)
++/* Use the portable gmtime/localtime difference on Windows and on embedded
++   targets (e.g. ESP32 / newlib) where struct tm has no tm_gmtoff. */
++#if defined(_WIN32) || !defined(__GLIBC__)
+     {
+         struct tm *tm;
+         time_t gm_ti, loc_ti;

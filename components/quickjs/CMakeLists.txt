@@ -14,6 +14,31 @@ if(NOT EXISTS "${QJS}/quickjs.c")
         "components/quickjs/extern/quickjs")
 endif()
 
+# The submodule is pinned to pristine upstream; ESP-IDF/newlib adaptations live as
+# patches here and are applied (idempotently) at configure time. Currently:
+#   0001-getTimezoneOffset-portable.patch — use the portable gmtime/localtime path
+#   where struct tm has no tm_gmtoff (newlib), instead of the glibc tm_gmtoff branch.
+file(GLOB QJS_PATCHES "${CMAKE_CURRENT_LIST_DIR}/patches/*.patch")
+list(SORT QJS_PATCHES)
+foreach(patch ${QJS_PATCHES})
+    # Skip if already applied: a reverse-apply check succeeds only when it's in place.
+    execute_process(
+        COMMAND git apply --reverse --check "${patch}"
+        WORKING_DIRECTORY "${QJS}"
+        RESULT_VARIABLE _qjs_applied
+        OUTPUT_QUIET ERROR_QUIET)
+    if(NOT _qjs_applied EQUAL 0)
+        execute_process(
+            COMMAND git apply "${patch}"
+            WORKING_DIRECTORY "${QJS}"
+            RESULT_VARIABLE _qjs_rc)
+        if(NOT _qjs_rc EQUAL 0)
+            message(FATAL_ERROR "Failed to apply QuickJS patch: ${patch}")
+        endif()
+        message(STATUS "Applied QuickJS patch: ${patch}")
+    endif()
+endforeach()
+
 set(QJS_SRCS
     "${QJS}/quickjs.c"
     "${QJS}/libregexp.c"
