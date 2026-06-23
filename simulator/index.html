@@ -323,6 +323,9 @@ function renderRuleList() {
       } else if (c instanceof Fact) {
         desc = 'fact';
         status = '<span class="cunknown">value=' + esc(JSON.stringify(c._value)) + '</span>';
+      } else if (c && c._desc) {          // watchdog / stale conditions carry a label
+        desc = c._desc;
+        status = ok ? '<span class="cok">✓</span>' : '<span class="cfail">✗</span>';
       } else {
         desc = '(condition)';
         status = ok ? '<span class="cok">✓</span>' : '<span class="cfail">✗</span>';

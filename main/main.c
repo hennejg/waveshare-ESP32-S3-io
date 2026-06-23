@@ -1,3 +1,4 @@
+#include <string.h>
 #include <nvs_flash.h>
 #include <esp_heap_caps.h>
 #include <nvs.h>
@@ -72,6 +73,14 @@ static void set_eth_only(bool on)
 
 /* --------------------------------------------------------- MQTT callbacks */
 
+/* Feed the rule engine the broker connection state as an internal '$sys/mqtt'
+ * message ("up"/"down"), so rules can gate on mqttConnected()/mqttDown(). Injected
+ * locally via the normal message path — never published to or read from the broker. */
+static void scripting_feed_mqtt_state(const char *state)
+{
+    scripting_on_mqtt_message("$sys/mqtt", 9, state, strlen(state));
+}
+
 static void on_mqtt_connected(void)
 {
     led_status_set_mqtt(true);
@@ -80,9 +89,14 @@ static void on_mqtt_connected(void)
     led_on_mqtt_connected();
     buzzer_on_mqtt_connected();
     scripting_on_mqtt_connected();
+    scripting_feed_mqtt_state("up");
 }
 
-static void on_mqtt_disconnected(void) { led_status_set_mqtt(false); }
+static void on_mqtt_disconnected(void)
+{
+    led_status_set_mqtt(false);
+    scripting_feed_mqtt_state("down");
+}
 
 static void on_mqtt_message(const char *topic, size_t tlen,
                              const char *data,  size_t dlen)

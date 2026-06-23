@@ -372,6 +372,57 @@ made self-suppressing). `set(v)` only emits when `v !== ` the current value (`==
 comparison, so it's change-detection for primitives; replace a held object rather than
 mutating it in place).
 
+### Liveness & fallback — `watchdog`, `.stale()`, MQTT state
+
+The point of on-board rules is to keep working when the governing system or its link
+goes away. These primitives detect that absence and let you gate fallback behaviour.
+
+| Form | Meaning |
+|------|---------|
+| `watchdog(ms)` | a liveness fact: **alive** while fed within `ms`, **expired** otherwise |
+| `wd.feed()` | keep-alive (in a `then()`) — re-arms the timeout, recovers if expired |
+| `wd.isAlive()` / `wd.isExpired()` | conditions to gate on |
+| `mqtt(topic).stale(ms)` | a watchdog **auto-fed** by messages on `topic` — matches when no message for `ms` |
+| `mqttConnected()` / `mqttDown()` | the broker connection state (fed by the firmware) |
+
+A watchdog **starts alive with a grace period** (the timeout is armed when a rule using
+it registers), so a healthy system has `ms` after boot to check in before fallback kicks
+in. Feeding re-arms it; the alive→expired (timeout) and expired→alive (recovery)
+transitions emit, so gating rules re-evaluate.
+
+```js
+// Fallback: while the controlling system is absent, DI0 toggles the lights locally.
+var control = watchdog(90000);                              // expires after 90s with no sign of life
+
+rule('control alive')                                       // feed from a heartbeat — or from the
+  .when(mqtt('sys/heartbeat')).then(() => control.feed());  // commands the system re-issues
+
+rule('manual override')
+  .when(input(0).isOn(), control.isExpired())
+  .then(() => { output(0).toggle(); output(1).toggle(); /* … */ });
+```
+
+This covers **both** failure modes: a broker/network outage and a dead controller both
+stop the messages, so the watchdog expires either way (within `ms`). For the pure
+heartbeat case, `mqtt('sys/heartbeat').stale(90000)` is the same thing without the
+explicit feed rule:
+
+```js
+rule('manual override')
+  .when(input(0).isOn(), mqtt('sys/heartbeat').stale(90000))
+  .then(() => { /* … */ });
+```
+
+`mqttConnected()` / `mqttDown()` reflect the broker connection **immediately** (the
+firmware feeds connect/disconnect as an internal `$sys/mqtt` event), so you can react to
+a clean disconnect without waiting for a watchdog timeout — handy as a faster companion
+to the watchdog. They become meaningful after the first connection event.
+
+> **A note on trust.** Time-based and liveness facts are only as trustworthy as their
+> inputs — an MQTT heartbeat is unauthenticated and a clock may be wrong (cron is
+> boot-relative until SNTP lands). For anything safety-relevant, treat fallback as a
+> local interlock, not a security control.
+
 ### How events reach rules (the fact model)
 
 Each `input(ch)`, `output(ch)`, and `mqtt(topic)` is a **distinct fact**. When something
@@ -582,6 +633,13 @@ f.get() / f.value         // read
 f.is(fn)                  // condition: fn(value) is truthy
 f.is(x)                   // condition: value === x
 f.isTrue() / f.isFalse()  // condition: value truthy / falsy
+
+// ── liveness / fallback ─────────────────────────────────────────────────────
+var wd = watchdog(ms)     // alive while fed within ms, else expired
+wd.feed()                 // keep-alive (in then())
+wd.isAlive() / wd.isExpired()           // conditions
+mqtt(topic).stale(ms)     // condition: no message on topic for ms (auto-fed watchdog)
+mqttConnected() / mqttDown()            // broker connection state (host-fed)
 
 // ── in then() bodies ───────────────────────────────────────────────────────
 print(…)                  // log to the console (args joined by space)

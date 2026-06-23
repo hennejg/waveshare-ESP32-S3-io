@@ -18,6 +18,10 @@
 //   fact(initial)        → synthetic value: .set(v) in then(), .is(fn|value) in when()
 //                          (calculated by some rules, gated on by others);
 //                          .isTrue()/.isFalse() gate on truthiness
+//   watchdog(ms)         → liveness fact: .feed() keeps it alive, .isAlive()/.isExpired()
+//                          gate on it (expires if not fed for ms) — for local fallback
+//   mqtt(topic).stale(ms)→ watchdog auto-fed by messages on topic (matches when stale)
+//   mqttConnected() / mqttDown() → MQTT broker connection state (host-fed)
 //   mqtt(topic).is(fn)   → MqttCondition   (condition + value holder)
 //   input(ch).is(bool)   → InputCondition  (.value / .get() read the live level)
 //   output(ch)           → actuator { set(bool), on(), off(), toggle(), get(), value }
@@ -378,6 +382,61 @@ FactCondition.prototype._check = function() {
     return (typeof this._matcher === 'function') ? !!this._matcher(v) : (v === this._matcher);
 };
 
+// ── Watchdog: liveness / dead-man's-switch ────────────────────────────────────
+// watchdog(ms) is "alive" while fed within `ms`, else "expired" — the basis for local
+// fallback when a governing system or its link goes away. It starts alive with a grace
+// period (the timeout is armed when a rule using it registers), so a healthy system has
+// `ms` after boot to check in before fallback kicks in. .feed() re-arms; transitions
+// (alive→expired on timeout, expired→alive on a feed) emit so gating rules re-evaluate.
+// It is its own dispatch fact. Used via .isAlive()/.isExpired() in when() and .feed() in
+// then(); cancelled by _reset_rules (its timer runs through _schedule).
+function Watchdog(ms) {
+    this.ms       = ms;
+    this._alive   = true;
+    this._factKey = 'fact:' + (++_factSeq);
+    this._timer   = null;
+    this._started = false;
+}
+Watchdog.prototype._rearm = function() {
+    if (this._timer != null) _unschedule(this._timer);
+    var self = this;
+    this._timer = _schedule(this.ms, function() {
+        self._timer = null;
+        if (self._alive) { self._alive = false; _emit(self._factKey); }   // timed out → expired
+    });
+};
+Watchdog.prototype._arm = function() {           // at rule registration; idempotent
+    if (this._started) return;
+    this._started = true;
+    this._rearm();                                // start the grace period
+};
+Watchdog.prototype.feed = function() {
+    var was = this._alive;
+    this._alive = true; this._started = true;
+    this._rearm();
+    if (!was) _emit(this._factKey);               // recovered → notify gating rules
+    return true;
+};
+Watchdog.prototype._cond = function(test, label) {   // a condition bound to this watchdog
+    var self = this;
+    return { _factKey: self._factKey, _check: test, _arm: function() { self._arm(); }, _desc: label };
+};
+Watchdog.prototype.isAlive   = function() { var s = this; return this._cond(function() { return  s._alive; }, 'watchdog.isAlive()'); };
+Watchdog.prototype.isExpired = function() { var s = this; return this._cond(function() { return !s._alive; }, 'watchdog.isExpired()'); };
+
+// mqtt(topic).stale(ms): a watchdog auto-fed by messages on `topic` — matches (stale)
+// when no message arrived for `ms`. _on_mqtt feeds it; otherwise it is a Watchdog.
+function StaleCondition(topic, ms) {
+    this.topic    = topic;
+    this._wd      = new Watchdog(ms);
+    this._factKey = this._wd._factKey;
+    this._desc    = "mqtt('" + topic + "').stale(" + ms + ")";
+}
+StaleCondition.prototype._check = function() { return !this._wd._alive; };   // stale = expired
+StaleCondition.prototype._arm   = function() { this._wd._arm(); };
+StaleCondition.prototype._feed  = function() { this._wd.feed(); };
+MqttCondition.prototype.stale = function(ms) { return new StaleCondition(this.topic, ms); };
+
 // ── Public factory functions ─────────────────────────────────────────────────
 
 function mqtt(topic)  { return new MqttCondition(topic); }
@@ -386,6 +445,10 @@ function output(ch)   { return new OutputCondition(ch); }
 function every(ms)    { return new IntervalCondition(ms); }
 function cron(expr)   { return new CronCondition(expr); }
 function fact(initial){ return new Fact(initial); }
+function watchdog(ms) { return new Watchdog(ms); }
+// MQTT connection state, fed by the host as internal '$sys/mqtt' events (up/down).
+function mqttConnected() { return mqtt('$sys/mqtt').is(function(s){ return s === 'up';   }); }
+function mqttDown()      { return mqtt('$sys/mqtt').is(function(s){ return s === 'down'; }); }
 
 // ── Rule builder (fluent API) ────────────────────────────────────────────────
 
@@ -510,7 +573,8 @@ function _run_steps(r, idx) {
 // ── Internal event handlers — called from C ──────────────────────────────────
 
 function _on_mqtt(topic, payload) {
-    var armed = [];
+    _resetCascade();                 // root event — fresh cascade budget (stale feeds may emit)
+    var armed = [], feed = [];
     for (var i = 0; i < _rules.length; i++) {
         var conds = _rules[i].conditions;
         for (var j = 0; j < conds.length; j++) {
@@ -519,9 +583,12 @@ function _on_mqtt(topic, payload) {
                 c.value = payload;
                 c._seen = true;
                 if (c._once) { c._armed = true; armed.push(c); }
+            } else if (c instanceof StaleCondition && c.topic === topic) {
+                feed.push(c);
             }
         }
     }
+    for (var fi = 0; fi < feed.length; fi++) feed[fi]._feed();   // re-arm stale watchdogs
     _fire_matching('mqtt:' + topic);
     // Disarm edge conditions: they match only during this message's pass, so a
     // later _on_input → _fire_matching won't re-fire the rule.
