@@ -5,6 +5,7 @@
 #include "dout.h"
 #include "led.h"
 #include "buzzer.h"
+#include "scripting.h"
 
 #include <string.h>
 #include <inttypes.h>
@@ -101,14 +102,17 @@ static void basic_apply_do(uint8_t op, uint8_t mask)
 
 static void basic_handle_rx(const rx_msg_t *m)
 {
-    if (m->id == (uint16_t)(s_base + 2) && m->dlc == 2)
+    if (m->id == (uint16_t)(s_base + 2) && m->dlc == 2) {
         basic_apply_do(m->data[0], m->data[1]);
-    else if (m->id == (uint16_t)(s_base + 3) && m->dlc == 3)
+        scripting_on_can_activity();   /* upstream control write → CAN command-health feed */
+    } else if (m->id == (uint16_t)(s_base + 3) && m->dlc == 3) {
         led_set_rgb(m->data[0], m->data[1], m->data[2]);
-    else if (m->id == (uint16_t)(s_base + 4) && m->dlc >= 2) {
+        scripting_on_can_activity();
+    } else if (m->id == (uint16_t)(s_base + 4) && m->dlc >= 2) {
         uint16_t f = (uint16_t)(m->data[0] | (m->data[1] << 8));
         uint32_t d = (m->dlc >= 3) ? (uint32_t)m->data[2] * 10u : 200u;
         if (f > 0) buzzer_beep_once(f, d);
+        scripting_on_can_activity();
     } else if (m->id == (uint16_t)(s_base + 5) && m->dlc == 0) {
         uint8_t di = 0;
         for (int i = 0; i < 8; i++) if (di_get(i)) di |= (uint8_t)(1u << i);
@@ -360,6 +364,7 @@ static void n2k_handle_rx(const rx_msg_t *m)
             if (want != dout_get(sw)) dout_set(sw, want);
         }
         n2k_tx_do_bank();
+        scripting_on_can_activity();   /* upstream DO control → CAN command-health feed */
         return;
     }
 
@@ -374,12 +379,14 @@ static void n2k_handle_rx(const rx_msg_t *m)
         uint16_t mfr = (uint16_t)m->data[2] | ((uint16_t)m->data[3] << 8);
         if (mfr != N2K_MFR_CODE) return;
         uint8_t sub_fn = m->data[4];
-        if (sub_fn == 0x01 && m->data[1] >= 6)           /* LED */
+        if (sub_fn == 0x01 && m->data[1] >= 6) {          /* LED */
             led_set_rgb(m->data[5], m->data[6], m->data[7]);
-        else if (sub_fn == 0x02 && m->data[1] >= 6) {    /* Buzzer */
+            scripting_on_can_activity();
+        } else if (sub_fn == 0x02 && m->data[1] >= 6) {   /* Buzzer */
             uint16_t freq = (uint16_t)m->data[5] | ((uint16_t)m->data[6] << 8);
             uint32_t dur  = (m->data[1] >= 7) ? (uint32_t)m->data[7] * 10u : 200u;
             if (freq > 0) buzzer_beep_once(freq, dur);
+            scripting_on_can_activity();
         }
     }
 }

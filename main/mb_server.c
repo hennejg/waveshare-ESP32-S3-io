@@ -4,6 +4,7 @@
 #include "dout.h"
 #include "led.h"
 #include "buzzer.h"
+#include "scripting.h"
 
 #include "mbcontroller.h"
 #include "driver/gpio.h"
@@ -80,6 +81,10 @@ static void event_task(void *arg)
 
         mb_param_info_t info;
         if (mbc_slave_get_param_info(s_handle, &info, 10) != ESP_OK) continue;
+
+        /* A coil/holding-register write is an upstream control command — feed the rule
+         * engine's MODBUS command-health source (modbus(ms) in the DSL). */
+        scripting_on_modbus_activity();
 
         if (ev & MB_EVENT_COILS_WR) {
             mbc_slave_lock(s_handle);

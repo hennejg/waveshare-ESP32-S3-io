@@ -3,6 +3,8 @@
 //   _di_get(ch)          → bool    read digital input 0-7
 //   _dout_set(ch, bool)  → void    write digital output 0-7
 //   _dout_get(ch)        → bool    read current digital output state
+//   _led_set(r, g, b)    → void    drive the RGB LED (IO mode only)
+//   _buzzer_set(freqHz)  → void    continuous buzzer tone (0 = off)
 //   print(str)           → void    log to ESP console
 //
 // Public API exposed to user scripts:
@@ -28,6 +30,10 @@
 //   output(ch)           → actuator { set(bool), on(), off(), toggle(), get(), value }
 //                          (set/on/off/toggle return the resulting level) AND a fact
 //                          { is(bool), isOn(), isOff() } usable in when()
+//   led()                → actuator { set(r,g,b) | set("#rrggbb"), off() }
+//   buzzer()             → actuator { set(freqHz), off() }  (continuous tone)
+//   modbus(ms) / can(ms) → upstream command-health: auto-fed watchdogs, .isAlive() while
+//                          commands arrive within ms, .isExpired() when the link goes quiet
 //
 // Condition semantics (Drools-like — a bare pattern matches, .is() narrows it):
 //   input(ch)            → always matches; use input(ch).value in then()
@@ -125,7 +131,8 @@ function _drive_output(ch, v) {
 function _reset_rules() {
     _cancel_all_timers();
     _rules = [];
-    _cronTriggers = [];   // timers already cancelled above; drop the old trigger registry
+    _cronTriggers = [];        // timers already cancelled above; drop the old trigger registry
+    _activityWatchdogs = {};   // drop modbus()/can() health watchdogs from the old rule set
     _watchOutputs = false;
     _resetCascade();
 }
@@ -225,6 +232,38 @@ OutputCondition.prototype._check = function() {
     if (this._expected === undefined) return true;
     return cur === this._expected;
 };
+
+// ── Actuators: led() and buzzer() ─────────────────────────────────────────────
+// Singletons (one RGB LED, one buzzer), used in then() bodies — like output(), they
+// drive hardware via host bindings. Deliberately simpler than the MQTT led/buzzer paths:
+// no per-call duration or sequences — the rule engine's own timing (after/heldFor/every/
+// cron) covers that. Note: led().set() only takes effect in LED "IO" mode; in status mode
+// the firmware owns the LED and the write is ignored.
+
+// "#rrggbb" (leading '#' optional) → [r,g,b]; null if unparseable.
+function _parseHexColor(s) {
+    s = String(s).replace(/^#/, '');
+    if (!/^[0-9a-fA-F]{6}$/.test(s)) return null;
+    return [parseInt(s.slice(0, 2), 16), parseInt(s.slice(2, 4), 16), parseInt(s.slice(4, 6), 16)];
+}
+function Led() {}
+// led().set(r, g, b)  or  led().set("#rrggbb")
+Led.prototype.set = function(r, g, b) {
+    if (typeof r === 'string') {
+        var c = _parseHexColor(r);
+        if (!c) { print('[rules] led().set: bad colour "' + r + '"'); return this; }
+        _led_set(c[0], c[1], c[2]);
+    } else {
+        _led_set(r, g, b);
+    }
+    return this;
+};
+Led.prototype.off = function() { _led_set(0, 0, 0); return this; };
+
+function Buzzer() {}
+// buzzer().set(freqHz) → continuous tone; buzzer().off() → silence.
+Buzzer.prototype.set = function(freq) { _buzzer_set(freq); return this; };
+Buzzer.prototype.off = function()     { _buzzer_set(0);    return this; };
 
 // ── Time triggers (every / cron) ──────────────────────────────────────────────
 // Unlike .after()/.heldFor() (which time a rule's *action*), these are trigger
@@ -482,15 +521,42 @@ StaleCondition.prototype._arm   = function() { this._wd._arm(); };
 StaleCondition.prototype._feed  = function() { this._wd.feed(); };
 MqttCondition.prototype.stale = function(ms) { return new StaleCondition(this.topic, ms); };
 
+// ── Fieldbus command health: modbus(ms) / can(ms) ─────────────────────────────
+// Upstream-control liveness for the MODBUS and CAN/NMEA2000 command paths — the fieldbus
+// analogue of mqtt(topic).stale(ms). Each is a Watchdog the host auto-feeds whenever a
+// command arrives (the firmware calls _on_activity('modbus'|'can') on every inbound
+// write/control command), so .isAlive() means "a command came within ms" and .isExpired()
+// means the upstream link has gone quiet — the basis for local fallback. Like any
+// watchdog, each starts with an `ms` grace period from when its rule registers.
+var _activityWatchdogs = {};   // source key → [Watchdog, ...]
+function _activitySource(key, ms) {
+    var wd = new Watchdog(ms);
+    (_activityWatchdogs[key] || (_activityWatchdogs[key] = [])).push(wd);
+    return wd;
+}
+// Host-called when an upstream command arrives on `key` — keep its watchdogs alive
+// (feed() emits only on a quiet→active recovery, so gating rules re-evaluate on edges).
+function _on_activity(key) {
+    var list = _activityWatchdogs[key];
+    if (!list) return;
+    _resetCascade();                       // root event → fresh cascade budget
+    for (var i = 0; i < list.length; i++) list[i].feed();
+}
+
 // ── Public factory functions ─────────────────────────────────────────────────
 
 function mqtt(topic)  { return new MqttCondition(topic); }
 function input(ch)    { return new InputCondition(ch); }
 function output(ch)   { return new OutputCondition(ch); }
+function led()        { return new Led(); }
+function buzzer()     { return new Buzzer(); }
 function every(ms)    { return new IntervalCondition(ms); }
 function cron(expr)   { return new CronCondition(expr); }
 function fact(initial){ return new Fact(initial); }
 function watchdog(ms) { return new Watchdog(ms); }
+// Upstream command-health watchdogs, auto-fed by the host (see _on_activity).
+function modbus(ms)   { return _activitySource('modbus', ms); }
+function can(ms)      { return _activitySource('can', ms); }
 // MQTT connection state, fed by the host as internal '$sys/mqtt' events (up/down).
 function mqttConnected() { return mqtt('$sys/mqtt').is(function(s){ return s === 'up';   }); }
 function mqttDown()      { return mqtt('$sys/mqtt').is(function(s){ return s === 'down'; }); }

@@ -47,6 +47,8 @@ static const scripting_io_t s_scripting_io = {
     .dout_set      = dout_set,
     .dout_get      = dout_get,
     .mqtt_subscribe = app_mqtt_subscribe,
+    .led_set       = led_set_rgb,      /* effective in IO mode (no-op in status mode) */
+    .buzzer_set    = buzzer_set_tone,
 };
 #define NVS_ETH_NS   "app_config"
 #define NVS_ETH_KEY  "eth_only"

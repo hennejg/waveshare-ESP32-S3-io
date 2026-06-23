@@ -23,6 +23,7 @@ adding constraints narrows it.
 2. [Facts and helpers](#2-facts-and-helpers)
    - [`input(ch)`](#inputch--digital-input)
    - [`output(ch)`](#outputch--digital-output)
+   - [`led()` and `buzzer()`](#led-and-buzzer--led-and-buzzer-actuators)
    - [`mqtt(topic)`](#mqtttopic--mqtt-message)
    - [How events reach rules (the fact model)](#how-events-reach-rules-the-fact-model)
 3. [Time-based rules](#3-time-based-rules)
@@ -245,6 +246,36 @@ rule('DO1 follows DO0')
 > wedge the engine (or trip the device watchdog). Writing an output to the value it
 > already holds is a no-op and emits no event.
 
+### `led()` and `buzzer()` — LED and buzzer actuators
+
+Two more actuators for `then()` bodies. They are **write-only** (not conditions) and
+deliberately simple — no per-call duration or sequences like the MQTT LED/buzzer paths;
+when you want timing, drive them from the engine's own timers (`.after()`, `.heldFor()`,
+`every()`, `cron()`).
+
+| Form | Effect |
+|------|--------|
+| `led().set(r, g, b)` | set the RGB LED (each channel `0`–`255`) |
+| `led().set("#rrggbb")` | set from a hex colour (leading `#` optional) |
+| `led().off()` | turn the LED off (black) |
+| `buzzer().set(freqHz)` | play a continuous tone (`100`–`10000` Hz) |
+| `buzzer().off()` | silence the buzzer |
+
+```js
+// Visible + audible alarm while DI0 is active; clear it when DI0 releases.
+rule('alarm on')
+  .when(input(0).isOn())
+  .then(function () { led().set('#ff0000'); buzzer().set(2000); });
+
+rule('alarm off')
+  .when(input(0).isOff())
+  .then(function () { led().off(); buzzer().off(); });
+```
+
+> **The LED needs IO mode.** `led()` only takes effect when the LED is configured in
+> **IO** mode; in **status** mode the firmware owns the LED (showing connectivity) and the
+> write is ignored. The buzzer is always available.
+
 ### `mqtt(topic)` — MQTT message
 
 | Form | Meaning |
@@ -388,6 +419,8 @@ goes away. These primitives detect that absence and let you gate fallback behavi
 | `wd.isAlive()` / `wd.isExpired()` | conditions to gate on |
 | `mqtt(topic).stale(ms)` | a watchdog **auto-fed** by messages on `topic` — matches when no message for `ms` |
 | `mqttConnected()` / `mqttDown()` | the broker connection state (fed by the firmware) |
+| `modbus(ms)` | upstream **MODBUS** command health: a watchdog auto-fed by each inbound coil/holding-register write |
+| `can(ms)` | upstream **CAN/NMEA2000** command health: a watchdog auto-fed by each inbound control write |
 
 A watchdog **starts alive with a grace period** (the timeout is armed when a rule using
 it registers), so a healthy system has `ms` after boot to check in before fallback kicks
@@ -421,6 +454,23 @@ rule('manual override')
 firmware feeds connect/disconnect as an internal `$sys/mqtt` event), so you can react to
 a clean disconnect without waiting for a watchdog timeout — handy as a faster companion
 to the watchdog. They become meaningful after the first connection event.
+
+`modbus(ms)` and `can(ms)` extend the same idea to the fieldbuses: each is a watchdog the
+firmware auto-feeds whenever an upstream **command** arrives (a MODBUS coil/holding-register
+write, or a CAN/NMEA2000 control write — reads/polls don't count). So `.isAlive()` means a
+command came within `ms`, and `.isExpired()` means that control link has gone quiet — the
+same fallback gate as the MQTT case, for a different transport:
+
+```js
+// If the MODBUS master stops commanding us for 10 s, fall back to local control.
+rule('modbus fallback')
+  .when(input(0).isOn(), modbus(10000).isExpired())
+  .then(() => output(0).toggle());
+```
+
+Like any watchdog they **start alive with an `ms` grace period** from when the rule
+registers, so the upstream has that long after boot to begin commanding before fallback
+kicks in. `can(ms)` covers both basic-CAN and NMEA2000 modes (whichever is configured).
 
 > **A note on trust.** Time-based and liveness facts are only as trustworthy as their
 > inputs — an MQTT heartbeat is unauthenticated, and NTP is unauthenticated too, so a
@@ -620,6 +670,13 @@ output(ch).is(bool)       // condition: matches when level == bool
 output(ch).isOn()         // .is(true)
 output(ch).isOff()        // .is(false)
 
+// ── led() / buzzer() — actuators (then() only) ─────────────────────────────
+led().set(r, g, b)        // set RGB (0-255 each)
+led().set('#rrggbb')      // set from hex (IO mode only; ignored in status mode)
+led().off()               // LED off
+buzzer().set(freqHz)      // continuous tone (100-10000 Hz)
+buzzer().off()            // silence
+
 // ── mqtt(topic) — condition + last payload ─────────────────────────────────
 mqtt(topic)               // matches once any message arrived (level/held)
 mqtt(topic).is(fn)        // matches when fn(payload) is truthy
@@ -644,6 +701,8 @@ wd.feed()                 // keep-alive (in then())
 wd.isAlive() / wd.isExpired()           // conditions
 mqtt(topic).stale(ms)     // condition: no message on topic for ms (auto-fed watchdog)
 mqttConnected() / mqttDown()            // broker connection state (host-fed)
+modbus(ms).isAlive() / .isExpired()     // upstream MODBUS command health (auto-fed)
+can(ms).isAlive() / .isExpired()        // upstream CAN/NMEA2000 command health (auto-fed)
 
 // ── in then() bodies ───────────────────────────────────────────────────────
 print(…)                  // log to the console (args joined by space)
