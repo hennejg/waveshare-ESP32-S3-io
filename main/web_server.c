@@ -1021,7 +1021,9 @@ esp_err_t web_server_start(void)
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn     = httpd_uri_match_wildcard;
-    cfg.max_uri_handlers = 18;
+    /* Derive from the table so adding a handler never overflows the cap and
+     * silently drops the last registration (the wildcard file-serving fallback). */
+    cfg.max_uri_handlers = sizeof(s_handlers) / sizeof(s_handlers[0]);
     /* Allocate the httpd task stack from the reserved internal DMA pool
      * (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT), not from PSRAM.
      * PSRAM stacks fail the esp_ptr_in_dram() check inside the SPI-flash driver,
