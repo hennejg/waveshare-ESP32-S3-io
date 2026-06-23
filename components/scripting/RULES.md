@@ -513,3 +513,17 @@ print(…)                  // log to the console (args joined by space)
 > **Simulator note:** the simulator loads the engine (`dsl.js`) once at page load.
 > Editing your *script* and clicking **Apply Rules** re-runs the script, but editing the
 > *engine* requires a full **page reload** to take effect.
+
+---
+
+## Tests
+
+The engine has a test suite (Node's built-in runner, zero dependencies) that loads the
+real `dsl.js` into a sandbox with mock I/O and a deterministic fake clock:
+
+```sh
+cd components/scripting && npm test
+```
+
+Tests live in `components/scripting/test/`. When you change the engine, run the suite
+first and add a case for any new behaviour.
