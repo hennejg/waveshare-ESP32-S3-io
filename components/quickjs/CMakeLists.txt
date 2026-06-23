@@ -81,7 +81,11 @@ target_compile_options(${COMPONENT_LIB} PRIVATE
 
 # Suppress upstream warnings so our build output stays clean.
 # -Wno-format: uint32_t is 'unsigned long' on Xtensa, causing format mismatches.
+# -Wno-error: this is vendored upstream code — don't fail our build on its warnings,
+#   which vary by toolchain (e.g. -Wmaybe-uninitialized false positives under the newer
+#   GCC in CI). Our own components are still built with -Werror.
 target_compile_options(${COMPONENT_LIB} PRIVATE
+    -Wno-error
     -Wno-format
     -Wno-incompatible-pointer-types
     -Wno-unused-variable
