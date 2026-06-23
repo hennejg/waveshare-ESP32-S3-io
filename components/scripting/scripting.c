@@ -9,6 +9,8 @@
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
 #include <string.h>
+#include <sys/time.h>
+#include <stdbool.h>
 
 // dsl.js is embedded verbatim at build time (EMBED_TXTFILES in CMakeLists.txt), so the
 // firmware always runs the canonical engine source — no hand-synced copy to drift.
@@ -34,7 +36,7 @@ extern const char dsl_js_start[] asm("_binary_dsl_js_start");
 
 /* ── Event queue ─────────────────────────────────────────────────────────── */
 
-typedef enum { EVT_MQTT, EVT_INPUT_CHANGE, EVT_RELOAD, EVT_TIMER } evt_type_t;
+typedef enum { EVT_MQTT, EVT_INPUT_CHANGE, EVT_RELOAD, EVT_TIMER, EVT_TIME_SYNC } evt_type_t;
 
 typedef struct {
     evt_type_t type;
@@ -49,6 +51,12 @@ typedef struct {
 static QueueHandle_t       s_queue;
 static const char         *s_user_script;
 const  scripting_io_t     *g_scripting_io;  // used by bindings.c
+
+/* Wall-clock validity: false until the system clock holds real time (RTC seed at boot
+ * or an SNTP sync), at which point cron may safely arm. Set before the scripting task
+ * starts (RTC path) or from the EVT_TIME_SYNC handler (SNTP path) — both on or before
+ * the scripting task, so the bool is only ever touched there; no lock needed. */
+static bool s_time_valid = false;
 
 /* ── Rule timers (.after / .heldFor) ─────────────────────────────────────────
  * dsl.js drives time-based rules through _set_timer(ms, fn) → id and
@@ -137,11 +145,29 @@ static JSValue js_clear_timer(JSContext *ctx, JSValue this_val, int argc, JSValu
     return JS_UNDEFINED;
 }
 
+// Wall-clock epoch in ms (UTC), straight from gettimeofday — the explicit time source
+// for cron, instead of relying on QuickJS Date.now()'s own gettimeofday wiring.
+static JSValue js_now(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    double ms = (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
+    return JS_NewFloat64(ctx, ms);
+}
+
+// True once the clock holds real wall-clock time; dsl.js gates cron arming on this.
+static JSValue js_time_valid(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
+{
+    return JS_NewBool(ctx, s_time_valid);
+}
+
 static void register_timer_bindings(JSContext *ctx)
 {
     JSValue g = JS_GetGlobalObject(ctx);
     JS_SetPropertyStr(ctx, g, "_set_timer",   JS_NewCFunction(ctx, js_set_timer,   "_set_timer",   2));
     JS_SetPropertyStr(ctx, g, "_clear_timer", JS_NewCFunction(ctx, js_clear_timer, "_clear_timer", 1));
+    JS_SetPropertyStr(ctx, g, "_now",         JS_NewCFunction(ctx, js_now,         "_now",         0));
+    JS_SetPropertyStr(ctx, g, "_time_valid",  JS_NewCFunction(ctx, js_time_valid,  "_time_valid",  0));
     JS_FreeValue(ctx, g);
 }
 
@@ -224,9 +250,10 @@ static void scripting_task(void *arg)
     eval_or_log(ctx, s_user_script, "<user>");
     drain_jobs(rt);
 
-    JSValue global   = JS_GetGlobalObject(ctx);
-    JSValue on_mqtt  = JS_GetPropertyStr(ctx, global, "_on_mqtt");
-    JSValue on_input = JS_GetPropertyStr(ctx, global, "_on_input");
+    JSValue global       = JS_GetGlobalObject(ctx);
+    JSValue on_mqtt      = JS_GetPropertyStr(ctx, global, "_on_mqtt");
+    JSValue on_input     = JS_GetPropertyStr(ctx, global, "_on_input");
+    JSValue on_time_sync = JS_GetPropertyStr(ctx, global, "_on_time_sync");
     JS_FreeValue(ctx, global);
 
     ESP_LOGI(TAG, "Rule engine ready. Free heap: %lu B  SPIRAM: %lu B",
@@ -273,6 +300,22 @@ static void scripting_task(void *arg)
                 }
                 break;
             }
+            case EVT_TIME_SYNC:
+                // Clock just became real (first SNTP sync, or corrected by a later one).
+                // Mark valid and let dsl.js re-arm cron from the corrected wall-clock.
+                s_time_valid = true;
+                if (JS_IsFunction(ctx, on_time_sync)) {
+                    JSValue r = JS_Call(ctx, on_time_sync, JS_UNDEFINED, 0, NULL);
+                    if (JS_IsException(r)) {
+                        JSValue exc = JS_GetException(ctx);
+                        const char *msg = JS_ToCString(ctx, exc);
+                        ESP_LOGE(TAG, "_on_time_sync error: %s", msg ? msg : "(unknown)");
+                        JS_FreeCString(ctx, msg);
+                        JS_FreeValue(ctx, exc);
+                    }
+                    JS_FreeValue(ctx, r);
+                }
+                break;
             }
             drain_jobs(rt);
         }
@@ -339,6 +382,24 @@ void scripting_reload(const char *new_script)
         ESP_LOGW(TAG, "scripting_reload: queue full");
         free(copy);
     }
+}
+
+void scripting_set_time_valid(void)
+{
+    // Boot path: the RTC seeded real time before the scripting task started, so cron
+    // may arm at load. Just flip the flag the _time_valid() binding reports.
+    s_time_valid = true;
+}
+
+void scripting_on_time_sync(void)
+{
+    // Runtime path: an SNTP sync stepped the clock. Tell the scripting task to re-arm
+    // cron from the corrected wall-clock (it also sets s_time_valid). If the engine
+    // isn't up yet, the boot-time _time_valid() read covers arming.
+    if (!s_queue) { s_time_valid = true; return; }
+    scripting_evt_t ev = { .type = EVT_TIME_SYNC };
+    if (xQueueSend(s_queue, &ev, 0) != pdTRUE)
+        ESP_LOGW(TAG, "scripting_on_time_sync: queue full");
 }
 
 void scripting_on_input_change(uint8_t channel, bool state)

@@ -286,14 +286,35 @@
       <p class="hint">When enabled, the system clock is synced from this server and mirrored to the
       battery-backed RTC. NTP takes precedence over the RTC. Saved with the rest of the configuration.</p>
 
+      <h2>Timezone</h2>
+      <label>Local timezone
+        <select id="tz_select" onchange="updateTzFields()">
+          <option value="">UTC</option>
+          <option value="CET-1CEST,M3.5.0,M10.5.0/3">Central Europe (Berlin, Paris, Madrid)</option>
+          <option value="GMT0BST,M3.5.0/1,M10.5.0">UK / Ireland (London, Dublin)</option>
+          <option value="EET-2EEST,M3.5.0/3,M10.5.0/4">Eastern Europe (Helsinki, Athens)</option>
+          <option value="EST5EDT,M3.2.0,M11.1.0">US Eastern</option>
+          <option value="CST6CDT,M3.2.0,M11.1.0">US Central</option>
+          <option value="MST7MDT,M3.2.0,M11.1.0">US Mountain</option>
+          <option value="PST8PDT,M3.2.0,M11.1.0">US Pacific</option>
+          <option value="__custom__">Custom (POSIX TZ string)…</option>
+        </select>
+      </label>
+      <label id="tz_custom_wrap" style="display:none">Custom POSIX TZ string
+        <input type="text" id="tz_custom" maxlength="47" placeholder="CET-1CEST,M3.5.0,M10.5.0/3">
+      </label>
+      <p class="hint">Cron rules and the displayed local time use this zone, with DST handled by the
+      built-in rules. UTC means no offset. The RTC and SNTP always run on UTC internally.</p>
+
       <h2>Device clock</h2>
       <table style="width:auto">
+        <tr><td style="padding:.2rem .8rem .2rem 0;color:#555">Local time</td>
+            <td id="time_local" style="font-variant-numeric:tabular-nums">—</td></tr>
         <tr><td style="padding:.2rem .8rem .2rem 0;color:#555">System time (UTC)</td>
             <td id="time_system" style="font-variant-numeric:tabular-nums">—</td></tr>
         <tr><td style="padding:.2rem .8rem .2rem 0;color:#555">RTC chip</td>
             <td id="time_rtc">—</td></tr>
       </table>
-      <p class="hint">All times are UTC; cron-style rules in the rule engine also run on UTC.</p>
       <div class="io-row" style="margin-top:.6rem">
         <button type="button" onclick="refreshTime()">Refresh</button>
         <button type="button" onclick="setDeviceTime()">Set from this browser</button>
@@ -574,6 +595,7 @@ rule('my-rule')
           document.getElementById('sntp_enable').checked = !!cfg.sntp.enable;
           document.getElementById('sntp_server').value   = cfg.sntp.server ?? '';
         }
+        setTimezone(cfg.tz ?? '');
         refreshTime();
         document.getElementById('pass_hint').textContent =
           cfg.mqtt_password_set ? 'Password is set.' : 'No password stored.';
@@ -672,6 +694,7 @@ rule('my-rule')
             enable: document.getElementById('sntp_enable').checked,
             server: document.getElementById('sntp_server').value.trim(),
           },
+          tz: getTimezone(),
           di,
           dout,
         };
@@ -705,19 +728,47 @@ rule('my-rule')
     }
     updateCanFields();
 
+    /* ── Timezone select / custom field ── */
+    function updateTzFields() {
+      const isCustom = document.getElementById('tz_select').value === '__custom__';
+      document.getElementById('tz_custom_wrap').style.display = isCustom ? '' : 'none';
+    }
+    // Reflect a stored POSIX TZ string into the select (or the custom field if unlisted).
+    function setTimezone(tz) {
+      const sel = document.getElementById('tz_select');
+      const known = Array.from(sel.options).some(o => o.value === tz && o.value !== '__custom__');
+      if (known) {
+        sel.value = tz;
+        document.getElementById('tz_custom').value = '';
+      } else {
+        sel.value = '__custom__';
+        document.getElementById('tz_custom').value = tz;
+      }
+      updateTzFields();
+    }
+    function getTimezone() {
+      const sel = document.getElementById('tz_select');
+      return sel.value === '__custom__'
+        ? document.getElementById('tz_custom').value.trim()
+        : sel.value;
+    }
+
     /* ── Time / RTC ── */
     async function refreshTime() {
+      const locEl = document.getElementById('time_local');
       const sysEl = document.getElementById('time_system');
       const rtcEl = document.getElementById('time_rtc');
       try {
         const r = await apiFetch('/api/time');
         if (!r.ok) throw new Error('HTTP ' + r.status);
         const t = await r.json();
+        locEl.textContent = t.local ? (t.local + (t.tz ? '' : ' (UTC)')) : '—';
         sysEl.textContent = t.utc ?? '—';
         if (!t.rtc_present)      rtcEl.textContent = 'not detected';
         else if (!t.rtc_valid)   rtcEl.textContent = 'present, time invalid (lost power)';
         else                     rtcEl.textContent = t.rtc_utc ?? 'present';
       } catch (e) {
+        locEl.textContent = 'unavailable';
         sysEl.textContent = 'unavailable';
         rtcEl.textContent = '—';
       }

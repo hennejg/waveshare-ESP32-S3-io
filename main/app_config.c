@@ -20,6 +20,7 @@ _Static_assert(sizeof(app_config_t) < 3000,
 #define K_LED_MODE      "led_mode"
 #define K_CAN_CFG       "can_cfg"
 #define K_SNTP_CFG      "sntp_cfg"
+#define K_TZ            "tz"
 
 static app_config_t s_cfg = {
     .device_name       = "Waveshare-ESP32",
@@ -33,6 +34,7 @@ static app_config_t s_cfg = {
     .can    = { .mode = 0, .n2k_addr = 0x50, .base_id = 0x100,
                 .bitrate = 250000, .tx_interval_ms = 1000 },
     .sntp   = { .enable = 1, .server = "pool.ntp.org" },
+    .tz     = "",   /* empty = UTC */
 };
 
 #define NVS_GET_STR(h, key, dst) \
@@ -50,6 +52,7 @@ esp_err_t app_config_init(void)
     NVS_GET_STR(h, K_MQTT_USER,   s_cfg.mqtt_user);
     NVS_GET_STR(h, K_MQTT_PASS,   s_cfg.mqtt_password);
     NVS_GET_STR(h, K_MQTT_TOPIC,  s_cfg.mqtt_topic_prefix);
+    NVS_GET_STR(h, K_TZ,          s_cfg.tz);
 
     /* DI config blob — silently keep defaults if not found or size changed
        (the latter happens when di_config_t grows beyond its reserved bytes). */
@@ -89,6 +92,7 @@ esp_err_t app_config_update(const app_config_t *cfg)
     nvs_set_str(h, K_MQTT_USER,   s_cfg.mqtt_user);
     nvs_set_str(h, K_MQTT_PASS,   s_cfg.mqtt_password);
     nvs_set_str(h, K_MQTT_TOPIC,  s_cfg.mqtt_topic_prefix);
+    nvs_set_str(h, K_TZ,          s_cfg.tz);
     nvs_set_blob(h, K_DI_CFG,    s_cfg.di,   sizeof(s_cfg.di));
     nvs_set_blob(h, K_DOUT_CFG,  s_cfg.dout, sizeof(s_cfg.dout));
     nvs_set_blob(h, K_MODBUS_CFG, &s_cfg.modbus, sizeof(s_cfg.modbus));

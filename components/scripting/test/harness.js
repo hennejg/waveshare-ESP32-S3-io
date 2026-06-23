@@ -14,7 +14,8 @@ const vm   = require('node:vm');
 
 const DSL_SRC = fs.readFileSync(path.join(__dirname, '..', 'dsl.js'), 'utf8');
 
-function createEngine() {
+function createEngine(opts) {
+  opts = opts || {};
   const di    = new Array(8).fill(false);   // digital input state
   const dout  = new Array(8).fill(false);   // digital output state
   const prints = [];                        // captured print() output
@@ -25,6 +26,10 @@ function createEngine() {
   let nextId = 1;
   const timers = new Map();   // id -> { at, fn }
 
+  // Mirrors the device _time_valid() binding: cron stays suppressed until the clock is
+  // real. Defaults true (legacy behaviour); pass { timeValid: false } to test suppression.
+  let timeValid = opts.timeValid !== undefined ? !!opts.timeValid : true;
+
   const sandbox = {
     _di_get(ch)        { return !!di[ch]; },
     _dout_set(ch, v)   { dout[ch] = !!v; },
@@ -32,7 +37,8 @@ function createEngine() {
     print(...a)        { prints.push(a.join(' ')); },
     _set_timer(ms, fn) { const id = nextId++; timers.set(id, { at: now + (ms | 0), fn }); return id; },
     _clear_timer(id)   { timers.delete(id); },
-    _now()             { return now; },   // virtual wall-clock (epoch ms) for cron
+    _now()             { return now; },        // virtual wall-clock (epoch ms) for cron
+    _time_valid()      { return timeValid; },  // clock-validity gate for cron
     T,
   };
 
@@ -80,6 +86,10 @@ function createEngine() {
     advance,
     now() { return now; },
     setClock(ms) { now = ms; },   // set the virtual epoch (call before loading cron rules)
+    // Mark the clock valid and re-arm cron — mirrors the device EVT_TIME_SYNC path
+    // (scripting_on_time_sync → _on_time_sync). Call after an SNTP-style clock step.
+    timeSync()     { timeValid = true; sandbox._on_time_sync(); },
+    setTimeValid(v){ timeValid = !!v; },
   };
 }
 

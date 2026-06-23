@@ -9,6 +9,7 @@
 #define APP_CFG_MQTT_PASS_LEN     64
 #define APP_CFG_MQTT_TOPIC_LEN    64
 #define APP_CFG_SNTP_SERVER_LEN   64
+#define APP_CFG_TZ_LEN            48   /* POSIX TZ string, e.g. "CET-1CEST,M3.5.0,M10.5.0/3" */
 #define APP_CFG_DI_COUNT           8
 #define APP_CFG_DO_COUNT           8
 #define APP_CFG_IO_NAME_MAX        20   /* max visible chars; empty = use index number */
@@ -63,6 +64,10 @@ typedef struct {
         uint8_t _pad[3];
         char    server[APP_CFG_SNTP_SERVER_LEN]; /* NTP server hostname */
     } sntp;
+
+    /* POSIX TZ string for local time (cron + UI display). Empty = UTC.
+       e.g. "CET-1CEST,M3.5.0,M10.5.0/3" for Europe/Berlin. */
+    char tz[APP_CFG_TZ_LEN];
 } app_config_t;
 
 esp_err_t           app_config_init(void);

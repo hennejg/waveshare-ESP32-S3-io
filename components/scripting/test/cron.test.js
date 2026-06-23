@@ -3,7 +3,19 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { createEngine } = require('./harness.js');
 
-// cron is evaluated in UTC. Anchor tests to known UTC instants.
+// cron is evaluated in LOCAL time. Pin this test process to UTC so the UTC-anchored
+// instants below behave as before (local == UTC); the local-time/DST tests at the bottom
+// switch TZ explicitly via withTZ(). Node applies process.env.TZ changes at runtime, and
+// the test runner gives each file its own process, so this pin doesn't leak elsewhere.
+process.env.TZ = 'UTC';
+
+// Run a body under a specific timezone, restoring UTC afterwards. Set before any Date use
+// (cron arms — and computes the first match — at load() time).
+function withTZ(tz, fn) {
+  process.env.TZ = tz;
+  try { return fn(); } finally { process.env.TZ = 'UTC'; }
+}
+
 const MON_2024_01_01 = Date.UTC(2024, 0, 1, 0, 0, 0); // Monday 2024-01-01 00:00:00Z
 const SUN_2023_12_31 = Date.UTC(2023, 11, 31, 0, 0, 0); // Sunday 2023-12-31 00:00:00Z
 const HOUR = 3600000, DAY = 24 * HOUR, MIN = 60000;
@@ -92,4 +104,61 @@ test('reload cancels cron timers', () => {
   assert.equal(e.pendingTimers(), 0);
   e.advance(10 * MIN);
   assert.equal(e.T.n, undefined);
+});
+
+// ── Local time ────────────────────────────────────────────────────────────────
+test('cron fires at the configured local time, not UTC', () => {
+  // Etc/GMT-2 is a fixed UTC+2 zone (no DST). "07:00 local" == 05:00 UTC.
+  withTZ('Etc/GMT-2', () => {
+    const e = createEngine();
+    e.setClock(MON_2024_01_01);   // 2024-01-01 00:00 UTC == 02:00 local
+    e.load(`rule('d').when(cron('0 7 * * *')).then(function(){ T.n = (T.n||0)+1; });`);
+    e.advance(5 * HOUR - 1); assert.equal(e.T.n, undefined); // 04:59:59.999 UTC
+    e.advance(1);            assert.equal(e.T.n, 1);         // 05:00 UTC == 07:00 local
+    e.advance(DAY);          assert.equal(e.T.n, 2);         // next local 07:00
+  });
+});
+
+// ── DST ─────────────────────────────────────────────────────────────────────
+test('cron skips a wall-clock time that DST spring-forward removes', () => {
+  // Europe/Berlin springs forward 2024-03-31: 02:00 CET → 03:00 CEST, so local 02:30
+  // never occurs that day. A daily "02:30" job fires 03-30, is skipped 03-31, fires 04-01.
+  withTZ('Europe/Berlin', () => {
+    const e = createEngine();
+    e.setClock(Date.UTC(2024, 2, 30, 0, 0, 0));  // 03-30 00:00 UTC == 01:00 CET
+    e.load(`rule('dst').when(cron('30 2 * * *')).then(function(){ T.n = (T.n||0)+1; });`);
+    // 03-30 02:30 CET == 01:30 UTC → fires once within the first 2 h.
+    e.advance(2 * HOUR);         assert.equal(e.T.n, 1);
+    // Next 24 h covers all of 03-31, where 02:30 local does not exist → no fire.
+    e.advance(24 * HOUR);        assert.equal(e.T.n, 1);
+    // 04-01 02:30 CEST == 00:30 UTC → fires again.
+    e.advance(24 * HOUR);        assert.equal(e.T.n, 2);
+  });
+});
+
+// ── Suppress until valid + re-arm on sync ─────────────────────────────────────
+test('cron stays suppressed until the clock is valid, then arms on time-sync', () => {
+  const e = createEngine({ timeValid: false });
+  e.setClock(0);   // boot-relative epoch (1970)
+  e.load(`rule('s').when(cron('0 7 * * *')).then(function(){ T.n = (T.n||0)+1; });`);
+  assert.equal(e.pendingTimers(), 0);          // suppressed — not armed off a 1970 clock
+  e.advance(8 * HOUR); assert.equal(e.T.n, undefined);
+
+  // SNTP-style step to a real time, then sync → cron arms from the corrected clock.
+  e.setClock(MON_2024_01_01);
+  e.timeSync();
+  assert.equal(e.pendingTimers(), 1);
+  e.advance(7 * HOUR - 1); assert.equal(e.T.n, undefined);
+  e.advance(1);            assert.equal(e.T.n, 1);   // 07:00 of the real day, not 7 h after boot
+});
+
+test('time-sync re-arms an already-armed cron without duplicating its timer', () => {
+  const e = createEngine();                    // timeValid defaults true
+  e.setClock(MON_2024_01_01);
+  e.load(`rule('r').when(cron('0 * * * *')).then(function(){ T.n = (T.n||0)+1; });`);
+  assert.equal(e.pendingTimers(), 1);
+  e.timeSync();                                // re-sync: cancel + re-arm, not add
+  assert.equal(e.pendingTimers(), 1);
+  e.advance(HOUR); assert.equal(e.T.n, 1);     // still fires exactly once per hour
+  e.advance(HOUR); assert.equal(e.T.n, 2);
 });
