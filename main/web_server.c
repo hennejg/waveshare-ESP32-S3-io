@@ -6,7 +6,12 @@
 #include "dout.h"
 #include "led.h"
 #include "matter.h"
+#include "rtc.h"
 #include "scripting.h"
+#include "sntp_sync.h"
+
+#include <time.h>
+#include <sys/time.h>
 
 extern const char DEMO_SCRIPT[];
 
@@ -274,6 +279,10 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON_AddNumberToObject(mb, "address",  cfg->modbus.address);
     cJSON_AddNumberToObject(mb, "baudrate", cfg->modbus.baudrate);
 
+    cJSON *sntp = cJSON_AddObjectToObject(root, "sntp");
+    cJSON_AddBoolToObject  (sntp, "enable", cfg->sntp.enable);
+    cJSON_AddStringToObject(sntp, "server", cfg->sntp.server);
+
     cJSON *di = cJSON_AddArrayToObject(root, "di");
     for (int i = 0; i < APP_CFG_DI_COUNT; i++) {
         cJSON *item = cJSON_CreateObject();
@@ -402,6 +411,15 @@ static esp_err_t api_config_post(httpd_req_t *req)
             cfg.modbus.baudrate = (uint32_t)v->valuedouble;
     }
 
+    cJSON *sntp_j = cJSON_GetObjectItem(root, "sntp");
+    if (cJSON_IsObject(sntp_j)) {
+        cJSON *v;
+        if ((v = cJSON_GetObjectItem(sntp_j, "enable")) && cJSON_IsBool(v))
+            cfg.sntp.enable = cJSON_IsTrue(v) ? 1 : 0;
+        if ((v = cJSON_GetObjectItem(sntp_j, "server")) && cJSON_IsString(v))
+            strlcpy(cfg.sntp.server, v->valuestring, sizeof(cfg.sntp.server));
+    }
+
     cJSON_Delete(root);
 
     /* Validate names before saving */
@@ -416,12 +434,120 @@ static esp_err_t api_config_post(httpd_req_t *req)
     }
 
     app_config_update(&cfg);
+    sntp_sync_apply();   /* apply any SNTP server / enable change immediately */
     di_publish_all();
     /* Re-subscribe with potentially new names, then publish all DO states. */
     dout_on_mqtt_connected();
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+    return ESP_OK;
+}
+
+/* ----------------------------------------------------------------- time / RTC */
+
+/* Format a UTC epoch as ISO-8601 "YYYY-MM-DDTHH:MM:SSZ" into buf (>= 21 bytes). */
+static void iso8601_utc(time_t t, char *buf, size_t len)
+{
+    struct tm tm_utc;
+    gmtime_r(&t, &tm_utc);
+    strftime(buf, len, "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+}
+
+/* GET /api/time — report the system clock and the battery-backed RTC.
+ * All times are UTC. "rtc_valid" is false when the RTC reports an oscillator
+ * stop (i.e. it lost power and its time is meaningless). */
+static esp_err_t api_time_get(httpd_req_t *req)
+{
+    time_t now = time(NULL);
+
+    struct tm rtc_tm;
+    bool rtc_valid = false;
+    bool rtc_ok    = (rtc_dev_read(&rtc_tm, &rtc_valid) == ESP_OK);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "epoch", (double)now);
+    char iso[24];
+    iso8601_utc(now, iso, sizeof(iso));
+    cJSON_AddStringToObject(root, "utc", iso);
+
+    cJSON_AddBoolToObject(root, "rtc_present", rtc_ok);
+    cJSON_AddBoolToObject(root, "rtc_valid",   rtc_ok && rtc_valid);
+    if (rtc_ok && rtc_valid) {
+        /* struct tm from the RTC is UTC; turn it back into an epoch for display. */
+        char riso[24];
+        strftime(riso, sizeof(riso), "%Y-%m-%dT%H:%M:%SZ", &rtc_tm);
+        cJSON_AddStringToObject(root, "rtc_utc", riso);
+    }
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json ? json : "{}");
+    cJSON_free(json);
+    return ESP_OK;
+}
+
+/* POST /api/time {"epoch": <unix seconds, UTC>} — set the system clock and
+ * mirror it to the RTC. Used to set the time manually from the browser. */
+static esp_err_t api_time_post(httpd_req_t *req)
+{
+    if (!check_auth(req)) return send_401(req);
+    if (req->content_len > BODY_MAX) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body too large");
+        return ESP_OK;
+    }
+
+    char *body = malloc(req->content_len + 1);
+    if (!body) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_OK;
+    }
+    int received = httpd_req_recv(req, body, req->content_len);
+    if (received <= 0) {
+        free(body);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv failed");
+        return ESP_OK;
+    }
+    body[received] = '\0';
+
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_OK;
+    }
+
+    cJSON *epoch = cJSON_GetObjectItem(root, "epoch");
+    if (!cJSON_IsNumber(epoch) || epoch->valuedouble < 1000000000.0) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing/invalid epoch");
+        return ESP_OK;
+    }
+    time_t t = (time_t)epoch->valuedouble;
+    cJSON_Delete(root);
+
+    struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+    settimeofday(&tv, NULL);
+
+    struct tm utc;
+    gmtime_r(&t, &utc);
+    esp_err_t rtc_ret = rtc_dev_set(&utc);
+
+    char iso[24];
+    iso8601_utc(t, iso, sizeof(iso));
+    ESP_LOGI(TAG, "time set from UI: %s (RTC %s)", iso,
+             rtc_ret == ESP_OK ? "updated" : "unavailable");
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddStringToObject(resp, "status", "ok");
+    cJSON_AddStringToObject(resp, "utc", iso);
+    cJSON_AddBoolToObject(resp, "rtc_updated", rtc_ret == ESP_OK);
+    char *json = cJSON_PrintUnformatted(resp);
+    cJSON_Delete(resp);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json ? json : "{\"status\":\"ok\"}");
+    cJSON_free(json);
     return ESP_OK;
 }
 
@@ -884,6 +1010,8 @@ static const httpd_uri_t s_handlers[] = {
     { .uri = "/api/factory-reset",     .method = HTTP_POST, .handler = api_factory_reset     },
     { .uri = "/api/rules",             .method = HTTP_GET,  .handler = api_rules_get         },
     { .uri = "/api/rules",             .method = HTTP_POST, .handler = api_rules_post        },
+    { .uri = "/api/time",              .method = HTTP_GET,  .handler = api_time_get          },
+    { .uri = "/api/time",              .method = HTTP_POST, .handler = api_time_post         },
     { .uri = "/*",                     .method = HTTP_GET,  .handler = file_get              },
 };
 

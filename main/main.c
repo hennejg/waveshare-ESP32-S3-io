@@ -23,6 +23,9 @@
 #include "web_server.h"
 #include "matter.h"
 #include "scripting.h"
+#include "rtc.h"
+#include "sntp_sync.h"
+#include <sys/time.h>
 
 #define TAG          "main"
 
@@ -127,6 +130,7 @@ static void on_network_ready(const char *iface)
     esp_err_t mqtt_ret = app_mqtt_start();
     if (mqtt_ret != ESP_OK)
         ESP_LOGE(TAG, "MQTT start failed: %s", esp_err_to_name(mqtt_ret));
+    sntp_sync_apply();   /* start NTP sync now that the network is up */
 }
 
 static bool s_eth_connected = false;
@@ -164,6 +168,21 @@ static void on_eth_only_requested(void)
     ESP_LOGI(TAG, "ETH-only mode saved — rebooting");
 }
 
+/* Days-from-civil (UTC) → epoch seconds — dependency-free (avoids relying on timegm). */
+static time_t utc_tm_to_epoch(const struct tm *t)
+{
+    int      y   = t->tm_year + 1900;
+    int      m   = t->tm_mon + 1;
+    int      d   = t->tm_mday;
+    y -= (m <= 2);
+    int      era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153u * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    long     days = (long)era * 146097 + (long)doe - 719468;
+    return (time_t)days * 86400 + t->tm_hour * 3600 + t->tm_min * 60 + t->tm_sec;
+}
+
 /* ------------------------------------------------------------ app_main */
 
 void app_main(void)
@@ -180,6 +199,26 @@ void app_main(void)
     button_init();
     ESP_ERROR_CHECK(di_init());
     ESP_ERROR_CHECK(dout_init());
+
+    /* RTC: seed the system clock from the battery-backed PCF85063 if its stored time
+     * is valid (i.e. set by a previous SNTP sync). SNTP will refine/correct it once the
+     * network is up; with no valid RTC time we simply wait for SNTP. Non-fatal — a
+     * missing/failed RTC must not stop the device from booting. */
+    if (rtc_dev_init() == ESP_OK) {
+        struct tm rt;
+        bool valid = false;
+        if (rtc_dev_read(&rt, &valid) == ESP_OK && valid) {
+            struct timeval tv = { .tv_sec = utc_tm_to_epoch(&rt), .tv_usec = 0 };
+            settimeofday(&tv, NULL);
+            ESP_LOGI(TAG, "System clock seeded from RTC: %04d-%02d-%02d %02d:%02d:%02d UTC",
+                     rt.tm_year + 1900, rt.tm_mon + 1, rt.tm_mday,
+                     rt.tm_hour, rt.tm_min, rt.tm_sec);
+        } else {
+            ESP_LOGW(TAG, "RTC time not valid yet — waiting for SNTP");
+        }
+    } else {
+        ESP_LOGW(TAG, "RTC not available");
+    }
 
     /* Load user script from NVS; fall back to built-in demo if none stored. */
     const char *startup_script = DEMO_SCRIPT;
