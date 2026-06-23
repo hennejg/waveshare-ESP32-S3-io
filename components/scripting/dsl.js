@@ -11,6 +11,8 @@
 //                                                      of conditions (scheduled pulse)
 //   rule(name).when(...).heldFor(ms).then(fn)        → fn runs only if the conditions
 //                                                      hold continuously for ms
+//   rule(name).when(...).noLoop().then(fn)           → rule won't re-fire from its own
+//                                                      consequence (Drools-style no-loop)
 //   mqtt(topic).is(fn)   → MqttCondition   (condition + value holder)
 //   input(ch).is(bool)   → InputCondition  (.value / .get() read the live level)
 //   output(ch)           → actuator { set(bool), on(), off(), toggle(), get(), value }
@@ -260,6 +262,7 @@ function RuleBuilder(name) {
     this._heldFor   = 0;     // .heldFor(ms): conditions must hold this long before firing
     this._nextDelay = 0;     // .after(ms):   delay applied to the next .then() step
     this._steps     = [];    // action timeline: [{ delay, fn }, ...]
+    this._noLoop    = false; // .noLoop(): don't re-fire from this rule's own consequence
     this._rule      = null;  // the registered rule object (created on first .then())
 }
 RuleBuilder.prototype.when = function() {
@@ -273,6 +276,14 @@ RuleBuilder.prototype.when = function() {
 RuleBuilder.prototype.heldFor = function(ms) {
     this._heldFor = ms;
     if (this._rule) this._rule.heldFor = ms;
+    return this;
+};
+// No-loop (Drools-style): the rule will not be re-fired by changes its OWN action
+// causes — directly or through the cascade it triggers. Other rules still react to
+// its writes, and it still fires on later, independent events. Order-independent.
+RuleBuilder.prototype.noLoop = function() {
+    this._noLoop = true;
+    if (this._rule) this._rule.noLoop = true;
     return this;
 };
 // Schedule the next .then() step `ms` after the previous one — fire-and-forget,
@@ -297,6 +308,8 @@ RuleBuilder.prototype.then = function(fn) {
             action:     null,
             _facts:     f.facts,       // fact keys this rule listens to (e.g. 'input:4')
             _wildcard:  f.wildcard,    // true → re-evaluate on every event
+            noLoop:     this._noLoop,  // .noLoop(): suppress self-re-firing
+            _firing:    false,         // re-entrancy guard for noLoop
             _timer:     null,          // pending heldFor timer
             _fired:     false          // heldFor latch (one fire per sustained period)
         };
@@ -361,6 +374,16 @@ function _rule_matches(r) {
     return true;
 }
 
+// Run a rule's action with the no-loop guard. A noLoop rule sets _firing for the
+// duration of its action (and the synchronous cascade it spawns), so any re-evaluation
+// reaching it during that window — i.e. caused by its own consequence — is skipped.
+function _run_action(r) {
+    if (r.noLoop && r._firing) return;   // its own consequence reached it again — skip
+    r._firing = true;
+    try { r.action(); } catch (e) { print('[rule:' + r.name + '] error: ' + e); }
+    r._firing = false;
+}
+
 // factKey identifies the fact that changed (e.g. 'input:4', 'mqtt:rules/trigger').
 // Only rules that reference that fact — or wildcard rules — are evaluated; a rule
 // gated solely on a different fact keeps its state untouched. factKey null/omitted
@@ -378,15 +401,12 @@ function _fire_matching(factKey, _isCascade) {
                     r._timer = _schedule(r.heldFor, (function(rule) {
                         return function() {
                             rule._timer = null;
-                            if (_rule_matches(rule)) {
-                                rule._fired = true;
-                                try { rule.action(); } catch (e) { print('[rule:' + rule.name + '] error: ' + e); }
-                            }
+                            if (_rule_matches(rule)) { rule._fired = true; _run_action(rule); }
                         };
                     })(r));
                 }
             } else {
-                try { r.action(); } catch (e) { print('[rule:' + r.name + '] error: ' + e); }
+                _run_action(r);
             }
         } else {
             // conditions no longer hold — cancel a pending sustain timer and re-arm

@@ -279,6 +279,7 @@ function renderRuleList() {
     var timing = '';
     if (r.heldFor) timing += ' <span class="cunknown">held ' + r.heldFor + 'ms' + (r._timer != null ? ' (arming…)' : '') + '</span>';
     if (r.steps && r.steps.length > 1) timing += ' <span class="cunknown">+' + (r.steps.length - 1) + ' delayed</span>';
+    if (r.noLoop) timing += ' <span class="cunknown">no-loop</span>';
     html += '<div class="rule-entry">'
       + '<div class="rule-name"><span class="rbadge' + (fc ? ' fired' : '') + '"></span>'
       + esc(r.name)

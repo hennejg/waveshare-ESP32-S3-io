@@ -429,6 +429,25 @@ rule('fault -> shed')  .when(output(7).isOn()).then(function () { output(0).off(
 > if exceeded, but a rule that *fights itself* (e.g. toggles an output it gates on) will
 > burn the budget every event — keep chains acyclic.
 
+### `.noLoop()` — don't re-fire from your own consequence
+
+A rule that writes a fact it also gates on would re-fire itself (bounded by the cascade
+cap, but still). `.noLoop()` suppresses exactly that: the rule won't be re-fired by
+changes *its own action* causes. Other rules still react to its writes, and it still
+fires on later, independent events — so it's per-rule self-suppression, not a global
+"stop cascading". (Same idea as Drools' `no-loop` rule attribute.)
+
+```js
+// Without .noLoop() this would re-fire itself every time it flips DO0
+// (until the cascade cap); with it, exactly one flip per trigger.
+rule('blink on command')
+  .when(mqtt('cmd/blink').once())
+  .noLoop()
+  .then(function () { output(0).toggle(); });
+```
+
+`.noLoop()` is order-independent in the chain (like `.heldFor()`).
+
 ---
 
 ## 5. Quick reference
@@ -438,6 +457,7 @@ rule('fault -> shed')  .when(output(7).isOn()).then(function () { output(0).off(
 rule(name).when(cond, cond, …).then(fn)      // AND of conditions
           .heldFor(ms).then(fn)              // fire after conditions held ms
           .then(a).after(ms).then(b)         // a now, b ms later (timeline)
+          .noLoop().then(fn)                 // don't re-fire from own consequence
 
 // ── input(ch) — condition + live value ─────────────────────────────────────
 input(ch)                 // bare: always matches
