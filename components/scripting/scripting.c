@@ -1,6 +1,5 @@
 #include "scripting.h"
 #include "scripting_priv.h"
-#include "dsl.js.h"
 #include "quickjs.h"
 
 #include <freertos/FreeRTOS.h>
@@ -8,7 +7,12 @@
 #include <freertos/queue.h>
 #include <esp_log.h>
 #include <esp_heap_caps.h>
+#include <esp_timer.h>
 #include <string.h>
+
+// dsl.js is embedded verbatim at build time (EMBED_TXTFILES in CMakeLists.txt), so the
+// firmware always runs the canonical engine source — no hand-synced copy to drift.
+extern const char dsl_js_start[] asm("_binary_dsl_js_start");
 
 #define TAG              "scripting"
 
@@ -30,7 +34,7 @@
 
 /* ── Event queue ─────────────────────────────────────────────────────────── */
 
-typedef enum { EVT_MQTT, EVT_INPUT_CHANGE, EVT_RELOAD } evt_type_t;
+typedef enum { EVT_MQTT, EVT_INPUT_CHANGE, EVT_RELOAD, EVT_TIMER } evt_type_t;
 
 typedef struct {
     evt_type_t type;
@@ -38,12 +42,108 @@ typedef struct {
         struct { char topic[MAX_TOPIC_LEN]; char payload[MAX_PAYLOAD_LEN]; } mqtt;
         struct { uint8_t channel; bool state; } input;
         struct { char *script; } reload;  // heap-allocated; task frees after eval
+        struct { uint32_t id; } timer;     // a rule timer fired (see _set_timer)
     };
 } scripting_evt_t;
 
 static QueueHandle_t       s_queue;
 static const char         *s_user_script;
 const  scripting_io_t     *g_scripting_io;  // used by bindings.c
+
+/* ── Rule timers (.after / .heldFor) ─────────────────────────────────────────
+ * dsl.js drives time-based rules through _set_timer(ms, fn) → id and
+ * _clear_timer(id). esp_timer callbacks run on the esp_timer task, but QuickJS is
+ * single-threaded and may only be touched from the scripting task — so the callback
+ * does nothing but post an EVT_TIMER carrying the id; the scripting task looks the id
+ * up and invokes the stored JS function. The table is thus only ever accessed from
+ * the scripting task (set / clear / EVT_TIMER), so it needs no lock. */
+#define MAX_TIMERS 24
+
+typedef struct {
+    bool               used;
+    uint32_t           id;
+    esp_timer_handle_t handle;
+    JSValue            fn;     // owned reference (JS_DupValue on set, freed on fire/clear)
+} timer_slot_t;
+
+static timer_slot_t s_timers[MAX_TIMERS];
+static uint32_t     s_next_timer_id = 1;
+
+static timer_slot_t *timer_find(uint32_t id)
+{
+    for (int i = 0; i < MAX_TIMERS; i++)
+        if (s_timers[i].used && s_timers[i].id == id) return &s_timers[i];
+    return NULL;
+}
+
+// esp_timer task context — must NOT touch QuickJS; just hand the id to our task.
+static void timer_fired_cb(void *arg)
+{
+    scripting_evt_t ev = { .type = EVT_TIMER };
+    ev.timer.id = (uint32_t)(uintptr_t)arg;
+    if (s_queue) xQueueSend(s_queue, &ev, 0);
+}
+
+static JSValue js_set_timer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
+{
+    int32_t ms;
+    if (JS_ToInt32(ctx, &ms, argv[0]) < 0) return JS_EXCEPTION;
+    if (!JS_IsFunction(ctx, argv[1]))
+        return JS_ThrowTypeError(ctx, "_set_timer: second argument must be a function");
+    if (ms < 0) ms = 0;
+
+    int slot = -1;
+    for (int i = 0; i < MAX_TIMERS; i++) if (!s_timers[i].used) { slot = i; break; }
+    if (slot < 0) {
+        ESP_LOGW(TAG, "rule timer table full (%d) — timer dropped", MAX_TIMERS);
+        return JS_NewInt32(ctx, -1);
+    }
+
+    uint32_t id = s_next_timer_id++;
+    if (s_next_timer_id == 0) s_next_timer_id = 1;   // never hand out id 0
+
+    esp_timer_create_args_t args = {
+        .callback        = timer_fired_cb,
+        .arg             = (void *)(uintptr_t)id,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name            = "rule",
+    };
+    esp_timer_handle_t h;
+    if (esp_timer_create(&args, &h) != ESP_OK)
+        return JS_NewInt32(ctx, -1);
+    if (esp_timer_start_once(h, (uint64_t)ms * 1000) != ESP_OK) {
+        esp_timer_delete(h);
+        return JS_NewInt32(ctx, -1);
+    }
+
+    s_timers[slot].used   = true;
+    s_timers[slot].id     = id;
+    s_timers[slot].handle = h;
+    s_timers[slot].fn     = JS_DupValue(ctx, argv[1]);
+    return JS_NewInt32(ctx, (int32_t)id);
+}
+
+static JSValue js_clear_timer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
+{
+    int32_t id;
+    if (JS_ToInt32(ctx, &id, argv[0]) < 0) return JS_EXCEPTION;
+    timer_slot_t *t = timer_find((uint32_t)id);
+    if (t) {
+        esp_timer_stop(t->handle);
+        esp_timer_delete(t->handle);
+        JS_FreeValue(ctx, t->fn);
+        t->used = false;
+    }
+    return JS_UNDEFINED;
+}
+
+static void register_timer_bindings(JSContext *ctx)
+{
+    JSValue g = JS_GetGlobalObject(ctx);
+    JS_SetPropertyStr(ctx, g, "_set_timer",   JS_NewCFunction(ctx, js_set_timer,   "_set_timer",   2));
+    JS_SetPropertyStr(ctx, g, "_clear_timer", JS_NewCFunction(ctx, js_clear_timer, "_clear_timer", 1));
+    JS_FreeValue(ctx, g);
+}
 
 /* ── PSRAM allocator for the QuickJS heap ────────────────────────────────── */
 
@@ -119,7 +219,8 @@ static void scripting_task(void *arg)
     JSContext *ctx = JS_NewContext(rt);
 
     scripting_register_bindings(ctx);
-    eval_or_log(ctx, DSL_JS_SOURCE, "<dsl>");
+    register_timer_bindings(ctx);
+    eval_or_log(ctx, dsl_js_start, "<dsl>");
     eval_or_log(ctx, s_user_script, "<user>");
     drain_jobs(rt);
 
@@ -147,11 +248,31 @@ static void scripting_task(void *arg)
                       JS_NewBool(ctx,  ev.input.state));
                 break;
             case EVT_RELOAD:
-                eval_or_log(ctx, "_rules=[]", "<reload>");
+                // _reset_rules() also cancels any pending .after()/.heldFor() timers
+                eval_or_log(ctx, "_reset_rules()", "<reload>");
                 eval_or_log(ctx, ev.reload.script, "<user>");
                 free(ev.reload.script);
                 ESP_LOGI(TAG, "Rules reloaded");
                 break;
+            case EVT_TIMER: {
+                timer_slot_t *t = timer_find(ev.timer.id);
+                if (t) {                              // ignore if already cleared/reloaded
+                    JSValue fn = t->fn;               // take ownership
+                    esp_timer_delete(t->handle);      // one-shot has already fired
+                    t->used = false;                  // free slot before calling (fn may re-arm)
+                    JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 0, NULL);
+                    if (JS_IsException(r)) {
+                        JSValue exc = JS_GetException(ctx);
+                        const char *msg = JS_ToCString(ctx, exc);
+                        ESP_LOGE(TAG, "rule timer error: %s", msg ? msg : "(unknown)");
+                        JS_FreeCString(ctx, msg);
+                        JS_FreeValue(ctx, exc);
+                    }
+                    JS_FreeValue(ctx, r);
+                    JS_FreeValue(ctx, fn);
+                }
+                break;
+            }
             }
             drain_jobs(rt);
         }
