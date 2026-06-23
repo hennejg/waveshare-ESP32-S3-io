@@ -296,7 +296,7 @@ conditions act as gates.
 
 | Form | Fires |
 |------|-------|
-| `every(ms)` | every `ms` milliseconds (first tick one period after the rule loads) |
+| `every(ms)` | every `ms` milliseconds (**minimum 100 ms**; first tick one period after the rule loads) |
 | `cron("m h dom mon dow")` | on a standard 5-field cron schedule |
 
 ```js
@@ -312,7 +312,8 @@ rule('morning')
 ```
 
 **Cron syntax** is the standard five fields — `minute hour day-of-month month day-of-week`
-— supporting `*`, lists (`a,b`), ranges (`a-b`), and steps (`*/n`, `a-b/n`). Day-of-week
+— supporting `*`, lists (`a,b`), ranges (`a-b`), and steps (`*/n`, `a-b/n`, and `a/n` =
+from `a` to the field max). Fields are **numeric only** (no `JAN`/`MON` names). Day-of-week
 is `0`–`6` with Sunday `0` (`7` also accepted). When **both** day-of-month and day-of-week
 are restricted, a day matches if **either** does (Vixie semantics).
 

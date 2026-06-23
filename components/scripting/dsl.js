@@ -13,8 +13,9 @@
 //                                                      hold continuously for ms
 //   rule(name).when(...).noLoop().then(fn)           → rule won't re-fire from its own
 //                                                      consequence (Drools-style no-loop)
-//   every(ms)            → time trigger: an edge event every ms (other when()-conditions gate it)
-//   cron("m h dom mon dow") → time trigger on a 5-field cron schedule (evaluated in UTC)
+//   every(ms)            → time trigger: an edge event every ms (min 100ms; other
+//                          when()-conditions gate it)
+//   cron("m h dom mon dow") → time trigger on a 5-field cron schedule (UTC; numeric fields)
 //   fact(initial)        → synthetic value: .set(v) in then(), .is(fn|value) in when()
 //                          (calculated by some rules, gated on by others);
 //                          .isTrue()/.isFalse() gate on truthiness
@@ -245,7 +246,16 @@ function _now_ms() {
 }
 
 // ── IntervalCondition: every(ms) ──
+// Intervals are floored at MIN_INTERVAL_MS: they re-arm every tick (a fresh esp_timer
+// per period on-device), so a very short period would churn the timer subsystem and the
+// scripting task. 100 ms is plenty for I/O automation; one-shot delays (.after/.heldFor)
+// and cron are not floored.
+var MIN_INTERVAL_MS = 100;
 function IntervalCondition(ms) {
+    if (!(ms >= MIN_INTERVAL_MS)) {           // also catches undefined/NaN/<=0
+        print('[rules] every(' + ms + ') raised to the ' + MIN_INTERVAL_MS + 'ms minimum');
+        ms = MIN_INTERVAL_MS;
+    }
     this.ms       = ms;
     this._factKey = 'time:' + (++_timeSeq);
     this._armed   = false;
@@ -271,16 +281,17 @@ function _cronField(spec, min, max) {
     var set = {};
     var parts = String(spec).split(',');
     for (var i = 0; i < parts.length; i++) {
-        var p = parts[i], step = 1, slash = p.indexOf('/');
+        var p = parts[i], step = 1, hasStep = false, slash = p.indexOf('/');
         if (slash >= 0) {
             step = parseInt(p.slice(slash + 1), 10);
             p = p.slice(0, slash);
+            hasStep = true;
             if (!(step >= 1)) throw new Error('cron: bad step in "' + spec + '"');
         }
         var lo, hi;
         if (p === '*') { lo = min; hi = max; }
         else if (p.indexOf('-') >= 0) { var r = p.split('-'); lo = parseInt(r[0], 10); hi = parseInt(r[1], 10); }
-        else { lo = hi = parseInt(p, 10); }
+        else { lo = parseInt(p, 10); hi = hasStep ? max : lo; }   // "a/n" → a..max step n (Vixie)
         if (!(lo >= min && hi <= max && lo <= hi)) throw new Error('cron: out of range in "' + spec + '"');
         for (var v = lo; v <= hi; v += step) set[v] = true;
     }

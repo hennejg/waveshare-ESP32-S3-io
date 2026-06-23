@@ -49,6 +49,14 @@ test("cron '*/15 * * * *' fires four times an hour", () => {
   assert.equal(e.T.n, 4);
 });
 
+test("cron 'a/n' steps from a to the field max (e.g. 5/15 → :05,:20,:35,:50)", () => {
+  const e = createEngine();
+  e.setClock(MON_2024_01_01);   // 00:00
+  e.load(`rule('q').when(cron('5/15 * * * *')).then(function(){ T.n = (T.n||0)+1; });`);
+  e.advance(HOUR);   // from 00:00 → 00:05, 00:20, 00:35, 00:50 (then 01:05 is past the hour)
+  assert.equal(e.T.n, 4);
+});
+
 test("cron '30 9-17 * * *' respects an hour range", () => {
   const e = createEngine();
   e.setClock(MON_2024_01_01);

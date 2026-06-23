@@ -51,6 +51,14 @@ test('reload cancels interval timers', () => {
   assert.equal(e.T.n, undefined);   // the old interval stopped ticking
 });
 
+test('every(ms) is floored at the 100ms minimum', () => {
+  const e = createEngine();
+  e.load(`rule('fast').when(every(50)).then(function(){ T.n = (T.n||0)+1; });`);
+  assert.ok(e.prints.some(p => /raised to the 100ms minimum/.test(p)), 'warns about the clamp');
+  e.advance(99); assert.equal(e.T.n, undefined);   // would have ticked at 50 if not floored
+  e.advance(1);  assert.equal(e.T.n, 1);            // ticks at 100ms instead
+});
+
 test('a time-triggered action can drive outputs (and cascades are bounded)', () => {
   const e = createEngine();
   e.load(`rule('blink').when(every(1000)).then(function(){ output(0).toggle(); });`);
