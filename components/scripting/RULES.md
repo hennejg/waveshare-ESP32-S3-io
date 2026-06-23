@@ -317,15 +317,18 @@ from `a` to the field max). Fields are **numeric only** (no `JAN`/`MON` names). 
 is `0`–`6` with Sunday `0` (`7` also accepted). When **both** day-of-month and day-of-week
 are restricted, a day matches if **either** does (Vixie semantics).
 
-> **Cron runs in UTC against the device clock — which is currently boot-relative.**
-> Fields are evaluated in **UTC** (local-time / timezone support is a follow-up). The
-> device has no RTC or SNTP yet, so its clock **starts at the Unix epoch (1970-01-01) on
-> every reboot and counts up from there** — wiring in real wall-clock time is a separate,
-> planned change (see [TIME_SOURCE_TODO.md](TIME_SOURCE_TODO.md)). Until then, cron
-> effectively schedules **relative to boot** (e.g.
-> `0 7 * * *` first fires ~7 h after start-up, then every 24 h), and that boot-relative
-> time is treated as authoritative. `every(ms)` is unaffected — it uses a purely relative
-> timer.
+> **Cron runs in the device's local time and only once the clock is real.**
+> Fields are evaluated in **local time** — the timezone configured on the *Time* page (a
+> POSIX `TZ` string; **UTC** when none is set), with DST handled by the zone's rules. The
+> wall-clock comes from the RTC at boot and from SNTP once the network is up. **Until the
+> clock is valid, cron stays suppressed** (so `0 7 * * *` can't fire ~7 h after a 1970
+> boot); when SNTP first syncs, cron is armed/re-armed against the corrected time. `every(ms)`
+> is unaffected — it uses a purely relative timer and runs immediately.
+>
+> *DST edge cases:* on spring-forward, a wall-clock time in the skipped hour never occurs,
+> so a job scheduled then is skipped that day; on fall-back, a repeated wall-clock time
+> fires once. This is inherent to local-time cron — use UTC if you need a fixed cadence
+> across DST.
 
 Each `every`/`cron` is its own fact, so its tick only re-evaluates the rules that use it,
 and reloading the rules cancels the timers.
@@ -420,9 +423,9 @@ a clean disconnect without waiting for a watchdog timeout — handy as a faster 
 to the watchdog. They become meaningful after the first connection event.
 
 > **A note on trust.** Time-based and liveness facts are only as trustworthy as their
-> inputs — an MQTT heartbeat is unauthenticated and a clock may be wrong (cron is
-> boot-relative until SNTP lands). For anything safety-relevant, treat fallback as a
-> local interlock, not a security control.
+> inputs — an MQTT heartbeat is unauthenticated, and NTP is unauthenticated too, so a
+> spoofed sync could make cron fire at the wrong moment. For anything safety-relevant,
+> treat fallback as a local interlock, not a security control.
 
 ### How events reach rules (the fact model)
 
@@ -625,7 +628,7 @@ mqtt(topic).value         // last payload
 
 // ── time triggers (edge; gate with other conditions) ───────────────────────
 every(ms)                 // fires every ms
-cron('m h dom mon dow')   // 5-field cron schedule (UTC; clock is boot-relative for now)
+cron('m h dom mon dow')   // 5-field cron schedule (local time; suppressed until clock valid)
 
 // ── fact(initial) — synthetic value: set by rules, gated on by rules ────────
 var f = fact(initial)     // value holder + condition

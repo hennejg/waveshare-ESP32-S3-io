@@ -15,7 +15,7 @@
 //                                                      consequence (Drools-style no-loop)
 //   every(ms)            → time trigger: an edge event every ms (min 100ms; other
 //                          when()-conditions gate it)
-//   cron("m h dom mon dow") → time trigger on a 5-field cron schedule (UTC; numeric fields)
+//   cron("m h dom mon dow") → time trigger on a 5-field cron schedule (local time; numeric fields)
 //   fact(initial)        → synthetic value: .set(v) in then(), .is(fn|value) in when()
 //                          (calculated by some rules, gated on by others);
 //                          .isTrue()/.isFalse() gate on truthiness
@@ -125,6 +125,7 @@ function _drive_output(ch, v) {
 function _reset_rules() {
     _cancel_all_timers();
     _rules = [];
+    _cronTriggers = [];   // timers already cancelled above; drop the old trigger registry
     _watchOutputs = false;
     _resetCascade();
 }
@@ -235,10 +236,10 @@ OutputCondition.prototype._check = function() {
 // _reset_rules (it runs through _schedule, so _cancel_all_timers covers it).
 var _timeSeq = 0;
 
-// Wall-clock epoch ms. Prefers a host _now() binding (mockable in tests); falls back to
-// Date.now(). NOTE: the device has no RTC/SNTP yet, so on-device this is time-since-boot
-// (the clock starts at the Unix epoch each reboot) — real wall-clock is a separate,
-// planned change; cron schedules are boot-relative until then. See RULES.md.
+// Wall-clock epoch ms (UTC). Prefers a host _now() binding (gettimeofday on-device,
+// mockable in tests); falls back to Date.now(). On-device real time comes from the RTC at
+// boot and SNTP once the network is up; until the clock is valid, cron stays suppressed
+// (see _clockValid / _on_time_sync). See RULES.md.
 function _now_ms() {
     if (typeof _now === 'function') return _now();
     if (typeof Date !== 'undefined' && Date.now) return Date.now();
@@ -274,9 +275,16 @@ IntervalCondition.prototype._arm = function() {
     });
 };
 
-// ── Cron: cron("min hour dom month dow") — standard 5-field, evaluated in UTC ──
-// Supports *, lists (a,b), ranges (a-b), and steps (*/n, a-b/n). Day-of-month and
-// day-of-week follow Vixie semantics: if both are restricted the match is OR.
+// ── Cron: cron("min hour dom month dow") — standard 5-field, local time ──
+// Evaluated in the device's local timezone (the configured POSIX TZ; UTC when none is
+// set). The wall-clock instant comes from _now_ms(); local field extraction uses the
+// JS Date local getters, which on-device resolve through QuickJS → newlib localtime, so
+// DST is handled by the TZ rules. Supports *, lists (a,b), ranges (a-b), and steps
+// (*/n, a-b/n). Day-of-month and day-of-week follow Vixie semantics: if both are
+// restricted the match is OR.
+// DST edge cases (unavoidable with local-time cron): on spring-forward a wall-clock time
+// in the skipped hour never occurs, so a job scheduled then is skipped that day; on
+// fall-back a repeated wall-clock time fires once (we advance strictly past each match).
 function _cronField(spec, min, max) {
     var set = {};
     var parts = String(spec).split(',');
@@ -313,38 +321,50 @@ function _parseCron(expr) {
     };
 }
 function _cronDayOk(f, d) {
-    var domOk = f.dom[d.getUTCDate()] === true;
-    var dowOk = f.dow[d.getUTCDay()] === true;
+    var domOk = f.dom[d.getDate()] === true;
+    var dowOk = f.dow[d.getDay()] === true;
     if (f.domR && f.dowR) return domOk || dowOk;   // Vixie OR
     if (f.domR) return domOk;
     if (f.dowR) return dowOk;
     return true;
 }
-// Next epoch ms strictly after fromMs matching the cron fields (UTC); -1 if none in ~5y.
+// Next epoch ms strictly after fromMs matching the cron fields in LOCAL time; -1 if none
+// in ~5y. Field tests/steps use local Date getters/setters (so the JS engine applies the
+// TZ + DST when mapping local fields ↔ epoch); the returned d.getTime() is still UTC ms.
 function _cronNext(f, fromMs) {
     var d = new Date(fromMs);
-    d.setUTCSeconds(0, 0);
-    d.setUTCMinutes(d.getUTCMinutes() + 1);        // minute granularity, strictly after
-    var capYear = new Date(fromMs).getUTCFullYear() + 5;
-    while (d.getUTCFullYear() <= capYear) {
-        if (f.month[d.getUTCMonth() + 1] !== true) { d.setUTCMonth(d.getUTCMonth() + 1, 1); d.setUTCHours(0, 0, 0, 0); continue; }
-        if (!_cronDayOk(f, d))                       { d.setUTCDate(d.getUTCDate() + 1);     d.setUTCHours(0, 0, 0, 0); continue; }
-        if (f.hour[d.getUTCHours()] !== true)        { d.setUTCHours(d.getUTCHours() + 1, 0, 0, 0); continue; }
-        if (f.minute[d.getUTCMinutes()] !== true)    { d.setUTCMinutes(d.getUTCMinutes() + 1, 0, 0); continue; }
+    d.setSeconds(0, 0);
+    d.setMinutes(d.getMinutes() + 1);              // minute granularity, strictly after
+    var capYear = new Date(fromMs).getFullYear() + 5;
+    while (d.getFullYear() <= capYear) {
+        if (f.month[d.getMonth() + 1] !== true) { d.setMonth(d.getMonth() + 1, 1); d.setHours(0, 0, 0, 0); continue; }
+        if (!_cronDayOk(f, d))                   { d.setDate(d.getDate() + 1);     d.setHours(0, 0, 0, 0); continue; }
+        if (f.hour[d.getHours()] !== true)       { d.setHours(d.getHours() + 1, 0, 0, 0); continue; }
+        if (f.minute[d.getMinutes()] !== true)   { d.setMinutes(d.getMinutes() + 1, 0, 0); continue; }
         return d.getTime();
     }
     return -1;
 }
+// Clock validity gates cron. Until the wall-clock is real (host _time_valid() — set by an
+// RTC seed at boot or the first SNTP sync) cron stays unarmed, so "0 7 * * *" can't fire
+// ~7 h after boot off a 1970 clock. Without the host binding (simulator, tests) the clock
+// is assumed real, so cron behaves as before. All cron triggers are tracked so the host
+// can re-arm them when the clock jumps from boot-relative to real (see _on_time_sync).
+var _clockValid   = (typeof _time_valid === 'function') ? !!_time_valid() : true;
+var _cronTriggers = [];
+
 function CronCondition(expr) {
     this.expr      = expr;
     this._fields   = _parseCron(expr);    // throws on a malformed expression
     this._factKey = 'time:' + (++_timeSeq);
     this._armed    = false;
     this._timer    = null;
+    _cronTriggers.push(this);
 }
 CronCondition.prototype._check = function() { return this._armed; };
 CronCondition.prototype._arm = function() {
-    if (this._timer != null) return;
+    if (this._timer != null) return;       // already armed (shared across rules)
+    if (!_clockValid) return;              // suppressed until time is valid; _on_time_sync arms
     var self = this;
     var now  = _now_ms();
     var next = _cronNext(self._fields, now);
@@ -357,6 +377,20 @@ CronCondition.prototype._arm = function() {
         self._arm();                       // schedule the following occurrence
     });
 };
+
+// Called by the host (EVT_TIME_SYNC) when SNTP (re)syncs the clock. esp_timer delays are
+// monotonic, so a cron timer armed against a boot-relative (or stale) clock would fire at
+// the wrong real moment after a step. Mark the clock valid, then cancel and re-arm every
+// cron trigger from the corrected wall-clock. every()/.after()/.heldFor() are relative and
+// need no re-arming. Exposed as a global so the C task can call it.
+function _on_time_sync() {
+    _clockValid = true;
+    for (var i = 0; i < _cronTriggers.length; i++) {
+        var c = _cronTriggers[i];
+        if (c._timer != null) { _unschedule(c._timer); c._timer = null; }
+        c._arm();
+    }
+}
 
 // ── Fact: synthetic working-memory value ──────────────────────────────────────
 // fact(initial) holds an arbitrary value that rules compute and gate on — the

@@ -10,6 +10,7 @@
 #include <esp_coexist.h>
 #include <wifi_config.h>
 #include "app_config.h"
+#include "app_time.h"
 #include "app_mqtt.h"
 #include "auth.h"
 #include "button.h"
@@ -195,6 +196,7 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     ESP_ERROR_CHECK(app_config_init());
+    app_time_apply_tz();   /* local time for cron + UI display; applied before scripting starts */
     ESP_ERROR_CHECK(auth_init());
     button_init();
     ESP_ERROR_CHECK(di_init());
@@ -213,6 +215,8 @@ void app_main(void)
             ESP_LOGI(TAG, "System clock seeded from RTC: %04d-%02d-%02d %02d:%02d:%02d UTC",
                      rt.tm_year + 1900, rt.tm_mon + 1, rt.tm_mday,
                      rt.tm_hour, rt.tm_min, rt.tm_sec);
+            /* Real time available before the engine starts → cron may arm at load. */
+            scripting_set_time_valid();
         } else {
             ESP_LOGW(TAG, "RTC time not valid yet — waiting for SNTP");
         }

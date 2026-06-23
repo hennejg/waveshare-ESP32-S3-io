@@ -1,5 +1,5 @@
 set(SRCS
-    "main.c" "app_config.c" "app_mqtt.c" "auth.c" "button.c" "buzzer.c"
+    "main.c" "app_config.c" "app_mqtt.c" "app_time.c" "auth.c" "button.c" "buzzer.c"
     "can_server.c" "di.c" "dout.c" "eth.c" "i2c_bus.c" "led.c" "mb_server.c"
     "rtc.c" "sntp_sync.c" "web_server.c"
 )

@@ -1,5 +1,6 @@
 #include "web_server.h"
 #include "app_config.h"
+#include "app_time.h"
 #include "auth.h"
 #include "buzzer.h"
 #include "di.h"
@@ -283,6 +284,8 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON_AddBoolToObject  (sntp, "enable", cfg->sntp.enable);
     cJSON_AddStringToObject(sntp, "server", cfg->sntp.server);
 
+    cJSON_AddStringToObject(root, "tz", cfg->tz);
+
     cJSON *di = cJSON_AddArrayToObject(root, "di");
     for (int i = 0; i < APP_CFG_DI_COUNT; i++) {
         cJSON *item = cJSON_CreateObject();
@@ -420,6 +423,10 @@ static esp_err_t api_config_post(httpd_req_t *req)
             strlcpy(cfg.sntp.server, v->valuestring, sizeof(cfg.sntp.server));
     }
 
+    cJSON *tz_j = cJSON_GetObjectItem(root, "tz");
+    if (cJSON_IsString(tz_j))
+        strlcpy(cfg.tz, tz_j->valuestring, sizeof(cfg.tz));
+
     cJSON_Delete(root);
 
     /* Validate names before saving */
@@ -434,7 +441,8 @@ static esp_err_t api_config_post(httpd_req_t *req)
     }
 
     app_config_update(&cfg);
-    sntp_sync_apply();   /* apply any SNTP server / enable change immediately */
+    sntp_sync_apply();    /* apply any SNTP server / enable change immediately */
+    app_time_apply_tz();  /* apply any timezone change to localtime + cron */
     di_publish_all();
     /* Re-subscribe with potentially new names, then publish all DO states. */
     dout_on_mqtt_connected();
@@ -479,6 +487,14 @@ static esp_err_t api_time_get(httpd_req_t *req)
         strftime(riso, sizeof(riso), "%Y-%m-%dT%H:%M:%SZ", &rtc_tm);
         cJSON_AddStringToObject(root, "rtc_utc", riso);
     }
+
+    /* Local time and the configured zone (TZ is applied process-wide via tzset). */
+    struct tm local_tm;
+    localtime_r(&now, &local_tm);
+    char local[32];
+    strftime(local, sizeof(local), "%Y-%m-%d %H:%M:%S", &local_tm);
+    cJSON_AddStringToObject(root, "local", local);
+    cJSON_AddStringToObject(root, "tz", app_config_get()->tz);
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -1021,7 +1037,9 @@ esp_err_t web_server_start(void)
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn     = httpd_uri_match_wildcard;
-    cfg.max_uri_handlers = 18;
+    /* Derive from the table so adding a handler never overflows the cap and
+     * silently drops the last registration (the wildcard file-serving fallback). */
+    cfg.max_uri_handlers = sizeof(s_handlers) / sizeof(s_handlers[0]);
     /* Allocate the httpd task stack from the reserved internal DMA pool
      * (MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT), not from PSRAM.
      * PSRAM stacks fail the esp_ptr_in_dram() check inside the SPI-flash driver,

@@ -39,3 +39,14 @@ void scripting_on_input_change(uint8_t channel, bool state);
 // Clears all existing rules, re-evaluates the DSL, then evaluates new_script.
 // Safe to call from any task. new_script is copied internally.
 void scripting_reload(const char *new_script);
+
+// Mark the wall-clock as valid (real time available). Cron triggers stay suppressed
+// until this is true, so they don't fire boot-relative. Call BEFORE scripting_init()
+// when the RTC seeded real time at boot. Safe to call from any task.
+void scripting_set_time_valid(void);
+
+// Notify the engine that the clock was (re)synced from SNTP. Marks time valid and
+// re-arms all cron triggers against the corrected wall-clock — the fix for the timer
+// step that occurs when SNTP jumps the clock from boot-relative to real time.
+// Safe to call from any task (e.g. the SNTP sync callback).
+void scripting_on_time_sync(void);
