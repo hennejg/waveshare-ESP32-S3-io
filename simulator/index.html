@@ -316,6 +316,13 @@ function renderRuleList() {
       } else if (c instanceof CronCondition) {
         desc = "cron('" + c.expr + "')";
         status = '<span class="cunknown">timer · UTC schedule</span>';
+      } else if (c instanceof FactCondition) {
+        desc = 'fact.is(' + (typeof c._matcher === 'function' ? 'fn' : JSON.stringify(c._matcher)) + ')';
+        status = (ok ? '<span class="cok">✓</span>' : '<span class="cfail">✗</span>')
+               + ' value=' + esc(JSON.stringify(c._src._value));
+      } else if (c instanceof Fact) {
+        desc = 'fact';
+        status = '<span class="cunknown">value=' + esc(JSON.stringify(c._value)) + '</span>';
       } else {
         desc = '(condition)';
         status = ok ? '<span class="cok">✓</span>' : '<span class="cfail">✗</span>';

@@ -15,6 +15,8 @@
 //                                                      consequence (Drools-style no-loop)
 //   every(ms)            → time trigger: an edge event every ms (other when()-conditions gate it)
 //   cron("m h dom mon dow") → time trigger on a 5-field cron schedule (evaluated in UTC)
+//   fact(initial)        → synthetic value: .set(v) in then(), .is(fn|value) in when()
+//                          (calculated by some rules, gated on by others)
 //   mqtt(topic).is(fn)   → MqttCondition   (condition + value holder)
 //   input(ch).is(bool)   → InputCondition  (.value / .get() read the live level)
 //   output(ch)           → actuator { set(bool), on(), off(), toggle(), get(), value }
@@ -240,7 +242,7 @@ function _now_ms() {
 // ── IntervalCondition: every(ms) ──
 function IntervalCondition(ms) {
     this.ms       = ms;
-    this._timeFact = 'time:' + (++_timeSeq);
+    this._factKey = 'time:' + (++_timeSeq);
     this._armed   = false;
     this._timer   = null;
 }
@@ -251,7 +253,7 @@ IntervalCondition.prototype._arm = function() {
     self._timer = _schedule(self.ms, function() {
         self._timer = null;
         self._armed = true;
-        _fire_matching(self._timeFact);
+        _fire_matching(self._factKey);
         self._armed = false;
         self._arm();                          // re-arm for the next period
     });
@@ -320,7 +322,7 @@ function _cronNext(f, fromMs) {
 function CronCondition(expr) {
     this.expr      = expr;
     this._fields   = _parseCron(expr);    // throws on a malformed expression
-    this._timeFact = 'time:' + (++_timeSeq);
+    this._factKey = 'time:' + (++_timeSeq);
     this._armed    = false;
     this._timer    = null;
 }
@@ -334,10 +336,42 @@ CronCondition.prototype._arm = function() {
     self._timer = _schedule(next - now, function() {
         self._timer = null;
         self._armed = true;
-        _fire_matching(self._timeFact);
+        _fire_matching(self._factKey);
         self._armed = false;
         self._arm();                       // schedule the following occurrence
     });
+};
+
+// ── Fact: synthetic working-memory value ──────────────────────────────────────
+// fact(initial) holds an arbitrary value that rules compute and gate on — the
+// Drools "calculated fact" pattern. It is a value holder (.set/.get/.value, used in
+// then()) AND a fact source: .set() emits a change event (only when the value
+// actually changes) so rules gating on .is(...) re-evaluate. Each fact is its own
+// dispatch key, and the change event runs through _emit, so the cascade cap and
+// .noLoop() apply just as they do for outputs.
+var _factSeq = 0;
+function Fact(initial) {
+    this._value   = (arguments.length ? initial : null);
+    this._factKey = 'fact:' + (++_factSeq);
+}
+Fact.prototype.get = function() { return this._value; };
+Object.defineProperty(Fact.prototype, 'value', { get: function() { return this._value; } });
+Fact.prototype.set = function(v) {
+    if (this._value !== v) { this._value = v; _emit(this._factKey); }   // change → event
+    return this._value;
+};
+Fact.prototype._check = function() { return true; };                    // bare fact always matches
+// .is(matcher): matcher is a predicate (fn of the value) or a constant to equal.
+Fact.prototype.is = function(matcher) { return new FactCondition(this, matcher); };
+
+function FactCondition(src, matcher) {
+    this._src     = src;             // the underlying Fact (live value lives here)
+    this._factKey = src._factKey;    // same dispatch key → .set() re-evaluates this rule
+    this._matcher = matcher;
+}
+FactCondition.prototype._check = function() {
+    var v = this._src._value;
+    return (typeof this._matcher === 'function') ? !!this._matcher(v) : (v === this._matcher);
 };
 
 // ── Public factory functions ─────────────────────────────────────────────────
@@ -347,6 +381,7 @@ function input(ch)    { return new InputCondition(ch); }
 function output(ch)   { return new OutputCondition(ch); }
 function every(ms)    { return new IntervalCondition(ms); }
 function cron(expr)   { return new CronCondition(expr); }
+function fact(initial){ return new Fact(initial); }
 
 // ── Rule builder (fluent API) ────────────────────────────────────────────────
 
@@ -378,7 +413,7 @@ function _ruleFacts(conditions) {
         if      (c instanceof InputCondition)  facts['input:'  + c.channel] = true;
         else if (c instanceof OutputCondition) facts['output:' + c.channel] = true;
         else if (c instanceof MqttCondition)   facts['mqtt:'   + c.topic]   = true;
-        else if (c && c._timeFact)             facts[c._timeFact]           = true;  // every()/cron()
+        else if (c && c._factKey)             facts[c._factKey]           = true;  // every()/cron()
         else                                   wildcard = true;
     }
     return { facts: facts, wildcard: wildcard };

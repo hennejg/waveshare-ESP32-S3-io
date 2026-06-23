@@ -329,6 +329,48 @@ are restricted, a day matches if **either** does (Vixie semantics).
 Each `every`/`cron` is its own fact, so its tick only re-evaluates the rules that use it,
 and reloading the rules cancels the timers.
 
+### Synthetic facts — `fact(initial)`
+
+A `fact` is a value you compute in some rules and gate on in others — the classic
+"calculated fact" pattern. It holds an arbitrary value (`.set(v)` / `.get()` / `.value`)
+and is itself a fact source: `.set()` emits a change event (only when the value actually
+changes) so rules gating on it re-evaluate.
+
+| Form | Meaning |
+|------|---------|
+| `fact(initial)` | create a value holder (used as a condition: bare → always matches) |
+| `f.set(v)` | set the value (emits a change event); returns the new value |
+| `f.get()` / `f.value` | read the current value |
+| `f.is(fn)` | condition: matches when `fn(value)` is truthy |
+| `f.is(x)` | condition: matches when `value === x` |
+
+```js
+var sunElevation = fact(0);
+
+// one rule calculates the fact …
+rule('update sun elevation')
+  .when(every(60000))
+  .then(function () {
+    sunElevation.set(/* compute from time + lat/lon … */ Math.random() * 90 - 45);
+  });
+
+// … others gate on it
+rule('light on at night')
+  .when(sunElevation.is(function (e) { return e < 5; }))
+  .then(function () { output(1).on(); });
+
+rule('light off at sunrise')
+  .when(sunElevation.is(function (e) { return e > 10; }))
+  .then(function () { output(1).off(); });
+```
+
+A `fact` is its own dispatch fact (setting it only re-evaluates rules that use it), and
+its change event runs through the same path as an output write — so the **cascade cap**
+and **`.noLoop()`** apply (a rule that sets a fact it also gates on is bounded / can be
+made self-suppressing). `set(v)` only emits when `v !== ` the current value (`===`
+comparison, so it's change-detection for primitives; replace a held object rather than
+mutating it in place).
+
 ### How events reach rules (the fact model)
 
 Each `input(ch)`, `output(ch)`, and `mqtt(topic)` is a **distinct fact**. When something
@@ -531,6 +573,13 @@ mqtt(topic).value         // last payload
 // ── time triggers (edge; gate with other conditions) ───────────────────────
 every(ms)                 // fires every ms
 cron('m h dom mon dow')   // 5-field cron schedule (UTC; clock is boot-relative for now)
+
+// ── fact(initial) — synthetic value: set by rules, gated on by rules ────────
+var f = fact(initial)     // value holder + condition
+f.set(v)                  // set (emits on change) → new value
+f.get() / f.value         // read
+f.is(fn)                  // condition: fn(value) is truthy
+f.is(x)                   // condition: value === x
 
 // ── in then() bodies ───────────────────────────────────────────────────────
 print(…)                  // log to the console (args joined by space)
