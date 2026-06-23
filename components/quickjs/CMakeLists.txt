@@ -79,13 +79,14 @@ target_compile_options(${COMPONENT_LIB} PRIVATE
     "-include" "${CMAKE_CURRENT_LIST_DIR}/compat/esp32_compat.h"
 )
 
-# Suppress upstream warnings so our build output stays clean.
+# Suppress upstream warnings so our build output stays clean. Disabling (not just
+# downgrading) is what reliably prevents IDF's -Werror=all from failing the build on
+# vendored code — and these vary by toolchain, e.g. -Wmaybe-uninitialized is a false
+# positive under CI's newer GCC that the local toolchain doesn't emit. Our own
+# components are still built with -Werror.
 # -Wno-format: uint32_t is 'unsigned long' on Xtensa, causing format mismatches.
-# -Wno-error: this is vendored upstream code — don't fail our build on its warnings,
-#   which vary by toolchain (e.g. -Wmaybe-uninitialized false positives under the newer
-#   GCC in CI). Our own components are still built with -Werror.
 target_compile_options(${COMPONENT_LIB} PRIVATE
-    -Wno-error
+    -Wno-maybe-uninitialized
     -Wno-format
     -Wno-incompatible-pointer-types
     -Wno-unused-variable
