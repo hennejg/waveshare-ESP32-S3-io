@@ -72,11 +72,15 @@
     .btn-row { margin-top:3rem; display:flex; gap:.5rem; flex-wrap:wrap; }
     #reboot-btn        { background:#b0413e; }
     #factory-reset-btn { background:#7a1e1e; }
-    /* Rules editor */
+    /* Rules editor — textarea is the fallback when CodeMirror fails to load */
     .rules-editor { width:100%; font-family:monospace; font-size:.82rem; padding:.5rem .6rem;
                     border:1px solid #ccc; border-radius:4px; resize:vertical; min-height:14rem; }
+    /* CodeMirror, when present, replaces the textarea */
+    .CodeMirror { height:22rem; border:1px solid #ccc; border-radius:4px;
+                  font-size:.82rem; line-height:1.35; }
     #rules-status { font-size:.82rem; min-height:1.2em; margin:.4rem 0; }
   </style>
+  <link rel="stylesheet" href="/codemirror.min.css">
 </head>
 <body>
 
@@ -959,17 +963,41 @@ rule('my-rule')
 
     /* ---- Rules editor ---- */
     let rulesLoaded = false;
+    let rulesCM = null;   // CodeMirror instance, once the (deferred) library has loaded
+
+    // Upgrade the #rules-script textarea to a CodeMirror editor. Idempotent, and a no-op
+    // until codemirror.min.js has loaded — so the plain textarea keeps working before the
+    // deferred scripts run, and as a fallback if they fail to load at all.
+    function ensureRulesEditor() {
+      if (rulesCM || typeof CodeMirror === 'undefined') return;
+      rulesCM = CodeMirror.fromTextArea(document.getElementById('rules-script'), {
+        mode: 'javascript', lineNumbers: true, lineWrapping: true,
+        tabSize: 2, indentUnit: 2,
+      });
+    }
+    function rulesText()     { return rulesCM ? rulesCM.getValue() : document.getElementById('rules-script').value; }
+    function setRulesText(s) { if (rulesCM) rulesCM.setValue(s); else document.getElementById('rules-script').value = s; }
 
     async function loadRules() {
+      ensureRulesEditor();
+      if (rulesCM) rulesCM.refresh();   // size correctly now the tab pane is visible
       if (rulesLoaded) return;
       try {
         const r = await apiFetch('/api/rules');
         if (!r.ok) return;
         const d = await r.json();
-        document.getElementById('rules-script').value = d.script || '';
+        setRulesText(d.script || '');
+        if (rulesCM) rulesCM.refresh();
         rulesLoaded = true;
       } catch (_) {}
     }
+
+    // The CodeMirror scripts are deferred (run after this inline init). If the Rules tab is
+    // the restored active tab, upgrade + size the editor once the library is ready.
+    document.addEventListener('DOMContentLoaded', function () {
+      const pane = document.getElementById('tab-rules');
+      if (pane && pane.classList.contains('active')) { ensureRulesEditor(); if (rulesCM) rulesCM.refresh(); }
+    });
 
     async function postRules(script, successMsg) {
       const st = document.getElementById('rules-status');
@@ -998,7 +1026,13 @@ rule('my-rule')
     }
 
     function saveRules() {
-      const script = document.getElementById('rules-script').value.trim();
+      const script = rulesText().trim();
+      if (script.length > 3900) {
+        const st = document.getElementById('rules-status');
+        st.className = 'err';
+        st.textContent = 'Script too long: ' + script.length + ' / 3900 characters.';
+        return;
+      }
       return postRules(script, 'Saved and applied.');
     }
 
@@ -1056,5 +1090,9 @@ rule('my-rule')
     }
   </script>
   <script src="/qrcode.min.js" defer></script>
+  <!-- CodeMirror 5 (self-hosted): syntax highlighting for the rule editor. Loads after
+       connectivity; the #rules-script textarea is the fallback if these fail to load. -->
+  <script src="/codemirror.min.js" defer></script>
+  <script src="/codemirror-javascript.min.js" defer></script>
 </body>
 </html>

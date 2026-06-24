@@ -101,8 +101,10 @@ All endpoints except the auth flow require an `Authorization: Basic base64(:<pas
 ### Automation Rules
 
 A built-in rule engine wires digital inputs, digital outputs, and MQTT messages together
-with a small JavaScript DSL. Rules are edited in the **Rules** tab of the web UI (or via
-`POST /api/rules`), saved to NVS, and hot-reloaded without a reboot.
+with a small JavaScript DSL. Rules are edited in the **Rules** tab of the web UI — a
+CodeMirror editor with JavaScript syntax highlighting and line numbers (self-hosted, so it
+works on an isolated network) — or via `POST /api/rules`, saved to NVS, and hot-reloaded
+without a reboot.
 
 See the **[Rule Language Reference](components/scripting/RULES.md)** for the full syntax —
 rule structure, the `input` / `output` / `mqtt` facts and their helpers, time-based rules
