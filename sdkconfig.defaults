@@ -157,3 +157,12 @@ CONFIG_ETHERNET_NETWORK_ENDPOINT_ID=0
 
 # Matter device identification strings (VendorID 0xFFF1 is the CSA test VID)
 CONFIG_CHIP_PROJECT_CONFIG="main/CHIPProjectConfig.h"
+
+# Prevent WiFi mode from persisting to NVS.  Without this, a captive-portal
+# session sets WIFI_MODE_APSTA via esp_wifi_set_mode(), which is restored from
+# NVS on the next boot by StartWiFiLayer() → esp_wifi_start() before BLE is
+# released.  The 752-byte SoftAP beacon buffer cannot be allocated from DMA
+# heap while BLE is active, causing a LoadProhibited crash in
+# ieee80211_hostap_attach.  Matter stores credentials in its own chip-* NVS
+# namespace and does not rely on WiFi NVS.
+CONFIG_ESP_WIFI_NVS_ENABLED=n
