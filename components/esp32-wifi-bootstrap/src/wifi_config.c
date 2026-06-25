@@ -489,7 +489,7 @@ static void wifi_config_server_on_settings_update(client_t *client) {
         /* Send a confirmation page before rebooting so the user sees feedback.
          * Reboot is cleaner than a live APSTA→STA transition: avoids mode-change
          * errors and ensures WiFi starts fresh in STA-only mode. */
-        char html[512];
+        char html[768];
         snprintf(html, sizeof(html),
                  "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
                  "<!DOCTYPE html><html><head>"
