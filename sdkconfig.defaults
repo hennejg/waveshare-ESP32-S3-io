@@ -91,10 +91,16 @@ CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
 # pure CPU — no DMA — so PSRAM is safe here.
 CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC=y
 
-# PSRAM heap routing — route allocations > 1 KiB to PSRAM when possible,
-# keeping internal DMA free for WiFi/BLE/SPI drivers.  1024 B threshold lets
-# small FreeRTOS objects (Queue_t, Timer_t) stay internal while larger app
-# buffers (scripting, JSON, HTTP bodies) go to PSRAM.
+# PSRAM heap routing — allocations > 1024 B go to PSRAM via malloc().
+# The W5500 rx_buffer uses heap_caps_malloc(MALLOC_CAP_DMA) and therefore
+# always lands in internal SRAM regardless of this threshold.
+# With ALWAYSINTERNAL=1024 the CHIP/NimBLE session objects (1025-4095 B range)
+# go to PSRAM, preserving ~8 KB more of internal DRAM headroom compared to
+# ALWAYSINTERNAL=4096.  The previous bounce-buffer fragmentation problem (SPI
+# RX path allocating 64-byte heap blocks on every W5500 transaction) is now
+# fixed in the W5500 MAC driver: the static DMA buffer is 64-byte aligned and
+# read lengths are padded to 64-byte multiples, so setup_dma_priv_buffer never
+# allocates a bounce buffer from the heap.
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
 # Move application .bss to PSRAM (~14 KB freed, measured on boot).  Safe for
 # non-DMA-critical static data; DMA drivers are unaffected.
@@ -113,8 +119,7 @@ CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 # 2048 bytes is far too small: httpd_start() + ESP_LOGE overflow it.
 CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=8192
 
-# httpd stack must be > SPIRAM_MALLOC_ALWAYSINTERNAL (4096) so it lands in
-# PSRAM when internal DRAM is exhausted by Matter.
+# httpd stack (> SPIRAM_MALLOC_ALWAYSINTERNAL=4096) lands in PSRAM.
 CONFIG_HTTPD_STACK_SIZE=6144
 
 # OTA requestor (needed by esp_matter_ota_provider component)
