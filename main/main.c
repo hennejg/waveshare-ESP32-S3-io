@@ -363,7 +363,7 @@ void app_main(void)
                 esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START, on_wifi_ap, NULL);
                 wifi_config_set_eth_only_callback(on_eth_only_requested);
                 wifi_config_set_eth_available_fn(is_eth_connected);
-                wifi_config_init("Waveshare (192.168.4.1)", NULL, on_wifi_ready);
+                wifi_config_init("Waveshare (192.168.4.1)", NULL, NULL);
             }
         }
 #else

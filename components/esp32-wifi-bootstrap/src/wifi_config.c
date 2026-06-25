@@ -471,7 +471,7 @@ static void wifi_config_server_on_settings_update(client_t *client) {
                 return;
         }
 
-        form_param_t *ssid_param = form_params_find(form, "ssid");
+        form_param_t *ssid_param     = form_params_find(form, "ssid");
         form_param_t *password_param = form_params_find(form, "password");
         if (!ssid_param) {
                 DEBUG("Invalid form data, redirecting to /settings");
@@ -480,23 +480,34 @@ static void wifi_config_server_on_settings_update(client_t *client) {
                 return;
         }
 
-        static const char payload[] = "HTTP/1.1 204 \r\nContent-Type: text/html\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        client_send(client, payload, sizeof(payload)-1);
-
         DEBUG("Setting wifi_ssid param = %s", ssid_param->value);
-        DEBUG("Setting wifi_password param = %s", password_param->value);
+        DEBUG("Setting wifi_password param = %s", password_param ? password_param->value : "(none)");
 
         sysparam_set_string("wifi_ssid", ssid_param->value);
-        if (password_param) {
-                sysparam_set_string("wifi_password", password_param->value);
-        } else {
-                sysparam_set_string("wifi_password", "");
-        }
+        sysparam_set_string("wifi_password", password_param ? password_param->value : "");
+
+        /* Send a confirmation page before rebooting so the user sees feedback.
+         * Reboot is cleaner than a live APSTA→STA transition: avoids mode-change
+         * errors and ensures WiFi starts fresh in STA-only mode. */
+        char html[512];
+        snprintf(html, sizeof(html),
+                 "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
+                 "<!DOCTYPE html><html><head>"
+                 "<meta charset='utf-8'>"
+                 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                 "<title>Connecting</title></head>"
+                 "<body style='font-family:sans-serif;text-align:center;padding:2rem'>"
+                 "<h2>Credentials saved</h2>"
+                 "<p>Rebooting &mdash; will connect to <strong>%.32s</strong>.</p>"
+                 "<p style='color:#888;font-size:.85rem'>"
+                 "To change WiFi: hold the BOOT button for &ge;&nbsp;5&nbsp;s.</p>"
+                 "</body></html>",
+                 ssid_param->value);
         form_params_free(form);
 
-        vTaskDelay(500 / portTICK_PERIOD_MS);
-
-        wifi_config_station_connect();
+        write(client->fd, html, strlen(html));
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
 }
 
 
