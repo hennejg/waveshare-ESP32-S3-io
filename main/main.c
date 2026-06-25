@@ -357,6 +357,16 @@ void app_main(void)
             esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START, on_wifi_ap, NULL);
             wifi_config_set_eth_only_callback(on_eth_only_requested);
             wifi_config_set_eth_available_fn(is_eth_connected);
+            /* If credentials are already stored, suppress the captive portal entirely.
+             * Without this, wifi_config's monitor fires on any brief disconnect and
+             * calls wifi_config_softap_start() → esp_wifi_scan_start(NULL, true) — a
+             * blocking all-channel scan that holds the radio for several seconds every
+             * 10 s, starving STA traffic of ACKs and causing send() EAGAIN on the httpd. */
+            char *ssid = NULL;
+            wifi_config_get(&ssid, NULL);
+            if (ssid && ssid[0])
+                wifi_config_disable_ap();
+            free(ssid);
             wifi_config_init("Waveshare (192.168.4.1)", NULL, NULL);
         }
 #else
