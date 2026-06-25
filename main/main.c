@@ -343,13 +343,29 @@ void app_main(void)
     if (!eth_only) {
 #ifdef CONFIG_APP_MATTER_ENABLE
         /* Matter handles WiFi credentials and connection via the NetworkCommissioning
-         * cluster.  Do NOT call wifi_config_init: with no stored credentials it
-         * would loop retrying an empty SSID, fragmenting the heap and starving BLE
-         * of the memory it needs for connection buffers (BLE_INIT: Malloc failed).
-         * Register a direct STA-got-IP handler; Matter's ConnectivityManager fires
-         * the standard IP_EVENT_STA_GOT_IP when it connects post-commissioning. */
+         * cluster.  Do NOT call wifi_config_init unconditionally: when BLE is active
+         * for commissioning, the wifi_config monitor task competes for the same
+         * scarce DMA heap.
+         *
+         * Exception: if the device is already commissioned (BLE has been released)
+         * but has no WiFi credentials — e.g. after a button-triggered WiFi reset —
+         * start the captive-portal AP so the user can re-provision.  Matter keeps
+         * its fabric; only WiFi credentials are re-entered via the portal. */
         esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                    on_matter_wifi_got_ip, NULL);
+        if (matter_is_commissioned()) {
+            char *ssid = NULL;
+            wifi_config_get(&ssid, NULL);
+            bool no_wifi_creds = (!ssid || !ssid[0]);
+            free(ssid);
+            if (no_wifi_creds) {
+                ESP_LOGI(TAG, "Commissioned but no WiFi credentials — starting captive portal");
+                esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START, on_wifi_ap, NULL);
+                wifi_config_set_eth_only_callback(on_eth_only_requested);
+                wifi_config_set_eth_available_fn(is_eth_connected);
+                wifi_config_init("Waveshare (192.168.4.1)", NULL, on_wifi_ready);
+            }
+        }
 #else
         /* Non-Matter: captive-portal WiFi provisioning via wifi-bootstrap. */
         esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START, on_wifi_ap, NULL);

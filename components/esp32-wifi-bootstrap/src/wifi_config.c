@@ -1053,7 +1053,10 @@ static int wifi_config_has_configuration() {
         char *wifi_ssid = NULL;
         sysparam_get_string("wifi_ssid", &wifi_ssid);
 
-        if (!wifi_ssid) {
+        /* wifi_config_reset() stores "" rather than deleting the key, so treat
+         * an empty string the same as absent. */
+        if (!wifi_ssid || !wifi_ssid[0]) {
+                free(wifi_ssid);
                 return 0;
         }
 
