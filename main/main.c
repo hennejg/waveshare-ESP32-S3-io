@@ -8,6 +8,7 @@
 #include <esp_event.h>
 #include <esp_wifi.h>
 #include <esp_coexist.h>
+#include <esp_bt.h>
 #include <wifi_config.h>
 #include "app_config.h"
 #include "app_time.h"
@@ -257,48 +258,73 @@ void app_main(void)
 
     bool eth_only = get_eth_only();
 
+#ifdef CONFIG_APP_MATTER_ENABLE
+    /* Initialize Matter (and its BLE stack) BEFORE starting WiFi.
+     *
+     * The WiFi driver's MAC connection buffer (7,168 B) is allocated
+     * asynchronously when esp_wifi_connect() fires.  If WiFi is started first,
+     * that buffer is carved from the main internal-DMA free block just as BLE
+     * tries to allocate its contiguous DMA chunk, leaving only ~31,744 B —
+     * not enough.  Starting Matter first keeps that block intact so BLE gets
+     * ~57,344 B and can succeed.
+     *
+     * Pre-register the STA netif BEFORE matter_init so that CHIP's
+     * InitWiFiStack finds it and skips creating a duplicate.  The AP (SoftAP)
+     * is intentionally NOT pre-created: CHIPoBLE handles commissioning, so the
+     * captive-portal AP is unnecessary and its beacon buffer (752 B DMA) would
+     * crash after BLE has consumed the main free block.
+     * wifi_config_disable_ap() prevents wifi-bootstrap from starting it. */
+    if (!eth_only) {
+        esp_netif_init();
+        esp_event_loop_create_default();
+        esp_netif_create_default_wifi_sta();
+        wifi_config_disable_ap();
+    }
+
+    /* Release classic-BT memory even in eth-only mode — it's never needed. */
+    esp_bt_mem_release(ESP_BT_MODE_CLASSIC_BT);
+
+    if (!eth_only) {
+        esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+
+        ESP_LOGI(TAG, "heap before matter_init: free=%u DMA_free=%u DMA_largest=%u",
+                 esp_get_free_heap_size(),
+                 heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+                 heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+
+        esp_err_t matter_ret = matter_init();
+        if (matter_ret != ESP_OK)
+            ESP_LOGW(TAG, "Matter init failed: %s", esp_err_to_name(matter_ret));
+        ESP_LOGI(TAG, "heap after matter_init: free=%u internal_free=%u internal_largest=%u",
+                 esp_get_free_heap_size(),
+                 heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    }
+#endif
+
+    /* Ethernet always.  Init before wifi_config so eth's SPI DMA buffers
+     * claim contiguous internal RAM before wifi_config event-handler
+     * registrations fragment the residual heap. */
+#ifndef CONFIG_APP_MATTER_ENABLE
+    if (eth_only) esp_netif_init(), esp_event_loop_create_default();
+#endif
+    esp_event_handler_register(IP_EVENT,   IP_EVENT_STA_LOST_IP, on_ip_lost,  NULL);
+    esp_event_handler_register(IP_EVENT,   IP_EVENT_ETH_LOST_IP, on_ip_lost,  NULL);
+    esp_err_t eth_ret = eth_init(on_eth_ready);
+    if (eth_ret != ESP_OK)
+        ESP_LOGW(TAG, "Ethernet init failed: %s", esp_err_to_name(eth_ret));
+
     if (!eth_only) {
         /* Normal: WiFi provisioning + STA. */
+        esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START, on_wifi_ap, NULL);
         wifi_config_set_eth_only_callback(on_eth_only_requested);
         wifi_config_set_eth_available_fn(is_eth_connected);
         wifi_config_init("Waveshare (192.168.4.1)", NULL, on_wifi_ready);
 
+        /* STA netif may already exist (created by CHIP's InitWiFiStack above). */
         esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
         if (sta) esp_netif_set_hostname(sta, app_config_get()->device_name);
     } else {
         ESP_LOGI(TAG, "ETH-only mode — skipping WiFi");
     }
-
-    /* Ethernet always. Event loop is ready after wifi_config_init (or immediately). */
-    if (eth_only) esp_netif_init(), esp_event_loop_create_default();
-    esp_err_t eth_ret = eth_init(on_eth_ready);
-    if (eth_ret != ESP_OK)
-        ESP_LOGW(TAG, "Ethernet init failed: %s", esp_err_to_name(eth_ret));
-
-    esp_event_handler_register(IP_EVENT,   IP_EVENT_STA_LOST_IP, on_ip_lost,  NULL);
-    esp_event_handler_register(IP_EVENT,   IP_EVENT_ETH_LOST_IP, on_ip_lost,  NULL);
-    if (!eth_only)
-        esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START, on_wifi_ap, NULL);
-
-#ifdef CONFIG_APP_MATTER_ENABLE
-    /* Give WiFi priority over BLE in the coexistence driver.  Matter BLE
-     * advertising is still active for commissioning, but WiFi traffic
-     * (HTTP, MQTT) no longer stalls behind BLE slots. */
-    esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
-
-    /* Diagnostic: show DMA-capable heap state before BLE controller init */
-    ESP_LOGI(TAG, "heap before matter_init: free=%u DMA_free=%u DMA_largest=%u",
-             esp_get_free_heap_size(),
-             heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
-             heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
-
-    /* Matter — initialise after network interfaces so the event loop is ready */
-    esp_err_t matter_ret = matter_init();
-    if (matter_ret != ESP_OK)
-        ESP_LOGW(TAG, "Matter init failed: %s", esp_err_to_name(matter_ret));
-    ESP_LOGI(TAG, "heap after matter_init: free=%u internal_free=%u internal_largest=%u",
-             esp_get_free_heap_size(),
-             heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-             heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-#endif
 }

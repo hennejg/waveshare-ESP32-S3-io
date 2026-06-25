@@ -26,10 +26,11 @@ CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
 # especially when combined with CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y.
 # (Dynamic TX buffers are Kconfig-forbidden when SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y)
 CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8
-# SPIRAM_TRY_ALLOCATE_WIFI_LWIP changes the RX buffer default from 10 to 16.
-# 16 × 1600 B = 25.6 KB of INTERNAL|DMA, which leaves the DMA pool ~9.6 KB
-# shorter for BLE controller allocations.  Pin it back to 10.
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
+# With Matter+BLE active, internal DMA is extremely scarce (~25 KB after
+# matter_init).  WiFi static RX buffers (1600 B each, MALLOC_CAP_DMA|INTERNAL)
+# are the largest tunable consumer; 2 is the minimum and sufficient for the
+# typical MQTT/HTTP workload.  32 dynamic RX buffers handle burst receive.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=2
 
 # Ethernet — enable built-in SPI Ethernet and W5500 driver
 CONFIG_ETH_USE_SPI_ETHERNET=y
@@ -69,10 +70,12 @@ CONFIG_LWIP_HOOK_ND6_GET_GW_DEFAULT=y
 # 8 DO + 8 DI + root endpoint = 17; add margin
 CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT=20
 
-# Stack sizes — Matter initialization runs on app_main's stack and is deep;
-# the CHIP task also needs more than the ESP-IDF default.
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=10240
-CONFIG_CHIP_TASK_STACK_SIZE=15360
+# Stack sizes — reduced to reclaim internal DMA for Matter+BLE+Ethernet.
+# app_main only needs 6 KB; matter_init runs synchronously but CHIP task is
+# separate.  CHIP task 6 KB verified stable; NimBLE host task 5 KB sufficient
+# (pool buffers already go to PSRAM via NIMBLE_MEM_ALLOC_MODE_EXTERNAL).
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+CONFIG_CHIP_TASK_STACK_SIZE=6144
 CONFIG_BT_NIMBLE_TASK_STACK_SIZE=5120
 # NimBLE host pool buffers (event queues, callouts, mutexes, semaphores) go to
 # PSRAM with EXTERNAL mode, freeing ~5-10 KiB of internal DRAM for FreeRTOS
@@ -88,10 +91,14 @@ CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
 # pure CPU — no DMA — so PSRAM is safe here.
 CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC=y
 
-# PSRAM heap routing — Matter makes many large allocations that exhaust
-# internal DRAM (leaving none for httpd/mqtt task stacks).  Route any
-# allocation larger than 4 KiB to PSRAM when internal RAM is full.
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+# PSRAM heap routing — route allocations > 1 KiB to PSRAM when possible,
+# keeping internal DMA free for WiFi/BLE/SPI drivers.  1024 B threshold lets
+# small FreeRTOS objects (Queue_t, Timer_t) stay internal while larger app
+# buffers (scripting, JSON, HTTP bodies) go to PSRAM.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
+# Move application .bss to PSRAM (~14 KB freed, measured on boot).  Safe for
+# non-DMA-critical static data; DMA drivers are unaffected.
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 # Allow FreeRTOS tasks (httpd, mqtt, etc.) to allocate their stacks in PSRAM
 # when internal DRAM is exhausted.
 CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y

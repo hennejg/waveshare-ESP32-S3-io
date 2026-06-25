@@ -384,19 +384,9 @@ static void n2k_handle_rx(const rx_msg_t *m)
     }
 }
 
-/* ================================================================ shared tasks */
+/* ================================================================ worker task */
 
-static void can_rx_task(void *arg)
-{
-    rx_msg_t m;
-    for (;;) {
-        if (!xQueueReceive(s_rx_q, &m, portMAX_DELAY)) continue;
-        if (s_mode == CAN_MODE_BASIC && !m.ide) basic_handle_rx(&m);
-        else if (s_mode == CAN_MODE_N2K &&  m.ide) n2k_handle_rx(&m);
-    }
-}
-
-static void can_tx_task(void *arg)
+static void can_worker_task(void *arg)
 {
     uint8_t    last_di  = 0xFF;
     TickType_t last_hb  = 0;
@@ -404,6 +394,12 @@ static void can_tx_task(void *arg)
     uint16_t   interval = app_config_get()->can.tx_interval_ms;
 
     for (;;) {
+        rx_msg_t m;
+        if (xQueueReceive(s_rx_q, &m, pdMS_TO_TICKS(TX_POLL_MS)) == pdTRUE) {
+            if (s_mode == CAN_MODE_BASIC && !m.ide) basic_handle_rx(&m);
+            else if (s_mode == CAN_MODE_N2K &&  m.ide) n2k_handle_rx(&m);
+        }
+
         TickType_t now = xTaskGetTickCount();
 
         /* ---- Basic mode ---- */
@@ -442,8 +438,6 @@ static void can_tx_task(void *arg)
                 }
             }
         }
-
-        vTaskDelay(pdMS_TO_TICKS(TX_POLL_MS));
     }
 }
 
@@ -486,7 +480,6 @@ esp_err_t can_server_init(void)
         ESP_LOGI(TAG, "N2k mode — preferred addr=0x%02x mfr=0x%03x", s_addr, N2K_MFR_CODE);
     }
 
-    xTaskCreate(can_rx_task, "can_rx", 4096, NULL, 5, NULL);
-    xTaskCreate(can_tx_task, "can_tx", 3072, NULL, 4, NULL);
+    xTaskCreate(can_worker_task, "can", 4096, NULL, 5, NULL);
     return ESP_OK;
 }

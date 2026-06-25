@@ -151,21 +151,42 @@ static int sdk_wifi_station_get_connect_status(void) {
         return sta_got_ip ? STATION_GOT_IP : 0;
 }
 
+static bool s_ap_disabled = false;
+void wifi_config_disable_ap(void) { s_ap_disabled = true; }
+
 static void wifi_config_init_wifi(void) {
         static bool wifi_inited = false;
         if (wifi_inited) return;
 
         esp_netif_init();
         esp_event_loop_create_default();
-        esp_netif_create_default_wifi_ap();
-        esp_netif_create_default_wifi_sta();
+        /* Create netifs if not already present (e.g. when Matter's InitWiFiStack
+         * ran first).  Skip AP entirely when wifi_config_disable_ap() was called
+         * (Matter CHIPoBLE handles commissioning; AP portal is not needed and
+         * its beacon buffers would exhaust the DMA that BLE already claimed). */
+        if (!s_ap_disabled && !esp_netif_get_handle_from_ifkey("WIFI_AP_DEF"))
+            esp_netif_create_default_wifi_ap();
+        if (!esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"))
+            esp_netif_create_default_wifi_sta();
 
-        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-        esp_wifi_init(&cfg);
+        /* Skip esp_wifi_init/start if WiFi is already running (e.g. Matter's
+         * InitWiFiStack ran first).  Calling esp_wifi_start() on an already-
+         * started driver triggers internal event processing that can fragment
+         * the residual internal DMA heap, starving later DMA consumers (eth). */
+        wifi_mode_t _mode;
+        bool already_started = (esp_wifi_get_mode(&_mode) == ESP_OK);
+        if (!already_started) {
+            wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+            esp_wifi_init(&cfg);
+        }
         esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
         esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
-        ESP_LOGI("wifi_config", "Starting WiFi...");
-        esp_wifi_start();
+        if (s_ap_disabled)
+            esp_wifi_set_mode(WIFI_MODE_STA);
+        if (!already_started) {
+            ESP_LOGI("wifi_config", "Starting WiFi...");
+            esp_wifi_start();
+        }
 
         wifi_inited = true;
 }
@@ -1022,7 +1043,8 @@ static void wifi_config_monitor_callback(TimerHandle_t xTimer) {
                         context->network_monitor_timer,
                         pdMS_TO_TICKS(WIFI_CONFIG_DISCONNECTED_MONITOR_INTERVAL), 0);
 
-                wifi_config_softap_start();
+                if (!s_ap_disabled)
+                        wifi_config_softap_start();
         }
 }
 
@@ -1083,7 +1105,10 @@ void wifi_config_start() {
         context->first_time = true;
 
         if (wifi_config_station_connect()) {
-                wifi_config_softap_start();
+                if (!s_ap_disabled)
+                        wifi_config_softap_start();
+                else
+                        return;  /* AP disabled + STA has no config: CHIPoBLE handles it */
         }
 
         if (!context->network_monitor_timer) {
