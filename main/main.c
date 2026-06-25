@@ -187,6 +187,17 @@ static time_t utc_tm_to_epoch(const struct tm *t)
 
 /* ------------------------------------------------------------ app_main */
 
+#ifdef CONFIG_APP_MATTER_ENABLE
+/* Called when Matter's ConnectivityManager connects WiFi STA post-commissioning.
+ * Start application services on WiFi only if Ethernet hasn't already done so. */
+static void on_matter_wifi_got_ip(void *arg, esp_event_base_t base,
+                                   int32_t id, void *data)
+{
+    if (!s_eth_connected)
+        on_wifi_ready();
+}
+#endif
+
 void app_main(void)
 {
     esp_err_t ret = nvs_flash_init();
@@ -259,32 +270,49 @@ void app_main(void)
     bool eth_only = get_eth_only();
 
 #ifdef CONFIG_APP_MATTER_ENABLE
-    /* Initialize Matter (and its BLE stack) BEFORE starting WiFi.
+    /* Init order: Ethernet → Matter (BLE).
      *
-     * The WiFi driver's MAC connection buffer (7,168 B) is allocated
-     * asynchronously when esp_wifi_connect() fires.  If WiFi is started first,
-     * that buffer is carved from the main internal-DMA free block just as BLE
-     * tries to allocate its contiguous DMA chunk, leaving only ~31,744 B —
-     * not enough.  Starting Matter first keeps that block intact so BLE gets
-     * ~57,344 B and can succeed.
+     * Ethernet (W5500 SPI) allocates from PSRAM (emac struct, rx_buffer) and
+     * does not consume internal DMA heap.  Initialising it first lets us detect
+     * the physical link before Matter configures its NetworkCommissioning
+     * cluster: if Ethernet link is up at that point, Matter uses Ethernet
+     * NetworkCommissioning (commissioner skips WiFi credential provisioning and
+     * reaches the device via mDNS on Ethernet).  If the link is down, Matter
+     * falls back to WiFi NetworkCommissioning.
+     *
+     * BLE still gets a contiguous DMA block because Ethernet init does not
+     * allocate from the DMA heap — the static dma_buf is in .dram1.bss and
+     * rx_buffer uses MALLOC_CAP_DEFAULT (→ PSRAM via SPIRAM_MALLOC_ALWAYSINTERNAL).
      *
      * Pre-register the STA netif BEFORE matter_init so that CHIP's
      * InitWiFiStack finds it and skips creating a duplicate.  The AP (SoftAP)
      * is intentionally NOT pre-created: CHIPoBLE handles commissioning, so the
      * captive-portal AP is unnecessary and its beacon buffer (752 B DMA) would
-     * crash after BLE has consumed the main free block.
-     * wifi_config_disable_ap() prevents wifi-bootstrap from starting it. */
+     * crash after BLE has consumed the main free block. */
     if (!eth_only) {
         esp_netif_init();
         esp_event_loop_create_default();
         esp_netif_create_default_wifi_sta();
-        wifi_config_disable_ap();
     }
 
     /* Release classic-BT memory even in eth-only mode — it's never needed. */
     esp_bt_mem_release(ESP_BT_MODE_CLASSIC_BT);
 
     if (!eth_only) {
+        /* Ethernet init first — lets matter_init() detect the link state. */
+        esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, on_ip_lost, NULL);
+        esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_LOST_IP, on_ip_lost, NULL);
+        esp_err_t eth_ret = eth_init(on_eth_ready);
+        if (eth_ret != ESP_OK)
+            ESP_LOGW(TAG, "Ethernet init failed: %s", esp_err_to_name(eth_ret));
+        else {
+            /* Wait up to 500 ms for physical link detection (W5500 auto-neg). */
+            for (int i = 0; i < 10 && !eth_link_is_up(); i++)
+                vTaskDelay(pdMS_TO_TICKS(50));
+            ESP_LOGI(TAG, "ETH link %s before matter_init",
+                     eth_link_is_up() ? "UP" : "down");
+        }
+
         esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
 
         ESP_LOGI(TAG, "heap before matter_init: free=%u DMA_free=%u DMA_largest=%u",
@@ -302,24 +330,33 @@ void app_main(void)
     }
 #endif
 
-    /* Ethernet always.  Init before wifi_config so eth's SPI DMA buffers
-     * claim contiguous internal RAM before wifi_config event-handler
-     * registrations fragment the residual heap. */
 #ifndef CONFIG_APP_MATTER_ENABLE
+    /* Non-Matter path: Ethernet init here (Matter path already did it above). */
     if (eth_only) esp_netif_init(), esp_event_loop_create_default();
-#endif
     esp_event_handler_register(IP_EVENT,   IP_EVENT_STA_LOST_IP, on_ip_lost,  NULL);
     esp_event_handler_register(IP_EVENT,   IP_EVENT_ETH_LOST_IP, on_ip_lost,  NULL);
     esp_err_t eth_ret = eth_init(on_eth_ready);
     if (eth_ret != ESP_OK)
         ESP_LOGW(TAG, "Ethernet init failed: %s", esp_err_to_name(eth_ret));
+#endif
 
     if (!eth_only) {
-        /* Normal: WiFi provisioning + STA. */
+#ifdef CONFIG_APP_MATTER_ENABLE
+        /* Matter handles WiFi credentials and connection via the NetworkCommissioning
+         * cluster.  Do NOT call wifi_config_init: with no stored credentials it
+         * would loop retrying an empty SSID, fragmenting the heap and starving BLE
+         * of the memory it needs for connection buffers (BLE_INIT: Malloc failed).
+         * Register a direct STA-got-IP handler; Matter's ConnectivityManager fires
+         * the standard IP_EVENT_STA_GOT_IP when it connects post-commissioning. */
+        esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                   on_matter_wifi_got_ip, NULL);
+#else
+        /* Non-Matter: captive-portal WiFi provisioning via wifi-bootstrap. */
         esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START, on_wifi_ap, NULL);
         wifi_config_set_eth_only_callback(on_eth_only_requested);
         wifi_config_set_eth_available_fn(is_eth_connected);
         wifi_config_init("Waveshare (192.168.4.1)", NULL, on_wifi_ready);
+#endif
 
         /* STA netif may already exist (created by CHIP's InitWiFiStack above). */
         esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");

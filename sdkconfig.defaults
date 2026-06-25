@@ -72,10 +72,13 @@ CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT=20
 
 # Stack sizes — reduced to reclaim internal DMA for Matter+BLE+Ethernet.
 # app_main only needs 6 KB; matter_init runs synchronously but CHIP task is
-# separate.  CHIP task 6 KB verified stable; NimBLE host task 5 KB sufficient
-# (pool buffers already go to PSRAM via NIMBLE_MEM_ALLOC_MODE_EXTERNAL).
+# separate.  CHIP task needs 8 KB: 6 KB was not enough for the ECDSA P-256
+# attestation signing during commissioning (AttestationRequest triggers a
+# ~3–4 KB mbedTLS stack burst that overflowed the 6 KB stack).
+# NimBLE host task 5 KB sufficient (pool buffers go to PSRAM via
+# NIMBLE_MEM_ALLOC_MODE_EXTERNAL).
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
-CONFIG_CHIP_TASK_STACK_SIZE=6144
+CONFIG_CHIP_TASK_STACK_SIZE=8192
 CONFIG_BT_NIMBLE_TASK_STACK_SIZE=5120
 # NimBLE host pool buffers (event queues, callouts, mutexes, semaphores) go to
 # PSRAM with EXTERNAL mode, freeing ~5-10 KiB of internal DRAM for FreeRTOS
@@ -83,6 +86,24 @@ CONFIG_BT_NIMBLE_TASK_STACK_SIZE=5120
 # With SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y the INTERNAL budget is tight; EXTERNAL
 # mode is what gives 8 WiFi TX buffers enough headroom to coexist with BLE.
 # BLE controller uses bt_osi_mem_calloc_internal which ignores this setting.
+# BLE controller activity slots.  Each slot consumes 828 bytes of BLE
+# controller IRAM/DRAM (separate from the application heap).  The Kconfig
+# default is 6; it was inadvertently set to 2 in sdkconfig, which starved
+# the controller: BLE connection handling failed with BLE_INIT: Malloc
+# failed, and LE Set Advertising Data returned BLE_ERR_MEM_CAPACITY after
+# every disconnect.  Explicitly lock to the correct default.
+CONFIG_BT_CTRL_BLE_MAX_ACT=6
+# With STATIC=0 (the default), the BLE controller allocates ACL TX buffers
+# dynamically from the internal DMA heap at connection time.  By that point,
+# the heap is severely fragmented (~7.7 KB largest free block), so even modest
+# allocations fail with "BLE_INIT: Malloc failed" 90 ms after BLE connect,
+# preventing the CHIP PASE session from making progress and timing out at 22 s.
+# Setting this to 6 pre-allocates the pool during controller init (when
+# DMA_largest is still ~31 KB), eliminating all connection-time heap allocation
+# in the BLE controller and the consequent post-disconnect BLE_ERR_MEM_CAPACITY
+# on ble_gap_adv_set_data.
+CONFIG_BT_CTRL_BLE_STATIC_ACL_TX_BUF_NB=6
+
 CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
 
 # mbedTLS BIGNUM/ECC workspace exhausts internal DRAM during NOC chain
@@ -124,6 +145,15 @@ CONFIG_HTTPD_STACK_SIZE=6144
 
 # OTA requestor (needed by esp_matter_ota_provider component)
 CONFIG_ENABLE_OTA_REQUESTOR=y
+
+# Enable Ethernet NetworkCommissioning driver so the device can commission via
+# Ethernet when a cable is connected (no WiFi credential step).  The default
+# ESPEthernetDriver::Init() is overridden in the submodule to use the existing
+# W5500 netif (ETH_DEF) instead of trying to set up a built-in EMAC.
+# ENABLE_ETHERNET_TELEMETRY is the Kconfig gate for ETHERNET_NETWORK_COMMISSIONING_DRIVER.
+CONFIG_ENABLE_ETHERNET_TELEMETRY=y
+CONFIG_ETHERNET_NETWORK_COMMISSIONING_DRIVER=y
+CONFIG_ETHERNET_NETWORK_ENDPOINT_ID=0
 
 # Matter device identification strings (VendorID 0xFFF1 is the CSA test VID)
 CONFIG_CHIP_PROJECT_CONFIG="main/CHIPProjectConfig.h"
