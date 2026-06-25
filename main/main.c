@@ -342,29 +342,22 @@ void app_main(void)
 
     if (!eth_only) {
 #ifdef CONFIG_APP_MATTER_ENABLE
-        /* Matter handles WiFi credentials and connection via the NetworkCommissioning
-         * cluster.  Do NOT call wifi_config_init unconditionally: when BLE is active
-         * for commissioning, the wifi_config monitor task competes for the same
-         * scarce DMA heap.
+        /* Do NOT call wifi_config_init when BLE is active (uncommissioned state):
+         * the wifi_config monitor task competes for the same scarce DMA heap.
          *
-         * Exception: if the device is already commissioned (BLE has been released)
-         * but has no WiFi credentials — e.g. after a button-triggered WiFi reset —
-         * start the captive-portal AP so the user can re-provision.  Matter keeps
-         * its fabric; only WiFi credentials are re-entered via the portal. */
+         * Once commissioned, BLE has been deinitialized and it is safe to use
+         * wifi_config for all WiFi management.  wifi_config connects directly if
+         * sysparam holds credentials, or opens the captive portal if not.
+         * Matter stores its WiFi credentials in chip-kvs (separate from sysparam);
+         * after a button-triggered reset or a captive-portal re-provision, chip-kvs
+         * may be stale or empty, so wifi_config must always drive the connection. */
         esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                    on_matter_wifi_got_ip, NULL);
         if (matter_is_commissioned()) {
-            char *ssid = NULL;
-            wifi_config_get(&ssid, NULL);
-            bool no_wifi_creds = (!ssid || !ssid[0]);
-            free(ssid);
-            if (no_wifi_creds) {
-                ESP_LOGI(TAG, "Commissioned but no WiFi credentials — starting captive portal");
-                esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START, on_wifi_ap, NULL);
-                wifi_config_set_eth_only_callback(on_eth_only_requested);
-                wifi_config_set_eth_available_fn(is_eth_connected);
-                wifi_config_init("Waveshare (192.168.4.1)", NULL, NULL);
-            }
+            esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START, on_wifi_ap, NULL);
+            wifi_config_set_eth_only_callback(on_eth_only_requested);
+            wifi_config_set_eth_available_fn(is_eth_connected);
+            wifi_config_init("Waveshare (192.168.4.1)", NULL, NULL);
         }
 #else
         /* Non-Matter: captive-portal WiFi provisioning via wifi-bootstrap. */
