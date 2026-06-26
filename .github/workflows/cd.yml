@@ -120,9 +120,11 @@ jobs:
           path: esp-matter
           key: esp-matter-${{ steps.matter-sha.outputs.sha }}
 
-      - name: Initialize esp-matter submodule
+      - name: Initialize and bootstrap esp-matter
         if: steps.cache-matter.outputs.cache-hit != 'true'
-        run: git submodule update --init --recursive --depth 1 esp-matter
+        run: |
+          git submodule update --init --recursive --depth 1 esp-matter
+          ./esp-matter/install.sh
 
       - name: Cache managed components (matter)
         uses: actions/cache@v5
@@ -134,6 +136,7 @@ jobs:
       - name: Build
         run: |
           . "$IDF_PATH/export.sh"
+          . ./esp-matter/export.sh
           idf.py -C apps/matter set-target esp32s3
           idf.py -C apps/matter build
 

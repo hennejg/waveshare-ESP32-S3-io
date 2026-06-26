@@ -3,7 +3,7 @@
 [![CI](https://github.com/hennejg/waveshare-ESP32-S3-io/actions/workflows/ci.yml/badge.svg)](https://github.com/hennejg/waveshare-ESP32-S3-io/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/hennejg/waveshare-ESP32-S3-io)](https://github.com/hennejg/waveshare-ESP32-S3-io/releases/latest)
 
-**[⬇ Download latest release](https://github.com/hennejg/waveshare-ESP32-S3-io/releases/latest)**
+**[⬇ Download latest release](https://github.com/hennejg/waveshare-ESP32-S3-io/releases/latest)** · **[⚡ Flash via browser](https://hennejg.github.io/waveshare-ESP32-S3-io/)** (Chrome/Edge + USB)
 
 Generic firmware based on ESP-IDF for
 the [Waveshare ESP32-S3-POE-ETH-8DI-8DO](https://www.waveshare.com/wiki/ESP32-S3-POE-ETH-8DI-8DO)
