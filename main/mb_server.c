@@ -11,6 +11,7 @@
 #include "driver/uart.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -33,6 +34,7 @@ static struct { uint8_t b[1]; } s_di;
 static struct { uint16_t r[2]; } s_hr;
 
 static void *s_handle = NULL;
+static esp_timer_handle_t s_update_timer;
 
 /* ---------------------------------------------------------------- colour decode */
 
@@ -48,25 +50,21 @@ static void apply_rgb252(uint16_t reg)
     led_set_rgb(r, g, b);
 }
 
-/* ---------------------------------------------------------------- tasks */
+/* ---------------------------------------------------------------- timer + task */
 
-/* Keeps DI and coil stores in sync with hardware (~10 ms cycle). */
-static void update_task(void *arg)
+static void update_timer_cb(void *arg)
 {
-    for (;;) {
-        mbc_slave_lock(s_handle);
+    mbc_slave_lock(s_handle);
 
-        uint8_t di = 0, co = 0;
-        for (int i = 0; i < 8; i++) {
-            if (di_get(i))   di |= (uint8_t)(1u << i);
-            if (dout_get(i)) co |= (uint8_t)(1u << i);
-        }
-        s_di.b[0]    = di;
-        s_coils.b[0] = co;
-
-        mbc_slave_unlock(s_handle);
-        vTaskDelay(pdMS_TO_TICKS(10));
+    uint8_t di = 0, co = 0;
+    for (int i = 0; i < 8; i++) {
+        if (di_get(i))   di |= (uint8_t)(1u << i);
+        if (dout_get(i)) co |= (uint8_t)(1u << i);
     }
+    s_di.b[0]    = di;
+    s_coils.b[0] = co;
+
+    mbc_slave_unlock(s_handle);
 }
 
 /* Handles write events from the Modbus master. */
@@ -168,8 +166,11 @@ esp_err_t mb_server_init(void)
 
     ESP_RETURN_ON_ERROR(mbc_slave_start(s_handle), TAG, "start");
 
-    xTaskCreate(update_task, "mb_update", 3072, NULL, 4, NULL);
-    xTaskCreate(event_task,  "mb_event",  4096, NULL, 5, NULL);
+    esp_timer_create_args_t ta = { .callback = update_timer_cb, .name = "mb_update" };
+    ESP_RETURN_ON_ERROR(esp_timer_create(&ta, &s_update_timer), TAG, "timer create");
+    ESP_RETURN_ON_ERROR(esp_timer_start_periodic(s_update_timer, 10000), TAG, "timer start");
+
+    xTaskCreate(event_task, "mb_event", 4096, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "Modbus RTU slave started — addr=%u baud=%"PRIu32,
              cfg->modbus.address, cfg->modbus.baudrate);

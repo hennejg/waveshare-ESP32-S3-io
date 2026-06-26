@@ -28,6 +28,9 @@
 #define ETH_SPI_HZ      (20 * 1000 * 1000)
 
 static eth_connected_cb_t s_on_connected;
+static volatile bool s_eth_link = false;
+
+bool eth_link_is_up(void) { return s_eth_link; }
 
 /* ---------------------------------------------------------------- events */
 
@@ -37,8 +40,8 @@ static void eth_event_handler(void *arg, esp_event_base_t base,
     switch (event_id) {
     case ETHERNET_EVENT_START:        ESP_LOGI(TAG, "Started");   break;
     case ETHERNET_EVENT_STOP:         ESP_LOGI(TAG, "Stopped");   break;
-    case ETHERNET_EVENT_CONNECTED:    ESP_LOGI(TAG, "Link up");   break;
-    case ETHERNET_EVENT_DISCONNECTED: ESP_LOGI(TAG, "Link down"); break;
+    case ETHERNET_EVENT_CONNECTED:    s_eth_link = true;  ESP_LOGI(TAG, "Link up");   break;
+    case ETHERNET_EVENT_DISCONNECTED: s_eth_link = false; ESP_LOGI(TAG, "Link down"); break;
     }
 }
 

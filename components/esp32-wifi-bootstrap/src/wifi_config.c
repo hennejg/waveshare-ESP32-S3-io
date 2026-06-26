@@ -151,21 +151,42 @@ static int sdk_wifi_station_get_connect_status(void) {
         return sta_got_ip ? STATION_GOT_IP : 0;
 }
 
+static bool s_ap_disabled = false;
+void wifi_config_disable_ap(void) { s_ap_disabled = true; }
+
 static void wifi_config_init_wifi(void) {
         static bool wifi_inited = false;
         if (wifi_inited) return;
 
         esp_netif_init();
         esp_event_loop_create_default();
-        esp_netif_create_default_wifi_ap();
-        esp_netif_create_default_wifi_sta();
+        /* Create netifs if not already present (e.g. when Matter's InitWiFiStack
+         * ran first).  Skip AP entirely when wifi_config_disable_ap() was called
+         * (Matter CHIPoBLE handles commissioning; AP portal is not needed and
+         * its beacon buffers would exhaust the DMA that BLE already claimed). */
+        if (!s_ap_disabled && !esp_netif_get_handle_from_ifkey("WIFI_AP_DEF"))
+            esp_netif_create_default_wifi_ap();
+        if (!esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"))
+            esp_netif_create_default_wifi_sta();
 
-        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-        esp_wifi_init(&cfg);
+        /* Skip esp_wifi_init/start if WiFi is already running (e.g. Matter's
+         * InitWiFiStack ran first).  Calling esp_wifi_start() on an already-
+         * started driver triggers internal event processing that can fragment
+         * the residual internal DMA heap, starving later DMA consumers (eth). */
+        wifi_mode_t _mode;
+        bool already_started = (esp_wifi_get_mode(&_mode) == ESP_OK);
+        if (!already_started) {
+            wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+            esp_wifi_init(&cfg);
+        }
         esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
         esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
-        ESP_LOGI("wifi_config", "Starting WiFi...");
-        esp_wifi_start();
+        if (s_ap_disabled)
+            esp_wifi_set_mode(WIFI_MODE_STA);
+        if (!already_started) {
+            ESP_LOGI("wifi_config", "Starting WiFi...");
+            esp_wifi_start();
+        }
 
         wifi_inited = true;
 }
@@ -450,7 +471,7 @@ static void wifi_config_server_on_settings_update(client_t *client) {
                 return;
         }
 
-        form_param_t *ssid_param = form_params_find(form, "ssid");
+        form_param_t *ssid_param     = form_params_find(form, "ssid");
         form_param_t *password_param = form_params_find(form, "password");
         if (!ssid_param) {
                 DEBUG("Invalid form data, redirecting to /settings");
@@ -459,23 +480,34 @@ static void wifi_config_server_on_settings_update(client_t *client) {
                 return;
         }
 
-        static const char payload[] = "HTTP/1.1 204 \r\nContent-Type: text/html\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        client_send(client, payload, sizeof(payload)-1);
-
         DEBUG("Setting wifi_ssid param = %s", ssid_param->value);
-        DEBUG("Setting wifi_password param = %s", password_param->value);
+        DEBUG("Setting wifi_password param = %s", password_param ? password_param->value : "(none)");
 
         sysparam_set_string("wifi_ssid", ssid_param->value);
-        if (password_param) {
-                sysparam_set_string("wifi_password", password_param->value);
-        } else {
-                sysparam_set_string("wifi_password", "");
-        }
+        sysparam_set_string("wifi_password", password_param ? password_param->value : "");
+
+        /* Send a confirmation page before rebooting so the user sees feedback.
+         * Reboot is cleaner than a live APSTA→STA transition: avoids mode-change
+         * errors and ensures WiFi starts fresh in STA-only mode. */
+        char html[768];
+        snprintf(html, sizeof(html),
+                 "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
+                 "<!DOCTYPE html><html><head>"
+                 "<meta charset='utf-8'>"
+                 "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                 "<title>Connecting</title></head>"
+                 "<body style='font-family:sans-serif;text-align:center;padding:2rem'>"
+                 "<h2>Credentials saved</h2>"
+                 "<p>Rebooting &mdash; will connect to <strong>%.32s</strong>.</p>"
+                 "<p style='color:#888;font-size:.85rem'>"
+                 "To change WiFi: hold the BOOT button for &ge;&nbsp;5&nbsp;s.</p>"
+                 "</body></html>",
+                 ssid_param->value);
         form_params_free(form);
 
-        vTaskDelay(500 / portTICK_PERIOD_MS);
-
-        wifi_config_station_connect();
+        write(client->fd, html, strlen(html));
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
 }
 
 
@@ -1022,7 +1054,8 @@ static void wifi_config_monitor_callback(TimerHandle_t xTimer) {
                         context->network_monitor_timer,
                         pdMS_TO_TICKS(WIFI_CONFIG_DISCONNECTED_MONITOR_INTERVAL), 0);
 
-                wifi_config_softap_start();
+                if (!s_ap_disabled)
+                        wifi_config_softap_start();
         }
 }
 
@@ -1031,7 +1064,10 @@ static int wifi_config_has_configuration() {
         char *wifi_ssid = NULL;
         sysparam_get_string("wifi_ssid", &wifi_ssid);
 
-        if (!wifi_ssid) {
+        /* wifi_config_reset() stores "" rather than deleting the key, so treat
+         * an empty string the same as absent. */
+        if (!wifi_ssid || !wifi_ssid[0]) {
+                free(wifi_ssid);
                 return 0;
         }
 
@@ -1083,7 +1119,10 @@ void wifi_config_start() {
         context->first_time = true;
 
         if (wifi_config_station_connect()) {
-                wifi_config_softap_start();
+                if (!s_ap_disabled)
+                        wifi_config_softap_start();
+                else
+                        return;  /* AP disabled + STA has no config: CHIPoBLE handles it */
         }
 
         if (!context->network_monitor_timer) {

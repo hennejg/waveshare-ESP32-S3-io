@@ -272,7 +272,7 @@ esp_err_t led_init(void)
 
     if (s_status_mode) {
         s_flash_q = xQueueCreate(1, sizeof(flash_t));
-        xTaskCreate(flash_task, "led_flash", 2048, NULL, 6, NULL);
+        xTaskCreate(flash_task, "led_flash", 3072, NULL, 6, NULL);
         refresh_status();   /* boot = 50% yellow */
         ESP_LOGI(TAG, "WS2812 on GPIO%d — Status mode", LED_GPIO);
     } else {

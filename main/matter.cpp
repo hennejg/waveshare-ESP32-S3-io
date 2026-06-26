@@ -14,13 +14,19 @@
 extern "C" {
 #include "dout.h"
 #include "app_config.h"
+#include "eth.h"
 #include "led.h"
 #include <esp_timer.h>
 }
 
+/* Defined in esp-matter's integration.cpp — selects Ethernet or WiFi driver
+ * for the NetworkCommissioning cluster before esp_matter::start() is called. */
+extern "C" void esp_matter_set_ethernet_commissioning(bool use_eth);
+
 #include <esp_err.h>
 #include <esp_log.h>
 #include <esp_matter.h>
+#include <esp_system.h>
 #include <esp_random.h>
 #include <nvs.h>
 #include <inttypes.h>
@@ -132,6 +138,12 @@ static void event_cb(const ChipDeviceEvent *event, intptr_t arg)
     switch (event->Type) {
     case chip::DeviceLayer::DeviceEventType::kCommissioningComplete:
         ESP_LOGI(TAG, "Matter commissioning complete");
+        break;
+    case chip::DeviceLayer::DeviceEventType::kFabricRemoved:
+        if (chip::Server::GetInstance().GetFabricTable().FabricCount() == 0) {
+            ESP_LOGW(TAG, "Last Matter fabric removed — rebooting to clean state");
+            esp_restart();
+        }
         break;
     case chip::DeviceLayer::DeviceEventType::kInternetConnectivityChange:
         ESP_LOGI(TAG, "Matter internet connectivity change");
@@ -255,8 +267,23 @@ esp_err_t matter_init(void)
 
     const app_config_t *cfg = app_config_get();
 
-    /* Create the root node */
+    /* Create the root node.
+     *
+     * If Ethernet link is up at this point, configure Ethernet NetworkCommissioning
+     * so the commissioning controller skips WiFi credential provisioning and reaches
+     * the device via mDNS on Ethernet after AddNOC.  If Ethernet is down, leave the
+     * feature_map at 0 so the legacy endpoint falls back to WiFi NetworkCommissioning
+     * (the controller will provision WiFi credentials instead).
+     */
     node::config_t node_cfg;
+    if (eth_link_is_up()) {
+        ESP_LOGI(TAG, "Ethernet link up — configuring Ethernet NetworkCommissioning");
+        node_cfg.root_node.network_commissioning.feature_map =
+            chip::to_underlying(NetworkCommissioning::Feature::kEthernetNetworkInterface);
+        esp_matter_set_ethernet_commissioning(true);
+    } else {
+        ESP_LOGI(TAG, "Ethernet not connected — using WiFi NetworkCommissioning");
+    }
     node_t *node = node::create(&node_cfg, attr_update_cb, identification_cb);
     if (!node) {
         ESP_LOGE(TAG, "Failed to create Matter node");
