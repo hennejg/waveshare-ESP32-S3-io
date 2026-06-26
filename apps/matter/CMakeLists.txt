@@ -1,7 +1,12 @@
 cmake_minimum_required(VERSION 3.16)
 
-# Shared components live two levels up (repo root/components/).
-set(EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../components")
+# Shared components — list explicitly so cmake never scans components/quickjs
+# or components/scripting (neither is used by this app and quickjs requires its
+# own submodule which is not initialized for the matter build).
+set(EXTRA_COMPONENT_DIRS
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../components/board"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../components/esp32-wifi-bootstrap"
+)
 
 # esp-matter is required for this app.
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../esp-matter/connectedhomeip/connectedhomeip/BUILD.gn")

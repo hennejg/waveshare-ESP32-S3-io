@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Waveshare ESP32-S3 Firmware</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      max-width: 620px;
+      margin: 3rem auto;
+      padding: 0 1.5rem;
+      color: #24292f;
+    }
+    h1  { font-size: 1.4rem; margin-bottom: 0.25rem; }
+    h2  { font-size: 1rem; margin: 2rem 0 0.5rem; color: #57606a; text-transform: uppercase; letter-spacing: .04em; }
+    p   { color: #57606a; margin: 0.25rem 0 1rem; line-height: 1.5; }
+    a   { color: #0969da; }
+    .card {
+      border: 1px solid #d0d7de;
+      border-radius: 6px;
+      padding: 1rem 1.25rem;
+      margin-bottom: 0.75rem;
+    }
+    .card h3 { margin: 0 0 0.25rem; font-size: 1rem; }
+    .card p  { margin: 0 0 0.75rem; font-size: 0.9rem; }
+    .btn {
+      display: inline-block;
+      padding: 0.4rem 1rem;
+      background: #0969da;
+      color: #fff;
+      border-radius: 6px;
+      text-decoration: none;
+      font-size: 0.9rem;
+    }
+    .btn:hover { background: #0860c9; }
+    .note { font-size: 0.8rem; color: #57606a; margin-top: 0.5rem; }
+  </style>
+</head>
+<body>
+  <h1>Waveshare ESP32-S3-POE-ETH Firmware</h1>
+  <p>
+    Open-source firmware for the
+    <a href="https://www.waveshare.com/wiki/ESP32-S3-POE-ETH-8DI-8DO">ESP32-S3-POE-ETH-8DI-8DO</a>
+    and
+    <a href="https://www.waveshare.com/wiki/ESP32-S3-ETH-8DI-8RO">ESP32-S3-POE-ETH-8DI-8RO</a>
+    industrial I/O modules.
+  </p>
+
+  <h2>Flash latest release</h2>
+
+  <div class="card">
+    <h3>Full firmware</h3>
+    <p>Rule engine, MQTT, CAN bus, Modbus RTU, full web UI. No Matter.</p>
+    <a class="btn" id="btn-full" href="flash.html">Install Full Firmware</a>
+    <p class="note">Requires Chrome or Edge with USB access.</p>
+  </div>
+
+  <div class="card">
+    <h3>Matter firmware</h3>
+    <p>WiFi provisioning + Matter (Apple Home / Google Home). No rule engine, no MQTT.</p>
+    <a class="btn" id="btn-matter" href="flash.html">Install Matter Firmware</a>
+    <p class="note">Requires Chrome or Edge with USB access.</p>
+  </div>
+
+  <h2>Resources</h2>
+  <p>
+    <a href="https://github.com/hennejg/waveshare-ESP32-S3-io">GitHub repository</a> ·
+    <a href="https://github.com/hennejg/waveshare-ESP32-S3-io/releases/latest">Latest release</a> ·
+    <a href="https://github.com/hennejg/waveshare-ESP32-S3-io/blob/master/README.md">Documentation</a>
+  </p>
+
+  <script>
+    // Resolve the latest release tag via the GitHub redirect, then build manifest URLs.
+    const REPO = 'hennejg/waveshare-ESP32-S3-io';
+    const API  = `https://api.github.com/repos/${REPO}/releases/latest`;
+    const BASE = `https://github.com/${REPO}/releases/download`;
+    const HERE = location.href.replace(/index\.html$/, '');
+
+    fetch(API)
+      .then(r => r.json())
+      .then(data => {
+        const tag = data.tag_name;
+        if (!tag) return;
+        for (const flavor of ['full', 'matter']) {
+          const manifest = encodeURIComponent(`${BASE}/${tag}/manifest-${flavor}.json`);
+          document.getElementById(`btn-${flavor}`).href = `${HERE}flash.html?manifest=${BASE}/${tag}/manifest-${flavor}.json`;
+        }
+      })
+      .catch(() => { /* leave links pointing at flash.html without a manifest — it shows a helpful message */ });
+  </script>
+</body>
+</html>
