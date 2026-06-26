@@ -86,7 +86,7 @@ jobs:
           #   that need Python.h; the IDF container ships the runtime only.
           # cffi patch: cffi==1.15.0 pinned by Pigweed has no cp312 wheel and
           #   uses C APIs removed in Python 3.12 — bump to >=1.16.0.
-          apt-get update -y -q && apt-get install -y -q --no-install-recommends python3-dev
+          apt-get update -y -q && apt-get install -y -q --no-install-recommends python3-dev pkg-config libssl-dev
           git submodule update --init --recursive --depth 1 esp-matter
           grep -rl "cffi==1\.15\." esp-matter | xargs -r sed -i 's/cffi==1\.15\.[0-9]*/cffi>=1.16.0/g'
           ./esp-matter/install.sh
