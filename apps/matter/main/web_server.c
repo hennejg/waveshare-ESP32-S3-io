@@ -5,6 +5,7 @@
 #include "dout.h"
 
 #include <string.h>
+#include <esp_check.h>
 #include <esp_http_server.h>
 #include <esp_log.h>
 #include <esp_system.h>
@@ -64,7 +65,7 @@ esp_err_t web_server_start(void)
 {
     if (s_server) return ESP_OK;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.stack_size = CONFIG_HTTPD_STACK_SIZE;
+    cfg.stack_size = 6144;
     ESP_RETURN_ON_ERROR(httpd_start(&s_server, &cfg), TAG, "httpd_start failed");
     httpd_uri_t routes[] = {
         { .uri = "/",           .method = HTTP_GET, .handler = handle_root   },
