@@ -110,6 +110,7 @@ jobs:
       - name: Build
         run: |
           . "$IDF_PATH/export.sh"
+          export ESP_MATTER_PATH="$GITHUB_WORKSPACE/esp-matter"
           . ./esp-matter/export.sh
           idf.py -C apps/matter set-target esp32s3
           idf.py -C apps/matter build
