@@ -123,6 +123,7 @@ jobs:
       - name: Initialize and bootstrap esp-matter
         if: steps.cache-matter.outputs.cache-hit != 'true'
         run: |
+          apt-get update -y -q && apt-get install -y -q --no-install-recommends libffi-dev
           git submodule update --init --recursive --depth 1 esp-matter
           ./esp-matter/install.sh
 
