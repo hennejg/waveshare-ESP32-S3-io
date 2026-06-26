@@ -26,6 +26,7 @@ extern "C" void esp_matter_set_ethernet_commissioning(bool use_eth);
 #include <esp_err.h>
 #include <esp_log.h>
 #include <esp_matter.h>
+#include <esp_system.h>
 #include <esp_random.h>
 #include <nvs.h>
 #include <inttypes.h>
@@ -137,6 +138,12 @@ static void event_cb(const ChipDeviceEvent *event, intptr_t arg)
     switch (event->Type) {
     case chip::DeviceLayer::DeviceEventType::kCommissioningComplete:
         ESP_LOGI(TAG, "Matter commissioning complete");
+        break;
+    case chip::DeviceLayer::DeviceEventType::kFabricRemoved:
+        if (chip::Server::GetInstance().GetFabricTable().FabricCount() == 0) {
+            ESP_LOGW(TAG, "Last Matter fabric removed — rebooting to clean state");
+            esp_restart();
+        }
         break;
     case chip::DeviceLayer::DeviceEventType::kInternetConnectivityChange:
         ESP_LOGI(TAG, "Matter internet connectivity change");
