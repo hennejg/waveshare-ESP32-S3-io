@@ -87,9 +87,13 @@ jobs:
           # cffi patch: cffi==1.15.0 pinned by Pigweed has no cp312 wheel and
           #   uses C APIs removed in Python 3.12 — bump to >=1.16.0.
           apt-get update -y -q && apt-get install -y -q --no-install-recommends \
-            python3-dev pkg-config libssl-dev libglib2.0-dev libdbus-1-dev \
-            libavahi-client-dev ninja-build libgirepository1.0-dev \
-            libcairo2-dev libreadline-dev unzip
+            autoconf automake libtool \
+            python3-dev python3-venv \
+            pkg-config libssl-dev libglib2.0-dev libdbus-1-dev \
+            libavahi-client-dev libavahi-common-dev \
+            ninja-build libgirepository1.0-dev libcairo2-dev \
+            libreadline-dev libevent-dev libmbedtls-dev \
+            nodejs unzip
           git submodule update --init --recursive --depth 1 esp-matter
           grep -rl "cffi==1\.15\." esp-matter | xargs -r sed -i 's/cffi==1\.15\.[0-9]*/cffi>=1.16.0/g'
           ./esp-matter/install.sh
