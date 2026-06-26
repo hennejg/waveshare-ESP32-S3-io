@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Waveshare ESP32-S3 — Flash Firmware</title>
+  <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      max-width: 560px;
+      margin: 3rem auto;
+      padding: 0 1.5rem;
+      color: #24292f;
+    }
+    h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
+    p  { color: #57606a; margin: 0.5rem 0 1.5rem; }
+    esp-web-install-button {
+      --esp-tools-button-color: #0969da;
+      --esp-tools-button-text-color: #fff;
+    }
+    .error { color: #cf222e; }
+  </style>
+</head>
+<body>
+  <h1>Flash Waveshare ESP32-S3 Firmware</h1>
+  <p id="description">Preparing installer…</p>
+  <div id="installer"></div>
+
+  <script>
+    const params   = new URLSearchParams(location.search);
+    const manifest = params.get('manifest');
+    const desc     = document.getElementById('description');
+    const container = document.getElementById('installer');
+
+    if (manifest) {
+      desc.textContent = 'Connect the device via USB, then click Install. Requires Chrome or Edge.';
+      const btn = document.createElement('esp-web-install-button');
+      btn.setAttribute('manifest', manifest);
+      container.appendChild(btn);
+    } else {
+      desc.innerHTML =
+        '<span class="error">No manifest URL supplied.</span> ' +
+        'Follow the Install link from the <a href="../releases/latest">latest release</a>.';
+    }
+  </script>
+</body>
+</html>

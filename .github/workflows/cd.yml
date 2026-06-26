@@ -169,16 +169,71 @@ jobs:
           name: build-matter
           path: release-matter
 
-      - name: Stage release assets
+      - name: Install esptool
+        run: pip install esptool
+
+      - name: Create merged binaries (ESP Web Tools / single-file flash)
         env:
           TAG: ${{ needs.tag.outputs.new_tag }}
         run: |
-          # Full firmware — rename binaries to include the version tag
+          # Full firmware: bootloader + partition-table + app + SPIFFS, offset 0x0
+          python -m esptool --chip esp32s3 merge_bin \
+            -o "waveshare_esp32s3_full-${TAG}-merged.bin" \
+            --flash-mode dio --flash-freq 80m --flash-size 16MB \
+            0x0      release-full/bootloader.bin \
+            0x8000   release-full/partition-table.bin \
+            0x20000  release-full/waveshare_esp32s3_full.bin \
+            0x326000 release-full/storage.bin
+
+          # Matter firmware: bootloader + partition-table + app (no SPIFFS)
+          python -m esptool --chip esp32s3 merge_bin \
+            -o "waveshare_esp32s3_matter-${TAG}-merged.bin" \
+            --flash-mode dio --flash-freq 80m --flash-size 16MB \
+            0x0     release-matter/bootloader.bin \
+            0x8000  release-matter/partition-table.bin \
+            0x20000 release-matter/waveshare_esp32s3_matter.bin
+
+      - name: Generate ESP Web Tools manifests
+        env:
+          TAG: ${{ needs.tag.outputs.new_tag }}
+        run: |
+          BASE="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          python3 -c "
+          import json, sys
+          tag, base = sys.argv[1], sys.argv[2]
+          for flavor, name in [('full', 'Full'), ('matter', 'Matter')]:
+              obj = {
+                  'name': f'Waveshare ESP32-S3 {name} Firmware',
+                  'version': tag,
+                  'new_install_prompt_erase': False,
+                  'builds': [{'chipFamily': 'ESP32-S3', 'parts': [
+                      {'path': f'{base}/waveshare_esp32s3_{flavor}-{tag}-merged.bin', 'offset': 0}
+                  ]}]
+              }
+              with open(f'manifest-{flavor}.json', 'w') as f:
+                  json.dump(obj, f, indent=2)
+          " "${TAG}" "${BASE}"
+
+      - name: Compute ESP Web Tools flash URLs
+        id: urls
+        env:
+          TAG: ${{ needs.tag.outputs.new_tag }}
+        run: |
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          REPO="${GITHUB_REPOSITORY##*/}"
+          BASE="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          PAGES="https://${OWNER}.github.io/${REPO}"
+          echo "flash_full=${PAGES}/flash.html?manifest=${BASE}/manifest-full.json"   >> "$GITHUB_OUTPUT"
+          echo "flash_matter=${PAGES}/flash.html?manifest=${BASE}/manifest-matter.json" >> "$GITHUB_OUTPUT"
+
+      - name: Stage remaining release assets
+        env:
+          TAG: ${{ needs.tag.outputs.new_tag }}
+        run: |
           cp release-full/waveshare_esp32s3_full.bin  "waveshare_esp32s3_full-${TAG}.bin"
           cp release-full/storage.bin                  "storage-${TAG}.bin"
           (cd release-full && zip "../waveshare-esp32s3-${TAG}-full-flash.zip" *)
 
-          # Matter firmware
           cp release-matter/waveshare_esp32s3_matter.bin "waveshare_esp32s3_matter-${TAG}.bin"
           (cd release-matter && zip "../waveshare-esp32s3-${TAG}-matter-flash.zip" *)
 
@@ -191,12 +246,27 @@ jobs:
             waveshare_esp32s3_full-*.bin
             storage-*.bin
             waveshare-esp32s3-*-full-flash.zip
+            waveshare_esp32s3_full-*-merged.bin
+            manifest-full.json
             waveshare_esp32s3_matter-*.bin
             waveshare-esp32s3-*-matter-flash.zip
+            waveshare_esp32s3_matter-*-merged.bin
+            manifest-matter.json
           body: |
-            ## Flash instructions
+            ## Flash via Browser
 
-            ### Full firmware (rule engine, MQTT, CAN, Modbus)
+            Requires Chrome or Edge with USB access. Connect the device before clicking.
+
+            | Firmware | Browser install | Includes |
+            |----------|----------------|---------|
+            | **Full** | [Install Full Firmware](${{ steps.urls.outputs.flash_full }}) | Rule engine, MQTT, CAN, Modbus |
+            | **Matter** | [Install Matter Firmware](${{ steps.urls.outputs.flash_matter }}) | Apple Home / Google Home |
+
+            ---
+
+            ## Manual flash (esptool)
+
+            ### Full firmware
 
             Download `waveshare-esp32s3-${{ needs.tag.outputs.new_tag }}-full-flash.zip`, unzip,
             then from inside the extracted folder:
@@ -219,7 +289,7 @@ jobs:
 
             ---
 
-            ### Matter firmware (Apple Home / Google Home)
+            ### Matter firmware
 
             Download `waveshare-esp32s3-${{ needs.tag.outputs.new_tag }}-matter-flash.zip`, unzip,
             then from inside the extracted folder:
