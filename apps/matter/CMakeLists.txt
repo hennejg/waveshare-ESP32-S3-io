@@ -37,6 +37,11 @@ include(${ESP_MATTER_PATH}/examples/common/cmake_common/components_include.cmake
 
 project(waveshare_esp32s3_matter)
 
+# matter.h lives in main/ (app-layer API); expose it to the board component
+# which calls matter_di_update() / matter_do_update() when GPIO state changes.
+idf_component_get_property(board_lib board COMPONENT_LIB)
+target_include_directories(${board_lib} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/main")
+
 idf_build_set_property(CXX_COMPILE_OPTIONS
     "-std=gnu++17;-Os;-DCHIP_HAVE_CONFIG_H;-Wno-overloaded-virtual" APPEND)
 idf_build_set_property(C_COMPILE_OPTIONS "-Os" APPEND)
