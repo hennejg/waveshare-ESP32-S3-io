@@ -82,10 +82,12 @@ jobs:
       - name: Initialize and bootstrap esp-matter
         if: steps.cache-matter.outputs.cache-hit != 'true'
         run: |
+          # python3-dev: Pigweed builds several C-extension wheels (bitarray etc.)
+          #   that need Python.h; the IDF container ships the runtime only.
+          # cffi patch: cffi==1.15.0 pinned by Pigweed has no cp312 wheel and
+          #   uses C APIs removed in Python 3.12 — bump to >=1.16.0.
+          apt-get update -y -q && apt-get install -y -q --no-install-recommends python3-dev
           git submodule update --init --recursive --depth 1 esp-matter
-          # cffi 1.15.0 (pinned by Pigweed) has no cp312 wheels and uses C APIs
-          # removed in Python 3.12. Patch any pinned constraint to 1.16+ before
-          # running install.sh so pip can download a pre-built wheel instead.
           grep -rl "cffi==1\.15\." esp-matter | xargs -r sed -i 's/cffi==1\.15\.[0-9]*/cffi>=1.16.0/g'
           ./esp-matter/install.sh
 
