@@ -1,0 +1,20 @@
+menu "Application"
+
+config APP_MATTER_ENABLE
+    bool "Enable Matter protocol support"
+    default y
+    select BT_ENABLED
+    select BT_NIMBLE_ENABLED
+    help
+        Enable the Matter (formerly CHIP) protocol stack.
+        Provides 8 On/Off Plug-In Unit endpoints (digital outputs) and
+        8 Contact Sensor endpoints (digital inputs) for home-automation
+        controllers like Apple Home, Google Home, and Home Assistant.
+
+        When enabled, the device advertises via BLE for commissioning and
+        via mDNS (_matter._tcp) once commissioned. Commissioning state and
+        fabric credentials are stored in the "fctry" NVS partition.
+
+        Adds roughly 1.5 MB to flash usage and ~200 KB to RAM usage.
+
+endmenu

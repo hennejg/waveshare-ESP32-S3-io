@@ -1,0 +1,25 @@
+menu "Board driver options"
+
+config APP_MQTT_ENABLE
+    bool "Enable MQTT integration in board drivers"
+    default y
+    help
+        When enabled, DI/DO/LED/buzzer drivers publish and subscribe over MQTT.
+        Disable for firmwares without an MQTT broker (e.g. Matter-only builds).
+
+config APP_SNTP_ENABLE
+    bool "Enable SNTP time synchronisation"
+    default y
+    help
+        Periodically sync the system clock from an NTP server and mirror each
+        sync to the battery-backed RTC.  Disable for firmwares that do not need
+        accurate local time (e.g. Matter-only builds).
+
+config APP_SCRIPTING_ENABLE
+    bool "Enable scripting engine callbacks"
+    default n
+    help
+        Internal: set by the full firmware when the rule engine is present.
+        Enables scripting_on_time_sync() call in sntp_sync.c.
+
+endmenu

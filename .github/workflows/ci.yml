@@ -6,7 +6,7 @@ on:
 
 jobs:
   build:
-    name: Build firmware
+    name: Build firmware (full)
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v5.5.4   # must match esp-idf submodule version
@@ -20,8 +20,7 @@ jobs:
       - name: Fix git safe directory (Docker container runs as root)
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      # Only QuickJS is required (the rule engine); esp-idf comes from the container
-      # and esp-matter is optional (Matter is disabled when its submodule is absent).
+      # Only QuickJS is required (the rule engine); esp-idf comes from the container.
       - name: Check out the QuickJS submodule
         run: |
           git config --global --add safe.directory '*'
@@ -30,27 +29,27 @@ jobs:
       - name: Cache managed components
         uses: actions/cache@v5
         with:
-          path: managed_components
-          key: managed-${{ hashFiles('main/idf_component.yml') }}
-          restore-keys: managed-
+          path: apps/full/managed_components
+          key: managed-full-${{ hashFiles('apps/full/main/idf_component.yml', 'components/board/idf_component.yml') }}
+          restore-keys: managed-full-
 
       - name: Build
         run: |
           . "$IDF_PATH/export.sh"
-          idf.py set-target esp32s3
-          idf.py build
+          idf.py -C apps/full set-target esp32s3
+          idf.py -C apps/full build
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: firmware-${{ github.sha }}
+          name: firmware-full-${{ github.sha }}
           retention-days: 7
           path: |
-            build/waveshare_esp32s3.bin
-            build/storage.bin
-            build/bootloader/bootloader.bin
-            build/partition_table/partition-table.bin
-            build/flash_args
+            apps/full/build/waveshare_esp32s3_full.bin
+            apps/full/build/storage.bin
+            apps/full/build/bootloader/bootloader.bin
+            apps/full/build/partition_table/partition-table.bin
+            apps/full/build/flash_args
 
   rule-engine-tests:
     name: Rule engine tests

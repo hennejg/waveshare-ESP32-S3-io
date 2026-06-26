@@ -5,15 +5,25 @@
 
 **[⬇ Download latest release](https://github.com/hennejg/waveshare-ESP32-S3-io/releases/latest)**
 
-Generic firmware based on ESP-IDF v6 for
+Generic firmware based on ESP-IDF for
 the [Waveshare ESP32-S3-POE-ETH-8DI-8DO](https://www.waveshare.com/wiki/ESP32-S3-POE-ETH-8DI-8DO)
 and [Waveshare ESP32-S3-POE-ETH-8DI-8RO](https://www.waveshare.com/wiki/ESP32-S3-ETH-8DI-8RO) industrial I/O expansion
 modules.
 
 The firmware that comes with those devices is relatively limited and hard to use without modifying and flashing it.
-Having an open hardware that lets one tinker with it, is of course, great and something I like about the Waveshare
-products. However, somtimes you want something that just works out of the box - and this is where this project might
-come in handy.
+Having open hardware that lets one tinker with it is great and something to like about the Waveshare products.
+However, sometimes you want something that just works out of the box — and this is where this project might come in handy.
+
+The project ships **two firmware flavors**. The Matter/CHIP SDK consumes too much DMA-capable RAM to coexist with the
+full feature set in a single binary, so the features are split across two separate applications that share the same
+board hardware abstraction layer (`components/board/`):
+
+| Flavor | Binary | What it includes |
+|--------|--------|-----------------|
+| **Full** (`apps/full/`) | `waveshare_esp32s3_full.bin` | Rule engine, MQTT, CAN bus, Modbus RTU, full web UI — **no Matter** |
+| **Matter** (`apps/matter/`) | `waveshare_esp32s3_matter.bin` | WiFi provisioning + Matter (Apple Home / Google Home), minimal web UI — no rule engine, no MQTT |
+
+**If you are not sure which to use, start with the full firmware** — it is what the CI builds and the releases contain.
 
 ## Hardware
 
@@ -65,38 +75,40 @@ flow — no prior authentication required, physical access is sufficient.
 
 ### Web Configuration UI
 
-Served at `http://<device-ip>/` on port 80. Settings include:
+Served at `http://<device-ip>/` on port 80. Settings include (full firmware):
 
-| Section         | What you can configure                           |
-|-----------------|--------------------------------------------------|
-| Device          | Device name (DHCP hostname), LED mode            |
-| MQTT Broker     | Broker URL, username/password, topic prefix      |
-| Digital Inputs  | Per-input name and invert flag                   |
-| Digital Outputs | Per-output name and invert flag                  |
-| CAN Bus         | Mode (Off / Basic / NMEA2000), address, bit rate |
-| Modbus RTU      | Enable/disable, slave address, baudrate          |
-| Automation Rules | JavaScript rule script (see [Automation Rules](#automation-rules)) |
+| Section          | What you can configure                                                      |
+|------------------|-----------------------------------------------------------------------------|
+| Device           | Device name (DHCP hostname), LED mode                                       |
+| MQTT Broker      | Broker URL, username/password, topic prefix                                 |
+| Digital Inputs   | Per-input name and invert flag                                              |
+| Digital Outputs  | Per-output name and invert flag                                             |
+| CAN Bus          | Mode (Off / Basic / NMEA2000), address, bit rate                            |
+| Modbus RTU       | Enable/disable, slave address, baudrate                                     |
+| Automation Rules | JavaScript rule script (see [Automation Rules](#automation-rules))          |
 
 The UI also provides **Save**, **Reboot**, and **Factory Reset** buttons.
 
-#### REST API
+#### REST API (full firmware)
 
 All endpoints except the auth flow require an `Authorization: Basic base64(:<password>)` header when a password is set.
 
-| Endpoint                   | Method | Auth required | Description                                             |
-|----------------------------|--------|---------------|---------------------------------------------------------|
-| `/api/auth/status`         | GET    | No            | `{"password_set": bool}`                                |
-| `/api/auth/begin`          | POST   | No            | Start token flow (LED blinks, 30 s)                     |
-| `/api/auth/token?s=<id>`   | GET    | No            | Poll: `waiting` / `ready` / `timeout`                   |
-| `/api/auth/set-password`   | POST   | No            | `{"token":"…","password":"…"}`                          |
-| `/api/config`              | GET    | Yes           | Read full configuration as JSON                         |
-| `/api/config`              | POST   | Yes           | Update configuration from JSON                          |
-| `/api/reboot`              | POST   | Yes           | Restart immediately                                     |
-| `/api/factory-reset`       | POST   | Yes           | Erase all settings and restart                          |
-| `/api/matter/pairing`      | GET    | Yes           | `{"qr_code":"…","manual_code":"…","commissioned":bool}` |
-| `/api/matter/decommission` | POST   | Yes           | Remove all fabrics, erase Matter state, reboot          |
-| `/api/rules`               | GET    | Yes           | Read the current rule script as `{"script":"…"}`        |
-| `/api/rules`               | POST   | Yes           | Save + hot-reload rules from `{"script":"…"}`           |
+| Endpoint                 | Method | Auth required | Description                                      |
+|--------------------------|--------|---------------|--------------------------------------------------|
+| `/api/auth/status`       | GET    | No            | `{"password_set": bool}`                         |
+| `/api/auth/begin`        | POST   | No            | Start token flow (LED blinks, 30 s)              |
+| `/api/auth/token?s=<id>` | GET    | No            | Poll: `waiting` / `ready` / `timeout`            |
+| `/api/auth/set-password` | POST   | No            | `{"token":"…","password":"…"}`                   |
+| `/api/config`            | GET    | Yes           | Read full configuration as JSON                  |
+| `/api/config`            | POST   | Yes           | Update configuration from JSON                   |
+| `/api/reboot`            | POST   | Yes           | Restart immediately                              |
+| `/api/factory-reset`     | POST   | Yes           | Erase all settings and restart                   |
+| `/api/rules`             | GET    | Yes           | Read the current rule script as `{"script":"…"}` |
+| `/api/rules`             | POST   | Yes           | Save + hot-reload rules from `{"script":"…"}`    |
+
+The matter firmware exposes a smaller API: `/api/auth/*`, `/api/config` (subset), `/api/reboot`,
+`/api/factory-reset`, `/api/matter/pairing` (GET — QR code + commissioning status), and
+`/api/matter/decommission` (POST — erase fabrics and reboot).
 
 ### Automation Rules
 
@@ -148,19 +160,24 @@ LED colour, buzzer, and a read-request trigger.
 **NMEA2000 mode** implements ISO address claiming, PGN 126993 Heartbeat, PGN 127501/127502 Binary Switch Banks (DI bank
 0, DO bank 1), and PGN 126720 Manufacturer Proprietary fast-packet (LED + buzzer).
 
-### Matter (Apple Home / Google Home / Home Assistant)
+### Matter (Apple Home / Google Home / Home Assistant) — separate firmware
 
 Full details in [`docs/matter.md`](docs/matter.md).
 
-The firmware includes optional Matter-over-Wi-Fi support (compiled in by default via `esp-matter`).
+Matter support is provided by the **`apps/matter/`** firmware flavor (see [Build & Flash — Matter firmware](#matter-firmware)).
+It is **not** present in the full firmware because the CHIP SDK exhausts DMA-capable RAM when combined with
+the rule engine and MQTT stack.
+
+Flash `apps/matter/` if you need to integrate the device into Apple Home, Google Home, or Home Assistant via the
+Matter protocol. You give up the rule engine, MQTT, CAN bus, and Modbus RTU in exchange.
 
 | Feature               | Description                                                                               |
 |-----------------------|-------------------------------------------------------------------------------------------|
 | **8 Digital Outputs** | Exposed as *On/Off Plug-in Unit* endpoints (controllable)                                 |
 | **8 Digital Inputs**  | Exposed as *Contact Sensor* endpoints (read-only state)                                   |
 | **Pairing code**      | Unique passcode + discriminator generated on first boot; survives reboot and decommission |
-| **QR code**           | Shown in the web UI under "Matter"; scan with your home app to pair                       |
-| **Decommission**      | "Remove from Home" button erases all fabric data and reboots cleanly                      |
+| **QR code**           | Shown in the web UI; scan with your home app to pair                                      |
+| **Decommission**      | Erase all fabric data via `POST /api/matter/decommission` or the minimal web UI           |
 | **Identify**          | LED blinks cyan at 1 Hz when any endpoint's Identify cluster is triggered                 |
 
 **Important — Contact Sensor = Door/Window in most home apps.** Home Assistant, HomeKit, and Google Home all render
@@ -217,32 +234,80 @@ Status mode all LED commands from MQTT, Modbus, and CAN are ignored.
 
 ### Prerequisites
 
-- ESP-IDF v5.5.4 installed as a git submodule under `esp-idf/`
+- ESP-IDF v5.5.4 — pinned as a git submodule under `esp-idf/`
 
 ```sh
-# First-time setup (after clone)
-git submodule update --init --recursive --depth 1
+# First-time setup (after clone) — installs toolchains for both firmware flavors
+git submodule update --init --depth 1 esp-idf components/esp32-wifi-bootstrap components/quickjs/extern/quickjs
 ./esp-idf/install.sh esp32s3
 ```
 
-### Build
+The Matter firmware also requires the `esp-matter` submodule (large — ~1 GB):
+
+```sh
+git submodule update --init --recursive esp-matter
+```
+
+A convenience wrapper `idf.sh` at the project root sources `esp-idf/export.sh` and forwards all arguments to
+`idf.py -C apps/full`. Use it to avoid repeating the source step.
+
+### Full firmware
+
+The full firmware (`apps/full/`) includes the rule engine, MQTT, CAN bus, Modbus RTU, and the full web UI.
+It does **not** require the `esp-matter` submodule.
+
+```sh
+# Build
+./idf.sh build
+
+# Flash everything (app + SPIFFS web UI + partition table)
+./idf.sh -p /dev/ttyUSBx flash
+
+# App only (fastest — use when only firmware changed)
+./idf.sh -p /dev/ttyUSBx app-flash
+
+# SPIFFS only (use when www/ content changed)
+./idf.sh -p /dev/ttyUSBx spiffs-flash
+```
+
+Alternatively, without the wrapper:
 
 ```sh
 . ./esp-idf/export.sh
-idf.py build
+idf.py -C apps/full build
+idf.py -C apps/full -p /dev/ttyUSBx flash
 ```
 
-### Flash
+### Matter firmware
+
+The matter firmware (`apps/matter/`) requires the `esp-matter` submodule to be initialized first (see Prerequisites).
 
 ```sh
-# Full flash (app + SPIFFS web UI + partition table)
-idf.py -p /dev/ttyUSBx flash
+. ./esp-idf/export.sh
+idf.py -C apps/matter build
+idf.py -C apps/matter -p /dev/ttyUSBx flash
+```
 
-# App only (fastest — use when only firmware changed)
-idf.py -p /dev/ttyUSBx app-flash
+> **Note:** The matter firmware has no SPIFFS partition. There is no `spiffs-flash` target.
 
-# SPIFFS only (use when www/ content changed)
-idf.py -p /dev/ttyUSBx spiffs-flash
+### Flashing a release binary
+
+Download `waveshare-esp32s3-<version>-full-flash.zip` from the
+[Releases](https://github.com/hennejg/waveshare-ESP32-S3-io/releases/latest) page, unzip, then from the
+extracted folder:
+
+```sh
+# Full install (first time or after partition layout changes)
+python -m esptool --chip esp32s3 -p /dev/ttyUSBx -b 460800 \
+  --before default-reset --after hard-reset \
+  write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB \
+  @flash_args
+
+# App update only
+python -m esptool --chip esp32s3 -p /dev/ttyUSBx -b 460800 \
+  --before default-reset --after hard-reset \
+  write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB \
+  0x20000 waveshare_esp32s3_full-<version>.bin
 ```
 
 ### First boot after fresh flash
@@ -256,40 +321,78 @@ idf.py -p /dev/ttyUSBx spiffs-flash
 ## Project Structure
 
 ```
-├── main/
-│   ├── main.c           Entry point, event/callback wiring
-│   ├── app_config.c/h   NVS-backed configuration store
-│   ├── app_mqtt.c/h     MQTT client wrapper
-│   ├── auth.c/h         Web UI authentication (password + BOOT button token flow)
-│   ├── button.c/h       BOOT button — long-press WiFi reset, short-press auth token
-│   ├── buzzer.c/h       Piezo buzzer (LEDC PWM) — single beep + sequences
-│   ├── can_server.c/h   CAN bus (Basic + NMEA2000 modes)
-│   ├── di.c/h           Digital inputs (GPIO interrupts + debounce)
-│   ├── dout.c/h         Digital outputs (TCA9554 I²C)
-│   ├── eth.c/h          W5500 Ethernet (SPI)
-│   ├── led.c/h          WS2812 LED (RMT) — IO and Status modes
-│   ├── matter.cpp/h     Matter integration (esp-matter, 8 DO + 8 DI endpoints)
-│   ├── mb_server.c/h    Modbus RTU slave
-│   └── web_server.c/h   HTTP config UI + REST API + auth endpoints
+├── apps/
+│   ├── full/                     Full firmware (rule engine, MQTT, CAN, Modbus — no Matter)
+│   │   ├── CMakeLists.txt
+│   │   ├── sdkconfig.defaults
+│   │   ├── partitions.csv        App + SPIFFS layout
+│   │   └── main/
+│   │       ├── main.c            Entry point, event/callback wiring
+│   │       ├── app_mqtt.c/h      MQTT client wrapper
+│   │       ├── app_time.c/h      Timezone / local-time helpers
+│   │       ├── can_server.c/h    CAN bus (Basic + NMEA2000 modes)
+│   │       ├── mb_server.c/h     Modbus RTU slave
+│   │       └── web_server.c/h    HTTP config UI + full REST API
+│   └── matter/                   Matter firmware (WiFi + Matter — no rule engine, no MQTT)
+│       ├── CMakeLists.txt
+│       ├── sdkconfig.defaults
+│       ├── partitions.csv        App-only layout (no SPIFFS)
+│       └── main/
+│           ├── main.c            Thin entry point
+│           ├── matter.cpp/h      Matter integration (esp-matter, 8 DO + 8 DI endpoints)
+│           └── web_server.c/h    Minimal HTTP UI + matter/status endpoints
+├── components/
+│   ├── board/                    Shared hardware abstraction layer (both firmware flavors)
+│   │   ├── app_config.c/h        NVS-backed configuration store
+│   │   ├── auth.c/h              Web UI authentication (password + BOOT button token flow)
+│   │   ├── button.c/h            BOOT button — long-press WiFi reset, short-press auth token
+│   │   ├── buzzer.c/h            Piezo buzzer (LEDC PWM) — single beep + sequences
+│   │   ├── di.c/h                Digital inputs (GPIO interrupts + debounce)
+│   │   ├── dout.c/h              Digital outputs (TCA9554 I²C)
+│   │   ├── eth.c/h               W5500 Ethernet (SPI)
+│   │   ├── i2c_bus.c/h           Shared I²C bus init
+│   │   ├── led.c/h               WS2812 LED (RMT) — IO and Status modes
+│   │   ├── rtc.c / app_rtc.h     DS3231 battery-backed RTC
+│   │   └── sntp_sync.c/h         SNTP client + RTC write-back
+│   ├── scripting/                Rule engine (QuickJS DSL — full firmware only)
+│   │   └── RULES.md              Rule language reference
+│   ├── quickjs/                  QuickJS JS engine (git submodule)
+│   └── esp32-wifi-bootstrap/     WiFi captive-portal provisioning (git submodule)
 ├── www/
-│   └── index.html       Single-page web UI (served from SPIFFS)
-└── docs/
-    ├── can.md           CAN bus API (Basic and NMEA2000 modes)
-    ├── matter.md        Matter integration — device model, commissioning, known quirks
-    ├── mqtt.md          MQTT API reference
-    └── modbus.md        Modbus RTU register map
+│   └── index.html                Single-page web UI (served from SPIFFS, full firmware only)
+├── simulator/                    Browser-based rule engine simulator
+│   └── README.md
+├── docs/
+│   ├── can.md                    CAN bus API (Basic and NMEA2000 modes)
+│   ├── matter.md                 Matter integration — device model, commissioning, known quirks
+│   ├── mqtt.md                   MQTT API reference
+│   └── modbus.md                 Modbus RTU register map
+├── esp-idf/                      ESP-IDF v5.5.4 (git submodule)
+├── esp-matter/                   Matter SDK / connectedhomeip (git submodule, matter firmware only)
+└── idf.sh                        Convenience wrapper: sources export.sh, defaults to apps/full
 ```
 
 ---
 
 ## Component Dependencies
 
-| Component                     | Source                        | Purpose                          |
-|-------------------------------|-------------------------------|----------------------------------|
-| `espressif/esp-modbus ^2.1.2` | Component Registry            | Modbus RTU slave                 |
-| `espressif/mqtt ^1.0.0`       | Component Registry            | MQTT client                      |
-| `espressif/led_strip ^3.0.0`  | Component Registry            | WS2812 RMT driver                |
-| `espressif/cjson *`           | Component Registry            | JSON parsing                     |
-| `espressif/w5500 ^1.0.1`      | Component Registry            | W5500 Ethernet PHY               |
-| `esp32-wifi-bootstrap`        | Git submodule (`components/`) | WiFi captive-portal provisioning |
-| `esp-matter`                  | Git submodule (`esp-matter/`) | Matter SDK (connectedhomeip)     |
+### Shared (`components/board/`)
+
+| Component                    | Source                        | Purpose                          |
+|------------------------------|-------------------------------|----------------------------------|
+| `espressif/led_strip ^3.0.0` | Component Registry            | WS2812 RMT driver                |
+| `esp32-wifi-bootstrap`       | Git submodule (`components/`) | WiFi captive-portal provisioning |
+
+### Full firmware (`apps/full/`)
+
+| Component                     | Source             | Purpose          |
+|-------------------------------|--------------------|------------------|
+| `espressif/esp-modbus ^2.1.2` | Component Registry | Modbus RTU slave |
+| `espressif/mqtt ^1.0.0`       | Component Registry | MQTT client      |
+| `espressif/cjson *`           | Component Registry | JSON parsing     |
+
+### Matter firmware (`apps/matter/`)
+
+| Component    | Source                        | Purpose                      |
+|--------------|-------------------------------|------------------------------|
+| `esp-matter` | Git submodule (`esp-matter/`) | Matter SDK (connectedhomeip) |

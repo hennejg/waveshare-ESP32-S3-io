@@ -1,5 +1,8 @@
 #include "buzzer.h"
-#include "app_mqtt.h"
+#ifdef CONFIG_APP_MQTT_ENABLE
+int app_mqtt_subscribe(const char *topic, int qos);
+#include "cJSON.h"
+#endif
 
 #include <string.h>
 
@@ -8,7 +11,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
-#include "cJSON.h"
 #include "esp_check.h"
 #include "esp_log.h"
 
@@ -40,6 +42,7 @@ static QueueHandle_t s_queue;
 
 /* ------------------------------------------------------------------ helpers */
 
+#ifdef CONFIG_APP_MQTT_ENABLE
 /* Parse {"freq": N, "duration": N} — duration required, freq optional (0=silence). */
 static bool parse_bstep(cJSON *obj, bstep_t *s)
 {
@@ -62,6 +65,7 @@ static bool parse_bstep(cJSON *obj, bstep_t *s)
     s->dur_ms  = d;
     return true;
 }
+#endif /* CONFIG_APP_MQTT_ENABLE */
 
 /* -------------------------------------------------------------------- task */
 
@@ -152,12 +156,15 @@ esp_err_t buzzer_init(void)
 
 void buzzer_on_mqtt_connected(void)
 {
+#ifdef CONFIG_APP_MQTT_ENABLE
     app_mqtt_subscribe("buzzer/beep", 0);
+#endif
 }
 
 void buzzer_on_mqtt_message(const char *topic, size_t tlen,
                              const char *data,  size_t dlen)
 {
+#ifdef CONFIG_APP_MQTT_ENABLE
     static const char SUFFIX[] = "buzzer/beep";
     const size_t sl = sizeof(SUFFIX) - 1;
     if (tlen < sl || memcmp(topic + tlen - sl, SUFFIX, sl) != 0) return;
@@ -192,4 +199,7 @@ void buzzer_on_mqtt_message(const char *topic, size_t tlen,
     } else {
         ESP_LOGW(TAG, "No valid steps in buzzer command");
     }
+#else
+    (void)topic; (void)tlen; (void)data; (void)dlen;
+#endif
 }

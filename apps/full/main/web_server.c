@@ -6,8 +6,10 @@
 #include "di.h"
 #include "dout.h"
 #include "led.h"
+#ifdef CONFIG_APP_MATTER_ENABLE
 #include "matter.h"
-#include "rtc.h"
+#endif
+#include "app_rtc.h"
 #include "scripting.h"
 #include "sntp_sync.h"
 
@@ -657,6 +659,7 @@ static esp_err_t file_get(httpd_req_t *req)
 
 /* --------------------------------------------------------- /api/matter/decommission */
 
+#ifdef CONFIG_APP_MATTER_ENABLE
 static esp_err_t api_matter_decommission(httpd_req_t *req)
 {
     if (!check_auth(req)) return send_401(req);
@@ -705,6 +708,7 @@ static esp_err_t api_matter_pairing(httpd_req_t *req)
     cJSON_free(json);
     return ESP_OK;
 }
+#endif /* CONFIG_APP_MATTER_ENABLE */
 
 /* --------------------------------------------------------------- /api/eth-only */
 
@@ -1019,8 +1023,10 @@ static const httpd_uri_t s_handlers[] = {
     { .uri = "/api/io/output",         .method = HTTP_POST, .handler = api_io_output         },
     { .uri = "/api/io/led",            .method = HTTP_POST, .handler = api_io_led            },
     { .uri = "/api/io/buzzer",         .method = HTTP_POST, .handler = api_io_buzzer         },
+#ifdef CONFIG_APP_MATTER_ENABLE
     { .uri = "/api/matter/pairing",       .method = HTTP_GET,  .handler = api_matter_pairing      },
     { .uri = "/api/matter/decommission", .method = HTTP_POST, .handler = api_matter_decommission },
+#endif
     { .uri = "/api/eth-only",          .method = HTTP_POST, .handler = api_eth_only          },
     { .uri = "/api/reboot",            .method = HTTP_POST, .handler = api_reboot            },
     { .uri = "/api/factory-reset",     .method = HTTP_POST, .handler = api_factory_reset     },

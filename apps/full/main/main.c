@@ -8,7 +8,9 @@
 #include <esp_event.h>
 #include <esp_wifi.h>
 #include <esp_coexist.h>
+#ifdef CONFIG_BT_ENABLED
 #include <esp_bt.h>
+#endif
 #include <wifi_config.h>
 #include "app_config.h"
 #include "app_time.h"
@@ -23,9 +25,11 @@
 #include "can_server.h"
 #include "mb_server.h"
 #include "web_server.h"
+#ifdef CONFIG_APP_MATTER_ENABLE
 #include "matter.h"
+#endif
 #include "scripting.h"
-#include "rtc.h"
+#include "app_rtc.h"
 #include "sntp_sync.h"
 #include <sys/time.h>
 
@@ -297,8 +301,10 @@ void app_main(void)
         esp_netif_create_default_wifi_sta();
     }
 
-    /* Release classic-BT memory even in eth-only mode — it's never needed. */
+#ifdef CONFIG_BT_ENABLED
+    /* Release classic-BT memory (only relevant when BT stack is compiled in). */
     esp_bt_mem_release(ESP_BT_MODE_CLASSIC_BT);
+#endif
 
     if (!eth_only) {
         /* Ethernet init first — lets matter_init() detect the link state. */

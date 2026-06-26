@@ -1,11 +1,16 @@
 #include "dout.h"
 #include "app_config.h"
-#include "app_mqtt.h"
+#ifdef CONFIG_APP_MQTT_ENABLE
+#include <stdbool.h>
+int  app_mqtt_publish(const char *topic, const char *payload, int len, int qos, bool retain);
+int  app_mqtt_subscribe(const char *topic, int qos);
+bool app_mqtt_is_connected(void);
+#include "cJSON.h"
+#endif
 
 #include <string.h>
 #include <ctype.h>
 
-#include "cJSON.h"
 #include "driver/i2c_master.h"
 #include "esp_check.h"
 #include "esp_log.h"
@@ -25,6 +30,7 @@ static bool                    s_state[NUM_DO];  /* logical state */
 
 /* ------------------------------------------------------------------ helpers */
 
+#ifdef CONFIG_APP_MQTT_ENABLE
 /* Accepted on-payloads: true 1 high on   (case-insensitive)
    Accepted off-payloads: false 0 low off */
 static bool parse_payload(const char *data, size_t len, bool *out)
@@ -68,6 +74,7 @@ static void apply_json_item(cJSON *item, uint8_t n)
         else if (parse_payload(s, slen, &state)) s_state[n] = state;
     }
 }
+#endif /* CONFIG_APP_MQTT_ENABLE */
 
 /* i2c_master_transmit wrapper: on ESP_ERR_INVALID_STATE (bus stuck) clocks
  * 9 SCL pulses to release SDA and retries once.  Handles both a mid-reset
@@ -97,6 +104,7 @@ static esp_err_t write_outputs(void)
     return i2c_transmit_safe(buf, sizeof(buf));
 }
 
+#ifdef CONFIG_APP_MQTT_ENABLE
 static void publish_one(uint8_t n)
 {
     const char *name = app_config_get()->dout[n].name;
@@ -105,6 +113,7 @@ static void publish_one(uint8_t n)
     else         snprintf(topic, sizeof(topic), "output/%u",    n + 1);
     app_mqtt_publish(topic, s_state[n] ? "true" : "false", -1, 0, false);
 }
+#endif
 
 /* ------------------------------------------------------------------ public */
 
@@ -144,18 +153,23 @@ esp_err_t dout_set(uint8_t n, bool state)
     esp_err_t ret = write_outputs();
     /* Only publish when the state changed — avoids an infinite echo loop
        caused by receiving our own confirmations back from the broker. */
+#ifdef CONFIG_APP_MQTT_ENABLE
     if (ret == ESP_OK && changed && app_mqtt_is_connected()) publish_one(n);
+#endif
     return ret;
 }
 
 void dout_publish_all(void)
 {
     write_outputs();    /* re-apply to hardware — picks up invert changes */
+#ifdef CONFIG_APP_MQTT_ENABLE
     for (uint8_t i = 0; i < NUM_DO; i++) publish_one(i);
+#endif
 }
 
 void dout_on_mqtt_connected(void)
 {
+#ifdef CONFIG_APP_MQTT_ENABLE
     const app_config_t *cfg = app_config_get();
     for (uint8_t i = 0; i < NUM_DO; i++) {
         char topic[36];
@@ -167,11 +181,13 @@ void dout_on_mqtt_connected(void)
     app_mqtt_subscribe("output/read", 0);
     app_mqtt_subscribe("output/set", 0);
     dout_publish_all();
+#endif
 }
 
 void dout_on_mqtt_message(const char *topic, size_t tlen,
                            const char *data,  size_t dlen)
 {
+#ifdef CONFIG_APP_MQTT_ENABLE
     /* Match suffix "output/set" — bulk set all outputs at once.
        Single value: apply same state/toggle to every output.
        JSON array:   apply each element to the corresponding output (1-indexed). */
@@ -236,4 +252,7 @@ void dout_on_mqtt_message(const char *topic, size_t tlen,
             }
         }
     }
+#else
+    (void)topic; (void)tlen; (void)data; (void)dlen;
+#endif
 }

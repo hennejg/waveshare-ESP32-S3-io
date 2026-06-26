@@ -1,7 +1,14 @@
 #include "di.h"
-#include "app_mqtt.h"
 #include "app_config.h"
+#ifdef CONFIG_APP_MQTT_ENABLE
+#include <stdbool.h>
+int  app_mqtt_publish(const char *topic, const char *payload, int len, int qos, bool retain);
+int  app_mqtt_subscribe(const char *topic, int qos);
+bool app_mqtt_is_connected(void);
+#endif
+#ifdef CONFIG_APP_MATTER_ENABLE
 #include "matter.h"
+#endif
 
 #include <string.h>
 
@@ -31,6 +38,7 @@ static inline bool read_pin(uint8_t n)
     return level ^ app_config_get()->di[n].invert;
 }
 
+#ifdef CONFIG_APP_MQTT_ENABLE
 static void publish_one(uint8_t n, bool state)
 {
     const char *name = app_config_get()->di[n].name;
@@ -39,12 +47,17 @@ static void publish_one(uint8_t n, bool state)
     else         snprintf(topic, sizeof(topic), "input/%u",    n + 1);
     app_mqtt_publish(topic, state ? "true" : "false", -1, 0, false);
 }
+#endif
 
 static void notify_one(uint8_t n, bool state)
 {
+#ifdef CONFIG_APP_MQTT_ENABLE
     if (app_mqtt_is_connected())
         publish_one(n, state);
+#endif
+#ifdef CONFIG_APP_MATTER_ENABLE
     matter_di_update(n, state);
+#endif
 }
 
 void di_publish_all(void)
@@ -125,17 +138,23 @@ esp_err_t di_init(void)
 
 void di_on_mqtt_connected(void)
 {
+#ifdef CONFIG_APP_MQTT_ENABLE
     app_mqtt_subscribe("input/read", 0);
     di_publish_all();
+#endif
 }
 
 void di_on_mqtt_message(const char *topic, size_t tlen,
                          const char *data,  size_t dlen)
 {
+#ifdef CONFIG_APP_MQTT_ENABLE
     /* Match any topic ending in "input/read" regardless of prefix. */
     static const char SUFFIX[] = "input/read";
     const size_t slen = sizeof(SUFFIX) - 1;
     if (tlen >= slen && memcmp(topic + tlen - slen, SUFFIX, slen) == 0) {
         di_publish_all();
     }
+#else
+    (void)topic; (void)tlen; (void)data; (void)dlen;
+#endif
 }

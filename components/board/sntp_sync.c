@@ -1,7 +1,9 @@
 #include "sntp_sync.h"
 #include "app_config.h"
-#include "rtc.h"
-#include "scripting.h"
+#include "app_rtc.h"
+#ifdef CONFIG_APP_SCRIPTING_ENABLE
+void scripting_on_time_sync(void);
+#endif
 
 #include "esp_netif_sntp.h"
 #include "esp_log.h"
@@ -26,7 +28,9 @@ static void on_time_synced(struct timeval *tv)
         ESP_LOGW(TAG, "SNTP synced; RTC update failed");
 
     /* Clock is now real: let the rule engine arm/re-arm cron from the corrected time. */
+#ifdef CONFIG_APP_SCRIPTING_ENABLE
     scripting_on_time_sync();
+#endif
 }
 
 void sntp_sync_apply(void)

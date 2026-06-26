@@ -1,10 +1,15 @@
 #include "led.h"
 #include "app_config.h"
-#include "app_mqtt.h"
+#ifdef CONFIG_APP_MQTT_ENABLE
+#include <stdbool.h>
+int  app_mqtt_publish(const char *topic, const char *payload, int len, int qos, bool retain);
+int  app_mqtt_subscribe(const char *topic, int qos);
+bool app_mqtt_is_connected(void);
+#include "cJSON.h"
+#endif
 
 #include <string.h>
 
-#include "cJSON.h"
 #include "led_strip.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -53,6 +58,7 @@ static bool parse_hex(const char *s, uint8_t *r, uint8_t *g, uint8_t *b)
     return true;
 }
 
+#ifdef CONFIG_APP_MQTT_ENABLE
 /* Parse a sequence step: {"color":"#RRGGBB","duration":N} — both fields required. */
 static bool parse_step(cJSON *obj, led_step_t *s)
 {
@@ -66,6 +72,7 @@ static bool parse_step(cJSON *obj, led_step_t *s)
     s->duration_ms = d;
     return true;
 }
+#endif
 
 static void hw_apply(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -75,12 +82,14 @@ static void hw_apply(uint8_t r, uint8_t g, uint8_t b)
     led_strip_refresh(s_strip);
 }
 
+#ifdef CONFIG_APP_MQTT_ENABLE
 static void publish_color(void)
 {
     char p[8];
     snprintf(p, sizeof(p), "#%02x%02x%02x", s_r, s_g, s_b);
     app_mqtt_publish("led", p, -1, 0, false);
 }
+#endif
 
 /* -------------------------------------------------------------------- task */
 
@@ -95,7 +104,9 @@ static void led_task(void *arg)
             /* Preempt remaining steps if a newer sequence has arrived. */
             if (uxQueueMessagesWaiting(s_queue)) break;
         }
+#ifdef CONFIG_APP_MQTT_ENABLE
         if (app_mqtt_is_connected()) publish_color();
+#endif
     }
 }
 
@@ -285,14 +296,17 @@ esp_err_t led_init(void)
 
 void led_on_mqtt_connected(void)
 {
+#ifdef CONFIG_APP_MQTT_ENABLE
     if (s_status_mode) return;   /* status mode doesn't subscribe to led/set */
     app_mqtt_subscribe("led/set", 0);
     publish_color();
+#endif
 }
 
 void led_on_mqtt_message(const char *topic, size_t tlen,
                           const char *data,  size_t dlen)
 {
+#ifdef CONFIG_APP_MQTT_ENABLE
     if (s_status_mode) return;   /* status mode ignores MQTT LED commands */
     static const char SUFFIX[] = "led/set";
     const size_t sl = sizeof(SUFFIX) - 1;
@@ -341,4 +355,7 @@ void led_on_mqtt_message(const char *topic, size_t tlen,
     } else {
         ESP_LOGW(TAG, "No valid steps in LED command");
     }
+#else
+    (void)topic; (void)tlen; (void)data; (void)dlen;
+#endif
 }

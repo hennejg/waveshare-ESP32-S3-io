@@ -9,4 +9,4 @@
 set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 . "$SCRIPT_DIR/esp-idf/export.sh" > /dev/null 2>&1
-exec idf.py "$@"
+exec idf.py -C "$SCRIPT_DIR/apps/full" "$@"

@@ -1,4 +1,4 @@
-#include "rtc.h"
+#include "app_rtc.h"
 #include "i2c_bus.h"
 
 #include "esp_check.h"
