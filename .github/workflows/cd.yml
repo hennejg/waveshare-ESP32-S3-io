@@ -42,8 +42,8 @@ jobs:
           git push origin "$NEXT"
           echo "tag=$NEXT" >> "$GITHUB_OUTPUT"
 
-  release:
-    name: Build & release (full firmware)
+  build-full:
+    name: Build full firmware
     needs: tag
     runs-on: ubuntu-latest
     container:
@@ -76,17 +76,111 @@ jobs:
           idf.py -C apps/full set-target esp32s3
           idf.py -C apps/full build
 
+      - name: Prepare artifacts
+        run: |
+          mkdir -p artifacts-full
+          cp apps/full/build/waveshare_esp32s3_full.bin  artifacts-full/
+          cp apps/full/build/storage.bin                  artifacts-full/
+          cp apps/full/build/bootloader/bootloader.bin    artifacts-full/bootloader.bin
+          cp apps/full/build/partition_table/partition-table.bin artifacts-full/partition-table.bin
+          cp apps/full/build/flash_args                   artifacts-full/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-full
+          path: artifacts-full/
+
+  build-matter:
+    name: Build matter firmware
+    needs: tag
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.5.4   # must match esp-idf submodule version
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: false
+
+      - name: Fix git safe directory (Docker container runs as root)
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory '*'
+
+      - name: Get esp-matter submodule commit (for cache key)
+        id: matter-sha
+        run: echo "sha=$(git ls-files -s esp-matter | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache esp-matter submodule
+        id: cache-matter
+        uses: actions/cache@v5
+        with:
+          path: esp-matter
+          key: esp-matter-${{ steps.matter-sha.outputs.sha }}
+
+      - name: Initialize esp-matter submodule
+        if: steps.cache-matter.outputs.cache-hit != 'true'
+        run: git submodule update --init --recursive --depth 1 esp-matter
+
+      - name: Cache managed components (matter)
+        uses: actions/cache@v5
+        with:
+          path: apps/matter/managed_components
+          key: managed-matter-${{ hashFiles('apps/matter/main/idf_component.yml', 'components/board/idf_component.yml') }}
+          restore-keys: managed-matter-
+
+      - name: Build
+        run: |
+          . "$IDF_PATH/export.sh"
+          idf.py -C apps/matter set-target esp32s3
+          idf.py -C apps/matter build
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p artifacts-matter
+          cp apps/matter/build/waveshare_esp32s3_matter.bin  artifacts-matter/
+          cp apps/matter/build/bootloader/bootloader.bin      artifacts-matter/bootloader.bin
+          cp apps/matter/build/partition_table/partition-table.bin artifacts-matter/partition-table.bin
+          cp apps/matter/build/flash_args                     artifacts-matter/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-matter
+          path: artifacts-matter/
+
+  release:
+    name: Create GitHub release
+    needs: [tag, build-full, build-matter]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download full firmware artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-full
+          path: release-full
+
+      - name: Download matter firmware artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-matter
+          path: release-matter
+
       - name: Stage release assets
         env:
           TAG: ${{ needs.tag.outputs.new_tag }}
         run: |
-          mkdir release
-          cp apps/full/build/waveshare_esp32s3_full.bin  "release/waveshare_esp32s3_full-${TAG}.bin"
-          cp apps/full/build/storage.bin                 "release/storage-${TAG}.bin"
-          cp apps/full/build/bootloader/bootloader.bin   "release/bootloader.bin"
-          cp apps/full/build/partition_table/partition-table.bin "release/partition-table.bin"
-          cp apps/full/build/flash_args                  "release/flash_args"
-          (cd release && zip "../waveshare-esp32s3-${TAG}-full-flash.zip" *)
+          # Full firmware — rename binaries to include the version tag
+          cp release-full/waveshare_esp32s3_full.bin  "waveshare_esp32s3_full-${TAG}.bin"
+          cp release-full/storage.bin                  "storage-${TAG}.bin"
+          (cd release-full && zip "../waveshare-esp32s3-${TAG}-full-flash.zip" *)
+
+          # Matter firmware
+          cp release-matter/waveshare_esp32s3_matter.bin "waveshare_esp32s3_matter-${TAG}.bin"
+          (cd release-matter && zip "../waveshare-esp32s3-${TAG}-matter-flash.zip" *)
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
@@ -94,15 +188,20 @@ jobs:
           tag_name: ${{ needs.tag.outputs.new_tag }}
           generate_release_notes: true
           files: |
-            release/waveshare_esp32s3_full-*.bin
-            release/storage-*.bin
+            waveshare_esp32s3_full-*.bin
+            storage-*.bin
             waveshare-esp32s3-*-full-flash.zip
+            waveshare_esp32s3_matter-*.bin
+            waveshare-esp32s3-*-matter-flash.zip
           body: |
             ## Flash instructions
 
-            ### First install (full flash)
+            ### Full firmware (rule engine, MQTT, CAN, Modbus)
+
             Download `waveshare-esp32s3-${{ needs.tag.outputs.new_tag }}-full-flash.zip`, unzip,
             then from inside the extracted folder:
+
+            #### First install (full flash)
             ```sh
             python -m esptool --chip esp32s3 -p /dev/ttyUSBx -b 460800 \
               --before default-reset --after hard-reset \
@@ -110,10 +209,33 @@ jobs:
               @flash_args
             ```
 
-            ### App update only (no web UI changes)
+            #### App update only (no web UI changes)
             ```sh
             python -m esptool --chip esp32s3 -p /dev/ttyUSBx -b 460800 \
               --before default-reset --after hard-reset \
               write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB \
               0x20000 waveshare_esp32s3_full-${{ needs.tag.outputs.new_tag }}.bin
+            ```
+
+            ---
+
+            ### Matter firmware (Apple Home / Google Home)
+
+            Download `waveshare-esp32s3-${{ needs.tag.outputs.new_tag }}-matter-flash.zip`, unzip,
+            then from inside the extracted folder:
+
+            #### First install (full flash)
+            ```sh
+            python -m esptool --chip esp32s3 -p /dev/ttyUSBx -b 460800 \
+              --before default-reset --after hard-reset \
+              write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB \
+              @flash_args
+            ```
+
+            #### App update only
+            ```sh
+            python -m esptool --chip esp32s3 -p /dev/ttyUSBx -b 460800 \
+              --before default-reset --after hard-reset \
+              write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB \
+              0x20000 waveshare_esp32s3_matter-${{ needs.tag.outputs.new_tag }}.bin
             ```

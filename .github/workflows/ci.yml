@@ -5,7 +5,7 @@ on:
     branches: [master, main]
 
 jobs:
-  build:
+  build-full:
     name: Build firmware (full)
     runs-on: ubuntu-latest
     container:
@@ -50,6 +50,62 @@ jobs:
             apps/full/build/bootloader/bootloader.bin
             apps/full/build/partition_table/partition-table.bin
             apps/full/build/flash_args
+
+  build-matter:
+    name: Build firmware (matter)
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.5.4   # must match esp-idf submodule version
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: false
+
+      - name: Fix git safe directory (Docker container runs as root)
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory '*'
+
+      - name: Get esp-matter submodule commit (for cache key)
+        id: matter-sha
+        run: echo "sha=$(git ls-files -s esp-matter | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache esp-matter submodule
+        id: cache-matter
+        uses: actions/cache@v5
+        with:
+          path: esp-matter
+          key: esp-matter-${{ steps.matter-sha.outputs.sha }}
+
+      - name: Initialize esp-matter submodule
+        if: steps.cache-matter.outputs.cache-hit != 'true'
+        run: git submodule update --init --recursive --depth 1 esp-matter
+
+      - name: Cache managed components (matter)
+        uses: actions/cache@v5
+        with:
+          path: apps/matter/managed_components
+          key: managed-matter-${{ hashFiles('apps/matter/main/idf_component.yml', 'components/board/idf_component.yml') }}
+          restore-keys: managed-matter-
+
+      - name: Build
+        run: |
+          . "$IDF_PATH/export.sh"
+          idf.py -C apps/matter set-target esp32s3
+          idf.py -C apps/matter build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: firmware-matter-${{ github.sha }}
+          retention-days: 7
+          path: |
+            apps/matter/build/waveshare_esp32s3_matter.bin
+            apps/matter/build/bootloader/bootloader.bin
+            apps/matter/build/partition_table/partition-table.bin
+            apps/matter/build/flash_args
 
   rule-engine-tests:
     name: Rule engine tests
