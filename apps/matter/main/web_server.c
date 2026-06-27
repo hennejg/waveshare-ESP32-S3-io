@@ -309,6 +309,7 @@ static esp_err_t api_config_post(httpd_req_t *req)
     }
 
     app_config_update(&cfg);
+    matter_set_node_label(cfg.device_name);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\"}");

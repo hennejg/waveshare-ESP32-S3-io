@@ -276,6 +276,9 @@ esp_err_t matter_init(void)
      * (the controller will provision WiFi credentials instead).
      */
     node::config_t node_cfg;
+    strlcpy(node_cfg.root_node.basic_information.node_label,
+            cfg->device_name,
+            sizeof(node_cfg.root_node.basic_information.node_label));
     if (eth_link_is_up()) {
         ESP_LOGI(TAG, "Ethernet link up — configuring Ethernet NetworkCommissioning");
         node_cfg.root_node.network_commissioning.feature_map =
@@ -414,4 +417,21 @@ void matter_do_update(uint8_t channel, bool state)
                       OnOff::Id,
                       OnOff::Attributes::OnOff::Id,
                       &val);
+}
+
+/* Buffer is static so the lambda can capture it by pointer across the ScheduleWork call. */
+static char s_pending_node_label[32 + 1];
+
+extern "C" void matter_set_node_label(const char *name)
+{
+    strlcpy(s_pending_node_label, name, sizeof(s_pending_node_label));
+    chip::DeviceLayer::PlatformMgr().ScheduleWork([](intptr_t) {
+        esp_matter_attr_val_t val = esp_matter_char_str(
+            s_pending_node_label, strlen(s_pending_node_label));
+        attribute::update(0,
+                          BasicInformation::Id,
+                          BasicInformation::Attributes::NodeLabel::Id,
+                          &val);
+        ESP_LOGI(TAG, "NodeLabel updated to \"%s\"", s_pending_node_label);
+    });
 }
