@@ -6,6 +6,7 @@
 #include <esp_coexist.h>
 #include <esp_bt.h>
 #include <esp_heap_caps.h>
+#include <esp_spiffs.h>
 #include <wifi_config.h>
 #include "app_config.h"
 #include "auth.h"
@@ -51,6 +52,7 @@ static void on_matter_wifi_got_ip(void *arg, esp_event_base_t base,
 static void on_wifi_ap(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     led_status_set_ap_mode(true);
+    web_server_start();
 }
 
 void app_main(void)
@@ -64,6 +66,18 @@ void app_main(void)
 
     ESP_ERROR_CHECK(app_config_init());
     ESP_ERROR_CHECK(auth_init());
+
+    esp_vfs_spiffs_conf_t spiffs = {
+        .base_path              = "/www",
+        .partition_label        = "storage",
+        .max_files              = 5,
+        .format_if_mount_failed = false,
+    };
+    esp_err_t spiffs_ret = esp_vfs_spiffs_register(&spiffs);
+    if (spiffs_ret != ESP_OK)
+        ESP_LOGW(TAG, "SPIFFS mount failed (%s) — web UI unavailable",
+                 esp_err_to_name(spiffs_ret));
+
     button_init();
     ESP_ERROR_CHECK(di_init());
     ESP_ERROR_CHECK(dout_init());
@@ -107,10 +121,14 @@ void app_main(void)
     esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START, on_wifi_ap, NULL);
     wifi_config_set_eth_available_fn(is_eth_connected);
 
-    if (matter_is_commissioned()) {
+    /* Always init WiFi — creates a SoftAP in uncommissioned state so the web UI
+     * (QR code / status) is reachable before Matter commissioning completes.
+     * In commissioned state: suppress the AP if credentials are already stored
+     * so the device connects STA-only without advertising a provisioning AP. */
+    {
         char *ssid = NULL;
         wifi_config_get(&ssid, NULL);
-        if (ssid && ssid[0])
+        if (matter_is_commissioned() && ssid && ssid[0])
             wifi_config_disable_ap();
         free(ssid);
         wifi_config_init("Waveshare Matter (192.168.4.1)", NULL, NULL);

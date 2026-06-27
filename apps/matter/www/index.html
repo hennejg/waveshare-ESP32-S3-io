@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Waveshare Matter</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; max-width: 560px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+    h1 { font-size: 1.3rem; margin: 0 0 .9rem; }
+    h2 { font-size: .95rem; color: #555; border-bottom: 1px solid #e8e8e8; padding-bottom: .25rem; margin: 1.5rem 0 .6rem; }
+    label { display: block; margin-top: 1rem; font-size: 0.85rem; font-weight: 600; color: #555; }
+    input[type="text"], input[type="password"] {
+      width: 100%; margin-top: 0.3rem; padding: 0.5rem 0.6rem;
+      border: 1px solid #ccc; border-radius: 4px; font-size: 1rem;
+    }
+    select {
+      width: 100%; margin-top: .3rem; padding: .5rem .6rem;
+      border: 1px solid #ccc; border-radius: 4px; font-size: 1rem;
+    }
+    table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; font-size: 0.9rem; }
+    th, td { padding: 0.4rem 0.6rem; text-align: left; border-bottom: 1px solid #eee; }
+    th { font-weight: 600; color: #555; }
+    td:last-child { text-align: center; }
+    .hint { font-size: 0.78rem; color: #888; margin-top: 0.25rem; }
+    button {
+      padding: 0.6rem 1.6rem; margin-top: 0;
+      background: #1a73e8; color: #fff; border: none; border-radius: 4px;
+      font-size: 1rem; cursor: pointer;
+    }
+    button:disabled { background: #aaa; cursor: default; }
+    #status { margin-top: 0.8rem; font-size: 0.9rem; min-height: 1.2em; }
+    .ok  { color: #2d7d46; }
+    .err { color: #c0392b; }
+    /* Auth overlay */
+    #auth-overlay { position:fixed; inset:0; background:#fff; display:flex;
+                    align-items:center; justify-content:center; z-index:100; }
+    .auth-box { max-width:400px; width:100%; padding:2rem; border:1px solid #ddd;
+                border-radius:8px; box-shadow:0 2px 12px rgba(0,0,0,.1); }
+    .auth-box h2 { margin-top:0; }
+    .auth-box button { margin-top:1rem; width:100%; }
+    .auth-box .hint { margin-top:.5rem; }
+    .spinner { display:inline-block; width:1em; height:1em; border:2px solid #ddd;
+               border-top-color:#1a73e8; border-radius:50%; animation:spin .8s linear infinite;
+               vertical-align:middle; margin-right:.4em; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+    /* IO panel */
+    .io-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:.4rem .3rem; margin:.5rem 0 .8rem; }
+    .io-cell { display:flex; align-items:center; gap:.35rem; min-width:0; }
+    .io-dot  { flex-shrink:0; width:11px; height:11px; border-radius:50%; background:#ccc; transition:background .15s; }
+    .io-dot.on { background:#2d7d46; }
+    .io-lbl  { font-size:.8rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .io-toggle { width:100%; padding:.3rem .3rem; border:1px solid #ccc; border-radius:4px;
+                 cursor:pointer; background:#f0f0f0; font-size:.8rem; margin-top:0;
+                 overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .io-toggle.on { background:#2d7d46; color:#fff; border-color:#2d7d46; }
+    .io-row { display:flex; align-items:center; gap:.6rem; margin:.5rem 0; flex-wrap:wrap; }
+    .io-row label { margin-top:0; font-weight:normal; }
+    /* Tabs */
+    .tab-bar { display:flex; flex-wrap:wrap; border-bottom:2px solid #e0e0e0; margin:0 0 1.2rem; padding:0; }
+    .tab-btn { background:none; border:none; border-bottom:3px solid transparent; margin-bottom:-2px;
+               padding:.45rem .65rem; font-size:.88rem; font-weight:500; color:#666;
+               cursor:pointer; border-radius:4px 4px 0 0; }
+    .tab-btn:hover:not(.active) { color:#333; background:#f5f5f5; }
+    .tab-btn.active { color:#1a73e8; border-bottom-color:#1a73e8; font-weight:600; }
+    .tab-pane { display:none; }
+    .tab-pane.active { display:block; }
+    /* Action button row */
+    .btn-row { margin-top:3rem; display:flex; gap:.5rem; flex-wrap:wrap; }
+    #reboot-btn        { background:#b0413e; }
+    #factory-reset-btn { background:#7a1e1e; }
+  </style>
+</head>
+<body>
+
+  <!-- Auth overlay — hidden when authenticated -->
+  <div id="auth-overlay">
+    <div class="auth-box">
+
+      <!-- Screen: no password set -->
+      <div id="auth-no-pw">
+        <h2>First-time Setup</h2>
+        <p>No password has been set. To protect the configuration, you need to create one.</p>
+        <p class="hint">This requires physical access to the device.</p>
+        <button id="auth-begin-btn" onclick="beginSetup()">Set up password…</button>
+        <p id="auth-err" class="err" style="min-height:1.2em"></p>
+      </div>
+
+      <!-- Screen: waiting for button press -->
+      <div id="auth-waiting" style="display:none">
+        <h2>Press the BOOT button</h2>
+        <p><span class="spinner"></span> The LED on the device is blinking yellow.</p>
+        <p>Briefly press the <strong>BOOT button (GPIO0)</strong> on the device within <strong id="auth-countdown">30</strong> s to confirm.</p>
+        <p class="hint">Longer press (&ge; 5 s) will reset WiFi instead.</p>
+        <button type="button" onclick="cancelSetup()" style="background:#888">Cancel</button>
+      </div>
+
+      <!-- Screen: enter new password -->
+      <div id="auth-set-pw" style="display:none">
+        <h2>Create Password</h2>
+        <label>Password (min. 8 characters)
+          <input type="password" id="auth-pw1" minlength="8" autocomplete="new-password">
+        </label>
+        <label>Confirm password
+          <input type="password" id="auth-pw2" autocomplete="new-password">
+        </label>
+        <button type="button" onclick="submitPassword()">Save Password</button>
+        <p id="auth-pw-err" class="err" style="min-height:1.2em"></p>
+      </div>
+
+      <!-- Screen: login -->
+      <div id="auth-login" style="display:none">
+        <h2>Login</h2>
+        <label>Password
+          <input type="password" id="auth-login-pw" autocomplete="current-password">
+        </label>
+        <button type="button" onclick="doLogin()">Login</button>
+        <p id="auth-login-err" class="err" style="min-height:1.2em"></p>
+        <p class="hint"><a href="#" onclick="beginSetup();return false">Forgot password?</a> (requires physical button press)</p>
+      </div>
+
+    </div>
+  </div>
+
+  <h1 id="page-title">Waveshare Matter</h1>
+
+  <nav class="tab-bar">
+    <button type="button" class="tab-btn" data-tab="matter"  onclick="switchTab('matter')">Matter</button>
+    <button type="button" class="tab-btn" data-tab="device"  onclick="switchTab('device')">Device</button>
+    <button type="button" class="tab-btn" data-tab="inputs"  onclick="switchTab('inputs')">Inputs</button>
+    <button type="button" class="tab-btn" data-tab="outputs" onclick="switchTab('outputs')">Outputs</button>
+  </nav>
+
+  <form id="form" novalidate>
+
+    <!-- ── Matter ── -->
+    <div id="tab-matter" class="tab-pane">
+      <div id="matter-commissioned-msg" style="display:none">
+        <p style="color:#2d7d46;font-size:.9rem;margin:.3rem 0">Device is commissioned into a Matter fabric.</p>
+        <button type="button" id="matter-decommission-btn" onclick="matterDecommission()"
+                style="background:#b0413e;padding:.45rem 1.2rem;font-size:.9rem;margin-top:.6rem">
+          Remove from Home
+        </button>
+        <p class="hint" style="margin-top:.4rem">Removes the device from all Matter fabrics and reboots. Your WiFi
+        config and pairing code are preserved — you can recommission immediately after reboot.</p>
+      </div>
+      <div id="matter-pair-info">
+        <p style="font-size:.85rem;color:#555;margin:.3rem 0">Scan this code with Apple Home, Google Home, or Home Assistant:</p>
+        <div id="matter-qr-canvas" style="display:flex;justify-content:center;margin:.8rem 0"></div>
+        <p style="font-size:.78rem;color:#888;text-align:center;margin:.2rem 0">
+          No QR? <a id="matter-qr-link" href="#" target="_blank" rel="noopener">Open in browser</a>
+        </p>
+        <label style="display:block;margin-top:.8rem;font-size:.85rem;font-weight:600;color:#555">Manual Pairing Code</label>
+        <code id="matter-manual-code" style="display:block;font-size:1.5rem;text-align:center;letter-spacing:.25em;padding:.5rem;border:1px solid #ddd;border-radius:4px;margin-top:.3rem;background:#f9f9f9"></code>
+        <p class="hint" style="margin-top:.4rem">Enter this code in your home automation app if QR scanning is unavailable.</p>
+      </div>
+    </div>
+
+    <!-- ── Device ── -->
+    <div id="tab-device" class="tab-pane">
+      <label>Device Name
+        <input type="text" id="device_name" maxlength="31">
+      </label>
+      <p class="hint">Used as DHCP hostname. Alphanumeric and hyphens only.</p>
+      <label>LED Mode
+        <select id="led_mode">
+          <option value="0">IO device — controlled via web UI</option>
+          <option value="1">Status feedback — shows connectivity state</option>
+        </select>
+      </label>
+      <p class="hint">Status mode: 50% yellow = alive, 50% green = network. Red/blue flashes = traffic. Takes effect after reboot.</p>
+
+      <h2>LED Colour</h2>
+      <div class="io-row">
+        <input type="color" id="led-color" value="#000000" title="Pick colour">
+        <button type="button" onclick="setLed()">Set</button>
+        <button type="button" onclick="setLed('#000000')" style="background:#888">Off</button>
+      </div>
+      <p class="hint">Only effective when LED Mode is "IO device".</p>
+    </div>
+
+    <!-- ── Inputs ── -->
+    <div id="tab-inputs" class="tab-pane">
+      <table>
+        <thead><tr><th>Input</th><th>Name</th><th>Invert</th></tr></thead>
+        <tbody id="di-table"></tbody>
+      </table>
+      <p class="hint">Name: label shown in the UI (max 20 chars, no <code>/</code>, unique). Invert: checked = active-low (GPIO low → <code>true</code>).</p>
+      <div id="di-grid" class="io-grid" style="margin-top:.6rem"></div>
+    </div>
+
+    <!-- ── Outputs ── -->
+    <div id="tab-outputs" class="tab-pane">
+      <table>
+        <thead><tr><th>Output</th><th>Name</th><th>Invert</th></tr></thead>
+        <tbody id="dout-table"></tbody>
+      </table>
+      <p class="hint">Name: label shown in the UI. Invert: checked = physical bit flipped relative to logical state.</p>
+      <div id="do-grid" class="io-grid" style="margin-top:.6rem"></div>
+    </div>
+
+    <div class="btn-row">
+      <button type="submit" id="btn">Save</button>
+      <button type="button" id="reboot-btn">Reboot</button>
+      <button type="button" id="factory-reset-btn">Factory Reset</button>
+    </div>
+  </form>
+  <p id="status"></p>
+  <p id="fw-version" style="font-size:.75rem;color:#bbb;margin-top:1.5rem;text-align:right"></p>
+
+  <script>
+    /* ---- Tab switching ---- */
+    function switchTab(name) {
+      document.querySelectorAll('.tab-btn').forEach(b =>
+        b.classList.toggle('active', b.dataset.tab === name));
+      document.querySelectorAll('.tab-pane').forEach(p =>
+        p.classList.toggle('active', p.id === 'tab-' + name));
+      try { localStorage.setItem('active_tab', name); } catch (_) {}
+    }
+
+    (function initTabs() {
+      let saved;
+      try { saved = localStorage.getItem('active_tab'); } catch (_) {}
+      if (saved) {
+        const el = document.querySelector('.tab-btn[data-tab="' + saved + '"]');
+        if (!el) saved = null;
+      }
+      switchTab(saved || 'matter');
+    })();
+
+    /* ---- Auth state machine ---- */
+    let authPassword = sessionStorage.getItem('auth_pw') || '';
+    let authToken    = '';
+    let pollTimer    = null;
+    let countdown    = 30;
+
+    function authHeaders() {
+      if (!authPassword) return {};
+      return { 'Authorization': 'Basic ' + btoa(':' + authPassword) };
+    }
+
+    async function apiFetch(url, opts = {}) {
+      opts.headers = { ...(opts.headers || {}), ...authHeaders() };
+      const r = await fetch(url, opts);
+      if (r.status === 401) { showLogin(); throw new Error('unauthorized'); }
+      return r;
+    }
+
+    function showScreen(id) {
+      ['auth-no-pw','auth-waiting','auth-set-pw','auth-login']
+        .forEach(s => document.getElementById(s).style.display = s === id ? '' : 'none');
+    }
+
+    function showOverlay(screen) {
+      stopIoPoll();
+      document.getElementById('auth-overlay').style.display = 'flex';
+      showScreen(screen);
+    }
+
+    function hideOverlay() {
+      document.getElementById('auth-overlay').style.display = 'none';
+    }
+
+    function showLogin() { showOverlay('auth-login'); }
+
+    async function initAuth() {
+      const r  = await fetch('/api/auth/status');
+      const st = await r.json();
+      if (!st.password_set) { showOverlay('auth-no-pw'); return; }
+      if (!authPassword)    { showLogin(); return; }
+      const tr = await fetch('/api/config', { headers: authHeaders() });
+      if (tr.ok) { hideOverlay(); load(); }
+      else        { authPassword = ''; sessionStorage.removeItem('auth_pw'); showLogin(); }
+    }
+
+    async function beginSetup() {
+      document.getElementById('auth-err').textContent = '';
+      document.getElementById('auth-begin-btn').disabled = true;
+      try {
+        const r = await fetch('/api/auth/begin', { method: 'POST' });
+        if (!r.ok) throw new Error('Failed (' + r.status + ')');
+        const d = await r.json();
+        startPolling(d.session);
+        showScreen('auth-waiting');
+        countdown = 30;
+        document.getElementById('auth-countdown').textContent = countdown;
+      } catch (e) {
+        document.getElementById('auth-err').textContent = e.message;
+        document.getElementById('auth-begin-btn').disabled = false;
+      }
+    }
+
+    function startPolling(session) {
+      stopPolling();
+      const tick = setInterval(async () => {
+        try {
+          const r = await fetch('/api/auth/token?s=' + session);
+          const d = await r.json();
+          if (d.status === 'ready') {
+            stopPolling();
+            authToken = d.token;
+            showScreen('auth-set-pw');
+          } else if (d.status === 'timeout') {
+            stopPolling();
+            document.getElementById('auth-err').textContent = 'Timed out. Try again.';
+            showScreen('auth-no-pw');
+            document.getElementById('auth-begin-btn').disabled = false;
+          } else if (d.status === 'idle') {
+            stopPolling();
+            document.getElementById('auth-err').textContent = 'Session lost — try again.';
+            showScreen('auth-no-pw');
+            document.getElementById('auth-begin-btn').disabled = false;
+          } else {
+            countdown--;
+            document.getElementById('auth-countdown').textContent = Math.max(0, countdown);
+          }
+        } catch (_) {}
+      }, 1000);
+      pollTimer = tick;
+    }
+
+    function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+
+    function cancelSetup() {
+      stopPolling();
+      fetch('/api/auth/token?s=cancel');
+      showScreen('auth-no-pw');
+      document.getElementById('auth-begin-btn').disabled = false;
+    }
+
+    async function submitPassword() {
+      const p1 = document.getElementById('auth-pw1').value;
+      const p2 = document.getElementById('auth-pw2').value;
+      const err = document.getElementById('auth-pw-err');
+      err.textContent = '';
+      if (p1.length < 8) { err.textContent = 'Password must be at least 8 characters.'; return; }
+      if (p1 !== p2)     { err.textContent = 'Passwords do not match.'; return; }
+      try {
+        const r = await fetch('/api/auth/set-password', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: authToken, password: p1 }),
+        });
+        if (!r.ok) { const d = await r.json(); err.textContent = d.error || 'Error'; return; }
+        authPassword = p1;
+        sessionStorage.setItem('auth_pw', p1);
+        authToken = '';
+        hideOverlay();
+        load();
+      } catch (e) { err.textContent = e.message; }
+    }
+
+    async function doLogin() {
+      const pw  = document.getElementById('auth-login-pw').value;
+      const err = document.getElementById('auth-login-err');
+      err.textContent = '';
+      const r = await fetch('/api/config', {
+        headers: { 'Authorization': 'Basic ' + btoa(':' + pw) }
+      });
+      if (r.ok) {
+        authPassword = pw;
+        sessionStorage.setItem('auth_pw', pw);
+        hideOverlay();
+        load();
+      } else { err.textContent = 'Wrong password.'; }
+    }
+
+    /* ---- Config form ---- */
+    const status = document.getElementById('status');
+    const btn    = document.getElementById('btn');
+    const diTbl   = document.getElementById('di-table');
+    const doutTbl = document.getElementById('dout-table');
+
+    for (let i = 0; i < 8; i++) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>DI${i + 1}</td>` +
+        `<td><input type="text" id="di_${i}_name" maxlength="20" style="width:9rem"></td>` +
+        `<td style="text-align:center"><input type="checkbox" id="di_${i}_invert"></td>`;
+      diTbl.appendChild(tr);
+    }
+    for (let i = 0; i < 8; i++) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>DO${i + 1}</td>` +
+        `<td><input type="text" id="dout_${i}_name" maxlength="20" style="width:9rem"></td>` +
+        `<td style="text-align:center"><input type="checkbox" id="dout_${i}_invert"></td>`;
+      doutTbl.appendChild(tr);
+    }
+
+    async function load() {
+      try {
+        const r = await apiFetch('/api/config');
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const cfg = await r.json();
+        document.getElementById('device_name').value = cfg.device_name ?? '';
+        if (cfg.device_name) {
+          document.title = cfg.device_name + ' (Matter)';
+          document.getElementById('page-title').textContent = cfg.device_name;
+        }
+        document.getElementById('led_mode').value = cfg.led_mode ?? 0;
+        (cfg.di ?? []).forEach((di, i) => {
+          const inv  = document.getElementById(`di_${i}_invert`);
+          const name = document.getElementById(`di_${i}_name`);
+          if (inv)  inv.checked = !!di.invert;
+          if (name) name.value  = di.name ?? '';
+        });
+        (cfg.dout ?? []).forEach((dout, i) => {
+          const inv  = document.getElementById(`dout_${i}_invert`);
+          const name = document.getElementById(`dout_${i}_name`);
+          if (inv)  inv.checked = !!dout.invert;
+          if (name) name.value  = dout.name ?? '';
+        });
+        buildIoPanel(cfg);
+        startIoPoll();
+        loadMatterPairing();
+      } catch (e) {
+        status.className = 'err';
+        status.textContent = 'Failed to load config: ' + e.message;
+      }
+    }
+
+    document.getElementById('form').addEventListener('submit', async e => {
+      e.preventDefault();
+      const devName = document.getElementById('device_name').value.trim();
+      if (!devName) {
+        switchTab('device');
+        document.getElementById('device_name').focus();
+        status.className = 'err';
+        status.textContent = 'Device name is required.';
+        return;
+      }
+      btn.disabled = true;
+      status.textContent = '';
+      try {
+        const di = [];
+        for (let i = 0; i < 8; i++) {
+          di.push({
+            invert: document.getElementById(`di_${i}_invert`).checked,
+            name:   document.getElementById(`di_${i}_name`).value.trim(),
+          });
+        }
+        const dout = [];
+        for (let i = 0; i < 8; i++) {
+          dout.push({
+            invert: document.getElementById(`dout_${i}_invert`).checked,
+            name:   document.getElementById(`dout_${i}_name`).value.trim(),
+          });
+        }
+        const cfg = {
+          device_name: devName,
+          led_mode:    parseInt(document.getElementById('led_mode').value, 10),
+          di,
+          dout,
+        };
+        const r = await apiFetch('/api/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(cfg),
+        });
+        const res = await r.json();
+        if (res.status === 'ok') {
+          status.className = 'ok';
+          status.textContent = 'Saved.';
+          load();
+        } else {
+          status.className = 'err';
+          status.textContent = 'Error: ' + JSON.stringify(res);
+        }
+      } catch (e) {
+        status.className = 'err';
+        status.textContent = 'Save failed: ' + e.message;
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    /* Poll until the device responds again, then reload. */
+    async function waitForReboot(label, factoryReset = false) {
+      status.className = 'ok';
+      status.textContent = label;
+      await new Promise(r => setTimeout(r, 3000));
+      const deadline = Date.now() + (factoryReset ? 60000 : 30000);
+      while (Date.now() < deadline) {
+        try {
+          const r = await fetch('/api/auth/status', { cache: 'no-store' });
+          if (r.ok) {
+            status.textContent = 'Back online — reloading…';
+            setTimeout(() => location.reload(), 400);
+            return;
+          }
+        } catch (_) {}
+        status.textContent = 'Waiting for device… ' +
+          Math.max(0, Math.round((deadline - Date.now()) / 1000)) + 's';
+        await new Promise(r => setTimeout(r, 1500));
+      }
+      status.className = 'error';
+      status.textContent = factoryReset
+        ? 'Device not responding — it may be in WiFi setup mode. Connect to the setup AP to continue.'
+        : 'Device not responding — try reloading manually.';
+    }
+
+    document.getElementById('reboot-btn').addEventListener('click', async () => {
+      if (!confirm('Reboot the device?')) return;
+      try { await apiFetch('/api/reboot', { method: 'POST' }); } catch (_) {}
+      waitForReboot('Rebooting…');
+    });
+
+    document.getElementById('factory-reset-btn').addEventListener('click', async () => {
+      if (!confirm(
+        'Factory Reset will erase ALL settings:\n' +
+        '  • WiFi credentials\n' +
+        '  • Device configuration (name, LED mode, IO names)\n' +
+        '  • Matter commissioning data\n\n' +
+        'The device attestation certificate is preserved.\n' +
+        'The device will restart — you will need to recommission it.\n\n' +
+        'Continue?')) return;
+      try { await apiFetch('/api/factory-reset', { method: 'POST' }); } catch (_) {}
+      waitForReboot('Resetting to factory defaults…', true);
+    });
+
+    /* ---- IO monitor & control ---- */
+    let ioPollTimer  = null;
+    let ioPollActive = false;
+
+    function buildIoPanel(cfg) {
+      const diG = document.getElementById('di-grid');
+      const doG = document.getElementById('do-grid');
+      diG.innerHTML = '';
+      doG.innerHTML = '';
+      for (let i = 0; i < 8; i++) {
+        const n = cfg.di?.[i]?.name || `DI${i + 1}`;
+        diG.insertAdjacentHTML('beforeend',
+          `<div class="io-cell"><span id="di-dot-${i}" class="io-dot" title="${n}"></span>` +
+          `<span class="io-lbl" title="${n}">${n}</span></div>`);
+      }
+      for (let i = 0; i < 8; i++) {
+        const n = cfg.dout?.[i]?.name || `DO${i + 1}`;
+        doG.insertAdjacentHTML('beforeend',
+          `<div class="io-cell"><button type="button" id="do-btn-${i}" class="io-toggle"` +
+          ` title="Click to toggle ${n}" onclick="toggleOutput(${i})">${n}</button></div>`);
+      }
+    }
+
+    function startIoPoll() {
+      if (ioPollActive) return;
+      ioPollActive = true;
+      schedulePoll();
+    }
+
+    function schedulePoll() {
+      ioPollTimer = setTimeout(async () => {
+        if (!ioPollActive) return;
+        await updateIoState();
+        if (ioPollActive) schedulePoll();
+      }, 2000);
+    }
+
+    function stopIoPoll() {
+      ioPollActive = false;
+      if (ioPollTimer) { clearTimeout(ioPollTimer); ioPollTimer = null; }
+    }
+
+    async function updateIoState() {
+      try {
+        const r = await apiFetch('/api/io/state');
+        if (!r.ok) return;
+        const d = await r.json();
+        (d.di   || []).forEach((v, i) => {
+          const el = document.getElementById(`di-dot-${i}`);
+          if (el) el.className = 'io-dot' + (v ? ' on' : '');
+        });
+        (d.dout || []).forEach((v, i) => {
+          const el = document.getElementById(`do-btn-${i}`);
+          if (el) el.className = 'io-toggle' + (v ? ' on' : '');
+        });
+      } catch (_) {}
+    }
+
+    async function toggleOutput(i) {
+      try {
+        await apiFetch('/api/io/output', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ channel: i, toggle: true }),
+        });
+        updateIoState();
+      } catch (_) {}
+    }
+
+    async function setLed(hexOverride) {
+      const hex = hexOverride || document.getElementById('led-color').value;
+      const r = parseInt(hex.slice(1, 3), 16);
+      const g = parseInt(hex.slice(3, 5), 16);
+      const b = parseInt(hex.slice(5, 7), 16);
+      try {
+        await apiFetch('/api/io/led', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ r, g, b }),
+        });
+      } catch (_) {}
+    }
+
+    async function loadVersion() {
+      try {
+        const r = await fetch('/api/version');
+        if (!r.ok) return;
+        const v = await r.json();
+        document.getElementById('fw-version').textContent =
+          'fw ' + v.version + ' · ' + v.idf + ' · ' + v.date;
+      } catch (_) {}
+    }
+    loadVersion();
+
+    initAuth();
+
+    /* ---- Matter commissioning ---- */
+    let s_qrRendered = false;
+
+    async function matterDecommission() {
+      if (!confirm(
+        'Remove this device from all Matter fabrics?\n\n' +
+        'The device will reboot. Your WiFi config and pairing code are preserved — ' +
+        'you can recommission immediately after reboot.')) return;
+      const btn = document.getElementById('matter-decommission-btn');
+      btn.disabled = true;
+      btn.textContent = 'Removing…';
+      try {
+        await apiFetch('/api/matter/decommission', { method: 'POST' });
+      } catch (_) {}
+      s_qrRendered = false;
+      waitForReboot('Decommissioning — rebooting…');
+    }
+
+    async function loadMatterPairing() {
+      try {
+        const r = await apiFetch('/api/matter/pairing');
+        if (!r.ok) return;
+        const d = await r.json();
+
+        if (d.commissioned) {
+          document.getElementById('matter-commissioned-msg').style.display = '';
+          document.getElementById('matter-pair-info').style.display = 'none';
+          return;
+        }
+
+        document.getElementById('matter-commissioned-msg').style.display = 'none';
+        document.getElementById('matter-pair-info').style.display = '';
+
+        if (d.qr_code) {
+          const url = 'https://project-chip.github.io/connectedhomeip/qrcode.html?data='
+                      + encodeURIComponent(d.qr_code);
+          document.getElementById('matter-qr-link').href = url;
+          document.getElementById('matter-manual-code').textContent = d.manual_code || '';
+
+          if (!s_qrRendered && typeof QRCode !== 'undefined') {
+            new QRCode(document.getElementById('matter-qr-canvas'), {
+              text: d.qr_code, width: 200, height: 200,
+              colorDark: '#000000', colorLight: '#ffffff',
+            });
+            s_qrRendered = true;
+          }
+        }
+      } catch (_) {}
+    }
+  </script>
+  <script src="/qrcode.min.js" defer></script>
+</body>
+</html>
