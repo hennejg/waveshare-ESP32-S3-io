@@ -34,7 +34,7 @@
     const container = document.getElementById('installer');
 
     if (manifest) {
-      desc.textContent = 'Connect the device via USB, then click Install. Requires Chrome or Edge.';
+      desc.textContent = 'Connect the device via USB, then click Install. Requires Chrome, Edge, or Firefox.';
       const btn = document.createElement('esp-web-install-button');
       btn.setAttribute('manifest', manifest);
       container.appendChild(btn);

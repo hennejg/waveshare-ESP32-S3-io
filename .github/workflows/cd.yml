@@ -278,7 +278,7 @@ jobs:
           body: |
             ## Flash via Browser
 
-            Requires Chrome or Edge with USB access. Connect the device before clicking.
+            Requires Chrome, Edge, or Firefox with USB access. Connect the device before clicking.
 
             | Firmware | Browser install | Includes |
             |----------|----------------|---------|
