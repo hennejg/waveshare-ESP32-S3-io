@@ -28,6 +28,7 @@ extern const char DEMO_SCRIPT[];
 #include <sys/stat.h>
 #include <lwip/sockets.h>
 
+#include <esp_app_desc.h>
 #include <esp_http_server.h>
 #include <esp_log.h>
 #include <esp_system.h>
@@ -1010,6 +1011,20 @@ static esp_err_t api_rules_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* -------------------------------------------------------------- /api/version */
+
+static esp_err_t api_version(httpd_req_t *req)
+{
+    const esp_app_desc_t *d = esp_app_get_description();
+    char json[160];
+    snprintf(json, sizeof(json),
+             "{\"version\":\"%s\",\"idf\":\"%s\",\"date\":\"%s\",\"time\":\"%s\"}",
+             d->version, d->idf_ver, d->date, d->time);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json);
+    return ESP_OK;
+}
+
 /* -------------------------------------------------------------- start / stop */
 
 static const httpd_uri_t s_handlers[] = {
@@ -1034,6 +1049,7 @@ static const httpd_uri_t s_handlers[] = {
     { .uri = "/api/rules",             .method = HTTP_POST, .handler = api_rules_post        },
     { .uri = "/api/time",              .method = HTTP_GET,  .handler = api_time_get          },
     { .uri = "/api/time",              .method = HTTP_POST, .handler = api_time_post         },
+    { .uri = "/api/version",           .method = HTTP_GET,  .handler = api_version           },
     { .uri = "/*",                     .method = HTTP_GET,  .handler = file_get              },
 };
 

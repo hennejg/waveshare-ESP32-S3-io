@@ -340,7 +340,8 @@ void app_main(void)
 
 #ifndef CONFIG_APP_MATTER_ENABLE
     /* Non-Matter path: Ethernet init here (Matter path already did it above). */
-    if (eth_only) esp_netif_init(), esp_event_loop_create_default();
+    esp_netif_init();
+    esp_event_loop_create_default();
     esp_event_handler_register(IP_EVENT,   IP_EVENT_STA_LOST_IP, on_ip_lost,  NULL);
     esp_event_handler_register(IP_EVENT,   IP_EVENT_ETH_LOST_IP, on_ip_lost,  NULL);
     esp_err_t eth_ret = eth_init(on_eth_ready);

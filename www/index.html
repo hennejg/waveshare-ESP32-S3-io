@@ -386,6 +386,7 @@ rule('my-rule')
     </div>
   </form>
   <p id="status"></p>
+  <p id="fw-version" style="font-size:.75rem;color:#bbb;margin-top:1.5rem;text-align:right"></p>
 
   <script>
     /* ---- Tab switching ---- */
@@ -1040,6 +1041,17 @@ rule('my-rule')
       if (!confirm('Reset to built-in demo rules? Your custom script will be erased.')) return;
       return postRules('', 'Demo restored.');
     }
+
+    async function loadVersion() {
+      try {
+        const r = await fetch('/api/version');
+        if (!r.ok) return;
+        const v = await r.json();
+        document.getElementById('fw-version').textContent =
+          'fw ' + v.version + ' · ' + v.idf + ' · ' + v.date;
+      } catch (_) {}
+    }
+    loadVersion();
 
     initAuth();
 

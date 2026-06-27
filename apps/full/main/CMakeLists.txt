@@ -8,6 +8,7 @@ idf_component_register(
     INCLUDE_DIRS "."
     REQUIRES esp32-wifi-bootstrap nvs_flash spiffs esp_http_server
              esp_netif esp_driver_twai esp_wifi esp_coex board scripting lwip
+             esp_app_format
 )
 
 set(_WWW ${CMAKE_SOURCE_DIR}/../../www)
