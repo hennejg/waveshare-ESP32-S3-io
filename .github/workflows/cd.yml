@@ -280,12 +280,10 @@ jobs:
             waveshare_esp32s3_full-*.bin
             storage-*.bin
             waveshare-esp32s3-*-full-flash.zip
-            waveshare_esp32s3_full-*-merged.bin
             manifest-full.json
             manifest-full-v*.json
             waveshare_esp32s3_matter-*.bin
             waveshare-esp32s3-*-matter-flash.zip
-            waveshare_esp32s3_matter-*-merged.bin
             manifest-matter.json
             manifest-matter-v*.json
           body: |
