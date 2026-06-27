@@ -1,0 +1,16 @@
+{
+  "name": "Waveshare ESP32-S3 Full Firmware",
+  "version": "v1.1.2",
+  "new_install_prompt_erase": false,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        {
+          "path": "https://hennejg.github.io/waveshare-ESP32-S3-io/firmware/waveshare_esp32s3_full-merged.bin",
+          "offset": 0
+        }
+      ]
+    }
+  ]
+}
