@@ -7,7 +7,7 @@
       "chipFamily": "ESP32-S3",
       "parts": [
         {
-          "path": "https://hennejg.github.io/waveshare-ESP32-S3-io/firmware/waveshare_esp32s3_matter-merged.bin",
+          "path": "https://hennejg.github.io/waveshare-ESP32-S3-io/firmware/waveshare_esp32s3_matter-v1.1.5-merged.bin",
           "offset": 0
         }
       ]
