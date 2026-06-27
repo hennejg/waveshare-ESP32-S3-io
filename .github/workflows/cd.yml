@@ -176,6 +176,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: master
+
       - name: Download full firmware artifacts
         uses: actions/download-artifact@v4
         with:
@@ -216,34 +221,33 @@ jobs:
         env:
           TAG: ${{ needs.tag.outputs.new_tag }}
         run: |
-          BASE="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          REPO="${GITHUB_REPOSITORY##*/}"
+          PAGES="https://${OWNER}.github.io/${REPO}"
           python3 -c "
           import json, sys
-          tag, base = sys.argv[1], sys.argv[2]
+          tag, pages = sys.argv[1], sys.argv[2]
           for flavor, name in [('full', 'Full'), ('matter', 'Matter')]:
               obj = {
                   'name': f'Waveshare ESP32-S3 {name} Firmware',
                   'version': tag,
                   'new_install_prompt_erase': False,
                   'builds': [{'chipFamily': 'ESP32-S3', 'parts': [
-                      {'path': f'{base}/waveshare_esp32s3_{flavor}-{tag}-merged.bin', 'offset': 0}
+                      {'path': f'{pages}/firmware/waveshare_esp32s3_{flavor}-merged.bin', 'offset': 0}
                   ]}]
               }
               with open(f'manifest-{flavor}.json', 'w') as f:
                   json.dump(obj, f, indent=2)
-          " "${TAG}" "${BASE}"
+          " "${TAG}" "${PAGES}"
 
       - name: Compute ESP Web Tools flash URLs
         id: urls
-        env:
-          TAG: ${{ needs.tag.outputs.new_tag }}
         run: |
           OWNER="${GITHUB_REPOSITORY%%/*}"
           REPO="${GITHUB_REPOSITORY##*/}"
-          BASE="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${TAG}"
           PAGES="https://${OWNER}.github.io/${REPO}"
-          echo "flash_full=${PAGES}/flash.html?manifest=${BASE}/manifest-full.json"   >> "$GITHUB_OUTPUT"
-          echo "flash_matter=${PAGES}/flash.html?manifest=${BASE}/manifest-matter.json" >> "$GITHUB_OUTPUT"
+          echo "flash_full=${PAGES}/flash.html?manifest=${PAGES}/manifest-full.json"   >> "$GITHUB_OUTPUT"
+          echo "flash_matter=${PAGES}/flash.html?manifest=${PAGES}/manifest-matter.json" >> "$GITHUB_OUTPUT"
 
       - name: Stage remaining release assets
         env:
@@ -328,3 +332,20 @@ jobs:
               write-flash --flash-mode dio --flash-freq 80m --flash-size 16MB \
               0x20000 waveshare_esp32s3_matter-${{ needs.tag.outputs.new_tag }}.bin
             ```
+
+      - name: Publish manifests and firmware to GitHub Pages
+        env:
+          TAG: ${{ needs.tag.outputs.new_tag }}
+        run: |
+          mkdir -p docs/firmware
+          cp manifest-full.json   docs/manifest-full.json
+          cp manifest-matter.json docs/manifest-matter.json
+          cp "waveshare_esp32s3_full-${TAG}-merged.bin"   docs/firmware/waveshare_esp32s3_full-merged.bin
+          cp "waveshare_esp32s3_matter-${TAG}-merged.bin" docs/firmware/waveshare_esp32s3_matter-merged.bin
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/manifest-full.json docs/manifest-matter.json docs/firmware/
+          git diff --cached --quiet && exit 0
+          git commit -m "chore: update firmware ${TAG} on GitHub Pages"
+          git pull --rebase origin master
+          git push

@@ -71,23 +71,9 @@
   </p>
 
   <script>
-    // Resolve the latest release tag via the GitHub redirect, then build manifest URLs.
-    const REPO = 'hennejg/waveshare-ESP32-S3-io';
-    const API  = `https://api.github.com/repos/${REPO}/releases/latest`;
-    const BASE = `https://github.com/${REPO}/releases/download`;
     const HERE = location.href.replace(/index\.html$/, '');
-
-    fetch(API)
-      .then(r => r.json())
-      .then(data => {
-        const tag = data.tag_name;
-        if (!tag) return;
-        for (const flavor of ['full', 'matter']) {
-          const manifest = encodeURIComponent(`${BASE}/${tag}/manifest-${flavor}.json`);
-          document.getElementById(`btn-${flavor}`).href = `${HERE}flash.html?manifest=${BASE}/${tag}/manifest-${flavor}.json`;
-        }
-      })
-      .catch(() => { /* leave links pointing at flash.html without a manifest — it shows a helpful message */ });
+    document.getElementById('btn-full').href   = `${HERE}flash.html?manifest=${HERE}manifest-full.json`;
+    document.getElementById('btn-matter').href = `${HERE}flash.html?manifest=${HERE}manifest-matter.json`;
   </script>
 </body>
 </html>
