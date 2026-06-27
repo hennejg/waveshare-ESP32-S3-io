@@ -228,26 +228,37 @@ jobs:
           import json, sys
           tag, pages = sys.argv[1], sys.argv[2]
           for flavor, name in [('full', 'Full'), ('matter', 'Matter')]:
-              obj = {
+              versioned = {
                   'name': f'Waveshare ESP32-S3 {name} Firmware',
                   'version': tag,
                   'new_install_prompt_erase': False,
                   'builds': [{'chipFamily': 'ESP32-S3', 'parts': [
-                      {'path': f'{pages}/firmware/waveshare_esp32s3_{flavor}-merged.bin', 'offset': 0}
+                      {'path': f'{pages}/firmware/waveshare_esp32s3_{flavor}-{tag}-merged.bin', 'offset': 0}
                   ]}]
               }
+              # versioned manifest — pinned to this release
+              with open(f'manifest-{flavor}-{tag}.json', 'w') as f:
+                  json.dump(versioned, f, indent=2)
+              # latest alias — always points to the most recent build
+              latest = dict(versioned)
+              latest['builds'] = [{'chipFamily': 'ESP32-S3', 'parts': [
+                  {'path': f'{pages}/firmware/waveshare_esp32s3_{flavor}-merged.bin', 'offset': 0}
+              ]}]
               with open(f'manifest-{flavor}.json', 'w') as f:
-                  json.dump(obj, f, indent=2)
+                  json.dump(latest, f, indent=2)
           " "${TAG}" "${PAGES}"
 
       - name: Compute ESP Web Tools flash URLs
         id: urls
+        env:
+          TAG: ${{ needs.tag.outputs.new_tag }}
         run: |
           OWNER="${GITHUB_REPOSITORY%%/*}"
           REPO="${GITHUB_REPOSITORY##*/}"
           PAGES="https://${OWNER}.github.io/${REPO}"
-          echo "flash_full=${PAGES}/flash.html?manifest=${PAGES}/manifest-full.json"   >> "$GITHUB_OUTPUT"
-          echo "flash_matter=${PAGES}/flash.html?manifest=${PAGES}/manifest-matter.json" >> "$GITHUB_OUTPUT"
+          # Release links use versioned manifests so old releases install the correct firmware
+          echo "flash_full=${PAGES}/flash.html?manifest=${PAGES}/manifest-full-${TAG}.json"   >> "$GITHUB_OUTPUT"
+          echo "flash_matter=${PAGES}/flash.html?manifest=${PAGES}/manifest-matter-${TAG}.json" >> "$GITHUB_OUTPUT"
 
       - name: Stage remaining release assets
         env:
@@ -271,10 +282,12 @@ jobs:
             waveshare-esp32s3-*-full-flash.zip
             waveshare_esp32s3_full-*-merged.bin
             manifest-full.json
+            manifest-full-v*.json
             waveshare_esp32s3_matter-*.bin
             waveshare-esp32s3-*-matter-flash.zip
             waveshare_esp32s3_matter-*-merged.bin
             manifest-matter.json
+            manifest-matter-v*.json
           body: |
             ## Flash via Browser
 
@@ -338,13 +351,19 @@ jobs:
           TAG: ${{ needs.tag.outputs.new_tag }}
         run: |
           mkdir -p docs/firmware
+          # Latest aliases — overwritten each release
           cp manifest-full.json   docs/manifest-full.json
           cp manifest-matter.json docs/manifest-matter.json
           cp "waveshare_esp32s3_full-${TAG}-merged.bin"   docs/firmware/waveshare_esp32s3_full-merged.bin
           cp "waveshare_esp32s3_matter-${TAG}-merged.bin" docs/firmware/waveshare_esp32s3_matter-merged.bin
+          # Versioned copies — permanent, referenced by the release page links
+          cp "manifest-full-${TAG}.json"   "docs/manifest-full-${TAG}.json"
+          cp "manifest-matter-${TAG}.json" "docs/manifest-matter-${TAG}.json"
+          cp "waveshare_esp32s3_full-${TAG}-merged.bin"   "docs/firmware/waveshare_esp32s3_full-${TAG}-merged.bin"
+          cp "waveshare_esp32s3_matter-${TAG}-merged.bin" "docs/firmware/waveshare_esp32s3_matter-${TAG}-merged.bin"
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/manifest-full.json docs/manifest-matter.json docs/firmware/
+          git add docs/manifest-full.json docs/manifest-matter.json docs/firmware/ docs/manifest-full-*.json docs/manifest-matter-*.json
           git diff --cached --quiet && exit 0
           git commit -m "chore: update firmware ${TAG} on GitHub Pages"
           git pull --rebase origin master
