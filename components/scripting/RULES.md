@@ -151,7 +151,8 @@ rule('complex gate')
 ## 2. Facts and helpers
 
 There are three fact sources. `input` and `mqtt` are **conditions** (usable in
-`when()`); `output` is for **actions and reading state** in `then()`.
+`when()`); `output` is for **actions and reading state** in `then()`. `mqtt` is also
+an **actuator**: call `.publish()` in `then()` to send a message to the broker.
 
 > **Conditions are immutable.** `input()` / `mqtt()` build a *base pattern*, and every
 > constraint method (`.is()`, `.isOn()`, `.isOff()`, `.once()`) returns a **new**
@@ -278,6 +279,11 @@ rule('alarm off')
 
 ### `mqtt(topic)` — MQTT message
 
+`mqtt(topic)` is dual-purpose: a **condition** (usable in `when()`) and an **actuator**
+(usable in `then()` to publish back to the broker).
+
+**As a condition:**
+
 | Form | Meaning |
 |------|---------|
 | `mqtt(topic)` | matches once **any** message has arrived on `topic` (level/held) |
@@ -317,6 +323,39 @@ rule('toggle per command')
 
 `.once()` is a true edge: if the rule's other conditions are not met at the instant the
 message arrives, the edge is **missed**, not queued.
+
+#### Publishing — `mqtt(topic).publish(payload [, opts])`
+
+In `then()` bodies, `mqtt(topic)` can also **send** a message to the broker:
+
+| Form | Effect |
+|------|--------|
+| `mqtt(topic).publish(payload)` | publish `payload` with QoS 0, non-retained |
+| `mqtt(topic).publish(payload, {qos: n})` | publish with QoS `0`, `1`, or `2` |
+| `mqtt(topic).publish(payload, {retain: true})` | publish with the retained flag set |
+| `mqtt(topic).publish(payload, {qos: n, retain: bool})` | explicit QoS and retained |
+
+`payload` is coerced to a string. Returns the broker message-id (`>= 0`) on success,
+or `-1` if the broker is not connected. The configured topic prefix is prepended
+automatically (a topic starting with `/` bypasses the prefix, same as all other MQTT
+operations).
+
+```js
+// Report the current output state every minute
+rule('heartbeat')
+  .when(every(60000))
+  .then(function () {
+    mqtt('status/do0').publish(output(0).value ? 'ON' : 'OFF', { retain: true });
+  });
+
+// Forward an incoming command to a second topic with QoS 1
+var cmd = mqtt('rules/cmd');
+rule('forward')
+  .when(cmd)
+  .then(function () {
+    mqtt('state/last-cmd').publish(cmd.value, { qos: 1, retain: true });
+  });
+```
 
 ### Time triggers — `every(ms)` and `cron(...)`
 
@@ -677,11 +716,15 @@ led().off()               // LED off
 buzzer().set(freqHz)      // continuous tone (100-10000 Hz)
 buzzer().off()            // silence
 
-// ── mqtt(topic) — condition + last payload ─────────────────────────────────
+// ── mqtt(topic) — condition + last payload + publisher ─────────────────────
 mqtt(topic)               // matches once any message arrived (level/held)
 mqtt(topic).is(fn)        // matches when fn(payload) is truthy
 mqtt(topic).once()        // edge: matches only on each arrival
 mqtt(topic).value         // last payload
+mqtt(topic).publish(payload)                    // send; QoS 0, non-retained (default)
+mqtt(topic).publish(payload, {qos: n})          // QoS 0|1|2
+mqtt(topic).publish(payload, {retain: true})    // retained
+mqtt(topic).publish(payload, {qos: n, retain: bool})  // both
 
 // ── time triggers (edge; gate with other conditions) ───────────────────────
 every(ms)                 // fires every ms

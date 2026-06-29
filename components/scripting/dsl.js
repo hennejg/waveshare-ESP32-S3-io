@@ -173,6 +173,15 @@ MqttCondition.prototype._check = function() {
     if (!this._predicate) return true;
     return !!this._predicate(this.value);
 };
+// action: publish a message to the MQTT broker.
+// opts: { qos: 0|1|2, retain: bool } — both optional, defaults to QoS 0 non-retained.
+// Returns the broker message-id (>= 0) on success, or -1 if not connected / no broker.
+MqttCondition.prototype.publish = function(payload, opts) {
+    opts = opts || {};
+    var qos    = (typeof opts.qos    === 'number')  ? (opts.qos | 0) : 0;
+    var retain = (typeof opts.retain === 'boolean') ? opts.retain    : false;
+    return _mqtt_publish(this.topic, String(payload), qos, retain);
+};
 
 // ── InputCondition ───────────────────────────────────────────────────────────
 

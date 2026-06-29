@@ -20,8 +20,8 @@ board hardware abstraction layer (`components/board/`):
 
 | Flavor | Binary | What it includes |
 |--------|--------|-----------------|
-| **Full** (`apps/full/`) | `waveshare_esp32s3_full.bin` | Rule engine, MQTT, CAN bus, Modbus RTU, full web UI — **no Matter** |
-| **Matter** (`apps/matter/`) | `waveshare_esp32s3_matter.bin` | WiFi provisioning + Matter (Apple Home / Google Home), minimal web UI — no rule engine, no MQTT |
+| **Full** (`apps/full/`) | `waveshare_esp32s3_full.bin` | [WiFi provisioning](#connectivity), [Ethernet](#connectivity), [Rule engine](#automation-rules), [MQTT](#mqtt), [CAN bus](#can-bus), [Modbus RTU](#modbus-rtu), [full web UI](#web-configuration-ui) — **no Matter** |
+| **Matter** (`apps/matter/`) | `waveshare_esp32s3_matter.bin` | [WiFi provisioning](#connectivity), [Ethernet](#connectivity), [Matter](#matter) (Apple Home / Google Home), minimal web UI — no rule engine, no MQTT |
 
 **If you are not sure which to use, start with the full firmware** — it is what the CI builds and the releases contain.
 
@@ -160,7 +160,9 @@ LED colour, buzzer, and a read-request trigger.
 **NMEA2000 mode** implements ISO address claiming, PGN 126993 Heartbeat, PGN 127501/127502 Binary Switch Banks (DI bank
 0, DO bank 1), and PGN 126720 Manufacturer Proprietary fast-packet (LED + buzzer).
 
-### Matter (Apple Home / Google Home / Home Assistant) — separate firmware
+### Matter
+
+> Apple Home / Google Home / Home Assistant — separate firmware
 
 Full details in [`docs/matter.md`](docs/matter.md).
 

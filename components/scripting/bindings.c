@@ -73,14 +73,42 @@ static JSValue js_buzzer_set(JSContext *ctx, JSValue this_val, int argc, JSValue
     return JS_UNDEFINED;
 }
 
+static JSValue js_mqtt_publish(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
+{
+    if (!g_scripting_io->mqtt_publish) return JS_NewInt32(ctx, -1);
+
+    const char *topic = JS_ToCString(ctx, argv[0]);
+    if (!topic) return JS_EXCEPTION;
+
+    const char *payload = JS_ToCString(ctx, argv[1]);
+    if (!payload) { JS_FreeCString(ctx, topic); return JS_EXCEPTION; }
+
+    int32_t qos = 0;
+    if (argc > 2 && !JS_IsUndefined(argv[2]))
+        JS_ToInt32(ctx, &qos, argv[2]);
+    if (qos < 0) qos = 0;
+    if (qos > 2) qos = 2;
+
+    bool retain = false;
+    if (argc > 3 && !JS_IsUndefined(argv[3]))
+        retain = (bool)JS_ToBool(ctx, argv[3]);
+
+    int msg_id = g_scripting_io->mqtt_publish(topic, payload, (int)strlen(payload),
+                                              (int)qos, retain);
+    JS_FreeCString(ctx, topic);
+    JS_FreeCString(ctx, payload);
+    return JS_NewInt32(ctx, msg_id);
+}
+
 void scripting_register_bindings(JSContext *ctx)
 {
     JSValue g = JS_GetGlobalObject(ctx);
-    JS_SetPropertyStr(ctx, g, "_di_get",     JS_NewCFunction(ctx, js_di_get,     "_di_get",     1));
-    JS_SetPropertyStr(ctx, g, "_dout_set",   JS_NewCFunction(ctx, js_dout_set,   "_dout_set",   2));
-    JS_SetPropertyStr(ctx, g, "_dout_get",   JS_NewCFunction(ctx, js_dout_get,   "_dout_get",   1));
-    JS_SetPropertyStr(ctx, g, "_led_set",    JS_NewCFunction(ctx, js_led_set,    "_led_set",    3));
-    JS_SetPropertyStr(ctx, g, "_buzzer_set", JS_NewCFunction(ctx, js_buzzer_set, "_buzzer_set", 1));
-    JS_SetPropertyStr(ctx, g, "print",       JS_NewCFunction(ctx, js_print,      "print",       1));
+    JS_SetPropertyStr(ctx, g, "_di_get",       JS_NewCFunction(ctx, js_di_get,       "_di_get",       1));
+    JS_SetPropertyStr(ctx, g, "_dout_set",     JS_NewCFunction(ctx, js_dout_set,     "_dout_set",     2));
+    JS_SetPropertyStr(ctx, g, "_dout_get",     JS_NewCFunction(ctx, js_dout_get,     "_dout_get",     1));
+    JS_SetPropertyStr(ctx, g, "_led_set",      JS_NewCFunction(ctx, js_led_set,      "_led_set",      3));
+    JS_SetPropertyStr(ctx, g, "_buzzer_set",   JS_NewCFunction(ctx, js_buzzer_set,   "_buzzer_set",   1));
+    JS_SetPropertyStr(ctx, g, "_mqtt_publish", JS_NewCFunction(ctx, js_mqtt_publish, "_mqtt_publish", 4));
+    JS_SetPropertyStr(ctx, g, "print",         JS_NewCFunction(ctx, js_print,        "print",         1));
     JS_FreeValue(ctx, g);
 }

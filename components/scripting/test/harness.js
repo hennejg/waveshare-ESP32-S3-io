@@ -32,6 +32,7 @@ function createEngine(opts) {
 
   let ledState   = { r: 0, g: 0, b: 0 };   // last led().set(...)
   let buzzerFreq = 0;                       // last buzzer().set(...) Hz (0 = off)
+  const published = [];                     // messages sent via mqtt(topic).publish()
 
   const sandbox = {
     _di_get(ch)        { return !!di[ch]; },
@@ -39,6 +40,10 @@ function createEngine(opts) {
     _dout_get(ch)      { return !!dout[ch]; },
     _led_set(r, g, b)  { ledState = { r: r | 0, g: g | 0, b: b | 0 }; },
     _buzzer_set(freq)  { buzzerFreq = freq | 0; },
+    _mqtt_publish(topic, payload, qos, retain) {
+      published.push({ topic, payload, qos, retain });
+      return published.length;  // fake msg_id
+    },
     print(...a)        { prints.push(a.join(' ')); },
     _set_timer(ms, fn) { const id = nextId++; timers.set(id, { at: now + (ms | 0), fn }); return id; },
     _clear_timer(id)   { timers.delete(id); },
@@ -86,6 +91,7 @@ function createEngine(opts) {
     output(ch)      { return !!dout[ch]; },
     setOutput(ch,v) { dout[ch] = !!v; },                            // seed output without an event
     prints,
+    published,
     T,
     pendingTimers() { return timers.size; },
     advance,
