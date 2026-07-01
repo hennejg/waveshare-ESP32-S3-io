@@ -64,7 +64,7 @@ jobs:
           git submodule update --init components/quickjs/extern/quickjs
 
       - name: Cache managed components
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: apps/full/managed_components
           key: managed-full-${{ hashFiles('apps/full/main/idf_component.yml', 'components/board/idf_component.yml') }}
@@ -115,7 +115,7 @@ jobs:
 
       - name: Cache esp-matter submodule
         id: cache-matter
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: esp-matter
           key: esp-matter-${{ steps.matter-sha.outputs.sha }}
@@ -142,7 +142,7 @@ jobs:
           PIP_BREAK_SYSTEM_PACKAGES=1 ./esp-matter/install.sh
 
       - name: Cache managed components (matter)
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: apps/matter/managed_components
           key: managed-matter-${{ hashFiles('apps/matter/main/idf_component.yml', 'components/board/idf_component.yml') }}
