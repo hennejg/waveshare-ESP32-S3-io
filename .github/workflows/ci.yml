@@ -136,7 +136,7 @@ jobs:
           submodules: false   # the DSL test suite is self-contained (no submodules)
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: '20'
 
