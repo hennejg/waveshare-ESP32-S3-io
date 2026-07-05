@@ -25,7 +25,7 @@ board hardware abstraction layer (`components/board/`):
 
 **If you are not sure which to use, start with the full firmware** — it is what the CI builds and the releases contain.
 
-## Hardware
+## Hardware Descrption
 
 |                     |                                                                                                         |
 |---------------------|---------------------------------------------------------------------------------------------------------|
@@ -398,3 +398,12 @@ python -m esptool --chip esp32s3 -p /dev/ttyUSBx -b 460800 \
 | Component    | Source                        | Purpose                      |
 |--------------|-------------------------------|------------------------------|
 | `esp-matter` | Git submodule (`esp-matter/`) | Matter SDK (connectedhomeip) |
+
+## Why not use...
+- **Arduino**? I didn't want to recompile/reflash every time I need a new feature
+- **Tasmota**?
+  * it doesn't support Modbus
+  * it doesn't support CAN bus/NMEA2000
+  * it doesn't support Matter
+  * its rule engine is rather limited, for example, it is harder to implement fallback behaviours for cases where the upstream management goes down
+    
