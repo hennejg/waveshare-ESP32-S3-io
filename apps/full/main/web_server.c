@@ -296,6 +296,8 @@ static esp_err_t api_config_get(httpd_req_t *req)
         cJSON_AddStringToObject(item, "name",   cfg->di[i].name);
         cJSON_AddItemToArray(di, item);
     }
+    /* Inputs from this index on are not optocoupler-isolated. */
+    cJSON_AddNumberToObject(root, "di_isolated", APP_CFG_DI_ISOLATED_COUNT);
 
     cJSON *dout = cJSON_AddArrayToObject(root, "dout");
     for (int i = 0; i < APP_CFG_DO_COUNT; i++) {
@@ -810,8 +812,10 @@ static esp_err_t api_io_state(httpd_req_t *req)
     cJSON *root = cJSON_CreateObject();
     cJSON *di   = cJSON_AddArrayToObject(root, "di");
     cJSON *dout = cJSON_AddArrayToObject(root, "dout");
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < APP_CFG_DI_COUNT; i++) {
         cJSON_AddItemToArray(di,   cJSON_CreateBool(di_get((uint8_t)i)));
+    }
+    for (int i = 0; i < APP_CFG_DO_COUNT; i++) {
         cJSON_AddItemToArray(dout, cJSON_CreateBool(dout_get((uint8_t)i)));
     }
     char *json = cJSON_PrintUnformatted(root);

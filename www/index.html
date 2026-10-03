@@ -55,6 +55,9 @@
                  cursor:pointer; background:#f0f0f0; font-size:.8rem; margin-top:0;
                  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .io-toggle.on { background:#2d7d46; color:#fff; border-color:#2d7d46; }
+    /* Non-isolated direct-GPIO inputs */
+    .aux-sep td { text-align:left; padding-top:.9rem; color:#c0392b; }
+    .aux-head   { grid-column:1/-1; margin-top:.4rem; font-size:.8rem; color:#c0392b; }
     .io-row { display:flex; align-items:center; gap:.6rem; margin:.5rem 0; flex-wrap:wrap; }
     .io-row label { margin-top:0; font-weight:normal; }
     .io-row input[type="number"] { width:5rem; margin-top:0; padding:.3rem .5rem; font-size:.9rem; }
@@ -553,14 +556,61 @@ rule('my-rule')
     const diTbl   = document.getElementById('di-table');
     const doutTbl = document.getElementById('dout-table');
 
-    /* Build the 8 DI and DO config rows once */
-    for (let i = 0; i < 8; i++) {
-      const tr = document.createElement('tr');
-      tr.innerHTML = `<td>DI${i + 1}</td>` +
-        `<td><input type="text" id="di_${i}_name" maxlength="20" style="width:9rem"></td>` +
-        `<td style="text-align:center"><input type="checkbox" id="di_${i}_invert"></td>`;
-      diTbl.appendChild(tr);
+    /* Input channel layout. Channels from di_isolated on are plain GPIOs: no
+       optocoupler, no protection. /api/config carries both the channel count
+       and di_isolated; if di_isolated is missing, nothing is treated as
+       isolated and every channel is marked. */
+    const AUX_GPIO = [1, 44, 43];
+    /* Silkscreen names of the same three pads, in channel order. */
+    const AUX_PAD  = ['IO1', 'RXD', 'TXD'];
+    const AUX_HEAD = 'Direct GPIO inputs — not isolated';
+    const AUX_WARN = 'No optocoupler, no protection: 0–3.3 V logic levels only. ' +
+                     'A field voltage destroys the MCU — condition these signals externally.';
+    let diCount    = 8;
+    let diIsolated = 8;
+
+    const diLabel = i => (i < diIsolated ? `DI${i + 1}` : `AUX${i - diIsolated + 1}`);
+    /* GPIO number of a non-isolated channel, a nice-to-have from a hard-coded
+       list and only trusted when the block has exactly the expected size.
+       undefined drops the number; it never decides whether to warn. */
+    const auxGpio = i => (i >= diIsolated && diCount - diIsolated === AUX_GPIO.length)
+                         ? AUX_GPIO[i - diIsolated] : undefined;
+    /* "IO1 · GPIO1" — the pad as it is printed on the board, then the GPIO. */
+    const auxPin  = i => { const g = auxGpio(i);
+                           return g === undefined ? undefined
+                                  : `${AUX_PAD[i - diIsolated]} \u00b7 GPIO${g}`; };
+
+    /* Build the DI config rows — rebuilt once the layout is known */
+    function buildDiRows() {
+      diTbl.innerHTML = '';
+      for (let i = 0; i < diCount; i++) {
+        if (i === diIsolated) {
+          diTbl.insertAdjacentHTML('beforeend',
+            `<tr class="aux-sep"><td colspan="3"><strong>${AUX_HEAD}</strong>` +
+            `<div class="hint err">${AUX_WARN}</div></td></tr>`);
+        }
+        const pin = auxPin(i);
+        const tr = document.createElement('tr');
+        tr.innerHTML =
+          `<td>${diLabel(i)}${pin === undefined ? '' : ` <span class="hint">${pin}</span>`}</td>` +
+          `<td><input type="text" id="di_${i}_name" maxlength="20" style="width:9rem"></td>` +
+          `<td style="text-align:center"><input type="checkbox" id="di_${i}_invert"></td>`;
+        diTbl.appendChild(tr);
+      }
     }
+    buildDiRows();
+
+    /* Channel count and the isolated/non-isolated boundary both come with the
+       config.  A config without di_isolated means we cannot tell, so warn on
+       every channel rather than vouch for any. */
+    function syncDiLayout(cfg) {
+      diCount    = (cfg.di ?? []).length || 8;
+      diIsolated = Number.isInteger(cfg.di_isolated)
+                   ? Math.min(cfg.di_isolated, diCount) : 0;
+      buildDiRows();
+    }
+
+    /* Build the 8 DO config rows once */
     for (let i = 0; i < 8; i++) {
       const tr = document.createElement('tr');
       tr.innerHTML = `<td>DO${i + 1}</td>` +
@@ -604,6 +654,7 @@ rule('my-rule')
         refreshTime();
         document.getElementById('pass_hint').textContent =
           cfg.mqtt_password_set ? 'Password is set.' : 'No password stored.';
+        syncDiLayout(cfg);
         (cfg.di ?? []).forEach((di, i) => {
           const inv  = document.getElementById(`di_${i}_invert`);
           const name = document.getElementById(`di_${i}_name`);
@@ -663,7 +714,7 @@ rule('my-rule')
       status.textContent = '';
       try {
         const di = [];
-        for (let i = 0; i < 8; i++) {
+        for (let i = 0; i < diCount; i++) {
           di.push({
             invert: document.getElementById(`di_${i}_invert`).checked,
             name:   document.getElementById(`di_${i}_name`).value.trim(),
@@ -876,11 +927,20 @@ rule('my-rule')
       const doG = document.getElementById('do-grid');
       diG.innerHTML = '';
       doG.innerHTML = '';
-      for (let i = 0; i < 8; i++) {
-        const n = cfg.di?.[i]?.name || `DI${i + 1}`;
+      for (let i = 0; i < diCount; i++) {
+        if (i === diIsolated) {
+          diG.insertAdjacentHTML('beforeend',
+            `<div class="aux-head"><strong>${AUX_HEAD}</strong>` +
+            `<div class="hint err">${AUX_WARN}</div></div>`);
+        }
+        const pin = auxPin(i);
+        const n = cfg.di?.[i]?.name || diLabel(i);
+        const t = i < diIsolated ? n
+                : pin === undefined ? `${n} — not isolated`
+                                    : `${n} — ${pin}, not isolated`;
         diG.insertAdjacentHTML('beforeend',
-          `<div class="io-cell"><span id="di-dot-${i}" class="io-dot" title="${n}"></span>` +
-          `<span class="io-lbl" title="${n}">${n}</span></div>`);
+          `<div class="io-cell"><span id="di-dot-${i}" class="io-dot" title="${t}"></span>` +
+          `<span class="io-lbl" title="${t}">${n}</span></div>`);
       }
       for (let i = 0; i < 8; i++) {
         const n = cfg.dout?.[i]?.name || `DO${i + 1}`;

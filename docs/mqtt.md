@@ -31,9 +31,20 @@ The client reconnects automatically with exponential backoff if the broker becom
 
 ---
 
-## Digital Inputs (DI1–DI8)
+## Digital Inputs
 
-The board has 8 optocoupler-isolated digital inputs on GPIO4–GPIO11.
+The board has 8 optocoupler-isolated digital inputs on GPIO4–GPIO11 (DI1–DI8).
+
+Firmware built with `APP_AUX_DI_ENABLE` has three more, non-isolated, on GPIO1/GPIO44/GPIO43. They are called AUX1–AUX3
+in the web UI and are published like any other input — the topic index continues after DI8:
+
+| Web UI | Pad | GPIO   | DI index | Default topic       |
+|--------|-----|--------|----------|---------------------|
+| AUX1   | IO1 | GPIO1  | 8        | `<prefix>/input/9`  |
+| AUX2   | RXD | GPIO44 | 9        | `<prefix>/input/10` |
+| AUX3   | TXD | GPIO43 | 10       | `<prefix>/input/11` |
+
+The option is off by default, so a stock firmware has 8 inputs. See the README for the wiring caveats.
 
 - `true` = input active
 - `false` = input inactive
@@ -48,16 +59,18 @@ Each input can be given a **name** in the web UI config page (max 20 characters,
 |---------------------------------|-----|----------|-------------------|
 | `<prefix>/input/<name-or-1..8>` | 0   | no       | `true` or `false` |
 
+`<name-or-1..8>` becomes `<name-or-1..11>` when `APP_AUX_DI_ENABLE` is set.
+
 **When published:**
 
-- On every MQTT broker connect (full state refresh of all 8 inputs)
+- On every MQTT broker connect (full state refresh of every input)
 - Whenever an input changes state (edge-triggered, 10 ms debounce)
 
 ### Subscribed topics
 
 | Topic                 | Expected payload | Effect                                                  |
 |-----------------------|------------------|---------------------------------------------------------|
-| `<prefix>/input/read` | any              | Immediately publishes the current state of all 8 inputs |
+| `<prefix>/input/read` | any              | Immediately publishes the current state of every input  |
 
 ---
 

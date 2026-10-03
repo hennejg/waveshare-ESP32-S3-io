@@ -6,10 +6,25 @@ on:
 
 jobs:
   build-full:
-    name: Build firmware (full)
+    name: Build firmware (full${{ matrix.label }})
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v5.5.4   # must match esp-idf submodule version
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - config: default
+            label: ''
+            sdkconfig: ''
+          # APP_AUX_DI_ENABLE compiles code the default build never sees: the
+          # UART-console #error, the 11-entry DI arrays, the AUX rows in the UI.
+          - config: aux-di
+            label: ', APP_AUX_DI_ENABLE'
+            sdkconfig: |
+              CONFIG_APP_AUX_DI_ENABLE=y
+              CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 
     steps:
       - name: Checkout
@@ -30,8 +45,14 @@ jobs:
         uses: actions/cache@v5
         with:
           path: apps/full/managed_components
-          key: managed-full-${{ hashFiles('apps/full/main/idf_component.yml', 'components/board/idf_component.yml') }}
+          key: managed-full-${{ matrix.config }}-${{ hashFiles('apps/full/main/idf_component.yml', 'components/board/idf_component.yml') }}
           restore-keys: managed-full-
+
+      - name: Append the extra sdkconfig options
+        if: matrix.sdkconfig != ''
+        env:
+          EXTRA_SDKCONFIG: ${{ matrix.sdkconfig }}
+        run: printf '\n%s' "$EXTRA_SDKCONFIG" >> apps/full/sdkconfig.defaults
 
       - name: Build
         run: |
@@ -39,7 +60,9 @@ jobs:
           idf.py -C apps/full set-target esp32s3
           idf.py -C apps/full build
 
+      # Only the default configuration ships; the option-on leg is a compile check.
       - name: Upload build artifacts
+        if: matrix.config == 'default'
         uses: actions/upload-artifact@v7
         with:
           name: firmware-full-${{ github.sha }}

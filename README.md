@@ -32,6 +32,7 @@ board hardware abstraction layer (`components/board/`):
 | **MCU**             | ESP32-S3-WROOM-1U-N16R8 (dual-core Xtensa LX7, 240 MHz, 16 MB Flash, 8 MB PSRAM)                        |
 | **Ethernet**        | W5500 SPI (10/100 Mbit)                                                                                 |
 | **Digital inputs**  | 8 × optocoupler-isolated (DI1–DI8, GPIO4–GPIO11)                                                        |
+| **Extra inputs**    | 3 × **non-isolated** 3.3 V GPIO (AUX1–AUX3, GPIO1/43/44) — [optional, off by default](#optional-extra-inputs-app_aux_di_enable) |
 | **Digital outputs** | (ESP32-S3-POE-ETH-8DI-8DO only) 8 × optocoupler-isolated Darlington (DO1–DO8, via TCA9554 I²C expander) |
 | **Relay outputs**   | (ESP32-S3-POE-ETH-8DI-8RO only) 8 × 1NO 1NC; ≤10A 250V AC or ≤10A 30V DC                                |
 | **CAN bus**         | ESP32-S3 TWAI peripheral (GPIO2 TX, GPIO3 RX)                                                           |
@@ -131,13 +132,14 @@ Full details in [`docs/mqtt.md`](docs/mqtt.md).
 
 | Resource               | Topics                               |
 |------------------------|--------------------------------------|
-| Digital inputs (read)  | `<prefix>/input/<name-or-1..8>`      |
+| Digital inputs (read)  | `<prefix>/input/<name-or-1..8>` (1..11 with the extra inputs) |
 | Digital outputs (set)  | `<prefix>/output/<name-or-1..8>/set` |
 | Digital outputs (bulk) | `<prefix>/output/set`                |
 | LED                    | `<prefix>/led/set`                   |
 | Buzzer                 | `<prefix>/buzzer/beep`               |
 
-- Input/output topics use a configured channel name, or the index number (1–8) if no name is set.
+- Input/output topics use a configured channel name, or the index number (1–8) if no name is set — inputs run to 11
+  with [`APP_AUX_DI_ENABLE`](#optional-extra-inputs-app_aux_di_enable).
 - Output commands accept `true`/`false`/`1`/`0`/`on`/`off`/`high`/`low`/`toggle` (case-insensitive).
 - The LED accepts `#RRGGBB`, a timed single step `{"color":"#RRGGBB","duration":ms}`, or a multi-step sequence array.
 - The buzzer accepts a single `{"freq":Hz,"duration":ms}` or a sequence array; omit `freq` for silent pauses.
@@ -229,6 +231,48 @@ Status mode all LED commands from MQTT, Modbus, and CAN are ignored.
 - **Debounce** — digital inputs have 10 ms software debounce.
 - **Unified state** — a DO write via any interface (MQTT, Modbus, CAN) is reflected immediately on all others. MQTT
   confirmation is published, Modbus coil is updated, CAN echoes the new state.
+
+### Optional Extra Inputs (`APP_AUX_DI_ENABLE`)
+
+> Build-time option, **off by default** — the released binaries do not contain it.
+
+`APP_AUX_DI_ENABLE` adds three further digital inputs on the **IO1, RXD and TXD** pads (GPIO1, GPIO44, GPIO43), behind the eight
+isolated ones.
+They show up as **AUX1–AUX3** in the web UI and occupy DI indices 8, 9 and 10. Enable it with
+`CONFIG_APP_AUX_DI_ENABLE=y` in `apps/full/sdkconfig.defaults`, or in `./idf.sh menuconfig` under
+*Board driver options → Three extra NON-ISOLATED digital inputs (GPIO1, GPIO44, GPIO43)*.
+
+**These three pins are not isolated.** They run straight to the ESP32-S3 — no optocoupler, no series resistor, no
+reverse protection — and must never see more than 3.3 V or less than 0 V. Conditioning them is up to the external
+circuit.
+
+**Important — GPIO43 needs a series resistor of at least 1 kΩ.** GPIO43 is U0TXD, and the ROM bootloader drives it as
+a push-pull output from every reset until the second-stage bootloader releases it — and indefinitely while the chip
+sits in UART download mode (esptool, BOOT button). A contact wired straight from GPIO43 to ground therefore shorts that
+driver on every boot and during every flash. It is deliberately the last channel, so a board that needs only two
+extra inputs can leave it unwired. GPIO44 (AUX2, U0RXD) is an input and has no such problem; GPIO1 is otherwise
+unused by this firmware.
+
+**The console has to move.** GPIO43/44 are UART0 TX/RX, so the option also requires
+`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` (*Component config → ESP System Settings → Channel for console output →
+USB Serial/JTAG Controller*). Building with the console still on UART0 fails with an `#error`.
+
+**Turning the option back off loses the input names.** The per-input settings are stored as one NVS blob. Eleven
+entries written by an option-on firmware do not fit the eight-entry buffer of an option-off one, so `nvs_get_blob()`
+returns `ESP_ERR_NVS_INVALID_LENGTH` and *every* input name and invert flag falls back to its default — the eight
+isolated ones included. Note them down before switching back.
+
+Not every interface grows with the extra channels:
+
+| Interface        | AUX1–AUX3 | Detail                                                              |
+|------------------|-----------|---------------------------------------------------------------------|
+| Web UI           | yes       | Listed as AUX1–AUX3, marked as not isolated                         |
+| REST API         | yes       | `/api/config` and the status JSON carry 11 input entries            |
+| MQTT             | yes       | `input/9`, `input/10`, `input/11` — the topic index is DI index + 1 |
+| CAN bus          | **no**    | DI state is packed into a single byte — room for 8                  |
+| Modbus RTU       | **no**    | Discrete inputs 10001–10008 only                                    |
+| Matter           | **no**    | 8 Contact Sensor endpoints, unchanged                               |
+| Automation rules | **no**    | `input` / `output` channels are limited to 0–7 (`RangeError` above) |
 
 ---
 

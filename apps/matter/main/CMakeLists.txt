@@ -15,14 +15,14 @@ set(_MWWW ${CMAKE_CURRENT_SOURCE_DIR}/../www)
 
 add_custom_command(
     OUTPUT  ${_MWWW}/index.html.gz
-    COMMAND gzip -k -f ${_MWWW}/index.html
+    COMMAND gzip -9 -n -k -f ${_MWWW}/index.html
     DEPENDS ${_MWWW}/index.html
     COMMENT "Compressing matter/www/index.html"
 )
 
 add_custom_command(
     OUTPUT  ${_WWW}/qrcode.min.js.gz
-    COMMAND gzip -k -f ${_WWW}/qrcode.min.js
+    COMMAND gzip -9 -n -k -f ${_WWW}/qrcode.min.js
     DEPENDS ${_WWW}/qrcode.min.js
     COMMENT "Compressing www/qrcode.min.js (for matter)"
 )

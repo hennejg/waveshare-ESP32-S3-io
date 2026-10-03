@@ -15,6 +15,47 @@ config APP_SNTP_ENABLE
         sync to the battery-backed RTC.  Disable for firmwares that do not need
         accurate local time (e.g. Matter-only builds).
 
+config APP_AUX_DI_ENABLE
+    bool "Three extra NON-ISOLATED digital inputs (GPIO1, GPIO44, GPIO43)"
+    depends on !APP_MATTER_ENABLE
+    default n
+    help
+        Adds three more inputs on GPIO1, GPIO44 and GPIO43 for boards that
+        need more than the eight on-board ones.  They are shown as AUX1, AUX2
+        and AUX3 in the web UI and occupy channels 8..10 of the DI array,
+        behind the eight isolated ones.
+
+        These three pins run straight to the ESP32-S3: no optocoupler, no
+        series resistor, no reverse protection.  They need external protection
+        and must never see more than 3.3 V or less than 0 V.
+
+        GPIO43/44 are UART0 TX/RX and carry the default console, so the console
+        has to be moved to USB-Serial/JTAG only (Component config -> ESP System
+        Settings -> Channel for console output -> USB Serial/JTAG Controller).
+        Building with the console still on UART0 fails with an #error.
+
+        Moving the console is not enough for GPIO43 (AUX3).  It is U0TXD, and the
+        ROM bootloader drives it as a push-pull output from every reset until
+        the second-stage bootloader releases it — and indefinitely while the
+        chip sits in UART download mode (esptool, BOOT button).  A contact
+        wired straight from GPIO43 to ground therefore shorts that driver on
+        every boot and during every flash.  Put a series resistor of at least
+        1 kOhm in that line.  GPIO43 is deliberately the LAST channel, so a
+        board that needs only two extra inputs can leave it unwired.
+        GPIO44 (AUX2) is U0RXD, an input, and has no such
+        problem; GPIO1 is unaffected and otherwise unused by this firmware.
+
+        The extra inputs are reported over the web UI, the REST API and MQTT.
+        They are NOT carried over CAN or Modbus: both pack the input states
+        into a single byte (can_server.c, mb_server.c), which has room for
+        eight.  The scripting engine does not see them either: its di/do
+        bindings reject channels above 7 with a RangeError.
+
+        Not offered in a Matter build.  The Matter app exposes exactly eight
+        Contact Sensor endpoints and its own web UI builds eight input rows, so
+        the extra channels would be invisible there — better unavailable than
+        half working.
+
 config APP_SCRIPTING_ENABLE
     bool "Enable scripting engine callbacks"
     default n
