@@ -370,7 +370,26 @@ static esp_err_t api_config_post(httpd_req_t *req)
     STR("device_name",      cfg.device_name);
     STR("mqtt_url",         cfg.mqtt_url);
     STR("mqtt_user",        cfg.mqtt_user);
-    STR("mqtt_topic_prefix",cfg.mqtt_topic_prefix);
+    /* The prefix is used verbatim as a publish topic and as the last-will
+       topic. '#' and '+' are illegal there (MQTT 3.1.1 3.3.2.1 / 4.7) and a
+       conforming broker closes the connection on CONNECT, after which MQTT
+       never reconnects and nothing in the log points at the cause. '/' at
+       either end produces an empty topic level. */
+    {
+        cJSON *_v = cJSON_GetObjectItem(root, "mqtt_topic_prefix");
+        if (cJSON_IsString(_v)) {
+            const char *pfx = _v->valuestring;
+            size_t len = strlen(pfx);
+            if (strpbrk(pfx, "#+") || (len && (pfx[0] == '/' || pfx[len - 1] == '/'))) {
+                cJSON_Delete(root);
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                    "mqtt_topic_prefix must not contain '#' or '+' "
+                                    "or start or end with '/'");
+                return ESP_OK;
+            }
+            strlcpy(cfg.mqtt_topic_prefix, pfx, sizeof(cfg.mqtt_topic_prefix));
+        }
+    }
     #undef STR
 
     /* Password: only update when a non-empty value is sent */
