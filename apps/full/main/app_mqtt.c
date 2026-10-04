@@ -94,6 +94,20 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
         break;
 
     case MQTT_EVENT_DATA:
+        /* A payload larger than CONFIG_MQTT_BUFFER_SIZE arrives as several
+           events. Only the first carries the topic; the continuations have
+           msg_topic == NULL and topic_len == 0, and forwarding those made the
+           rule engine run a pass with an empty topic over mid-payload bytes,
+           re-evaluating every wildcard rule. Without
+           CONFIG_MQTT_TOPIC_PRESENT_ALL_DATA_EVENTS there is no topic to
+           reassemble them under, so drop the continuations and say so once. */
+        if (event->topic_len == 0 || event->topic == NULL) {
+            if (event->current_data_offset == 0) break;   /* not a continuation */
+            ESP_LOGW(TAG, "dropping continuation of a %d-byte payload at offset %d"
+                          " — raise CONFIG_MQTT_BUFFER_SIZE to receive it whole",
+                     event->total_data_len, event->current_data_offset);
+            break;
+        }
         if (s_on_msg) {
             s_on_msg(event->topic, (size_t)event->topic_len,
                      event->data,  (size_t)event->data_len);
