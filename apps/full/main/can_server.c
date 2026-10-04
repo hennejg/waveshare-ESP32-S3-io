@@ -24,6 +24,7 @@
 #define CAN_TX_GPIO  GPIO_NUM_2
 #define CAN_RX_GPIO  GPIO_NUM_3
 #define TX_POLL_MS   50
+#define TX_FAIL_LOG_MS 10000   /* do not repeat a transmit failure more often */
 #define HB_PERIOD_MS 1000
 #define RX_QUEUE_DEPTH 32
 
@@ -61,15 +62,39 @@ static IRAM_ATTR bool rx_done_cb(twai_node_handle_t node,
 
 static uint16_t s_base;
 
+/* A rejected transmit used to vanish: basic_send() discarded the result and
+   n2k_send_frame() logged at DEBUG, which is below the configured level. That
+   is how an every-frame failure stayed invisible. Rate-limited so a
+   disconnected bus cannot flood the log. */
+static void tx_failed(uint32_t id, esp_err_t err)
+{
+    static TickType_t last;
+    static uint32_t   suppressed;
+    TickType_t now = xTaskGetTickCount();
+
+    if (last == 0 || (now - last) >= pdMS_TO_TICKS(TX_FAIL_LOG_MS)) {
+        if (suppressed)
+            ESP_LOGW(TAG, "%" PRIu32 " further transmits failed", suppressed);
+        ESP_LOGW(TAG, "TX %03" PRIx32 " failed: %s", id, esp_err_to_name(err));
+        last = now; suppressed = 0;
+    } else {
+        suppressed++;
+    }
+}
+
 static void basic_send(uint16_t id, const uint8_t *data, uint8_t dlc)
 {
     uint8_t buf[8] = {0};
+    if (dlc > 8) dlc = 8;
     if (dlc && data) memcpy(buf, data, dlc);
     twai_frame_t f = {
         .header = { .id = id, .dlc = dlc, .ide = 0, .rtr = 0 },
-        .buffer = buf, .buffer_len = sizeof(buf),
+        /* Must describe the payload, not the buffer: the driver rejects the
+           frame unless header.dlc == twaifd_len2dlc(buffer_len). */
+        .buffer = buf, .buffer_len = dlc,
     };
-    twai_node_transmit(s_node, &f, 5);
+    esp_err_t r = twai_node_transmit(s_node, &f, 5);
+    if (r != ESP_OK) tx_failed(id, r);
 }
 
 static void basic_tx_heartbeat(void)
@@ -185,13 +210,14 @@ static void n2k_send_frame(uint32_t can_id, const uint8_t *data, uint8_t dlc)
 {
     uint8_t buf[8];
     memset(buf, 0xFF, 8);
-    if (dlc && data) memcpy(buf, data, dlc < 8 ? dlc : 8);
+    if (dlc > 8) dlc = 8;
+    if (dlc && data) memcpy(buf, data, dlc);
     twai_frame_t f = {
-        .header = { .id = can_id, .dlc = dlc < 8 ? dlc : 8, .ide = 1, .rtr = 0 },
-        .buffer = buf, .buffer_len = sizeof(buf),
+        .header = { .id = can_id, .dlc = dlc, .ide = 1, .rtr = 0 },
+        .buffer = buf, .buffer_len = dlc,   /* see basic_send() */
     };
     esp_err_t r = twai_node_transmit(s_node, &f, 5);
-    if (r != ESP_OK) ESP_LOGD(TAG, "N2k TX %08"PRIx32": %s", can_id, esp_err_to_name(r));
+    if (r != ESP_OK) tx_failed(can_id, r);
 }
 
 /* Fast-packet sender: handles messages > 8 bytes. */
