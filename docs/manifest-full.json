@@ -1,6 +1,6 @@
 {
   "name": "Waveshare ESP32-S3 Full Firmware",
-  "version": "v1.1.9",
+  "version": "v1.1.10",
   "new_install_prompt_erase": false,
   "builds": [
     {
