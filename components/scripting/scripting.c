@@ -95,7 +95,14 @@ static void timer_fired_cb(void *arg)
 {
     scripting_evt_t ev = { .type = EVT_TIMER };
     ev.timer.id = (uint32_t)(uintptr_t)arg;
-    if (s_queue) xQueueSend(s_queue, &ev, 0);
+    /* A dropped timer event is not recoverable: the slot stays used, the JS
+       function reference is never released, and the rule that armed it never
+       hears back -- an .after() off-pulse never switches off, a watchdog()
+       never expires, an every() never re-arms. Say so, like the other
+       producers below do. */
+    if (s_queue && xQueueSend(s_queue, &ev, 0) != pdTRUE)
+        ESP_LOGW(TAG, "event queue full - rule timer %u dropped",
+                 (unsigned)ev.timer.id);
 }
 
 static JSValue js_set_timer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)

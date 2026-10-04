@@ -79,6 +79,11 @@ function _schedule(ms, fn) {
     if (typeof _set_timer === 'function')      id = _set_timer(ms, wrapped);
     else if (typeof setTimeout === 'function') id = setTimeout(wrapped, ms);
     else { fn(); return null; }   // no scheduler available — degrade to immediate
+    // _set_timer answers -1 when the timer table is full. Callers store the
+    // result in _timer and guard on `!= null`, and -1 != null is true in JS —
+    // so returning it would mark the rule as armed forever and stop it from
+    // ever trying again. Report "not scheduled" instead.
+    if (id == null || id < 0) return null;
     _pending.push(id);
     return id;
 }

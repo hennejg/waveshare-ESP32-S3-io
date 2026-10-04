@@ -26,6 +26,10 @@ function createEngine(opts) {
   let nextId = 1;
   const timers = new Map();   // id -> { at, fn }
 
+  // Mirrors MAX_TIMERS in scripting.c: the device answers -1 once its timer
+  // table is full. Unlimited by default; set it to exercise the refusal path.
+  let maxTimers = opts.maxTimers !== undefined ? opts.maxTimers : Infinity;
+
   // Mirrors the device _time_valid() binding: cron stays suppressed until the clock is
   // real. Defaults true (legacy behaviour); pass { timeValid: false } to test suppression.
   let timeValid = opts.timeValid !== undefined ? !!opts.timeValid : true;
@@ -45,7 +49,10 @@ function createEngine(opts) {
       return published.length;  // fake msg_id
     },
     print(...a)        { prints.push(a.join(' ')); },
-    _set_timer(ms, fn) { const id = nextId++; timers.set(id, { at: now + (ms | 0), fn }); return id; },
+    _set_timer(ms, fn) {
+      if (timers.size >= maxTimers) return -1;   // table full — as the device does
+      const id = nextId++; timers.set(id, { at: now + (ms | 0), fn }); return id;
+    },
     _clear_timer(id)   { timers.delete(id); },
     _now()             { return now; },        // virtual wall-clock (epoch ms) for cron
     _time_valid()      { return timeValid; },  // clock-validity gate for cron
@@ -94,6 +101,7 @@ function createEngine(opts) {
     published,
     T,
     pendingTimers() { return timers.size; },
+    setMaxTimers(n) { maxTimers = n; },   // simulate the table filling up / freeing
     advance,
     now() { return now; },
     setClock(ms) { now = ms; },   // set the virtual epoch (call before loading cron rules)
