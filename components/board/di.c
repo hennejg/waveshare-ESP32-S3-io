@@ -9,6 +9,11 @@ bool app_mqtt_is_connected(void);
 #ifdef CONFIG_APP_MATTER_ENABLE
 #include "matter.h"
 #endif
+#ifdef CONFIG_APP_SCRIPTING_ENABLE
+/* Declared rather than included: components/board does not depend on the
+   scripting component, and apps/matter excludes it from the build. */
+void scripting_on_input_change(uint8_t channel, bool state);
+#endif
 
 #include <string.h>
 
@@ -64,6 +69,9 @@ static void notify_one(uint8_t n, bool state)
        have no endpoint and are reported over MQTT and the web UI only. */
     if (di_is_isolated(n))
         matter_di_update(n, state);
+#endif
+#ifdef CONFIG_APP_SCRIPTING_ENABLE
+    scripting_on_input_change(n, state);
 #endif
 }
 
