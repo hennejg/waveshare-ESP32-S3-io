@@ -42,9 +42,13 @@ static IRAM_ATTR bool rx_done_cb(twai_node_handle_t node,
                                   const twai_rx_done_event_data_t *edata,
                                   void *ctx)
 {
-    uint8_t buf[8];
+    uint8_t buf[8] = {0};
     twai_frame_t f = { .buffer = buf, .buffer_len = sizeof(buf) };
     if (twai_node_receive_from_isr(node, &f) != ESP_OK) return false;
+    /* A remote-transmission-request frame carries no data. The HAL parses its
+       DLC but skips the data copy, so buf would keep whatever the ISR stack
+       held and basic_handle_rx() would drive the relay bank from it. */
+    if (f.header.rtr) return false;
     rx_msg_t m = { .id = f.header.id, .ide = f.header.ide,
                    .dlc = f.header.dlc > 8 ? 8 : f.header.dlc };
     memcpy(m.data, buf, m.dlc);
