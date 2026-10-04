@@ -790,6 +790,8 @@ static esp_err_t api_factory_reset(httpd_req_t *req)
 
 static esp_err_t api_reboot(httpd_req_t *req)
 {
+    if (!check_auth(req)) return send_401(req);
+
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"rebooting\"}");
 
