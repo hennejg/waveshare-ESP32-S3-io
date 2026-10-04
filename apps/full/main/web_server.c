@@ -1000,13 +1000,23 @@ static esp_err_t api_rules_post(httpd_req_t *req)
 
     const char *script = script_j->valuestring;
     nvs_handle_t h;
-    if (nvs_open(RULES_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        if (script[0] == '\0')
-            nvs_erase_key(h, RULES_NVS_KEY);
-        else
-            nvs_set_str(h, RULES_NVS_KEY, script);
-        nvs_commit(h);
+    /* Reported rather than discarded: a failed write left the rule running
+       until the next reboot, when the previous script silently came back,
+       while the handler had answered ok. */
+    esp_err_t nvs_ret = nvs_open(RULES_NVS_NS, NVS_READWRITE, &h);
+    if (nvs_ret == ESP_OK) {
+        nvs_ret = (script[0] == '\0') ? nvs_erase_key(h, RULES_NVS_KEY)
+                                      : nvs_set_str(h, RULES_NVS_KEY, script);
+        if (nvs_ret == ESP_ERR_NVS_NOT_FOUND) nvs_ret = ESP_OK;   /* erasing what was not there */
+        if (nvs_ret == ESP_OK) nvs_ret = nvs_commit(h);
         nvs_close(h);
+    }
+    if (nvs_ret != ESP_OK) {
+        ESP_LOGE(TAG, "storing rules failed: %s", esp_err_to_name(nvs_ret));
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "rules could not be stored");
+        return ESP_OK;
     }
 
     scripting_reload(script[0] ? script : DEMO_SCRIPT);
