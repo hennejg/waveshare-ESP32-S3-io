@@ -400,8 +400,12 @@ static esp_err_t api_config_post(httpd_req_t *req)
             uint32_t id = (uint32_t)v->valuedouble;
             if (id <= 0x7FF) cfg.can.base_id = (uint16_t)id;
         }
-        if ((v = cJSON_GetObjectItem(can_j, "bitrate")) && cJSON_IsNumber(v))
-            cfg.can.bitrate = (uint32_t)v->valuedouble;
+        if ((v = cJSON_GetObjectItem(can_j, "bitrate")) && cJSON_IsNumber(v)) {
+            uint32_t br = (uint32_t)v->valuedouble;
+            /* Outside this range twai_new_node_onchip() refuses the value and
+               can_server_init() fails — see the boot-order note in main.c. */
+            if (br >= 10000 && br <= 1000000) cfg.can.bitrate = br;
+        }
         if ((v = cJSON_GetObjectItem(can_j, "tx_interval_ms")) && cJSON_IsNumber(v))
             cfg.can.tx_interval_ms = (uint16_t)v->valuedouble;
     }
@@ -415,8 +419,10 @@ static esp_err_t api_config_post(httpd_req_t *req)
             uint32_t a = (uint32_t)v->valuedouble;
             if (a >= 1 && a <= 247) cfg.modbus.address = (uint8_t)a;
         }
-        if ((v = cJSON_GetObjectItem(mb, "baudrate")) && cJSON_IsNumber(v))
-            cfg.modbus.baudrate = (uint32_t)v->valuedouble;
+        if ((v = cJSON_GetObjectItem(mb, "baudrate")) && cJSON_IsNumber(v)) {
+            uint32_t bd = (uint32_t)v->valuedouble;
+            if (bd >= 1200 && bd <= 921600) cfg.modbus.baudrate = bd;
+        }
     }
 
     cJSON *sntp_j = cJSON_GetObjectItem(root, "sntp");
