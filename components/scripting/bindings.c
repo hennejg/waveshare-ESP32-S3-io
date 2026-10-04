@@ -39,27 +39,33 @@ static JSValue js_dout_get(JSContext *ctx, JSValue this_val, int argc, JSValue *
 static JSValue js_print(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
 {
     const char *str = JS_ToCString(ctx, argv[0]);
-    if (str) {
-        ESP_LOGI(TAG, "%s", str);
-        JS_FreeCString(ctx, str);
-    }
+    if (!str) return JS_EXCEPTION;   /* toString() threw -- do not swallow it */
+    ESP_LOGI(TAG, "%s", str);
+    JS_FreeCString(ctx, str);
     return JS_UNDEFINED;
 }
 
-/* Clamp a JS number argument to a 0-255 colour byte. */
-static uint8_t to_u8(JSContext *ctx, JSValue v)
+/* Clamp a JS number argument to a 0-255 colour byte. Returns false and leaves
+   the pending exception in place if the conversion threw -- an argument whose
+   valueOf() throws used to be silently taken as 0, and the exception then sat
+   in the runtime until some later operation tripped over it. */
+static bool to_u8(JSContext *ctx, JSValue v, uint8_t *out)
 {
     int32_t n = 0;
-    JS_ToInt32(ctx, &n, v);
+    if (JS_ToInt32(ctx, &n, v) < 0) return false;
     if (n < 0)   n = 0;
     if (n > 255) n = 255;
-    return (uint8_t)n;
+    *out = (uint8_t)n;
+    return true;
 }
 
 static JSValue js_led_set(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
 {
     if (!g_scripting_io->led_set) return JS_UNDEFINED;
-    g_scripting_io->led_set(to_u8(ctx, argv[0]), to_u8(ctx, argv[1]), to_u8(ctx, argv[2]));
+    uint8_t r, g, b;
+    if (!to_u8(ctx, argv[0], &r) || !to_u8(ctx, argv[1], &g) || !to_u8(ctx, argv[2], &b))
+        return JS_EXCEPTION;
+    g_scripting_io->led_set(r, g, b);
     return JS_UNDEFINED;
 }
 
@@ -80,12 +86,18 @@ static JSValue js_mqtt_publish(JSContext *ctx, JSValue this_val, int argc, JSVal
     const char *topic = JS_ToCString(ctx, argv[0]);
     if (!topic) return JS_EXCEPTION;
 
-    const char *payload = JS_ToCString(ctx, argv[1]);
+    /* ToCStringLen, not strlen: a payload containing a NUL would otherwise be
+       cut off there. */
+    size_t payload_len = 0;
+    const char *payload = JS_ToCStringLen(ctx, &payload_len, argv[1]);
     if (!payload) { JS_FreeCString(ctx, topic); return JS_EXCEPTION; }
 
     int32_t qos = 0;
-    if (argc > 2 && !JS_IsUndefined(argv[2]))
-        JS_ToInt32(ctx, &qos, argv[2]);
+    if (argc > 2 && !JS_IsUndefined(argv[2]) && JS_ToInt32(ctx, &qos, argv[2]) < 0) {
+        JS_FreeCString(ctx, topic);
+        JS_FreeCString(ctx, payload);
+        return JS_EXCEPTION;
+    }
     if (qos < 0) qos = 0;
     if (qos > 2) qos = 2;
 
@@ -93,7 +105,7 @@ static JSValue js_mqtt_publish(JSContext *ctx, JSValue this_val, int argc, JSVal
     if (argc > 3 && !JS_IsUndefined(argv[3]))
         retain = (bool)JS_ToBool(ctx, argv[3]);
 
-    int msg_id = g_scripting_io->mqtt_publish(topic, payload, (int)strlen(payload),
+    int msg_id = g_scripting_io->mqtt_publish(topic, payload, (int)payload_len,
                                               (int)qos, retain);
     JS_FreeCString(ctx, topic);
     JS_FreeCString(ctx, payload);
