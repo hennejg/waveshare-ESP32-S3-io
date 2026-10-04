@@ -398,7 +398,9 @@ static esp_err_t api_config_post(httpd_req_t *req)
         }
         if ((v = cJSON_GetObjectItem(can_j, "base_id")) && cJSON_IsNumber(v)) {
             uint32_t id = (uint32_t)v->valuedouble;
-            if (id <= 0x7FF) cfg.can.base_id = (uint16_t)id;
+            /* base_id + 1 .. base_id + 5 are used for TX and RX matching, so
+               the whole block has to fit in the 11-bit standard range. */
+            if (id + 5 <= 0x7FF) cfg.can.base_id = (uint16_t)id;
         }
         if ((v = cJSON_GetObjectItem(can_j, "bitrate")) && cJSON_IsNumber(v))
             cfg.can.bitrate = (uint32_t)v->valuedouble;

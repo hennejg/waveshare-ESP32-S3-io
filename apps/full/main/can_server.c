@@ -24,6 +24,9 @@
 #define CAN_TX_GPIO  GPIO_NUM_2
 #define CAN_RX_GPIO  GPIO_NUM_3
 #define TX_POLL_MS   50
+/* Do not repeat the bus-off warning more often than this. A node alone on the
+   bus cycles through bus-off indefinitely; the log must stay readable. */
+#define BUS_OFF_LOG_MS 10000
 #define HB_PERIOD_MS 1000
 #define RX_QUEUE_DEPTH 32
 
@@ -393,6 +396,39 @@ static void n2k_handle_rx(const rx_msg_t *m)
 
 /* ================================================================ worker task */
 
+/* The node stays in bus-off until recovery is started explicitly: after a
+   shorted or unterminated bus, or a bitrate mismatch, twai_node_transmit()
+   fails forever and RX is dead too. Nothing else watches for that — neither
+   sender checks the return value — so CAN would be gone until the next reboot
+   with nothing in the log. Polled here, where the worker already wakes every
+   TX_POLL_MS; reading the status is a register access. */
+static void can_check_bus_off(void)
+{
+    static bool       recovering;
+    static TickType_t last_log;
+    static uint32_t   suppressed;
+
+    twai_node_status_t st;
+    if (!s_node || twai_node_get_info(s_node, &st, NULL) != ESP_OK) return;
+
+    if (st.state != TWAI_ERROR_BUS_OFF) {
+        recovering = false;
+        return;
+    }
+    if (recovering) return;   /* recovery already under way */
+
+    TickType_t now = xTaskGetTickCount();
+    if (last_log == 0 || (now - last_log) >= pdMS_TO_TICKS(BUS_OFF_LOG_MS)) {
+        if (suppressed)
+            ESP_LOGW(TAG, "bus-off repeated %" PRIu32 " more times", suppressed);
+        ESP_LOGW(TAG, "bus-off (TEC=%u) — starting recovery", st.tx_error_count);
+        last_log = now; suppressed = 0;
+    } else {
+        suppressed++;
+    }
+    if (twai_node_recover(s_node) == ESP_OK) recovering = true;
+}
+
 static void can_worker_task(void *arg)
 {
     uint8_t    last_di  = 0xFF;
@@ -406,6 +442,8 @@ static void can_worker_task(void *arg)
             if (s_mode == CAN_MODE_BASIC && !m.ide) basic_handle_rx(&m);
             else if (s_mode == CAN_MODE_N2K &&  m.ide) n2k_handle_rx(&m);
         }
+
+        can_check_bus_off();
 
         TickType_t now = xTaskGetTickCount();
 
@@ -466,6 +504,12 @@ esp_err_t can_server_init(void)
         .io_cfg.bus_off_indicator = GPIO_NUM_NC,
         .bit_timing             = timing,
         .tx_queue_depth         = 16,
+        /* -1 = retransmit on arbitration loss or bus error, which is the
+           ordinary CAN behaviour. Left at its 0 default the HAL arms
+           single-shot transmission (twai_hal_v1.c: .ss = retry_cnt != -1), so
+           a frame lost to a higher-priority node was simply dropped — and no
+           sender here looks at the return value to notice. */
+        .fail_retry_cnt         = -1,
     };
     ESP_RETURN_ON_ERROR(twai_new_node_onchip(&node_cfg, &s_node), TAG, "new node");
 
