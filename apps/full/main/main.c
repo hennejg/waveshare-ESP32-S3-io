@@ -258,8 +258,18 @@ void app_main(void)
     ESP_ERROR_CHECK(scripting_init(startup_script, &s_scripting_io));
     ESP_ERROR_CHECK(led_init());
     ESP_ERROR_CHECK(buzzer_init());
-    ESP_ERROR_CHECK(mb_server_init());
-    ESP_ERROR_CHECK(can_server_init());
+    /* Not fatal: both take a stored baudrate/bitrate, and eth_init() runs much
+       further down. Aborting here would leave the unit with no network and no
+       web UI to correct the value with — an endless boot loop recoverable only
+       over the serial port. Log and carry on instead. */
+    esp_err_t mb_ret = mb_server_init();
+    if (mb_ret != ESP_OK)
+        ESP_LOGE(TAG, "Modbus server init failed: %s — continuing without Modbus",
+                 esp_err_to_name(mb_ret));
+    esp_err_t can_ret = can_server_init();
+    if (can_ret != ESP_OK)
+        ESP_LOGE(TAG, "CAN server init failed: %s — continuing without CAN",
+                 esp_err_to_name(can_ret));
 
     esp_vfs_spiffs_conf_t spiffs = {
         .base_path              = "/www",
