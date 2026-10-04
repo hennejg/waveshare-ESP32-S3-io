@@ -10,7 +10,15 @@
 #define APP_CFG_MQTT_TOPIC_LEN    64
 #define APP_CFG_SNTP_SERVER_LEN   64
 #define APP_CFG_TZ_LEN            48   /* POSIX TZ string, e.g. "CET-1CEST,M3.5.0,M10.5.0/3" */
-#define APP_CFG_DI_COUNT           8
+/* DI1-DI8 are optocoupler-isolated; DI9-DI11 (APP_AUX_DI_ENABLE) are bare
+   3.3 V GPIOs.  APP_CFG_DI_COUNT stays the total number of inputs. */
+#define APP_CFG_DI_ISOLATED_COUNT  8
+#ifdef CONFIG_APP_AUX_DI_ENABLE
+#define APP_CFG_DI_AUX_COUNT       3
+#else
+#define APP_CFG_DI_AUX_COUNT       0
+#endif
+#define APP_CFG_DI_COUNT          (APP_CFG_DI_ISOLATED_COUNT + APP_CFG_DI_AUX_COUNT)
 #define APP_CFG_DO_COUNT           8
 #define APP_CFG_IO_NAME_MAX        20   /* max visible chars; empty = use index number */
 
@@ -19,7 +27,12 @@
 
 /* Per-input / per-output configuration (shared layout for DI and DO).
    Stored as a fixed-size NVS blob.  If the blob size changes the old data is
-   silently discarded and defaults apply. */
+   silently discarded and defaults apply.
+   The array is read with nvs_get_blob() and sizeof() as the in/out length, so
+   growing APP_CFG_DI_COUNT is graceful: an 8-entry blob still loads into the
+   11-entry array and the new entries keep their defaults.  The downgrade is
+   not — 11 entries stored into an 8-entry buffer makes nvs_get_blob() return
+   ESP_ERR_NVS_INVALID_LENGTH and every DI name falls back to its default. */
 typedef struct {
     bool    invert;                        /* true = invert logical state */
     char    name[APP_CFG_IO_NAME_MAX + 1]; /* MQTT topic fragment, no '/', empty = "1".."8" */

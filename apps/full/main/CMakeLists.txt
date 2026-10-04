@@ -16,7 +16,7 @@ foreach(_f index.html qrcode.min.js
            codemirror.min.js codemirror.min.css codemirror-javascript.min.js)
     add_custom_command(
         OUTPUT  ${_WWW}/${_f}.gz
-        COMMAND gzip -k -f ${_WWW}/${_f}
+        COMMAND gzip -9 -n -k -f ${_WWW}/${_f}
         DEPENDS ${_WWW}/${_f}
         COMMENT "Compressing www/${_f}"
     )

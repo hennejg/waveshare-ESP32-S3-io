@@ -18,12 +18,16 @@ bool app_mqtt_is_connected(void);
 #include <esp_log.h>
 
 #define TAG          "di"
-#define NUM_DI       8
+#define NUM_DI       APP_CFG_DI_COUNT
 #define DEBOUNCE_MS  10
 
 static const gpio_num_t s_gpios[NUM_DI] = {
     GPIO_NUM_4, GPIO_NUM_5, GPIO_NUM_6,  GPIO_NUM_7,
     GPIO_NUM_8, GPIO_NUM_9, GPIO_NUM_10, GPIO_NUM_11,
+#if CONFIG_APP_AUX_DI_ENABLE
+    /* Auxiliary inputs — direct 3.3 V GPIOs, no optocoupler. */
+    GPIO_NUM_1, GPIO_NUM_44, GPIO_NUM_43,
+#endif
 };
 
 static bool         s_state[NUM_DI];
@@ -56,7 +60,10 @@ static void notify_one(uint8_t n, bool state)
         publish_one(n, state);
 #endif
 #ifdef CONFIG_APP_MATTER_ENABLE
-    matter_di_update(n, state);
+    /* The Matter app exposes exactly 8 contact sensors; the auxiliary inputs
+       have no endpoint and are reported over MQTT and the web UI only. */
+    if (di_is_isolated(n))
+        matter_di_update(n, state);
 #endif
 }
 
@@ -72,6 +79,11 @@ bool di_get(uint8_t n)
 {
     if (n >= NUM_DI) return false;
     return s_state[n];
+}
+
+bool di_is_isolated(uint8_t n)
+{
+    return n < APP_CFG_DI_ISOLATED_COUNT;
 }
 
 /* ----------------------------------------------------------------- ISR / task */
@@ -132,7 +144,12 @@ esp_err_t di_init(void)
     }
 
     ESP_LOGI(TAG, "Initialized %d inputs (GPIO%d..GPIO%d)",
-             NUM_DI, s_gpios[0], s_gpios[NUM_DI - 1]);
+             APP_CFG_DI_ISOLATED_COUNT, s_gpios[0],
+             s_gpios[APP_CFG_DI_ISOLATED_COUNT - 1]);
+#if CONFIG_APP_AUX_DI_ENABLE
+    ESP_LOGW(TAG, "Plus %d non-isolated inputs (GPIO%d, GPIO%d, GPIO%d)",
+             APP_CFG_DI_AUX_COUNT, s_gpios[8], s_gpios[9], s_gpios[10]);
+#endif
     return ESP_OK;
 }
 
