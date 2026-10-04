@@ -14,6 +14,8 @@ bool app_mqtt_is_connected(void);
 #include "driver/i2c_master.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "i2c_bus.h"
 
 #define TAG          "dout"
@@ -27,6 +29,26 @@ bool app_mqtt_is_connected(void);
 static i2c_master_bus_handle_t s_bus = NULL;
 static i2c_master_dev_handle_t s_dev = NULL;
 static bool                    s_state[NUM_DO];  /* logical state */
+
+/* Guards s_state[] together with the TCA9554 write it feeds. Setting one
+   output is a read-modify-write of the whole port byte, and it is driven from
+   the CAN task, the Modbus event task, the rule engine, the HTTP server and
+   the MQTT task. Without this, two concurrent changes let the loser write its
+   stale byte last: the reported state and the relay disagree until some
+   unrelated write happens to repair it.
+   Recursive, because dout_publish_all() is reached both directly and from the
+   bulk MQTT path, which already holds the lock. */
+static SemaphoreHandle_t       s_lock;
+
+static inline void dout_lock(void)
+{
+    if (s_lock) xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
+}
+
+static inline void dout_unlock(void)
+{
+    if (s_lock) xSemaphoreGiveRecursive(s_lock);
+}
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -119,6 +141,10 @@ static void publish_one(uint8_t n)
 
 esp_err_t dout_init(void)
 {
+    if (!s_lock) {
+        s_lock = xSemaphoreCreateRecursiveMutex();
+        ESP_RETURN_ON_FALSE(s_lock, ESP_ERR_NO_MEM, TAG, "output mutex");
+    }
     ESP_RETURN_ON_ERROR(i2c_bus_init(), TAG, "I2C bus init");
     s_bus = i2c_bus_handle();   /* shared with the PCF85063 RTC */
 
@@ -148,9 +174,11 @@ bool dout_get(uint8_t n)
 esp_err_t dout_set(uint8_t n, bool state)
 {
     if (n >= NUM_DO) return ESP_ERR_INVALID_ARG;
+    dout_lock();
     bool changed = (s_state[n] != state);
     s_state[n] = state;
     esp_err_t ret = write_outputs();
+    dout_unlock();
     /* Only publish when the state changed — avoids an infinite echo loop
        caused by receiving our own confirmations back from the broker. */
 #ifdef CONFIG_APP_MQTT_ENABLE
@@ -161,7 +189,9 @@ esp_err_t dout_set(uint8_t n, bool state)
 
 void dout_publish_all(void)
 {
+    dout_lock();
     write_outputs();    /* re-apply to hardware — picks up invert changes */
+    dout_unlock();
 #ifdef CONFIG_APP_MQTT_ENABLE
     for (uint8_t i = 0; i < NUM_DO; i++) publish_one(i);
 #endif
@@ -208,19 +238,24 @@ void dout_on_mqtt_message(const char *topic, size_t tlen,
             }
             int n = cJSON_GetArraySize(arr);
             if (n > NUM_DO) n = NUM_DO;
+            dout_lock();
             for (int i = 0; i < n; i++)
                 apply_json_item(cJSON_GetArrayItem(arr, i), (uint8_t)i);
+            dout_unlock();
             cJSON_Delete(arr);
         } else {
             bool state;
+            dout_lock();
             if (parse_toggle(data, dlen)) {
                 for (uint8_t i = 0; i < NUM_DO; i++) s_state[i] = !s_state[i];
             } else if (parse_payload(data, dlen, &state)) {
                 for (uint8_t i = 0; i < NUM_DO; i++) s_state[i] = state;
             } else {
+                dout_unlock();
                 ESP_LOGW(TAG, "output/set: unrecognised payload");
                 return;
             }
+            dout_unlock();
         }
         dout_publish_all();
         return;
