@@ -570,6 +570,13 @@ rule('my-rule')
     let diIsolated = 8;
 
     const diLabel = i => (i < diIsolated ? `DI${i + 1}` : `AUX${i - diIsolated + 1}`);
+
+    /* Channel names come from the config and are whatever the API accepted:
+       validate_names() only rejects '/' and duplicates. They are interpolated
+       into markup below, including into attributes that sit next to an inline
+       handler, so escape them at the point of use. */
+    const esc = s => String(s).replace(/[&<>"']/g,
+      c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     /* GPIO number of a non-isolated channel, a nice-to-have from a hard-coded
        list and only trusted when the block has exactly the expected size.
        undefined drops the number; it never decides whether to warn. */
@@ -934,7 +941,7 @@ rule('my-rule')
             `<div class="hint err">${AUX_WARN}</div></div>`);
         }
         const pin = auxPin(i);
-        const n = cfg.di?.[i]?.name || diLabel(i);
+        const n = esc(cfg.di?.[i]?.name || diLabel(i));
         const t = i < diIsolated ? n
                 : pin === undefined ? `${n} — not isolated`
                                     : `${n} — ${pin}, not isolated`;
@@ -943,7 +950,7 @@ rule('my-rule')
           `<span class="io-lbl" title="${t}">${n}</span></div>`);
       }
       for (let i = 0; i < 8; i++) {
-        const n = cfg.dout?.[i]?.name || `DO${i + 1}`;
+        const n = esc(cfg.dout?.[i]?.name || `DO${i + 1}`);
         doG.insertAdjacentHTML('beforeend',
           `<div class="io-cell"><button type="button" id="do-btn-${i}" class="io-toggle"` +
           ` title="Click to toggle ${n}" onclick="toggleOutput(${i})">${n}</button></div>`);
