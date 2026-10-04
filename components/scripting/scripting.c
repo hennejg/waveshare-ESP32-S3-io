@@ -25,6 +25,12 @@ extern const char dsl_js_start[] asm("_binary_dsl_js_start");
 
 // QuickJS heap allocated from PSRAM via custom allocator.
 #define JS_HEAP_LIMIT    (1 * 1024 * 1024)
+
+/* Upper bound on how long one event may spend inside JavaScript. Without it an
+   endless loop in a user script stops the engine for the rest of the boot --
+   and because the script is persisted before it runs, for every boot after
+   that too. See components/scripting/Kconfig. */
+#define TIME_BUDGET_US   ((int64_t)CONFIG_SCRIPTING_TIME_BUDGET_MS * 1000)
 #define JS_STACK_LIMIT   (16 * 1024)
 
 // Max topic / payload through the event queue; larger messages are truncated.
@@ -239,6 +245,26 @@ static void call2(JSContext *ctx, JSValue fn, JSValue a0, JSValue a1)
     JS_FreeValue(ctx, a1);
 }
 
+/* ── Execution time budget ──────────────────────────────────────────────── */
+
+static int64_t s_deadline_us;   /* 0 = no budget in force */
+
+/* QuickJS polls this while interpreting; a non-zero answer throws
+   InternalError at that point, unwinding whatever the script was doing. */
+static int js_interrupt(JSRuntime *rt, void *opaque)
+{
+    (void)rt; (void)opaque;
+    if (!s_deadline_us) return 0;
+    return esp_timer_get_time() > s_deadline_us;
+}
+
+/* Called before every entry into JS. The deadline has to be renewed per event,
+   not per boot: once it has passed, every further call would throw at once. */
+static inline void budget_start(void)
+{
+    s_deadline_us = TIME_BUDGET_US ? esp_timer_get_time() + TIME_BUDGET_US : 0;
+}
+
 /* ── Scripting task ──────────────────────────────────────────────────────── */
 
 static void scripting_task(void *arg)
@@ -247,12 +273,15 @@ static void scripting_task(void *arg)
     JS_SetMemoryLimit(rt, JS_HEAP_LIMIT);
     JS_SetMaxStackSize(rt, JS_STACK_LIMIT);
     JS_SetGCThreshold(rt, 256 * 1024);
+    JS_SetInterruptHandler(rt, js_interrupt, NULL);
 
     JSContext *ctx = JS_NewContext(rt);
 
     scripting_register_bindings(ctx);
     register_timer_bindings(ctx);
+    budget_start();
     eval_or_log(ctx, dsl_js_start, "<dsl>");
+    budget_start();
     eval_or_log(ctx, s_user_script, "<user>");
     drain_jobs(rt);
 
@@ -270,6 +299,7 @@ static void scripting_task(void *arg)
     scripting_evt_t ev;
     for (;;) {
         if (xQueueReceive(s_queue, &ev, pdMS_TO_TICKS(200)) == pdTRUE) {
+            budget_start();
             switch (ev.type) {
             case EVT_MQTT:
                 call2(ctx, on_mqtt,
@@ -284,6 +314,7 @@ static void scripting_task(void *arg)
             case EVT_RELOAD:
                 // _reset_rules() also cancels any pending .after()/.heldFor() timers
                 eval_or_log(ctx, "_reset_rules()", "<reload>");
+                budget_start();   /* the user script gets a budget of its own */
                 eval_or_log(ctx, ev.reload.script, "<user>");
                 free(ev.reload.script);
                 ESP_LOGI(TAG, "Rules reloaded");
