@@ -278,15 +278,11 @@ static esp_err_t api_auth_set_password(httpd_req_t *req)
         return ESP_OK;
     }
 
-    if (!auth_token_consume(token_j->valuestring)) {
-        cJSON_Delete(root);
-        httpd_resp_set_status(req, "403 Forbidden");
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, "{\"error\":\"invalid_token\"}");
-        return ESP_OK;
-    }
+    /* Check the password before spending the token. It is single use and only
+       obtainable by pressing the button on the device, so rejecting the input
+       afterwards would send the user back to the hardware for a typo.
 
-    /* The Basic-auth parser reads the header into a 160-byte buffer, so a
+       The Basic-auth parser reads the header into a 160-byte buffer, so a
        password that cannot fit there could be set and would then lock the user
        out of the very API that set it. "Basic " plus base64 of ":" + password
        must stay within that buffer -- see APP_CFG_PASSWORD_MAX. */
@@ -301,6 +297,14 @@ static esp_err_t api_auth_set_password(httpd_req_t *req)
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_set_type(req, "application/json");
         httpd_resp_sendstr(req, "{\"error\":\"password_too_short\"}");
+        return ESP_OK;
+    }
+
+    if (!auth_token_consume(token_j->valuestring)) {
+        cJSON_Delete(root);
+        httpd_resp_set_status(req, "403 Forbidden");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"invalid_token\"}");
         return ESP_OK;
     }
 
