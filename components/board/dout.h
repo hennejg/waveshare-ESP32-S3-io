@@ -10,7 +10,24 @@ esp_err_t dout_init(void);
 /* Returns the current logical state of output n (0-7). */
 bool      dout_get(uint8_t n);
 
-/* Set output n to state, write to hardware, publish confirmation. */
+/* Current logical state of all eight outputs, bit 0 = DO1. */
+uint8_t   dout_get_all(void);
+
+/* Change several outputs as one operation: read, compute and write happen
+   under the same lock and reach the chip in a single transfer, so the
+   addressed channels switch together and no other task can slip a change in
+   between. Applied in the order clear, set, toggle; overlapping masks are
+   therefore resolved toggle-last.
+
+   Bit n of each mask refers to output n+1. Returns the result of the transfer;
+   on failure nothing changes. Prefer this over a loop of dout_set() — that
+   writes the whole port once per bit, so the outputs step through the
+   intermediate patterns and a transfer failing halfway leaves some channels
+   switched and others not. */
+esp_err_t dout_modify(uint8_t set, uint8_t clear, uint8_t toggle);
+
+/* Set output n to state, write to hardware, publish confirmation.
+   Shorthand for dout_modify() on a single channel. */
 esp_err_t dout_set(uint8_t n, bool state);
 
 /* Re-apply current logical states to hardware (e.g. after invert config

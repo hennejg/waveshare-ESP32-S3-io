@@ -66,11 +66,9 @@ static bool    s_coils_mirror_valid;
 
 static void update_timer_cb(void *arg)
 {
-    uint8_t di = 0, co = 0;
-    for (int i = 0; i < 8; i++) {
-        if (di_get(i))   di |= (uint8_t)(1u << i);
-        if (dout_get(i)) co |= (uint8_t)(1u << i);
-    }
+    uint8_t di = 0;
+    for (int i = 0; i < 8; i++) if (di_get(i)) di |= (uint8_t)(1u << i);
+    uint8_t co = dout_get_all();   /* one consistent snapshot, not eight reads */
 
     mbc_slave_lock(s_handle);
     s_di.b[0] = di;
@@ -102,16 +100,17 @@ static void apply_coil_write(const mb_param_info_t *info)
     unsigned last  = first + (info->size ? info->size : 1u);
     if (last > 8u) last = 8u;
 
-    for (unsigned i = first; i < last; i++) {
-        bool bit = (co >> i) & 1;
-        if (bit != dout_get((uint8_t)i)) dout_set((uint8_t)i, bit);
-    }
+    /* Build the masks for the addressed range and apply them in one go, so the
+       coils of a single request switch together and the state cannot move
+       between reading it and writing it. */
+    uint8_t touched = 0;
+    for (unsigned i = first; i < last; i++) touched |= (uint8_t)(1u << i);
+    dout_modify((uint8_t)(co & touched), (uint8_t)(~co & touched), 0u);
 
     /* Re-sync the image with what the outputs actually took — a write that
        failed must not keep being reported back as the coil state — and hand
        the refresher a fresh reference value. */
-    uint8_t actual = 0;
-    for (uint8_t i = 0; i < 8; i++) if (dout_get(i)) actual |= (uint8_t)(1u << i);
+    uint8_t actual = dout_get_all();
     mbc_slave_lock(s_handle);
     s_coils.b[0]         = actual;
     s_coils_mirror       = actual;

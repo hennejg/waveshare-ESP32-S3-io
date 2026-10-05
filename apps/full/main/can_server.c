@@ -166,24 +166,27 @@ static void basic_tx_di(uint8_t bits) { basic_send(s_base + 1, &bits, 1); }
 static void basic_tx_do(void)
 {
     uint8_t f[2] = {0, 0};
-    for (int i = 0; i < 8; i++) if (dout_get(i)) f[1] |= (uint8_t)(1u << i);
+    f[1] = dout_get_all();
     basic_send(s_base + 2, f, 2);
 }
 
 /* DO opcodes: 0=WRITE, 1=SET, 2=CLEAR, 3=TOGGLE */
 static void basic_apply_do(uint8_t op, uint8_t mask)
 {
-    uint8_t cur = 0;
-    for (int i = 0; i < 8; i++) if (dout_get(i)) cur |= (uint8_t)(1u << i);
-    uint8_t next;
+    /* One atomic change rather than a read followed by eight single-bit
+       writes: dout_set() rewrites the whole port each time, so the outputs
+       used to step through the intermediate patterns, the state could move
+       between the read and the write, and a transfer failing halfway left
+       some channels switched and others not. */
+    esp_err_t ret;
     switch (op) {
-    case 0: next = mask;         break;
-    case 1: next = cur |  mask;  break;
-    case 2: next = cur & ~mask;  break;
-    case 3: next = cur ^  mask;  break;
+    case 0: ret = dout_modify(mask, (uint8_t)~mask, 0u); break;   /* WRITE  */
+    case 1: ret = dout_modify(mask, 0u, 0u);             break;   /* SET    */
+    case 2: ret = dout_modify(0u, mask, 0u);             break;   /* CLEAR  */
+    case 3: ret = dout_modify(0u, 0u, mask);             break;   /* TOGGLE */
     default: return;
     }
-    for (int i = 0; i < 8; i++) { bool b = (next >> i) & 1; if (b != dout_get(i)) dout_set(i, b); }
+    if (ret != ESP_OK) ESP_LOGW(TAG, "DO command failed: %s", esp_err_to_name(ret));
     basic_tx_do();
 }
 
@@ -370,7 +373,7 @@ static void n2k_tx_di_bank(void)
 static void n2k_tx_do_bank(void)
 {
     uint8_t bitmask = 0;
-    for (int i = 0; i < 8; i++) if (dout_get(i)) bitmask |= (uint8_t)(1u << i);
+    bitmask = dout_get_all();
     uint8_t data[8];
     encode_switch_bank(data, N2K_DO_INSTANCE, bitmask);
     n2k_send_frame(n2k_make_id(N2K_PGN_SW_STATUS, 3, s_addr, N2K_ADDR_GLOBAL), data, 8);
@@ -440,13 +443,23 @@ static void n2k_handle_rx(const rx_msg_t *m)
     if (pgn == N2K_PGN_SW_CONTROL && m->dlc == 8) {
         /* Only handle bank N2K_DO_INSTANCE */
         if (m->data[0] != N2K_DO_INSTANCE) return;
+        /* Collect the whole bank first: a switch-control message addresses up
+           to eight channels and they have to change together, not one port
+           write at a time. 0x02/0x03 mean "no change" and stay out of both
+           masks. */
+        uint8_t set = 0, clear = 0;
         for (int sw = 0; sw < 8; sw++) {
             int byte_pos = 1 + sw / 4;
             int bit_pos  = (sw % 4) * 2;
             uint8_t state = (m->data[byte_pos] >> bit_pos) & 0x3;
-            if (state > 0x01) continue;   /* 0x02/0x03 = no-change */
-            bool want = (state == 0x01);
-            if (want != dout_get(sw)) dout_set(sw, want);
+            if (state > 0x01) continue;
+            if (state == 0x01) set |= (uint8_t)(1u << sw);
+            else               clear |= (uint8_t)(1u << sw);
+        }
+        if (set || clear) {
+            esp_err_t ret = dout_modify(set, clear, 0u);
+            if (ret != ESP_OK)
+                ESP_LOGW(TAG, "N2k switch control failed: %s", esp_err_to_name(ret));
         }
         n2k_tx_do_bank();
         scripting_on_can_activity();   /* upstream DO control → CAN command-health feed */
