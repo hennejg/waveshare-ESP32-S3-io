@@ -1,4 +1,6 @@
 #include "mb_server.h"
+
+#include <string.h>
 #include "app_config.h"
 #include "di.h"
 #include "dout.h"
@@ -121,12 +123,13 @@ mb_err_enum_t mbc_reg_coils_slave_cb(mb_base_t *inst, uint8_t *reg_buffer,
     if ((uint32_t)address + n_coils > MB_NUM_COILS) return MB_ENOREG;
 
     if (mode == MB_REG_READ) {
+        /* The stack hands us a slice of the response frame without clearing
+           it, so the padding bits of the last byte would otherwise carry
+           leftovers of an earlier request. Modbus wants them zero. */
+        memset(reg_buffer, 0, (size_t)((n_coils + 7u) / 8u));
         uint8_t live = dout_get_all();
-        for (uint16_t i = 0; i < n_coils; i++) {
-            uint16_t src = (uint16_t)(address + i);
-            if (live & (1u << src)) reg_buffer[i >> 3] |=  (uint8_t)(1u << (i & 7));
-            else                    reg_buffer[i >> 3] &= (uint8_t)~(1u << (i & 7));
-        }
+        for (uint16_t i = 0; i < n_coils; i++)
+            if (live & (1u << (address + i))) reg_buffer[i >> 3] |= (uint8_t)(1u << (i & 7));
         return MB_ENOERR;
     }
 
@@ -145,10 +148,9 @@ mb_err_enum_t mbc_reg_discrete_slave_cb(mb_base_t *inst, uint8_t *reg_buffer,
     address--;
     if ((uint32_t)address + n_discrete > MB_NUM_DISCRETE) return MB_ENOREG;
 
-    for (uint16_t i = 0; i < n_discrete; i++) {
-        if (di_get((uint8_t)(address + i))) reg_buffer[i >> 3] |=  (uint8_t)(1u << (i & 7));
-        else                                reg_buffer[i >> 3] &= (uint8_t)~(1u << (i & 7));
-    }
+    memset(reg_buffer, 0, (size_t)((n_discrete + 7u) / 8u));   /* see the coil path */
+    for (uint16_t i = 0; i < n_discrete; i++)
+        if (di_get((uint8_t)(address + i))) reg_buffer[i >> 3] |= (uint8_t)(1u << (i & 7));
     return MB_ENOERR;
 }
 

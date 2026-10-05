@@ -77,7 +77,10 @@ static bool s_time_valid = false;
  * does nothing but post an EVT_TIMER carrying the id; the scripting task looks the id
  * up and invokes the stored JS function. The table is thus only ever accessed from
  * the scripting task (set / clear / EVT_TIMER), so it needs no lock. */
-#define MAX_TIMERS 24
+/* Two generations of rules share this table during a reload: the running set
+   still holds its slots while the new script is being evaluated, so it has to
+   be big enough for both or the new script quietly fails to arm. */
+#define MAX_TIMERS 48
 
 typedef struct {
     bool               used;
@@ -88,6 +91,9 @@ typedef struct {
 
 static timer_slot_t s_timers[MAX_TIMERS];
 static uint32_t     s_next_timer_id = 1;
+/* Counts refusals, so a reload can tell whether the new script got every
+   timer it asked for. */
+static uint32_t     s_timer_full_count;
 
 static timer_slot_t *timer_find(uint32_t id)
 {
@@ -104,7 +110,7 @@ static timer_slot_t *timer_find(uint32_t id)
 
    Single producer (the esp_timer task) and single consumer (the scripting
    task), so head and tail need no lock. */
-#define TIMER_OVERFLOW_SLOTS 16
+#define TIMER_OVERFLOW_SLOTS (MAX_TIMERS + 1)   /* one slot is the empty marker */
 static volatile uint32_t s_overflow[TIMER_OVERFLOW_SLOTS];
 static volatile uint8_t  s_of_head, s_of_tail;
 
@@ -139,6 +145,7 @@ static JSValue js_set_timer(JSContext *ctx, JSValue this_val, int argc, JSValue 
     int slot = -1;
     for (int i = 0; i < MAX_TIMERS; i++) if (!s_timers[i].used) { slot = i; break; }
     if (slot < 0) {
+        s_timer_full_count++;
         ESP_LOGW(TAG, "rule timer table full (%d) — timer dropped", MAX_TIMERS);
         return JS_NewInt32(ctx, -1);
     }
@@ -465,6 +472,8 @@ static void scripting_task(void *arg)
                 scripting_register_bindings(nctx);
                 register_timer_bindings(nctx);
 
+                uint32_t full_before = s_timer_full_count;
+
                 budget_start();
                 bool ok = eval_check(nctx, dsl_js_start, "<dsl>");
                 if (ok) {
@@ -472,6 +481,17 @@ static void scripting_task(void *arg)
                     ok = eval_check(nctx, ev.reload.script, "<user>");
                 }
                 free(ev.reload.script);
+
+                /* The running rules still hold their slots while this was
+                   evaluated. If the table ran out, the new script is missing
+                   timers it asked for -- an every() that never ticks, a
+                   watchdog that never expires. Refuse the reload rather than
+                   install a ruleset that is quietly incomplete. */
+                if (ok && s_timer_full_count != full_before) {
+                    ESP_LOGE(TAG, "reload needs more timers than are free (%d total)",
+                             MAX_TIMERS);
+                    ok = false;
+                }
 
                 if (!ok) {
                     /* Release what the failed script managed to arm, keep the
