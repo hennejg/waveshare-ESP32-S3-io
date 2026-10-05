@@ -65,37 +65,61 @@ static IRAM_ATTR bool rx_done_cb(twai_node_handle_t node,
 
 static uint16_t s_base;
 
-/* twai_node_transmit() does not copy the frame. The driver keeps a pointer to
-   it and to its buffer until the transmission completes -- esp_twai_onchip.c
-   either sets p_curr_tx = frame or queues &frame in tx_mount_queue. A frame
-   built on the stack is therefore still being read after the sender has
-   returned and the stack slot has been reused.
+/* The driver does not copy a frame: it keeps a pointer to the twai_frame_t and
+   to its buffer in p_curr_tx and in tx_mount_queue until the transmission
+   finishes. Frames therefore live here rather than on the sender's stack, and
+   a slot is reused only once the driver has reported that frame done.
 
-   Observed on the wire with a CAN analyser: of two frames sent back to back,
-   the first (hardware idle, sent at once) arrives correctly, while the second
-   (queued, sent later) goes out as 4C5 [0] instead of 102 [2] -- a corrupted
-   id and length. One frame per second is always clean.
+   The table is one slot deeper than the driver's TX queue, because the driver
+   can hold tx_queue_depth queued frames plus the one in flight. A free-running
+   ring would not be enough even at that size: on a bus that makes no progress
+   the index wraps while frames are still pending, and overwriting a pending
+   frame changes what later goes on the wire.
 
-   A ring as deep as the driver's TX queue keeps every frame in flight alive.
-   All senders run on the CAN worker task, so the index needs no locking. */
-#define TX_SLOTS 16
+   If every slot is in flight the frame is dropped and reported. That is the
+   safe direction: losing a status frame on a stalled bus is recoverable,
+   corrupting one that is already queued is not.
+
+   Known limitation: frames still sitting in the driver's queue when the node
+   goes bus-off are not dequeued and produce no completion callback, so their
+   slots stay taken until the node recovers. Transmission then reports
+   ESP_ERR_NO_MEM rather than going quiet. */
+#define TX_QUEUE_DEPTH 16
+#define TX_SLOTS       (TX_QUEUE_DEPTH + 1)
 
 static struct {
-    twai_frame_t f;
-    uint8_t      buf[8];
+    twai_frame_t  f;
+    uint8_t       buf[8];
+    volatile bool busy;
 } s_tx[TX_SLOTS];
-static uint8_t s_tx_next;
 
 static twai_frame_t *tx_claim(const uint8_t *data, uint8_t dlc, uint8_t fill)
 {
-    __typeof__(s_tx[0]) *slot = &s_tx[s_tx_next];
-    s_tx_next = (uint8_t)((s_tx_next + 1u) % TX_SLOTS);
+    for (int i = 0; i < TX_SLOTS; i++) {
+        if (s_tx[i].busy) continue;
+        s_tx[i].busy = true;
+        memset(s_tx[i].buf, fill, sizeof(s_tx[i].buf));
+        if (dlc && data) memcpy(s_tx[i].buf, data, dlc);
+        s_tx[i].f.buffer     = s_tx[i].buf;
+        s_tx[i].f.buffer_len = dlc;
+        return &s_tx[i].f;
+    }
+    return NULL;
+}
 
-    memset(slot->buf, fill, sizeof(slot->buf));
-    if (dlc && data) memcpy(slot->buf, data, dlc);
-    slot->f.buffer     = slot->buf;
-    slot->f.buffer_len = dlc;
-    return &slot->f;
+static void tx_release(const twai_frame_t *f)
+{
+    for (int i = 0; i < TX_SLOTS; i++)
+        if (&s_tx[i].f == f) { s_tx[i].busy = false; return; }
+}
+
+/* Fires for every frame the hardware took, successful or not. */
+static IRAM_ATTR bool tx_done_cb(twai_node_handle_t node,
+                                 const twai_tx_done_event_data_t *edata, void *ctx)
+{
+    (void)node; (void)ctx;
+    tx_release(edata->done_tx_frame);
+    return false;
 }
 
 /* A rejected transmit used to vanish: basic_send() discarded the result and
@@ -121,13 +145,14 @@ static void tx_failed(uint32_t id, esp_err_t err)
 static void basic_send(uint16_t id, const uint8_t *data, uint8_t dlc)
 {
     if (dlc > 8) dlc = 8;
+    twai_frame_t *f = tx_claim(data, dlc, 0x00);
+    if (!f) { tx_failed(id, ESP_ERR_NO_MEM); return; }
     /* buffer_len must describe the payload, not the buffer: the driver rejects
        the frame unless header.dlc == twaifd_len2dlc(buffer_len). */
-    twai_frame_t *f = tx_claim(data, dlc, 0x00);
     f->header = (twai_frame_header_t){ .id = id, .dlc = dlc, .ide = 0, .rtr = 0 };
     f->buffer_len = dlc;
     esp_err_t r = twai_node_transmit(s_node, f, 5);
-    if (r != ESP_OK) tx_failed(id, r);
+    if (r != ESP_OK) { tx_release(f); tx_failed(id, r); }
 }
 
 static void basic_tx_heartbeat(void)
@@ -243,10 +268,11 @@ static void n2k_send_frame(uint32_t can_id, const uint8_t *data, uint8_t dlc)
 {
     if (dlc > 8) dlc = 8;
     twai_frame_t *f = tx_claim(data, dlc, 0xFF);   /* see basic_send() */
+    if (!f) { tx_failed(can_id, ESP_ERR_NO_MEM); return; }
     f->header = (twai_frame_header_t){ .id = can_id, .dlc = dlc, .ide = 1, .rtr = 0 };
     f->buffer_len = dlc;
     esp_err_t r = twai_node_transmit(s_node, f, 5);
-    if (r != ESP_OK) tx_failed(can_id, r);
+    if (r != ESP_OK) { tx_release(f); tx_failed(can_id, r); }
 }
 
 /* Fast-packet sender: handles messages > 8 bytes. */
@@ -559,7 +585,7 @@ esp_err_t can_server_init(void)
         .io_cfg.quanta_clk_out  = GPIO_NUM_NC,
         .io_cfg.bus_off_indicator = GPIO_NUM_NC,
         .bit_timing             = timing,
-        .tx_queue_depth         = 16,
+        .tx_queue_depth         = TX_QUEUE_DEPTH,
         /* -1 = retransmit on arbitration loss or bus error, which is the
            ordinary CAN behaviour. Left at its 0 default the HAL arms
            single-shot transmission (twai_hal_v1.c: .ss = retry_cnt != -1), so
@@ -570,7 +596,7 @@ esp_err_t can_server_init(void)
     ESP_RETURN_ON_ERROR(twai_new_node_onchip(&node_cfg, &s_node), TAG, "new node");
 
     s_rx_q = xQueueCreate(RX_QUEUE_DEPTH, sizeof(rx_msg_t));
-    twai_event_callbacks_t cbs = { .on_rx_done = rx_done_cb };
+    twai_event_callbacks_t cbs = { .on_rx_done = rx_done_cb, .on_tx_done = tx_done_cb };
     ESP_RETURN_ON_ERROR(twai_node_register_event_callbacks(s_node, &cbs, NULL),
                         TAG, "register cbs");
     ESP_RETURN_ON_ERROR(twai_node_enable(s_node), TAG, "enable");
