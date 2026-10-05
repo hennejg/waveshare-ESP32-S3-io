@@ -19,6 +19,11 @@
 #define MB_UART     UART_NUM_1
 #define MB_TX_GPIO  GPIO_NUM_17
 #define MB_RX_GPIO  GPIO_NUM_18
+/* The isolated RS-485 transceiver is not auto-direction: the board brings its
+   driver enable out on GPIO21, documented by Waveshare as "RS485 UART RTS pin".
+   UART_MODE_RS485_HALF_DUPLEX makes the UART drive RTS as the direction
+   signal, but only if RTS is actually routed to that pin. */
+#define MB_RTS_GPIO GPIO_NUM_21
 
 /* ---------------------------------------------------------------- data stores */
 
@@ -140,7 +145,7 @@ esp_err_t mb_server_init(void)
        internally; uart_set_pin/mode patch it afterwards. */
     ESP_RETURN_ON_ERROR(
         uart_set_pin(MB_UART, MB_TX_GPIO, MB_RX_GPIO,
-                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE),
+                     MB_RTS_GPIO, UART_PIN_NO_CHANGE),
         TAG, "uart_set_pin");
     ESP_RETURN_ON_ERROR(
         uart_set_mode(MB_UART, UART_MODE_RS485_HALF_DUPLEX),
