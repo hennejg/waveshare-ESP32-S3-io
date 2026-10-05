@@ -33,6 +33,7 @@
     #status { margin-top: 0.8rem; font-size: 0.9rem; min-height: 1.2em; }
     .ok  { color: #2d7d46; }
     .err { color: #c0392b; }
+    .banner-warn { background:#fdecea; border:1px solid #e6b0aa; color:#922b21; padding:.5rem .7rem; border-radius:4px; margin:.5rem 0; font-size:.85rem; }
     /* Auth overlay */
     #auth-overlay { position:fixed; inset:0; background:#fff; display:flex;
                     align-items:center; justify-content:center; z-index:100; }
@@ -357,6 +358,7 @@
     <div id="tab-rules" class="tab-pane">
       <h2>Automation Rules</h2>
       <p class="hint">JavaScript rule script — changes are saved to the device and applied immediately without reboot. Leave empty and save to revert to the built-in demo. See the <a href="https://github.com/hennejg/waveshare-ESP32-S3-io/blob/master/components/scripting/RULES.md" target="_blank" rel="noopener">rule language reference</a>.</p>
+      <div id="rules-quarantine" class="banner-warn" style="display:none"></div>
       <textarea id="rules-script" class="rules-editor" spellcheck="false" maxlength="3900"></textarea>
       <p id="rules-status"></p>
       <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.4rem">
@@ -1056,6 +1058,14 @@ rule('my-rule')
         const d = await r.json();
         setRulesText(d.script || '');
         if (rulesCM) rulesCM.refresh();
+        const q = document.getElementById('rules-quarantine');
+        if (d.quarantined) {
+          q.textContent = 'These rules repeatedly failed to load (an endless loop or timeout), '
+            + 'so the device is running the built-in demo instead. Fix the script and save to re-enable it.';
+          q.style.display = '';
+        } else {
+          q.style.display = 'none';
+        }
         rulesLoaded = true;
       } catch (_) {}
     }

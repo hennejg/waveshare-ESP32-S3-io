@@ -62,6 +62,7 @@ typedef struct {
 
 static QueueHandle_t       s_queue;
 static const char         *s_user_script;
+static scripting_loaded_fn_t s_loaded_cb;   // startup load-outcome callback (may be NULL)
 const  scripting_io_t     *g_scripting_io;  // used by bindings.c
 
 /* Wall-clock validity: false until the system clock holds real time (RTC seed at boot
@@ -255,6 +256,7 @@ static void call2(JSContext *ctx, JSValue fn, JSValue a0, JSValue a1)
 /* ── Execution time budget ──────────────────────────────────────────────── */
 
 static int64_t s_deadline_us;   /* 0 = no budget in force */
+static volatile bool s_interrupted;   /* set when the budget tripped this entry */
 
 /* QuickJS polls this while interpreting; a non-zero answer throws
    InternalError at that point, unwinding whatever the script was doing. */
@@ -262,13 +264,15 @@ static int js_interrupt(JSRuntime *rt, void *opaque)
 {
     (void)rt; (void)opaque;
     if (!s_deadline_us) return 0;
-    return esp_timer_get_time() > s_deadline_us;
+    if (esp_timer_get_time() > s_deadline_us) { s_interrupted = true; return 1; }
+    return 0;
 }
 
 /* Called before every entry into JS. The deadline has to be renewed per event,
    not per boot: once it has passed, every further call would throw at once. */
 static inline void budget_start(void)
 {
+    s_interrupted = false;
     s_deadline_us = TIME_BUDGET_US ? esp_timer_get_time() + TIME_BUDGET_US : 0;
 }
 
@@ -290,7 +294,12 @@ static void scripting_task(void *arg)
     eval_or_log(ctx, dsl_js_start, "<dsl>");
     budget_start();
     eval_or_log(ctx, s_user_script, "<user>");
+    /* Report whether the startup script finished within the time budget, before
+       drain_jobs() can set the flag from a pending job. The caller uses this to
+       quarantine a persisted script that never loads. */
+    bool user_interrupted = s_interrupted;
     drain_jobs(rt);
+    if (s_loaded_cb) s_loaded_cb(user_interrupted);
 
     JSValue global       = JS_GetGlobalObject(ctx);
     JSValue on_mqtt      = JS_GetPropertyStr(ctx, global, "_on_mqtt");
@@ -375,9 +384,11 @@ static void scripting_task(void *arg)
 
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
-esp_err_t scripting_init(const char *user_script, const scripting_io_t *io)
+esp_err_t scripting_init(const char *user_script, const scripting_io_t *io,
+                         scripting_loaded_fn_t on_loaded)
 {
     s_user_script  = user_script;
+    s_loaded_cb    = on_loaded;
     g_scripting_io = io;
 
     s_queue = xQueueCreate(QUEUE_DEPTH, sizeof(scripting_evt_t));

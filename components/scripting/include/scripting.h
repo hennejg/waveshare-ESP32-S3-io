@@ -24,10 +24,20 @@ typedef struct {
     scripting_buzzer_set_fn_t     buzzer_set;   /* continuous tone; 0 Hz = off */
 } scripting_io_t;
 
+// Called once from the scripting task after the startup user_script has been
+// evaluated. interrupted == true means evaluation hit the execution time budget
+// (CONFIG_SCRIPTING_TIME_BUDGET_MS) — typically a top-level loop — so the rules
+// did not finish loading. Lets the caller track repeated load failures and
+// quarantine a persisted script that never loads. May be NULL. Runs on the
+// scripting task context, so it may block briefly (e.g. an NVS write).
+typedef void (*scripting_loaded_fn_t)(bool interrupted);
+
 // Initialize the scripting engine and start the rule evaluation task.
 // user_script must remain valid for the application lifetime (string literal or static buffer).
 // io must remain valid for the application lifetime.
-esp_err_t scripting_init(const char *user_script, const scripting_io_t *io);
+// on_loaded is invoked once after the startup script is evaluated (may be NULL).
+esp_err_t scripting_init(const char *user_script, const scripting_io_t *io,
+                         scripting_loaded_fn_t on_loaded);
 
 // Called from the MQTT connected callback — subscribes to the rules topic.
 void scripting_on_mqtt_connected(void);
