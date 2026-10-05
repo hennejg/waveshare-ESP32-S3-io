@@ -18,6 +18,10 @@
 
 extern const char DEMO_SCRIPT[];
 
+/* Rule-script quarantine state (owned by main.c). */
+extern bool rules_is_quarantined(void);
+extern void rules_clear_quarantine(void);
+
 #define RULES_NVS_NS  "scripting"
 #define RULES_NVS_KEY "script"
 #define RULES_MAX_LEN 3900
@@ -988,6 +992,9 @@ static esp_err_t api_rules_get(httpd_req_t *req)
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "script", script);
+    /* True when this stored script was swapped for the demo after repeated
+       load failures; the editor shows it so the script can be corrected. */
+    cJSON_AddBoolToObject(root, "quarantined", rules_is_quarantined());
     free(buf);
 
     char *body = cJSON_PrintUnformatted(root);
@@ -1046,6 +1053,9 @@ static esp_err_t api_rules_post(httpd_req_t *req)
         return ESP_OK;
     }
 
+    /* A new script gets a fresh start: reset the strike count and lift any
+       quarantine before reloading. */
+    rules_clear_quarantine();
     scripting_reload(script[0] ? script : DEMO_SCRIPT);
 
     cJSON_Delete(root);

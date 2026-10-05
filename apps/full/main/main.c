@@ -59,6 +59,54 @@ static const scripting_io_t s_scripting_io = {
 #define NVS_ETH_NS   "app_config"
 #define NVS_ETH_KEY  "eth_only"
 
+/* ------------------------------------------------------------ rule quarantine */
+
+/* A persisted user script that never finishes loading — an endless loop trips
+   the rule-engine time budget (CONFIG_SCRIPTING_TIME_BUDGET_MS), so the rules
+   never register — is swapped for the demo after RULES_FAIL_MAX unsuccessful
+   boots, and the web UI is told why. The strike count shares the scripting NVS
+   namespace; it is bumped before the script runs and cleared once it loads
+   cleanly (scripting_init's on_loaded callback). Saving new rules clears it. */
+#define RULES_NVS_NS   "scripting"
+#define RULES_FAIL_KEY "fail"
+#define RULES_FAIL_MAX 3
+
+static bool s_rules_quarantined;   /* RAM mirror, read by the web API */
+
+bool rules_is_quarantined(void) { return s_rules_quarantined; }
+
+/* Clear the strike count and lift quarantine — called when new rules are saved,
+   so a corrected script gets a fresh start. */
+void rules_clear_quarantine(void)
+{
+    s_rules_quarantined = false;
+    nvs_handle_t h;
+    if (nvs_open(RULES_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        esp_err_t e = nvs_erase_key(h, RULES_FAIL_KEY);
+        if (e == ESP_OK) nvs_commit(h);   /* ESP_ERR_NVS_NOT_FOUND: nothing to clear */
+        nvs_close(h);
+    }
+}
+
+/* Runs on the scripting task once the startup script has been evaluated. A
+   clean load clears the strike bumped at boot; a time-budget trip leaves it in
+   place, so a script that never loads climbs to RULES_FAIL_MAX and is
+   quarantined on a later boot. Skipped while already quarantined (the demo is
+   running, there is nothing to vindicate). */
+static void on_rules_loaded(bool interrupted)
+{
+    if (interrupted) {
+        ESP_LOGW(TAG, "user rules did not load within the time budget — "
+                      "will quarantine after repeated failures");
+        return;
+    }
+    nvs_handle_t h;
+    if (nvs_open(RULES_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        if (nvs_erase_key(h, RULES_FAIL_KEY) == ESP_OK) nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
 /* ---------------------------------------------------------------- helpers */
 
 static bool get_eth_only(void)
@@ -246,16 +294,46 @@ void app_main(void)
     /* Load user script from NVS; fall back to built-in demo if none stored. */
     const char *startup_script = DEMO_SCRIPT;
     static char s_nvs_script_buf[4096];
+    bool have_user_script = false;
     {
         nvs_handle_t h;
         size_t len = sizeof(s_nvs_script_buf);
-        if (nvs_open("scripting", NVS_READONLY, &h) == ESP_OK) {
-            if (nvs_get_str(h, "script", s_nvs_script_buf, &len) == ESP_OK)
+        if (nvs_open(RULES_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+            if (nvs_get_str(h, "script", s_nvs_script_buf, &len) == ESP_OK) {
                 startup_script = s_nvs_script_buf;
+                have_user_script = true;
+            }
             nvs_close(h);
         }
     }
-    ESP_ERROR_CHECK(scripting_init(startup_script, &s_scripting_io));
+
+    /* Quarantine a stored script that keeps failing to load (see above). Only
+       a user script is at risk; the demo always loads. Bump the strike count
+       before running it — the count is committed before the engine starts, so
+       even a hard hang with the budget disabled still climbs across boots. */
+    if (have_user_script) {
+        nvs_handle_t h;
+        if (nvs_open(RULES_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+            uint8_t strikes = 0;
+            nvs_get_u8(h, RULES_FAIL_KEY, &strikes);   /* absent -> 0 */
+            if (strikes >= RULES_FAIL_MAX) {
+                s_rules_quarantined = true;
+                startup_script = DEMO_SCRIPT;
+                ESP_LOGE(TAG, "rules quarantined after %u failed loads — running demo; "
+                              "save new rules to re-enable", strikes);
+            } else {
+                nvs_set_u8(h, RULES_FAIL_KEY, (uint8_t)(strikes + 1));
+                nvs_commit(h);
+            }
+            nvs_close(h);
+        }
+    }
+
+    /* While quarantined the demo is running, so there is no strike to clear —
+       pass no callback, keeping the count at the threshold until new rules
+       arrive. Otherwise let the engine report whether the script loaded. */
+    ESP_ERROR_CHECK(scripting_init(startup_script, &s_scripting_io,
+                                   s_rules_quarantined ? NULL : on_rules_loaded));
     ESP_ERROR_CHECK(led_init());
     ESP_ERROR_CHECK(buzzer_init());
     /* Not fatal: both take a stored baudrate/bitrate, and eth_init() runs much
