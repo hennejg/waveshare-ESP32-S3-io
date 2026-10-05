@@ -1,0 +1,27 @@
+menu "Rule engine"
+
+    config SCRIPTING_TIME_BUDGET_MS
+        int "Time budget per rule-engine event (ms, 0 = unlimited)"
+        default 2000
+        range 0 60000
+        help
+            Upper bound on how long one event may spend inside JavaScript —
+            an input edge, an MQTT message, a timer, or loading a script.
+
+            Without a bound, a user script containing an endless loop stops the
+            rule engine for good: every later event, including the reload of a
+            corrected script, queues up behind it and is never processed. The
+            HTTP handler still answers ok, and the task watchdog only prints a
+            message because CONFIG_ESP_TASK_WDT_PANIC is not set. Since the
+            script is written to NVS before it ever runs, rebooting re-enters
+            the same hang.
+
+            When the budget is exceeded, QuickJS throws InternalError at the
+            next interrupt check. _run_steps() already catches it, so the rule
+            fails and the engine carries on.
+
+            2000 ms is generous for I/O automation, where a rule body is
+            normally a handful of operations. Raise it if you do heavy work in
+            a rule; 0 disables the check and restores the old behaviour.
+
+endmenu

@@ -79,6 +79,11 @@ function _schedule(ms, fn) {
     if (typeof _set_timer === 'function')      id = _set_timer(ms, wrapped);
     else if (typeof setTimeout === 'function') id = setTimeout(wrapped, ms);
     else { fn(); return null; }   // no scheduler available — degrade to immediate
+    // _set_timer answers -1 when the timer table is full. Callers store the
+    // result in _timer and guard on `!= null`, and -1 != null is true in JS —
+    // so returning it would mark the rule as armed forever and stop it from
+    // ever trying again. Report "not scheduled" instead.
+    if (id == null || id < 0) return null;
     _pending.push(id);
     return id;
 }
@@ -185,8 +190,20 @@ MqttCondition.prototype.publish = function(payload, opts) {
 
 // ── InputCondition ───────────────────────────────────────────────────────────
 
+// Channel numbers reach the host as integers; keep the DSL's own bookkeeping
+// in step so a fact key cannot drift away from the pin that was read.
+function _channel(ch, what) {
+    var n = Number(ch);
+    if (!isFinite(n) || Math.floor(n) !== n)
+        throw new RangeError(what + ' channel must be a whole number, got ' + ch);
+    return n;
+}
+
 function InputCondition(ch) {
-    this.channel = ch;
+    // Normalise: the host truncates to an integer, but the dispatch key is built
+    // from this value. input(3.7) would read DI3 and then wait for 'input:3.7',
+    // a fact nothing ever emits -- the rule is registered and never fires.
+    this.channel = _channel(ch, 'input');
     this._expected = undefined;
 }
 // Copy-on-write: returns a NEW narrowed pattern, never mutates the receiver, so
@@ -216,7 +233,7 @@ InputCondition.prototype.get = function() { return _di_get(this.channel); };
 // _drive_output emits an 'output:ch' event so rules gated on the output re-evaluate.
 
 function OutputCondition(ch) {
-    this.channel = ch;
+    this.channel = _channel(ch, 'output');
     this._expected = undefined;
 }
 // actuator side — mutators return the resulting level, e.g. print(output(0).toggle())

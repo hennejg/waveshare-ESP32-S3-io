@@ -24,6 +24,10 @@
 #define CAN_TX_GPIO  GPIO_NUM_2
 #define CAN_RX_GPIO  GPIO_NUM_3
 #define TX_POLL_MS   50
+#define TX_FAIL_LOG_MS 10000   /* do not repeat a transmit failure more often */
+/* Do not repeat the bus-off warning more often than this. A node alone on the
+   bus cycles through bus-off indefinitely; the log must stay readable. */
+#define BUS_OFF_LOG_MS 10000
 #define HB_PERIOD_MS 1000
 #define RX_QUEUE_DEPTH 32
 
@@ -42,9 +46,13 @@ static IRAM_ATTR bool rx_done_cb(twai_node_handle_t node,
                                   const twai_rx_done_event_data_t *edata,
                                   void *ctx)
 {
-    uint8_t buf[8];
+    uint8_t buf[8] = {0};
     twai_frame_t f = { .buffer = buf, .buffer_len = sizeof(buf) };
     if (twai_node_receive_from_isr(node, &f) != ESP_OK) return false;
+    /* A remote-transmission-request frame carries no data. The HAL parses its
+       DLC but skips the data copy, so buf would keep whatever the ISR stack
+       held and basic_handle_rx() would drive the relay bank from it. */
+    if (f.header.rtr) return false;
     rx_msg_t m = { .id = f.header.id, .ide = f.header.ide,
                    .dlc = f.header.dlc > 8 ? 8 : f.header.dlc };
     memcpy(m.data, buf, m.dlc);
@@ -57,15 +65,39 @@ static IRAM_ATTR bool rx_done_cb(twai_node_handle_t node,
 
 static uint16_t s_base;
 
+/* A rejected transmit used to vanish: basic_send() discarded the result and
+   n2k_send_frame() logged at DEBUG, which is below the configured level. That
+   is how an every-frame failure stayed invisible. Rate-limited so a
+   disconnected bus cannot flood the log. */
+static void tx_failed(uint32_t id, esp_err_t err)
+{
+    static TickType_t last;
+    static uint32_t   suppressed;
+    TickType_t now = xTaskGetTickCount();
+
+    if (last == 0 || (now - last) >= pdMS_TO_TICKS(TX_FAIL_LOG_MS)) {
+        if (suppressed)
+            ESP_LOGW(TAG, "%" PRIu32 " further transmits failed", suppressed);
+        ESP_LOGW(TAG, "TX %03" PRIx32 " failed: %s", id, esp_err_to_name(err));
+        last = now; suppressed = 0;
+    } else {
+        suppressed++;
+    }
+}
+
 static void basic_send(uint16_t id, const uint8_t *data, uint8_t dlc)
 {
     uint8_t buf[8] = {0};
+    if (dlc > 8) dlc = 8;
     if (dlc && data) memcpy(buf, data, dlc);
     twai_frame_t f = {
         .header = { .id = id, .dlc = dlc, .ide = 0, .rtr = 0 },
-        .buffer = buf, .buffer_len = sizeof(buf),
+        /* Must describe the payload, not the buffer: the driver rejects the
+           frame unless header.dlc == twaifd_len2dlc(buffer_len). */
+        .buffer = buf, .buffer_len = dlc,
     };
-    twai_node_transmit(s_node, &f, 5);
+    esp_err_t r = twai_node_transmit(s_node, &f, 5);
+    if (r != ESP_OK) tx_failed(id, r);
 }
 
 static void basic_tx_heartbeat(void)
@@ -181,13 +213,14 @@ static void n2k_send_frame(uint32_t can_id, const uint8_t *data, uint8_t dlc)
 {
     uint8_t buf[8];
     memset(buf, 0xFF, 8);
-    if (dlc && data) memcpy(buf, data, dlc < 8 ? dlc : 8);
+    if (dlc > 8) dlc = 8;
+    if (dlc && data) memcpy(buf, data, dlc);
     twai_frame_t f = {
-        .header = { .id = can_id, .dlc = dlc < 8 ? dlc : 8, .ide = 1, .rtr = 0 },
-        .buffer = buf, .buffer_len = sizeof(buf),
+        .header = { .id = can_id, .dlc = dlc, .ide = 1, .rtr = 0 },
+        .buffer = buf, .buffer_len = dlc,   /* see basic_send() */
     };
     esp_err_t r = twai_node_transmit(s_node, &f, 5);
-    if (r != ESP_OK) ESP_LOGD(TAG, "N2k TX %08"PRIx32": %s", can_id, esp_err_to_name(r));
+    if (r != ESP_OK) tx_failed(can_id, r);
 }
 
 /* Fast-packet sender: handles messages > 8 bytes. */
@@ -393,6 +426,39 @@ static void n2k_handle_rx(const rx_msg_t *m)
 
 /* ================================================================ worker task */
 
+/* The node stays in bus-off until recovery is started explicitly: after a
+   shorted or unterminated bus, or a bitrate mismatch, twai_node_transmit()
+   fails forever and RX is dead too. Nothing else watches for that — neither
+   sender checks the return value — so CAN would be gone until the next reboot
+   with nothing in the log. Polled here, where the worker already wakes every
+   TX_POLL_MS; reading the status is a register access. */
+static void can_check_bus_off(void)
+{
+    static bool       recovering;
+    static TickType_t last_log;
+    static uint32_t   suppressed;
+
+    twai_node_status_t st;
+    if (!s_node || twai_node_get_info(s_node, &st, NULL) != ESP_OK) return;
+
+    if (st.state != TWAI_ERROR_BUS_OFF) {
+        recovering = false;
+        return;
+    }
+    if (recovering) return;   /* recovery already under way */
+
+    TickType_t now = xTaskGetTickCount();
+    if (last_log == 0 || (now - last_log) >= pdMS_TO_TICKS(BUS_OFF_LOG_MS)) {
+        if (suppressed)
+            ESP_LOGW(TAG, "bus-off repeated %" PRIu32 " more times", suppressed);
+        ESP_LOGW(TAG, "bus-off (TEC=%u) — starting recovery", st.tx_error_count);
+        last_log = now; suppressed = 0;
+    } else {
+        suppressed++;
+    }
+    if (twai_node_recover(s_node) == ESP_OK) recovering = true;
+}
+
 static void can_worker_task(void *arg)
 {
     uint8_t    last_di  = 0xFF;
@@ -406,6 +472,8 @@ static void can_worker_task(void *arg)
             if (s_mode == CAN_MODE_BASIC && !m.ide) basic_handle_rx(&m);
             else if (s_mode == CAN_MODE_N2K &&  m.ide) n2k_handle_rx(&m);
         }
+
+        can_check_bus_off();
 
         TickType_t now = xTaskGetTickCount();
 
@@ -466,6 +534,12 @@ esp_err_t can_server_init(void)
         .io_cfg.bus_off_indicator = GPIO_NUM_NC,
         .bit_timing             = timing,
         .tx_queue_depth         = 16,
+        /* -1 = retransmit on arbitration loss or bus error, which is the
+           ordinary CAN behaviour. Left at its 0 default the HAL arms
+           single-shot transmission (twai_hal_v1.c: .ss = retry_cnt != -1), so
+           a frame lost to a higher-priority node was simply dropped — and no
+           sender here looks at the return value to notice. */
+        .fail_retry_cnt         = -1,
     };
     ESP_RETURN_ON_ERROR(twai_new_node_onchip(&node_cfg, &s_node), TAG, "new node");
 

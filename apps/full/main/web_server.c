@@ -370,7 +370,26 @@ static esp_err_t api_config_post(httpd_req_t *req)
     STR("device_name",      cfg.device_name);
     STR("mqtt_url",         cfg.mqtt_url);
     STR("mqtt_user",        cfg.mqtt_user);
-    STR("mqtt_topic_prefix",cfg.mqtt_topic_prefix);
+    /* The prefix is used verbatim as a publish topic and as the last-will
+       topic. '#' and '+' are illegal there (MQTT 3.1.1 3.3.2.1 / 4.7) and a
+       conforming broker closes the connection on CONNECT, after which MQTT
+       never reconnects and nothing in the log points at the cause. '/' at
+       either end produces an empty topic level. */
+    {
+        cJSON *_v = cJSON_GetObjectItem(root, "mqtt_topic_prefix");
+        if (cJSON_IsString(_v)) {
+            const char *pfx = _v->valuestring;
+            size_t len = strlen(pfx);
+            if (strpbrk(pfx, "#+") || (len && (pfx[0] == '/' || pfx[len - 1] == '/'))) {
+                cJSON_Delete(root);
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                    "mqtt_topic_prefix must not contain '#' or '+' "
+                                    "or start or end with '/'");
+                return ESP_OK;
+            }
+            strlcpy(cfg.mqtt_topic_prefix, pfx, sizeof(cfg.mqtt_topic_prefix));
+        }
+    }
     #undef STR
 
     /* Password: only update when a non-empty value is sent */
@@ -398,10 +417,16 @@ static esp_err_t api_config_post(httpd_req_t *req)
         }
         if ((v = cJSON_GetObjectItem(can_j, "base_id")) && cJSON_IsNumber(v)) {
             uint32_t id = (uint32_t)v->valuedouble;
-            if (id <= 0x7FF) cfg.can.base_id = (uint16_t)id;
+            /* base_id + 1 .. base_id + 5 are used for TX and RX matching, so
+               the whole block has to fit in the 11-bit standard range. */
+            if (id + 5 <= 0x7FF) cfg.can.base_id = (uint16_t)id;
         }
-        if ((v = cJSON_GetObjectItem(can_j, "bitrate")) && cJSON_IsNumber(v))
-            cfg.can.bitrate = (uint32_t)v->valuedouble;
+        if ((v = cJSON_GetObjectItem(can_j, "bitrate")) && cJSON_IsNumber(v)) {
+            uint32_t br = (uint32_t)v->valuedouble;
+            /* Outside this range twai_new_node_onchip() refuses the value and
+               can_server_init() fails — see the boot-order note in main.c. */
+            if (br >= 10000 && br <= 1000000) cfg.can.bitrate = br;
+        }
         if ((v = cJSON_GetObjectItem(can_j, "tx_interval_ms")) && cJSON_IsNumber(v))
             cfg.can.tx_interval_ms = (uint16_t)v->valuedouble;
     }
@@ -415,8 +440,10 @@ static esp_err_t api_config_post(httpd_req_t *req)
             uint32_t a = (uint32_t)v->valuedouble;
             if (a >= 1 && a <= 247) cfg.modbus.address = (uint8_t)a;
         }
-        if ((v = cJSON_GetObjectItem(mb, "baudrate")) && cJSON_IsNumber(v))
-            cfg.modbus.baudrate = (uint32_t)v->valuedouble;
+        if ((v = cJSON_GetObjectItem(mb, "baudrate")) && cJSON_IsNumber(v)) {
+            uint32_t bd = (uint32_t)v->valuedouble;
+            if (bd >= 1200 && bd <= 921600) cfg.modbus.baudrate = bd;
+        }
     }
 
     cJSON *sntp_j = cJSON_GetObjectItem(root, "sntp");
@@ -790,6 +817,8 @@ static esp_err_t api_factory_reset(httpd_req_t *req)
 
 static esp_err_t api_reboot(httpd_req_t *req)
 {
+    if (!check_auth(req)) return send_401(req);
+
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"rebooting\"}");
 
@@ -998,13 +1027,23 @@ static esp_err_t api_rules_post(httpd_req_t *req)
 
     const char *script = script_j->valuestring;
     nvs_handle_t h;
-    if (nvs_open(RULES_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
-        if (script[0] == '\0')
-            nvs_erase_key(h, RULES_NVS_KEY);
-        else
-            nvs_set_str(h, RULES_NVS_KEY, script);
-        nvs_commit(h);
+    /* Reported rather than discarded: a failed write left the rule running
+       until the next reboot, when the previous script silently came back,
+       while the handler had answered ok. */
+    esp_err_t nvs_ret = nvs_open(RULES_NVS_NS, NVS_READWRITE, &h);
+    if (nvs_ret == ESP_OK) {
+        nvs_ret = (script[0] == '\0') ? nvs_erase_key(h, RULES_NVS_KEY)
+                                      : nvs_set_str(h, RULES_NVS_KEY, script);
+        if (nvs_ret == ESP_ERR_NVS_NOT_FOUND) nvs_ret = ESP_OK;   /* erasing what was not there */
+        if (nvs_ret == ESP_OK) nvs_ret = nvs_commit(h);
         nvs_close(h);
+    }
+    if (nvs_ret != ESP_OK) {
+        ESP_LOGE(TAG, "storing rules failed: %s", esp_err_to_name(nvs_ret));
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "rules could not be stored");
+        return ESP_OK;
     }
 
     scripting_reload(script[0] ? script : DEMO_SCRIPT);
