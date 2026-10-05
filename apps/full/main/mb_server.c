@@ -112,9 +112,16 @@ static void apply_coil_write(const mb_param_info_t *info)
        the refresher a fresh reference value. */
     uint8_t actual = dout_get_all();
     mbc_slave_lock(s_handle);
-    s_coils.b[0]         = actual;
-    s_coils_mirror       = actual;
-    s_coils_mirror_valid = true;
+    /* Only put the actual state back if nobody has written the image since we
+       read it. The stack writes a new command straight into this byte and only
+       afterwards queues its record, so an unconditional write-back erases a
+       command the master has already been told was accepted. If it differs,
+       leave it alone -- its record is queued and will be handled next. */
+    if (s_coils.b[0] == co) {
+        s_coils.b[0]         = actual;
+        s_coils_mirror       = actual;
+        s_coils_mirror_valid = true;
+    }
     mbc_slave_unlock(s_handle);
 
     ESP_LOGD(TAG, "Coil write: coils %u..%u from 0x%02x, outputs 0x%02x",
@@ -144,40 +151,40 @@ static void apply_hr_write(const mb_param_info_t *info)
     }
 }
 
-/* Handles write events from the Modbus master. */
+/* Drains the stack's parameter FIFO and carries out the writes it reports. */
 static void event_task(void *arg)
 {
-    const mb_event_group_t WATCH =
-        (mb_event_group_t)(MB_EVENT_COILS_WR | MB_EVENT_HOLDING_REG_WR);
-
     for (;;) {
-        mb_event_group_t ev = mbc_slave_check_event(s_handle, WATCH);
-        if (!ev) continue;
-
-        /* Drain every record the stack has queued, and dispatch on the record's
-           own type. The parameter FIFO also receives read accesses, and the
-           event bits do not say which record belongs to them: taking exactly
-           one record meant a write could be carried out with the offset of an
-           earlier read. Measured on the bench -- five reads of HR40001 followed
-           by a write to HR40002 drove the LED, the record carrying
-           type=0x02 (HOLDING_REG_RD) and offset 0. Leaving read records in the
-           FIFO also fills it, after which write records are dropped. */
         mb_param_info_t info;
-        bool wrote = false;
-        uint32_t wait = 10;
 
-        while (mbc_slave_get_param_info(s_handle, &info, wait) == ESP_OK) {
-            wait = 0;    /* only the first record is worth waiting for */
-            if (info.type & MB_EVENT_HOLDING_REG_WR) { apply_hr_write(&info); wrote = true; }
-            else if (info.type & MB_EVENT_COILS_WR)  { apply_coil_write(&info); wrote = true; }
-            /* read records are consumed and discarded */
+        /* Block on the parameter FIFO itself, not on the write event bits.
+           Every access the stack serves queues a record here -- the six read
+           types included -- and nothing else drains them. Waiting for write
+           bits alone left the 20-deep queue permanently full after twenty
+           requests from a master that only polls, and from then on the stack
+           blocks for MB_PAR_INFO_TOUT before sending each further response:
+           that constant is 10 *ticks*, which is 100 ms at the configured
+           CONFIG_FREERTOS_HZ=100, so throughput collapses to about ten
+           requests per second.
+
+           Draining here also means a write is always dispatched on its own
+           record instead of on whatever happened to be at the front of the
+           queue, and it keeps the gap between the stack writing a command into
+           the shared buffer and this task reading it down to the scheduler's
+           latency. */
+        if (mbc_slave_get_param_info(s_handle, &info, 1000) != ESP_OK) continue;
+
+        if (info.type & MB_EVENT_HOLDING_REG_WR) {
+            apply_hr_write(&info);
+        } else if (info.type & MB_EVENT_COILS_WR) {
+            apply_coil_write(&info);
+        } else {
+            continue;   /* a read: consumed so the queue cannot fill up */
         }
 
-        if (wrote) {
-            /* An upstream control command — feed the rule engine's MODBUS
-               command-health source (modbus(ms) in the DSL). */
-            scripting_on_modbus_activity();
-        }
+        /* An upstream control command — feed the rule engine's MODBUS
+           command-health source (modbus(ms) in the DSL). */
+        scripting_on_modbus_activity();
     }
 }
 
