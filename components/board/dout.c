@@ -175,9 +175,20 @@ esp_err_t dout_set(uint8_t n, bool state)
 {
     if (n >= NUM_DO) return ESP_ERR_INVALID_ARG;
     dout_lock();
-    bool changed = (s_state[n] != state);
+    bool prev    = s_state[n];
+    bool changed = (prev != state);
     s_state[n] = state;
     esp_err_t ret = write_outputs();
+    /* The port byte never reached the chip, so the output did not move. Keeping
+       the requested value would make dout_get() report a state the hardware is
+       not in -- and a repeat of the same command would then be skipped by the
+       callers that compare against dout_get() first. */
+    if (ret != ESP_OK) {
+        s_state[n] = prev;
+        changed = false;
+        ESP_LOGW(TAG, "output %u: write failed (%s), state unchanged",
+                 n + 1u, esp_err_to_name(ret));
+    }
     dout_unlock();
     /* Only publish when the state changed — avoids an infinite echo loop
        caused by receiving our own confirmations back from the broker. */
