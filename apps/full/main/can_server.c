@@ -65,37 +65,61 @@ static IRAM_ATTR bool rx_done_cb(twai_node_handle_t node,
 
 static uint16_t s_base;
 
-/* twai_node_transmit() does not copy the frame. The driver keeps a pointer to
-   it and to its buffer until the transmission completes -- esp_twai_onchip.c
-   either sets p_curr_tx = frame or queues &frame in tx_mount_queue. A frame
-   built on the stack is therefore still being read after the sender has
-   returned and the stack slot has been reused.
+/* The driver does not copy a frame: it keeps a pointer to the twai_frame_t and
+   to its buffer in p_curr_tx and in tx_mount_queue until the transmission
+   finishes. Frames therefore live here rather than on the sender's stack, and
+   a slot is reused only once the driver has reported that frame done.
 
-   Observed on the wire with a CAN analyser: of two frames sent back to back,
-   the first (hardware idle, sent at once) arrives correctly, while the second
-   (queued, sent later) goes out as 4C5 [0] instead of 102 [2] -- a corrupted
-   id and length. One frame per second is always clean.
+   The table is one slot deeper than the driver's TX queue, because the driver
+   can hold tx_queue_depth queued frames plus the one in flight. A free-running
+   ring would not be enough even at that size: on a bus that makes no progress
+   the index wraps while frames are still pending, and overwriting a pending
+   frame changes what later goes on the wire.
 
-   A ring as deep as the driver's TX queue keeps every frame in flight alive.
-   All senders run on the CAN worker task, so the index needs no locking. */
-#define TX_SLOTS 16
+   If every slot is in flight the frame is dropped and reported. That is the
+   safe direction: losing a status frame on a stalled bus is recoverable,
+   corrupting one that is already queued is not.
+
+   Known limitation: frames still sitting in the driver's queue when the node
+   goes bus-off are not dequeued and produce no completion callback, so their
+   slots stay taken until the node recovers. Transmission then reports
+   ESP_ERR_NO_MEM rather than going quiet. */
+#define TX_QUEUE_DEPTH 16
+#define TX_SLOTS       (TX_QUEUE_DEPTH + 1)
 
 static struct {
-    twai_frame_t f;
-    uint8_t      buf[8];
+    twai_frame_t  f;
+    uint8_t       buf[8];
+    volatile bool busy;
 } s_tx[TX_SLOTS];
-static uint8_t s_tx_next;
 
 static twai_frame_t *tx_claim(const uint8_t *data, uint8_t dlc, uint8_t fill)
 {
-    __typeof__(s_tx[0]) *slot = &s_tx[s_tx_next];
-    s_tx_next = (uint8_t)((s_tx_next + 1u) % TX_SLOTS);
+    for (int i = 0; i < TX_SLOTS; i++) {
+        if (s_tx[i].busy) continue;
+        s_tx[i].busy = true;
+        memset(s_tx[i].buf, fill, sizeof(s_tx[i].buf));
+        if (dlc && data) memcpy(s_tx[i].buf, data, dlc);
+        s_tx[i].f.buffer     = s_tx[i].buf;
+        s_tx[i].f.buffer_len = dlc;
+        return &s_tx[i].f;
+    }
+    return NULL;
+}
 
-    memset(slot->buf, fill, sizeof(slot->buf));
-    if (dlc && data) memcpy(slot->buf, data, dlc);
-    slot->f.buffer     = slot->buf;
-    slot->f.buffer_len = dlc;
-    return &slot->f;
+static void tx_release(const twai_frame_t *f)
+{
+    for (int i = 0; i < TX_SLOTS; i++)
+        if (&s_tx[i].f == f) { s_tx[i].busy = false; return; }
+}
+
+/* Fires for every frame the hardware took, successful or not. */
+static IRAM_ATTR bool tx_done_cb(twai_node_handle_t node,
+                                 const twai_tx_done_event_data_t *edata, void *ctx)
+{
+    (void)node; (void)ctx;
+    tx_release(edata->done_tx_frame);
+    return false;
 }
 
 /* A rejected transmit used to vanish: basic_send() discarded the result and
@@ -121,13 +145,14 @@ static void tx_failed(uint32_t id, esp_err_t err)
 static void basic_send(uint16_t id, const uint8_t *data, uint8_t dlc)
 {
     if (dlc > 8) dlc = 8;
+    twai_frame_t *f = tx_claim(data, dlc, 0x00);
+    if (!f) { tx_failed(id, ESP_ERR_NO_MEM); return; }
     /* buffer_len must describe the payload, not the buffer: the driver rejects
        the frame unless header.dlc == twaifd_len2dlc(buffer_len). */
-    twai_frame_t *f = tx_claim(data, dlc, 0x00);
     f->header = (twai_frame_header_t){ .id = id, .dlc = dlc, .ide = 0, .rtr = 0 };
     f->buffer_len = dlc;
     esp_err_t r = twai_node_transmit(s_node, f, 5);
-    if (r != ESP_OK) tx_failed(id, r);
+    if (r != ESP_OK) { tx_release(f); tx_failed(id, r); }
 }
 
 static void basic_tx_heartbeat(void)
@@ -141,24 +166,27 @@ static void basic_tx_di(uint8_t bits) { basic_send(s_base + 1, &bits, 1); }
 static void basic_tx_do(void)
 {
     uint8_t f[2] = {0, 0};
-    for (int i = 0; i < 8; i++) if (dout_get(i)) f[1] |= (uint8_t)(1u << i);
+    f[1] = dout_get_all();
     basic_send(s_base + 2, f, 2);
 }
 
 /* DO opcodes: 0=WRITE, 1=SET, 2=CLEAR, 3=TOGGLE */
 static void basic_apply_do(uint8_t op, uint8_t mask)
 {
-    uint8_t cur = 0;
-    for (int i = 0; i < 8; i++) if (dout_get(i)) cur |= (uint8_t)(1u << i);
-    uint8_t next;
+    /* One atomic change rather than a read followed by eight single-bit
+       writes: dout_set() rewrites the whole port each time, so the outputs
+       used to step through the intermediate patterns, the state could move
+       between the read and the write, and a transfer failing halfway left
+       some channels switched and others not. */
+    esp_err_t ret;
     switch (op) {
-    case 0: next = mask;         break;
-    case 1: next = cur |  mask;  break;
-    case 2: next = cur & ~mask;  break;
-    case 3: next = cur ^  mask;  break;
+    case 0: ret = dout_modify(mask, (uint8_t)~mask, 0u); break;   /* WRITE  */
+    case 1: ret = dout_modify(mask, 0u, 0u);             break;   /* SET    */
+    case 2: ret = dout_modify(0u, mask, 0u);             break;   /* CLEAR  */
+    case 3: ret = dout_modify(0u, 0u, mask);             break;   /* TOGGLE */
     default: return;
     }
-    for (int i = 0; i < 8; i++) { bool b = (next >> i) & 1; if (b != dout_get(i)) dout_set(i, b); }
+    if (ret != ESP_OK) ESP_LOGW(TAG, "DO command failed: %s", esp_err_to_name(ret));
     basic_tx_do();
 }
 
@@ -243,10 +271,11 @@ static void n2k_send_frame(uint32_t can_id, const uint8_t *data, uint8_t dlc)
 {
     if (dlc > 8) dlc = 8;
     twai_frame_t *f = tx_claim(data, dlc, 0xFF);   /* see basic_send() */
+    if (!f) { tx_failed(can_id, ESP_ERR_NO_MEM); return; }
     f->header = (twai_frame_header_t){ .id = can_id, .dlc = dlc, .ide = 1, .rtr = 0 };
     f->buffer_len = dlc;
     esp_err_t r = twai_node_transmit(s_node, f, 5);
-    if (r != ESP_OK) tx_failed(can_id, r);
+    if (r != ESP_OK) { tx_release(f); tx_failed(can_id, r); }
 }
 
 /* Fast-packet sender: handles messages > 8 bytes. */
@@ -344,7 +373,7 @@ static void n2k_tx_di_bank(void)
 static void n2k_tx_do_bank(void)
 {
     uint8_t bitmask = 0;
-    for (int i = 0; i < 8; i++) if (dout_get(i)) bitmask |= (uint8_t)(1u << i);
+    bitmask = dout_get_all();
     uint8_t data[8];
     encode_switch_bank(data, N2K_DO_INSTANCE, bitmask);
     n2k_send_frame(n2k_make_id(N2K_PGN_SW_STATUS, 3, s_addr, N2K_ADDR_GLOBAL), data, 8);
@@ -371,30 +400,46 @@ static void n2k_handle_rx(const rx_msg_t *m)
     uint8_t src, dst;
     uint32_t pgn = n2k_decode_id(m->id, &src, &dst);
 
+    /* Address claims come first, before the "not ours" filter below. A claim
+       that conflicts with us is by definition sent from our own address, so
+       the filter used to discard exactly the frames the conflict branch was
+       looking for and that branch could never run: two devices on the default
+       address both kept it and neither backed off. Claims are also handled
+       while we are still claiming, not only once active -- that is the window
+       in which a collision is most likely. */
+    if (pgn == N2K_PGN_ADDRESS_CLAIM && m->dlc == 8) {
+        if (src != s_addr) return;                 /* somebody else's address */
+        if (s_ac_state != AC_ACTIVE && s_ac_state != AC_CLAIMING) return;
+
+        uint64_t their_name, our_name;
+        memcpy(&their_name, m->data, 8);
+        memcpy(&our_name,   s_name,  8);
+
+        /* ISO 11783-5: the lower NAME wins the address. */
+        if (our_name > their_name) {
+            s_addr++;
+            if (s_addr > 251) {
+                s_ac_state = AC_FAILED;
+                ESP_LOGW(TAG, "N2k: no free address left, giving up");
+                return;
+            }
+            s_ac_state   = AC_CLAIMING;
+            s_claim_tick = xTaskGetTickCount();
+            ESP_LOGW(TAG, "N2k: address conflict, moving to %u", s_addr);
+            n2k_send_address_claim(s_addr);
+        } else {
+            /* Our NAME is lower, so the address stays ours. Re-assert it so the
+               other device knows to move. */
+            n2k_send_address_claim(s_addr);
+        }
+        return;
+    }
+
     /* Skip our own frames. */
     if (src == s_addr) return;
 
     /* Only accept frames addressed to us or global. */
     if (dst != N2K_ADDR_GLOBAL && dst != s_addr) return;
-
-    if (pgn == N2K_PGN_ADDRESS_CLAIM && m->dlc == 8) {
-        /* Conflict check: other device claiming same address */
-        if (src == s_addr && s_ac_state == AC_ACTIVE) {
-            uint64_t their_name, our_name;
-            memcpy(&their_name, m->data, 8);
-            memcpy(&our_name,   s_name,  8);
-            if (our_name > their_name) {
-                /* We lose: try next address */
-                s_addr++;
-                if (s_addr > 251) { s_ac_state = AC_FAILED; return; }
-                s_ac_state = AC_CLAIMING;
-                s_claim_tick = xTaskGetTickCount();
-                n2k_send_address_claim(s_addr);
-            }
-            /* If our_name < their_name: they should re-address; we stay. */
-        }
-        return;
-    }
 
     if (pgn == N2K_PGN_ISO_REQUEST && m->dlc == 3) {
         uint32_t requested = (uint32_t)m->data[0]
@@ -414,13 +459,23 @@ static void n2k_handle_rx(const rx_msg_t *m)
     if (pgn == N2K_PGN_SW_CONTROL && m->dlc == 8) {
         /* Only handle bank N2K_DO_INSTANCE */
         if (m->data[0] != N2K_DO_INSTANCE) return;
+        /* Collect the whole bank first: a switch-control message addresses up
+           to eight channels and they have to change together, not one port
+           write at a time. 0x02/0x03 mean "no change" and stay out of both
+           masks. */
+        uint8_t set = 0, clear = 0;
         for (int sw = 0; sw < 8; sw++) {
             int byte_pos = 1 + sw / 4;
             int bit_pos  = (sw % 4) * 2;
             uint8_t state = (m->data[byte_pos] >> bit_pos) & 0x3;
-            if (state > 0x01) continue;   /* 0x02/0x03 = no-change */
-            bool want = (state == 0x01);
-            if (want != dout_get(sw)) dout_set(sw, want);
+            if (state > 0x01) continue;
+            if (state == 0x01) set |= (uint8_t)(1u << sw);
+            else               clear |= (uint8_t)(1u << sw);
+        }
+        if (set || clear) {
+            esp_err_t ret = dout_modify(set, clear, 0u);
+            if (ret != ESP_OK)
+                ESP_LOGW(TAG, "N2k switch control failed: %s", esp_err_to_name(ret));
         }
         n2k_tx_do_bank();
         scripting_on_can_activity();   /* upstream DO control → CAN command-health feed */
@@ -559,7 +614,7 @@ esp_err_t can_server_init(void)
         .io_cfg.quanta_clk_out  = GPIO_NUM_NC,
         .io_cfg.bus_off_indicator = GPIO_NUM_NC,
         .bit_timing             = timing,
-        .tx_queue_depth         = 16,
+        .tx_queue_depth         = TX_QUEUE_DEPTH,
         /* -1 = retransmit on arbitration loss or bus error, which is the
            ordinary CAN behaviour. Left at its 0 default the HAL arms
            single-shot transmission (twai_hal_v1.c: .ss = retry_cnt != -1), so
@@ -570,7 +625,7 @@ esp_err_t can_server_init(void)
     ESP_RETURN_ON_ERROR(twai_new_node_onchip(&node_cfg, &s_node), TAG, "new node");
 
     s_rx_q = xQueueCreate(RX_QUEUE_DEPTH, sizeof(rx_msg_t));
-    twai_event_callbacks_t cbs = { .on_rx_done = rx_done_cb };
+    twai_event_callbacks_t cbs = { .on_rx_done = rx_done_cb, .on_tx_done = tx_done_cb };
     ESP_RETURN_ON_ERROR(twai_node_register_event_callbacks(s_node, &cbs, NULL),
                         TAG, "register cbs");
     ESP_RETURN_ON_ERROR(twai_node_enable(s_node), TAG, "enable");

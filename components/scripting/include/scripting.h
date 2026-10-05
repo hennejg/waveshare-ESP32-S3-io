@@ -42,9 +42,21 @@ void scripting_on_mqtt_message(const char *topic, size_t topic_len,
 void scripting_on_input_change(uint8_t channel, bool state);
 
 // Replace the running script with new_script and restart rule evaluation.
-// Clears all existing rules, re-evaluates the DSL, then evaluates new_script.
+// The script is evaluated into a fresh context and only takes over if that
+// works; otherwise the rules already running carry on.
 // Safe to call from any task. new_script is copied internally.
 void scripting_reload(const char *new_script);
+
+// Outcome of the most recent reload the engine has finished acting on.
+// `generation` goes up by one each time, so a caller can note it before
+// scripting_reload() and wait for it to change rather than guessing.
+typedef struct {
+    uint32_t generation;
+    bool     ok;
+    char     message[96];      // empty when ok
+} scripting_reload_status_t;
+
+void scripting_reload_status(scripting_reload_status_t *out);
 
 // Mark the wall-clock as valid (real time available). Cron triggers stay suppressed
 // until this is true, so they don't fire boot-relative. Call BEFORE scripting_init()

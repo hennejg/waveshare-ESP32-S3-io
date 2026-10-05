@@ -82,18 +82,23 @@ static bool parse_toggle(const char *data, size_t len)
 
 /* Apply a single cJSON item (bool / number / string) to output n.
    Strings use the same vocabulary as individual output commands. */
-static void apply_json_item(cJSON *item, uint8_t n)
+/* Collect what one array element asks for into the masks, rather than editing
+   the state here: the whole array is then applied as one operation. */
+static void apply_json_item(cJSON *item, uint8_t n,
+                            uint8_t *set, uint8_t *clear, uint8_t *toggle)
 {
+    const uint8_t bit = (uint8_t)(1u << n);
+
     if (cJSON_IsBool(item)) {
-        s_state[n] = cJSON_IsTrue(item);
+        if (cJSON_IsTrue(item)) *set |= bit; else *clear |= bit;
     } else if (cJSON_IsNumber(item)) {
-        s_state[n] = (item->valuedouble != 0.0);
+        if (item->valuedouble != 0.0) *set |= bit; else *clear |= bit;
     } else if (cJSON_IsString(item)) {
         const char *s = item->valuestring;
         size_t slen   = strlen(s);
         bool state;
-        if (parse_toggle(s, slen))          s_state[n] = !s_state[n];
-        else if (parse_payload(s, slen, &state)) s_state[n] = state;
+        if (parse_toggle(s, slen))               *toggle |= bit;
+        else if (parse_payload(s, slen, &state)) { if (state) *set |= bit; else *clear |= bit; }
     }
 }
 #endif /* CONFIG_APP_MQTT_ENABLE */
@@ -171,30 +176,67 @@ bool dout_get(uint8_t n)
     return (n < NUM_DO) ? s_state[n] : false;
 }
 
-esp_err_t dout_set(uint8_t n, bool state)
+uint8_t dout_get_all(void)
 {
-    if (n >= NUM_DO) return ESP_ERR_INVALID_ARG;
+    uint8_t v = 0;
     dout_lock();
-    bool changed = (s_state[n] != state);
-    s_state[n] = state;
-    esp_err_t ret = write_outputs();
+    for (uint8_t i = 0; i < NUM_DO; i++) if (s_state[i]) v |= (uint8_t)(1u << i);
     dout_unlock();
-    /* Only publish when the state changed — avoids an infinite echo loop
-       caused by receiving our own confirmations back from the broker. */
+    return v;
+}
+
+esp_err_t dout_modify(uint8_t set, uint8_t clear, uint8_t toggle)
+{
+    uint8_t before = 0, after = 0;
+
+    dout_lock();
+    for (uint8_t i = 0; i < NUM_DO; i++) if (s_state[i]) before |= (uint8_t)(1u << i);
+
+    after = (uint8_t)(((before & (uint8_t)~clear) | set) ^ toggle);
+    for (uint8_t i = 0; i < NUM_DO; i++) s_state[i] = (after >> i) & 1u;
+
+    esp_err_t ret = write_outputs();
+    /* The port byte never reached the chip, so nothing moved. Keeping the
+       requested values would make dout_get() report a state the hardware is not
+       in -- and a repeat of the same command would then be skipped by callers
+       that compare against dout_get() first. */
+    if (ret != ESP_OK) {
+        for (uint8_t i = 0; i < NUM_DO; i++) s_state[i] = (before >> i) & 1u;
+        after = before;
+        ESP_LOGW(TAG, "outputs: write failed (%s), nothing changed",
+                 esp_err_to_name(ret));
+    }
+    dout_unlock();
+
+    /* Only publish channels that actually moved — avoids an echo loop from our
+       own confirmations coming back off the broker. */
 #ifdef CONFIG_APP_MQTT_ENABLE
-    if (ret == ESP_OK && changed && app_mqtt_is_connected()) publish_one(n);
+    uint8_t changed = (uint8_t)(before ^ after);
+    if (changed && app_mqtt_is_connected())
+        for (uint8_t i = 0; i < NUM_DO; i++)
+            if (changed & (1u << i)) publish_one(i);
 #endif
     return ret;
 }
 
-void dout_publish_all(void)
+esp_err_t dout_set(uint8_t n, bool state)
+{
+    if (n >= NUM_DO) return ESP_ERR_INVALID_ARG;
+    uint8_t bit = (uint8_t)(1u << n);
+    return dout_modify(state ? bit : 0u, state ? 0u : bit, 0u);
+}
+
+esp_err_t dout_publish_all(void)
 {
     dout_lock();
-    write_outputs();    /* re-apply to hardware — picks up invert changes */
+    esp_err_t ret = write_outputs();   /* re-apply — picks up invert changes */
     dout_unlock();
+    if (ret != ESP_OK)
+        ESP_LOGW(TAG, "outputs: re-apply failed (%s)", esp_err_to_name(ret));
 #ifdef CONFIG_APP_MQTT_ENABLE
     for (uint8_t i = 0; i < NUM_DO; i++) publish_one(i);
 #endif
+    return ret;
 }
 
 void dout_on_mqtt_connected(void)
@@ -238,27 +280,24 @@ void dout_on_mqtt_message(const char *topic, size_t tlen,
             }
             int n = cJSON_GetArraySize(arr);
             if (n > NUM_DO) n = NUM_DO;
-            dout_lock();
+            uint8_t set = 0, clear = 0, toggle = 0;
             for (int i = 0; i < n; i++)
-                apply_json_item(cJSON_GetArrayItem(arr, i), (uint8_t)i);
-            dout_unlock();
+                apply_json_item(cJSON_GetArrayItem(arr, i), (uint8_t)i,
+                                &set, &clear, &toggle);
             cJSON_Delete(arr);
+            dout_modify(set, clear, toggle);
         } else {
             bool state;
-            dout_lock();
             if (parse_toggle(data, dlen)) {
-                for (uint8_t i = 0; i < NUM_DO; i++) s_state[i] = !s_state[i];
+                dout_modify(0u, 0u, 0xFFu);
             } else if (parse_payload(data, dlen, &state)) {
-                for (uint8_t i = 0; i < NUM_DO; i++) s_state[i] = state;
+                dout_modify(state ? 0xFFu : 0u, state ? 0u : 0xFFu, 0u);
             } else {
-                dout_unlock();
                 ESP_LOGW(TAG, "output/set: unrecognised payload");
                 return;
             }
-            dout_unlock();
         }
-        dout_publish_all();
-        return;
+        return;   /* dout_modify() publishes the channels that moved */
     }
 
     /* Match suffix "output/read" */

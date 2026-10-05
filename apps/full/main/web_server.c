@@ -40,6 +40,19 @@ extern const char DEMO_SCRIPT[];
 #include "mbedtls/base64.h"
 
 #define TAG        "web_server"
+
+/* Longest password whose HTTP Basic header still fits check_auth()'s 160-byte
+   buffer: "Basic " + base64(":" + password) must stay within 159 characters,
+   which 113 does at 158 and 114 exceeds at 162. */
+#define APP_CFG_PASSWORD_MAX 113
+
+/* Total time a request body may take to arrive. */
+#define BODY_RECV_TIMEOUT_MS 5000
+
+/* How long POST /api/rules waits for the rule engine to accept or refuse the
+   script. Handlers run on the server task, so this caps how long one request
+   can hold up the others. */
+#define RULES_APPLY_TIMEOUT_MS 1000
 #define WWW_BASE   "/www"
 #define CHUNK_SIZE  4096
 #define BODY_MAX    2048  /* names add ~768 bytes to the di/dout arrays */
@@ -98,6 +111,41 @@ static bool validate_names(const di_config_t *arr, int count, const char **err_m
         }
     }
     return true;
+}
+
+/* httpd_req_recv() returns what a single socket read yielded. The loop in
+   httpd_recv_with_opt() only repeats for HTTPD_RECV_OPT_BLOCKING, and
+   httpd_recv() passes HTTPD_RECV_OPT_NONE, so one call can return far less
+   than content_len. Measured on an ESP32-S3-POE-ETH-8DI-8DO with a 2895-byte
+   rule script: a single call returned 1440 bytes when the body was sent in one
+   go, 724 over four segments and 145 over twenty -- all three then failed to
+   parse and answered 400 Invalid JSON.
+
+   buf must hold content_len + 1 bytes. Returns the length read, or -1. */
+static int recv_body(httpd_req_t *req, char *buf, size_t cap)
+{
+    size_t want = req->content_len;
+    if (want > cap) return -1;
+
+    /* The deadline is absolute, not per read: a client that dribbles one byte
+       at a time must not be able to hold the handler open indefinitely. The
+       server processes handlers on its own task, so a stalled body would block
+       every other request -- and /api/auth/set-password reads its body before
+       the token is checked, so this is reachable without credentials. */
+    const int64_t deadline = esp_timer_get_time() + (int64_t)BODY_RECV_TIMEOUT_MS * 1000;
+    size_t got = 0;
+    while (got < want) {
+        int r = httpd_req_recv(req, buf + got, want - got);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            if (esp_timer_get_time() >= deadline) return -1;
+            continue;
+        }
+        if (r <= 0) return -1;
+        got += (size_t)r;
+        if (esp_timer_get_time() >= deadline && got < want) return -1;
+    }
+    buf[got] = '\0';
+    return (int)got;
 }
 
 /* ------------------------------------------------------------------ auth check */
@@ -214,9 +262,8 @@ static esp_err_t api_auth_set_password(httpd_req_t *req)
     }
     char *body = malloc(req->content_len + 1);
     if (!body) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_OK; }
-    int n = httpd_req_recv(req, body, req->content_len);
-    if (n <= 0) { free(body); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
-    body[n] = '\0';
+    int n = recv_body(req, body, req->content_len);
+    if (n < 0) { free(body); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
     cJSON *root = cJSON_Parse(body);
     free(body);
@@ -231,19 +278,33 @@ static esp_err_t api_auth_set_password(httpd_req_t *req)
         return ESP_OK;
     }
 
-    if (!auth_token_consume(token_j->valuestring)) {
+    /* Check the password before spending the token. It is single use and only
+       obtainable by pressing the button on the device, so rejecting the input
+       afterwards would send the user back to the hardware for a typo.
+
+       The Basic-auth parser reads the header into a 160-byte buffer, so a
+       password that cannot fit there could be set and would then lock the user
+       out of the very API that set it. "Basic " plus base64 of ":" + password
+       must stay within that buffer -- see APP_CFG_PASSWORD_MAX. */
+    if (strlen(pw_j->valuestring) > APP_CFG_PASSWORD_MAX) {
         cJSON_Delete(root);
-        httpd_resp_set_status(req, "403 Forbidden");
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, "{\"error\":\"invalid_token\"}");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "password too long (max 113 characters)");
         return ESP_OK;
     }
-
     if (strlen(pw_j->valuestring) < 8) {
         cJSON_Delete(root);
         httpd_resp_set_status(req, "400 Bad Request");
         httpd_resp_set_type(req, "application/json");
         httpd_resp_sendstr(req, "{\"error\":\"password_too_short\"}");
+        return ESP_OK;
+    }
+
+    if (!auth_token_consume(token_j->valuestring)) {
+        cJSON_Delete(root);
+        httpd_resp_set_status(req, "403 Forbidden");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"invalid_token\"}");
         return ESP_OK;
     }
 
@@ -342,13 +403,12 @@ static esp_err_t api_config_post(httpd_req_t *req)
         return ESP_OK;
     }
 
-    int received = httpd_req_recv(req, body, req->content_len);
-    if (received <= 0) {
+    int received = recv_body(req, body, req->content_len);
+    if (received < 0) {
         free(body);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv failed");
         return ESP_OK;
     }
-    body[received] = '\0';
 
     cJSON *root = cJSON_Parse(body);
     free(body);
@@ -551,13 +611,12 @@ static esp_err_t api_time_post(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
         return ESP_OK;
     }
-    int received = httpd_req_recv(req, body, req->content_len);
-    if (received <= 0) {
+    int received = recv_body(req, body, req->content_len);
+    if (received < 0) {
         free(body);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv failed");
         return ESP_OK;
     }
-    body[received] = '\0';
 
     cJSON *root = cJSON_Parse(body);
     free(body);
@@ -753,8 +812,8 @@ static esp_err_t api_eth_only(httpd_req_t *req)
     }
 
     char body[65] = {};
-    int received = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (received <= 0) {
+    int received = recv_body(req, body, sizeof(body) - 1);
+    if (received < 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv failed");
         return ESP_OK;
     }
@@ -864,9 +923,8 @@ static esp_err_t api_io_output(httpd_req_t *req)
         return ESP_OK;
     }
     char body[65];
-    int n = httpd_req_recv(req, body, req->content_len);
-    if (n <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
-    body[n] = '\0';
+    int n = recv_body(req, body, sizeof(body) - 1);
+    if (n < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
     cJSON *root = cJSON_Parse(body);
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
@@ -893,7 +951,15 @@ static esp_err_t api_io_output(httpd_req_t *req)
     }
     cJSON_Delete(root);
 
-    dout_set(ch, new_val);
+    esp_err_t set_ret = dout_set(ch, new_val);
+    if (set_ret != ESP_OK) {
+        /* dout_set() restores the previous state when the transfer fails, so
+           confirming the command here would report a switch that never
+           happened. */
+        ESP_LOGW(TAG, "output %d: set failed: %s", ch + 1, esp_err_to_name(set_ret));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "output write failed");
+        return ESP_OK;
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
     return ESP_OK;
@@ -908,9 +974,8 @@ static esp_err_t api_io_led(httpd_req_t *req)
         return ESP_OK;
     }
     char body[65];
-    int n = httpd_req_recv(req, body, req->content_len);
-    if (n <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
-    body[n] = '\0';
+    int n = recv_body(req, body, sizeof(body) - 1);
+    if (n < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
     cJSON *root = cJSON_Parse(body);
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
@@ -947,9 +1012,8 @@ static esp_err_t api_io_buzzer(httpd_req_t *req)
         return ESP_OK;
     }
     char body[65];
-    int n = httpd_req_recv(req, body, req->content_len);
-    if (n <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
-    body[n] = '\0';
+    int n = recv_body(req, body, sizeof(body) - 1);
+    if (n < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
     cJSON *root = cJSON_Parse(body);
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
@@ -1010,9 +1074,8 @@ static esp_err_t api_rules_post(httpd_req_t *req)
     char *body = malloc(req->content_len + 1);
     if (!body) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_OK; }
 
-    int n = httpd_req_recv(req, body, req->content_len);
-    if (n <= 0) { free(body); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
-    body[n] = '\0';
+    int n = recv_body(req, body, req->content_len);
+    if (n < 0) { free(body); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
     cJSON *root = cJSON_Parse(body);
     free(body);
@@ -1046,9 +1109,51 @@ static esp_err_t api_rules_post(httpd_req_t *req)
         return ESP_OK;
     }
 
-    scripting_reload(script[0] ? script : DEMO_SCRIPT);
+    /* Wait for the engine's verdict instead of acknowledging a request we
+       cannot see through. A reload can be refused -- a syntax error, a global
+       const clashing with the previous script, no free timers -- and the rules
+       already running then stay in place, which the caller has to be told.
 
+       Bounded on purpose: handlers run on the server's own task, so a long
+       wait here would hold up every other request. A reload normally finishes
+       in milliseconds; if it has not after RULES_APPLY_TIMEOUT_MS the request
+       is answered with 202 and the outcome is left to the log. */
+    scripting_reload_status_t before;
+    scripting_reload_status(&before);
+
+    scripting_reload(script[0] ? script : DEMO_SCRIPT);
     cJSON_Delete(root);
+
+    scripting_reload_status_t now = before;
+    for (int waited = 0; waited < RULES_APPLY_TIMEOUT_MS; waited += 10) {
+        scripting_reload_status(&now);
+        if (now.generation != before.generation) break;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    if (now.generation == before.generation) {
+        httpd_resp_set_status(req, "202 Accepted");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"status\":\"accepted\"}");
+        return ESP_OK;
+    }
+
+    if (!now.ok) {
+        /* Stored but not running: say so plainly, including that the previous
+           rules are the ones still in effect. */
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddStringToObject(resp, "status", "rejected");
+        cJSON_AddStringToObject(resp, "error", now.message);
+        cJSON_AddStringToObject(resp, "detail", "previous rules still running");
+        char *body_out = cJSON_PrintUnformatted(resp);
+        cJSON_Delete(resp);
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, body_out ? body_out : "{\"status\":\"rejected\"}");
+        free(body_out);
+        return ESP_OK;
+    }
+
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
     return ESP_OK;
