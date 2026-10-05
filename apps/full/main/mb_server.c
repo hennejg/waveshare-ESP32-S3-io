@@ -22,7 +22,9 @@
 /* The isolated RS-485 transceiver is not auto-direction: the board brings its
    driver enable out on GPIO21, documented by Waveshare as "RS485 UART RTS pin".
    UART_MODE_RS485_HALF_DUPLEX makes the UART drive RTS as the direction
-   signal, but only if RTS is actually routed to that pin. */
+   signal, but only if RTS is actually routed to that pin. Left unrouted the
+   pin floats, the driver sits enabled, and the board holds the whole bus --
+   it can then neither answer nor hear anyone else. */
 #define MB_RTS_GPIO GPIO_NUM_21
 
 /* ---------------------------------------------------------------- data stores */
@@ -57,19 +59,80 @@ static void apply_rgb252(uint16_t reg)
 
 /* ---------------------------------------------------------------- timer + task */
 
+/* What the refresher last stored in the coil image, so it can tell its own
+   value apart from one a master has written since. */
+static uint8_t s_coils_mirror;
+static bool    s_coils_mirror_valid;
+
 static void update_timer_cb(void *arg)
 {
-    mbc_slave_lock(s_handle);
-
     uint8_t di = 0, co = 0;
     for (int i = 0; i < 8; i++) {
         if (di_get(i))   di |= (uint8_t)(1u << i);
         if (dout_get(i)) co |= (uint8_t)(1u << i);
     }
-    s_di.b[0]    = di;
-    s_coils.b[0] = co;
 
+    mbc_slave_lock(s_handle);
+    s_di.b[0] = di;
+    /* The stack writes a master's command into this same byte and only then
+       signals the event, so event_task() may not have read it yet. Refreshing
+       unconditionally dropped commands the master had already been told were
+       accepted -- measured at 3 of 40 writes on the bench. Only refresh while
+       the image still holds what this function last put there. */
+    if (!s_coils_mirror_valid || s_coils.b[0] == s_coils_mirror) {
+        s_coils.b[0]         = co;
+        s_coils_mirror       = co;
+        s_coils_mirror_valid = true;
+    }
     mbc_slave_unlock(s_handle);
+}
+
+static void apply_coil_write(void)
+{
+    mbc_slave_lock(s_handle);
+    uint8_t co = s_coils.b[0];
+    mbc_slave_unlock(s_handle);
+
+    for (uint8_t i = 0; i < 8; i++) {
+        bool bit = (co >> i) & 1;
+        if (bit != dout_get(i)) dout_set(i, bit);
+    }
+
+    /* Re-sync the image with what the outputs actually took — a write that
+       failed must not keep being reported back as the coil state — and hand
+       the refresher a fresh reference value. */
+    uint8_t actual = 0;
+    for (uint8_t i = 0; i < 8; i++) if (dout_get(i)) actual |= (uint8_t)(1u << i);
+    mbc_slave_lock(s_handle);
+    s_coils.b[0]         = actual;
+    s_coils_mirror       = actual;
+    s_coils_mirror_valid = true;
+    mbc_slave_unlock(s_handle);
+
+    ESP_LOGD(TAG, "Coil write: asked 0x%02x, outputs 0x%02x", co, actual);
+}
+
+static void apply_hr_write(const mb_param_info_t *info)
+{
+    mbc_slave_lock(s_handle);
+    uint16_t led_val    = s_hr.r[0];
+    uint16_t buzzer_val = s_hr.r[1];
+    mbc_slave_unlock(s_handle);
+
+    /* One FC16 can cover both registers, so test each register against the
+       written range instead of dispatching on the start offset alone. With
+       the old if/else-if a write of HR40001+HR40002 only ever drove the LED. */
+    unsigned first = info->mb_offset;
+    unsigned last  = first + (info->size ? info->size : 1u);   /* [first, last) */
+
+    if (first <= 0u && 0u < last) {
+        apply_rgb252(led_val);
+        ESP_LOGD(TAG, "HR40001 LED: 0x%04x", led_val);
+    }
+    if (first <= 1u && 1u < last && buzzer_val > 0) {
+        buzzer_beep_once(buzzer_val, 200);
+        ESP_LOGD(TAG, "HR40002 Buzzer: %u Hz", buzzer_val);
+    }
 }
 
 /* Handles write events from the Modbus master. */
@@ -82,37 +145,29 @@ static void event_task(void *arg)
         mb_event_group_t ev = mbc_slave_check_event(s_handle, WATCH);
         if (!ev) continue;
 
+        /* Drain every record the stack has queued, and dispatch on the record's
+           own type. The parameter FIFO also receives read accesses, and the
+           event bits do not say which record belongs to them: taking exactly
+           one record meant a write could be carried out with the offset of an
+           earlier read. Measured on the bench -- five reads of HR40001 followed
+           by a write to HR40002 drove the LED, the record carrying
+           type=0x02 (HOLDING_REG_RD) and offset 0. Leaving read records in the
+           FIFO also fills it, after which write records are dropped. */
         mb_param_info_t info;
-        if (mbc_slave_get_param_info(s_handle, &info, 10) != ESP_OK) continue;
+        bool wrote = false;
+        uint32_t wait = 10;
 
-        /* A coil/holding-register write is an upstream control command — feed the rule
-         * engine's MODBUS command-health source (modbus(ms) in the DSL). */
-        scripting_on_modbus_activity();
-
-        if (ev & MB_EVENT_COILS_WR) {
-            mbc_slave_lock(s_handle);
-            uint8_t co = s_coils.b[0];
-            mbc_slave_unlock(s_handle);
-            for (uint8_t i = 0; i < 8; i++) {
-                bool bit = (co >> i) & 1;
-                if (bit != dout_get(i)) dout_set(i, bit);
-            }
-            ESP_LOGD(TAG, "Coil write: 0x%02x", co);
+        while (mbc_slave_get_param_info(s_handle, &info, wait) == ESP_OK) {
+            wait = 0;    /* only the first record is worth waiting for */
+            if (info.type & MB_EVENT_HOLDING_REG_WR) { apply_hr_write(&info); wrote = true; }
+            else if (info.type & MB_EVENT_COILS_WR)  { apply_coil_write();    wrote = true; }
+            /* read records are consumed and discarded */
         }
 
-        if (ev & MB_EVENT_HOLDING_REG_WR) {
-            mbc_slave_lock(s_handle);
-            uint16_t led_val    = s_hr.r[0];
-            uint16_t buzzer_val = s_hr.r[1];
-            mbc_slave_unlock(s_handle);
-
-            if (info.mb_offset == 0) {
-                apply_rgb252(led_val);
-                ESP_LOGD(TAG, "HR40001 LED: 0x%04x", led_val);
-            } else if (info.mb_offset == 1 && buzzer_val > 0) {
-                buzzer_beep_once(buzzer_val, 200);
-                ESP_LOGD(TAG, "HR40002 Buzzer: %u Hz", buzzer_val);
-            }
+        if (wrote) {
+            /* An upstream control command — feed the rule engine's MODBUS
+               command-health source (modbus(ms) in the DSL). */
+            scripting_on_modbus_activity();
         }
     }
 }
