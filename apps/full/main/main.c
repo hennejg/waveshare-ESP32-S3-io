@@ -142,11 +142,16 @@ static void on_network_ready(const char *iface)
     sntp_sync_apply();   /* start NTP sync now that the network is up */
 }
 
-static bool s_eth_connected = false;
+static bool s_eth_connected  = false;
+static bool s_wifi_connected = false;
 
 static bool is_eth_connected(void) { return s_eth_connected; }
 
-static void on_wifi_ready(void) { on_network_ready("WiFi"); }
+static void on_wifi_ready(void)
+{
+    s_wifi_connected = true;
+    on_network_ready("WiFi");
+}
 
 static void on_eth_ready(void)
 {
@@ -156,7 +161,16 @@ static void on_eth_ready(void)
 
 static void on_ip_lost(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
-    if (id == IP_EVENT_ETH_LOST_IP) s_eth_connected = false;
+    if (id == IP_EVENT_ETH_LOST_IP) s_eth_connected  = false;
+    if (id == IP_EVENT_STA_LOST_IP) s_wifi_connected = false;
+
+    /* The web server listens on INADDR_ANY and is shared by both interfaces.
+       Stopping it whenever either one loses its address took the Ethernet UI
+       down when WiFi dropped -- and nothing brought it back, because the
+       Ethernet link never produced a new Got-IP event. Only stop once no
+       usable interface is left. */
+    if (s_eth_connected || s_wifi_connected) return;
+
     led_status_set_network(false);
     web_server_stop();   /* free port 80 before wifi-bootstrap may restart the AP HTTP server */
 }
