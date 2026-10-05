@@ -484,8 +484,23 @@ static void scripting_task(void *arg)
                    first. Only if that works is it swapped in; otherwise the old
                    one carries on serving the rules it already has. */
                 char err[96] = "";
+
+                /* Both generations are alive while the new script is being
+                   evaluated, and the memory limit applies to the runtime as a
+                   whole. With the limit enforced, a script that legitimately
+                   uses most of its budget left no room to build the
+                   replacement -- and since the swap never happened the old
+                   context was never freed either, so every further reload
+                   failed the same way until a reboot.
+
+                   Lift the ceiling for the duration of the handover. The
+                   steady-state budget is unchanged: it is restored as soon as
+                   one of the two contexts is gone. */
+                JS_SetMemoryLimit(rt, JS_HEAP_LIMIT * 2);
+
                 JSContext *nctx = JS_NewContext(rt);
                 if (!nctx) {
+                    JS_SetMemoryLimit(rt, JS_HEAP_LIMIT);
                     ESP_LOGE(TAG, "reload: out of memory, rules unchanged");
                     free(ev.reload.script);
                     publish_reload_result(false, "out of memory");
@@ -531,6 +546,7 @@ static void scripting_task(void *arg)
                         theirs[i] = !was_used[i] && s_timers[i].used;
                     clear_timers(nctx, theirs);
                     JS_FreeContext(nctx);
+                    JS_SetMemoryLimit(rt, JS_HEAP_LIMIT);   /* new one is gone again */
                     ESP_LOGE(TAG, "rules not applied, previous rules still running");
                     publish_reload_result(false, err);
                     break;
@@ -543,6 +559,7 @@ static void scripting_task(void *arg)
                 JS_FreeValue(ctx, on_time_sync);
                 JS_FreeValue(ctx, on_activity);
                 JS_FreeContext(ctx);
+                JS_SetMemoryLimit(rt, JS_HEAP_LIMIT);   /* old one is gone */
 
                 ctx = nctx;
                 bind_handlers(ctx, &on_mqtt, &on_input, &on_time_sync, &on_activity);
