@@ -96,19 +96,36 @@ static timer_slot_t *timer_find(uint32_t id)
     return NULL;
 }
 
+/* Timer ids that did not fit in the event queue. Losing one is not a missed
+   tick but a permanent defect: the slot stays used, its esp_timer is never
+   deleted and its JS function never released, so an .after() off-pulse never
+   switches off, a watchdog() never expires, an every() never re-arms -- and
+   after MAX_TIMERS such losses no rule can arm a timer at all.
+
+   Single producer (the esp_timer task) and single consumer (the scripting
+   task), so head and tail need no lock. */
+#define TIMER_OVERFLOW_SLOTS 16
+static volatile uint32_t s_overflow[TIMER_OVERFLOW_SLOTS];
+static volatile uint8_t  s_of_head, s_of_tail;
+
 // esp_timer task context — must NOT touch QuickJS; just hand the id to our task.
 static void timer_fired_cb(void *arg)
 {
     scripting_evt_t ev = { .type = EVT_TIMER };
     ev.timer.id = (uint32_t)(uintptr_t)arg;
-    /* A dropped timer event is not recoverable: the slot stays used, the JS
-       function reference is never released, and the rule that armed it never
-       hears back -- an .after() off-pulse never switches off, a watchdog()
-       never expires, an every() never re-arms. Say so, like the other
-       producers below do. */
-    if (s_queue && xQueueSend(s_queue, &ev, 0) != pdTRUE)
-        ESP_LOGW(TAG, "event queue full - rule timer %u dropped",
+
+    if (s_queue && xQueueSend(s_queue, &ev, 0) == pdTRUE) return;
+
+    uint8_t next = (uint8_t)((s_of_head + 1u) % TIMER_OVERFLOW_SLOTS);
+    if (next == s_of_tail) {                 /* even the overflow ring is full */
+        ESP_LOGE(TAG, "rule timer %u lost: event queue and overflow both full",
                  (unsigned)ev.timer.id);
+        return;
+    }
+    s_overflow[s_of_head] = ev.timer.id;
+    s_of_head = next;
+    ESP_LOGW(TAG, "event queue full - rule timer %u deferred",
+             (unsigned)ev.timer.id);
 }
 
 static JSValue js_set_timer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
@@ -248,6 +265,22 @@ static void drain_jobs(JSRuntime *rt)
     while (JS_ExecutePendingJob(rt, &ctx2) > 0) {}
 }
 
+/* Same as eval_or_log(), but says whether it worked. */
+static bool eval_check(JSContext *ctx, const char *src, const char *name)
+{
+    JSValue result = JS_Eval(ctx, src, strlen(src), name, JS_EVAL_TYPE_GLOBAL);
+    bool ok = !JS_IsException(result);
+    if (!ok) {
+        JSValue exc = JS_GetException(ctx);
+        const char *msg = JS_ToCString(ctx, exc);
+        ESP_LOGE(TAG, "JS error in %s: %s", name, msg ? msg : "(unknown)");
+        JS_FreeCString(ctx, msg);
+        JS_FreeValue(ctx, exc);
+    }
+    JS_FreeValue(ctx, result);
+    return ok;
+}
+
 static void eval_or_log(JSContext *ctx, const char *src, const char *name)
 {
     JSValue result = JS_Eval(ctx, src, strlen(src), name, JS_EVAL_TYPE_GLOBAL);
@@ -303,6 +336,63 @@ static inline void budget_start(void)
     s_deadline_us = TIME_BUDGET_US ? esp_timer_get_time() + TIME_BUDGET_US : 0;
 }
 
+/* Runs one elapsed timer. Reached from the event queue and, when that was
+   full, from the overflow ring. */
+static void run_timer(JSContext *ctx, uint32_t id)
+{
+    timer_slot_t *t = timer_find(id);
+    if (!t) return;                       // already cleared or belongs to a replaced context
+
+    JSValue fn = t->fn;                   // take ownership
+    esp_timer_delete(t->handle);          // one-shot has already fired
+    t->used = false;                      // free slot before calling (fn may re-arm)
+
+    JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 0, NULL);
+    if (JS_IsException(r)) {
+        JSValue exc = JS_GetException(ctx);
+        const char *msg = JS_ToCString(ctx, exc);
+        ESP_LOGE(TAG, "rule timer error: %s", msg ? msg : "(unknown)");
+        JS_FreeCString(ctx, msg);
+        JS_FreeValue(ctx, exc);
+    }
+    JS_FreeValue(ctx, r);
+    JS_FreeValue(ctx, fn);
+}
+
+static void drain_overflow(JSContext *ctx)
+{
+    while (s_of_tail != s_of_head) {
+        uint32_t id = s_overflow[s_of_tail];
+        s_of_tail = (uint8_t)((s_of_tail + 1u) % TIMER_OVERFLOW_SLOTS);
+        budget_start();
+        run_timer(ctx, id);
+    }
+}
+
+/* Release the slots marked in `mine`, freeing their JS references against the
+   context they were created in. */
+static void clear_timers(JSContext *ctx, const bool *mine)
+{
+    for (int i = 0; i < MAX_TIMERS; i++) {
+        if (!mine[i] || !s_timers[i].used) continue;
+        esp_timer_stop(s_timers[i].handle);
+        esp_timer_delete(s_timers[i].handle);
+        JS_FreeValue(ctx, s_timers[i].fn);
+        s_timers[i].used = false;
+    }
+}
+
+static void bind_handlers(JSContext *ctx, JSValue *mqtt, JSValue *input,
+                          JSValue *time_sync, JSValue *activity)
+{
+    JSValue global = JS_GetGlobalObject(ctx);
+    *mqtt      = JS_GetPropertyStr(ctx, global, "_on_mqtt");
+    *input     = JS_GetPropertyStr(ctx, global, "_on_input");
+    *time_sync = JS_GetPropertyStr(ctx, global, "_on_time_sync");
+    *activity  = JS_GetPropertyStr(ctx, global, "_on_activity");
+    JS_FreeValue(ctx, global);
+}
+
 /* ── Scripting task ──────────────────────────────────────────────────────── */
 
 static void scripting_task(void *arg)
@@ -323,12 +413,8 @@ static void scripting_task(void *arg)
     eval_or_log(ctx, s_user_script, "<user>");
     drain_jobs(rt);
 
-    JSValue global       = JS_GetGlobalObject(ctx);
-    JSValue on_mqtt      = JS_GetPropertyStr(ctx, global, "_on_mqtt");
-    JSValue on_input     = JS_GetPropertyStr(ctx, global, "_on_input");
-    JSValue on_time_sync = JS_GetPropertyStr(ctx, global, "_on_time_sync");
-    JSValue on_activity  = JS_GetPropertyStr(ctx, global, "_on_activity");
-    JS_FreeValue(ctx, global);
+    JSValue on_mqtt, on_input, on_time_sync, on_activity;
+    bind_handlers(ctx, &on_mqtt, &on_input, &on_time_sync, &on_activity);
 
     ESP_LOGI(TAG, "Rule engine ready. Free heap: %lu B  SPIRAM: %lu B",
              (unsigned long)esp_get_free_heap_size(),
@@ -336,6 +422,8 @@ static void scripting_task(void *arg)
 
     scripting_evt_t ev;
     for (;;) {
+        drain_overflow(ctx);   /* timers the event queue could not take */
+
         if (xQueueReceive(s_queue, &ev, pdMS_TO_TICKS(200)) == pdTRUE) {
             budget_start();
             switch (ev.type) {
@@ -349,33 +437,70 @@ static void scripting_task(void *arg)
                       JS_NewInt32(ctx, ev.input.channel),
                       JS_NewBool(ctx,  ev.input.state));
                 break;
-            case EVT_RELOAD:
-                // _reset_rules() also cancels any pending .after()/.heldFor() timers
-                eval_or_log(ctx, "_reset_rules()", "<reload>");
-                budget_start();   /* the user script gets a budget of its own */
-                eval_or_log(ctx, ev.reload.script, "<user>");
+            case EVT_RELOAD: {
+                /* A reload gets its own JSContext instead of being evaluated on
+                   top of the old one. Re-evaluating in the same context kept
+                   the previous script's global lexical bindings, so a second
+                   save of a script containing a top-level `const` failed with
+                   "redeclaration of ..." -- a compile error, so nothing of the
+                   new script ran, and the old rules had already been cleared.
+                   It also meant a user script could overwrite _reset_rules or a
+                   DSL prototype and keep that for the rest of the boot.
+
+                   The new context is built and the script evaluated into it
+                   first. Only if that works is it swapped in; otherwise the old
+                   one carries on serving the rules it already has. */
+                JSContext *nctx = JS_NewContext(rt);
+                if (!nctx) {
+                    ESP_LOGE(TAG, "reload: out of memory, rules unchanged");
+                    free(ev.reload.script);
+                    break;
+                }
+
+                /* Timers already armed belong to the old context; remember them
+                   so the right set is released whichever way this goes. */
+                bool was_used[MAX_TIMERS];
+                for (int i = 0; i < MAX_TIMERS; i++) was_used[i] = s_timers[i].used;
+
+                scripting_register_bindings(nctx);
+                register_timer_bindings(nctx);
+
+                budget_start();
+                bool ok = eval_check(nctx, dsl_js_start, "<dsl>");
+                if (ok) {
+                    budget_start();   /* the user script gets a budget of its own */
+                    ok = eval_check(nctx, ev.reload.script, "<user>");
+                }
                 free(ev.reload.script);
+
+                if (!ok) {
+                    /* Release what the failed script managed to arm, keep the
+                       running rules. */
+                    bool theirs[MAX_TIMERS];
+                    for (int i = 0; i < MAX_TIMERS; i++)
+                        theirs[i] = !was_used[i] && s_timers[i].used;
+                    clear_timers(nctx, theirs);
+                    JS_FreeContext(nctx);
+                    ESP_LOGE(TAG, "rules not applied, previous rules still running");
+                    break;
+                }
+
+                drain_jobs(rt);
+                clear_timers(ctx, was_used);          /* old context's timers */
+                JS_FreeValue(ctx, on_mqtt);
+                JS_FreeValue(ctx, on_input);
+                JS_FreeValue(ctx, on_time_sync);
+                JS_FreeValue(ctx, on_activity);
+                JS_FreeContext(ctx);
+
+                ctx = nctx;
+                bind_handlers(ctx, &on_mqtt, &on_input, &on_time_sync, &on_activity);
                 ESP_LOGI(TAG, "Rules reloaded");
                 break;
-            case EVT_TIMER: {
-                timer_slot_t *t = timer_find(ev.timer.id);
-                if (t) {                              // ignore if already cleared/reloaded
-                    JSValue fn = t->fn;               // take ownership
-                    esp_timer_delete(t->handle);      // one-shot has already fired
-                    t->used = false;                  // free slot before calling (fn may re-arm)
-                    JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 0, NULL);
-                    if (JS_IsException(r)) {
-                        JSValue exc = JS_GetException(ctx);
-                        const char *msg = JS_ToCString(ctx, exc);
-                        ESP_LOGE(TAG, "rule timer error: %s", msg ? msg : "(unknown)");
-                        JS_FreeCString(ctx, msg);
-                        JS_FreeValue(ctx, exc);
-                    }
-                    JS_FreeValue(ctx, r);
-                    JS_FreeValue(ctx, fn);
-                }
-                break;
             }
+            case EVT_TIMER:
+                run_timer(ctx, ev.timer.id);
+                break;
             case EVT_TIME_SYNC:
                 // Clock just became real (first SNTP sync, or corrected by a later one).
                 // Mark valid and let dsl.js re-arm cron from the corrected wall-clock.

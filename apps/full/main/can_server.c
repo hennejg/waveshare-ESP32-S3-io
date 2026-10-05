@@ -400,30 +400,46 @@ static void n2k_handle_rx(const rx_msg_t *m)
     uint8_t src, dst;
     uint32_t pgn = n2k_decode_id(m->id, &src, &dst);
 
+    /* Address claims come first, before the "not ours" filter below. A claim
+       that conflicts with us is by definition sent from our own address, so
+       the filter used to discard exactly the frames the conflict branch was
+       looking for and that branch could never run: two devices on the default
+       address both kept it and neither backed off. Claims are also handled
+       while we are still claiming, not only once active -- that is the window
+       in which a collision is most likely. */
+    if (pgn == N2K_PGN_ADDRESS_CLAIM && m->dlc == 8) {
+        if (src != s_addr) return;                 /* somebody else's address */
+        if (s_ac_state != AC_ACTIVE && s_ac_state != AC_CLAIMING) return;
+
+        uint64_t their_name, our_name;
+        memcpy(&their_name, m->data, 8);
+        memcpy(&our_name,   s_name,  8);
+
+        /* ISO 11783-5: the lower NAME wins the address. */
+        if (our_name > their_name) {
+            s_addr++;
+            if (s_addr > 251) {
+                s_ac_state = AC_FAILED;
+                ESP_LOGW(TAG, "N2k: no free address left, giving up");
+                return;
+            }
+            s_ac_state   = AC_CLAIMING;
+            s_claim_tick = xTaskGetTickCount();
+            ESP_LOGW(TAG, "N2k: address conflict, moving to %u", s_addr);
+            n2k_send_address_claim(s_addr);
+        } else {
+            /* Our NAME is lower, so the address stays ours. Re-assert it so the
+               other device knows to move. */
+            n2k_send_address_claim(s_addr);
+        }
+        return;
+    }
+
     /* Skip our own frames. */
     if (src == s_addr) return;
 
     /* Only accept frames addressed to us or global. */
     if (dst != N2K_ADDR_GLOBAL && dst != s_addr) return;
-
-    if (pgn == N2K_PGN_ADDRESS_CLAIM && m->dlc == 8) {
-        /* Conflict check: other device claiming same address */
-        if (src == s_addr && s_ac_state == AC_ACTIVE) {
-            uint64_t their_name, our_name;
-            memcpy(&their_name, m->data, 8);
-            memcpy(&our_name,   s_name,  8);
-            if (our_name > their_name) {
-                /* We lose: try next address */
-                s_addr++;
-                if (s_addr > 251) { s_ac_state = AC_FAILED; return; }
-                s_ac_state = AC_CLAIMING;
-                s_claim_tick = xTaskGetTickCount();
-                n2k_send_address_claim(s_addr);
-            }
-            /* If our_name < their_name: they should re-address; we stay. */
-        }
-        return;
-    }
 
     if (pgn == N2K_PGN_ISO_REQUEST && m->dlc == 3) {
         uint32_t requested = (uint32_t)m->data[0]
