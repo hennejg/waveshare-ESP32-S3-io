@@ -100,6 +100,31 @@ static bool validate_names(const di_config_t *arr, int count, const char **err_m
     return true;
 }
 
+/* httpd_req_recv() returns what a single socket read yielded. The loop in
+   httpd_recv_with_opt() only repeats for HTTPD_RECV_OPT_BLOCKING, and
+   httpd_recv() passes HTTPD_RECV_OPT_NONE, so one call can return far less
+   than content_len. Measured on an ESP32-S3-POE-ETH-8DI-8DO with a 2895-byte
+   rule script: a single call returned 1440 bytes when the body was sent in one
+   go, 724 over four segments and 145 over twenty -- all three then failed to
+   parse and answered 400 Invalid JSON.
+
+   buf must hold content_len + 1 bytes. Returns the length read, or -1. */
+static int recv_body(httpd_req_t *req, char *buf, size_t cap)
+{
+    size_t want = req->content_len;
+    if (want > cap) return -1;
+
+    size_t got = 0;
+    while (got < want) {
+        int r = httpd_req_recv(req, buf + got, want - got);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (r <= 0) return -1;
+        got += (size_t)r;
+    }
+    buf[got] = '\0';
+    return (int)got;
+}
+
 /* ------------------------------------------------------------------ auth check */
 
 /* Returns true if the request carries a valid password (or no password is set). */
@@ -214,9 +239,8 @@ static esp_err_t api_auth_set_password(httpd_req_t *req)
     }
     char *body = malloc(req->content_len + 1);
     if (!body) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_OK; }
-    int n = httpd_req_recv(req, body, req->content_len);
-    if (n <= 0) { free(body); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
-    body[n] = '\0';
+    int n = recv_body(req, body, req->content_len);
+    if (n < 0) { free(body); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
     cJSON *root = cJSON_Parse(body);
     free(body);
@@ -342,13 +366,12 @@ static esp_err_t api_config_post(httpd_req_t *req)
         return ESP_OK;
     }
 
-    int received = httpd_req_recv(req, body, req->content_len);
-    if (received <= 0) {
+    int received = recv_body(req, body, req->content_len);
+    if (received < 0) {
         free(body);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv failed");
         return ESP_OK;
     }
-    body[received] = '\0';
 
     cJSON *root = cJSON_Parse(body);
     free(body);
@@ -551,13 +574,12 @@ static esp_err_t api_time_post(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
         return ESP_OK;
     }
-    int received = httpd_req_recv(req, body, req->content_len);
-    if (received <= 0) {
+    int received = recv_body(req, body, req->content_len);
+    if (received < 0) {
         free(body);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv failed");
         return ESP_OK;
     }
-    body[received] = '\0';
 
     cJSON *root = cJSON_Parse(body);
     free(body);
@@ -753,8 +775,8 @@ static esp_err_t api_eth_only(httpd_req_t *req)
     }
 
     char body[65] = {};
-    int received = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (received <= 0) {
+    int received = recv_body(req, body, sizeof(body) - 1);
+    if (received < 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv failed");
         return ESP_OK;
     }
@@ -864,9 +886,8 @@ static esp_err_t api_io_output(httpd_req_t *req)
         return ESP_OK;
     }
     char body[65];
-    int n = httpd_req_recv(req, body, req->content_len);
-    if (n <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
-    body[n] = '\0';
+    int n = recv_body(req, body, sizeof(body) - 1);
+    if (n < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
     cJSON *root = cJSON_Parse(body);
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
@@ -908,9 +929,8 @@ static esp_err_t api_io_led(httpd_req_t *req)
         return ESP_OK;
     }
     char body[65];
-    int n = httpd_req_recv(req, body, req->content_len);
-    if (n <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
-    body[n] = '\0';
+    int n = recv_body(req, body, sizeof(body) - 1);
+    if (n < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
     cJSON *root = cJSON_Parse(body);
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
@@ -947,9 +967,8 @@ static esp_err_t api_io_buzzer(httpd_req_t *req)
         return ESP_OK;
     }
     char body[65];
-    int n = httpd_req_recv(req, body, req->content_len);
-    if (n <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
-    body[n] = '\0';
+    int n = recv_body(req, body, sizeof(body) - 1);
+    if (n < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
     cJSON *root = cJSON_Parse(body);
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
@@ -1010,9 +1029,8 @@ static esp_err_t api_rules_post(httpd_req_t *req)
     char *body = malloc(req->content_len + 1);
     if (!body) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_OK; }
 
-    int n = httpd_req_recv(req, body, req->content_len);
-    if (n <= 0) { free(body); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
-    body[n] = '\0';
+    int n = recv_body(req, body, req->content_len);
+    if (n < 0) { free(body); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
     cJSON *root = cJSON_Parse(body);
     free(body);
