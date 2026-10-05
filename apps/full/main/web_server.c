@@ -45,6 +45,9 @@ extern const char DEMO_SCRIPT[];
    buffer: "Basic " + base64(":" + password) must stay within 159 characters,
    which 113 does at 158 and 114 exceeds at 162. */
 #define APP_CFG_PASSWORD_MAX 113
+
+/* Total time a request body may take to arrive. */
+#define BODY_RECV_TIMEOUT_MS 5000
 #define WWW_BASE   "/www"
 #define CHUNK_SIZE  4096
 #define BODY_MAX    2048  /* names add ~768 bytes to the di/dout arrays */
@@ -119,12 +122,22 @@ static int recv_body(httpd_req_t *req, char *buf, size_t cap)
     size_t want = req->content_len;
     if (want > cap) return -1;
 
+    /* The deadline is absolute, not per read: a client that dribbles one byte
+       at a time must not be able to hold the handler open indefinitely. The
+       server processes handlers on its own task, so a stalled body would block
+       every other request -- and /api/auth/set-password reads its body before
+       the token is checked, so this is reachable without credentials. */
+    const int64_t deadline = esp_timer_get_time() + (int64_t)BODY_RECV_TIMEOUT_MS * 1000;
     size_t got = 0;
     while (got < want) {
         int r = httpd_req_recv(req, buf + got, want - got);
-        if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            if (esp_timer_get_time() >= deadline) return -1;
+            continue;
+        }
         if (r <= 0) return -1;
         got += (size_t)r;
+        if (esp_timer_get_time() >= deadline && got < want) return -1;
     }
     buf[got] = '\0';
     return (int)got;
@@ -929,7 +942,15 @@ static esp_err_t api_io_output(httpd_req_t *req)
     }
     cJSON_Delete(root);
 
-    dout_set(ch, new_val);
+    esp_err_t set_ret = dout_set(ch, new_val);
+    if (set_ret != ESP_OK) {
+        /* dout_set() restores the previous state when the transfer fails, so
+           confirming the command here would report a switch that never
+           happened. */
+        ESP_LOGW(TAG, "output %d: set failed: %s", ch + 1, esp_err_to_name(set_ret));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "output write failed");
+        return ESP_OK;
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
     return ESP_OK;

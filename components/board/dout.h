@@ -15,7 +15,10 @@ esp_err_t dout_set(uint8_t n, bool state);
 
 /* Re-apply current logical states to hardware (e.g. after invert config
    change) and publish all states. */
-void dout_publish_all(void);
+/* Re-apply the logical state to the chip and publish it. Returns the result of
+   the transfer; on failure the previous state is restored and published, so
+   what is reported is always what the hardware actually holds. */
+esp_err_t dout_publish_all(void);
 
 /* Wire these into the MQTT callbacks in main.c. */
 void dout_on_mqtt_connected(void);

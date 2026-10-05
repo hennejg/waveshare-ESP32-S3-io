@@ -198,14 +198,38 @@ esp_err_t dout_set(uint8_t n, bool state)
     return ret;
 }
 
-void dout_publish_all(void)
+/* Publish the current logical state without touching the hardware. */
+static void publish_all(void)
 {
-    dout_lock();
-    write_outputs();    /* re-apply to hardware — picks up invert changes */
-    dout_unlock();
 #ifdef CONFIG_APP_MQTT_ENABLE
     for (uint8_t i = 0; i < NUM_DO; i++) publish_one(i);
+#else
+    (void)0;
 #endif
+}
+
+/* Push s_state[] to the chip and, if that fails, put back what was there.
+   Same contract as dout_set() for a whole-port change: the logical state only
+   ever reflects a transfer that actually happened. Call with the lock held. */
+static esp_err_t commit_locked(const bool prev[NUM_DO])
+{
+    esp_err_t ret = write_outputs();
+    if (ret != ESP_OK) {
+        memcpy(s_state, prev, sizeof(bool) * NUM_DO);
+        ESP_LOGW(TAG, "bulk write failed (%s), outputs unchanged", esp_err_to_name(ret));
+    }
+    return ret;
+}
+
+esp_err_t dout_publish_all(void)
+{
+    bool prev[NUM_DO];
+    dout_lock();
+    memcpy(prev, s_state, sizeof(prev));
+    esp_err_t ret = commit_locked(prev);   /* re-apply — picks up invert changes */
+    dout_unlock();
+    publish_all();                         /* reports the state that is now real */
+    return ret;
 }
 
 void dout_on_mqtt_connected(void)
@@ -249,14 +273,19 @@ void dout_on_mqtt_message(const char *topic, size_t tlen,
             }
             int n = cJSON_GetArraySize(arr);
             if (n > NUM_DO) n = NUM_DO;
+            bool prev[NUM_DO];
             dout_lock();
+            memcpy(prev, s_state, sizeof(prev));
             for (int i = 0; i < n; i++)
                 apply_json_item(cJSON_GetArrayItem(arr, i), (uint8_t)i);
+            commit_locked(prev);
             dout_unlock();
             cJSON_Delete(arr);
         } else {
             bool state;
+            bool prev[NUM_DO];
             dout_lock();
+            memcpy(prev, s_state, sizeof(prev));
             if (parse_toggle(data, dlen)) {
                 for (uint8_t i = 0; i < NUM_DO; i++) s_state[i] = !s_state[i];
             } else if (parse_payload(data, dlen, &state)) {
@@ -266,9 +295,10 @@ void dout_on_mqtt_message(const char *topic, size_t tlen,
                 ESP_LOGW(TAG, "output/set: unrecognised payload");
                 return;
             }
+            commit_locked(prev);
             dout_unlock();
         }
-        dout_publish_all();
+        publish_all();   /* whatever the transfer left behind, not what was asked for */
         return;
     }
 
