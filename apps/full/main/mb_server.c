@@ -87,15 +87,24 @@ static void update_timer_cb(void *arg)
     mbc_slave_unlock(s_handle);
 }
 
-static void apply_coil_write(void)
+static void apply_coil_write(const mb_param_info_t *info)
 {
     mbc_slave_lock(s_handle);
     uint8_t co = s_coils.b[0];
     mbc_slave_unlock(s_handle);
 
-    for (uint8_t i = 0; i < 8; i++) {
+    /* Apply only the coils this request actually addressed. The buffer always
+       holds all eight bits, but the ones outside the request are a snapshot the
+       refresher left behind: if CAN, a rule or the web UI moved an output since,
+       writing them back would silently revert that change. FC05 therefore
+       touches exactly one output, FC15 exactly its range. */
+    unsigned first = info->mb_offset;
+    unsigned last  = first + (info->size ? info->size : 1u);
+    if (last > 8u) last = 8u;
+
+    for (unsigned i = first; i < last; i++) {
         bool bit = (co >> i) & 1;
-        if (bit != dout_get(i)) dout_set(i, bit);
+        if (bit != dout_get((uint8_t)i)) dout_set((uint8_t)i, bit);
     }
 
     /* Re-sync the image with what the outputs actually took — a write that
@@ -109,7 +118,8 @@ static void apply_coil_write(void)
     s_coils_mirror_valid = true;
     mbc_slave_unlock(s_handle);
 
-    ESP_LOGD(TAG, "Coil write: asked 0x%02x, outputs 0x%02x", co, actual);
+    ESP_LOGD(TAG, "Coil write: coils %u..%u from 0x%02x, outputs 0x%02x",
+             first, last - 1u, co, actual);
 }
 
 static void apply_hr_write(const mb_param_info_t *info)
@@ -160,7 +170,7 @@ static void event_task(void *arg)
         while (mbc_slave_get_param_info(s_handle, &info, wait) == ESP_OK) {
             wait = 0;    /* only the first record is worth waiting for */
             if (info.type & MB_EVENT_HOLDING_REG_WR) { apply_hr_write(&info); wrote = true; }
-            else if (info.type & MB_EVENT_COILS_WR)  { apply_coil_write();    wrote = true; }
+            else if (info.type & MB_EVENT_COILS_WR)  { apply_coil_write(&info); wrote = true; }
             /* read records are consumed and discarded */
         }
 
