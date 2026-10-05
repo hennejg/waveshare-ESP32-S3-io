@@ -192,15 +192,46 @@ static void register_timer_bindings(JSContext *ctx)
 
 /* ── PSRAM allocator for the QuickJS heap ────────────────────────────────── */
 
-// Custom allocator — prefixed s3_ to avoid clashing with quickjs.h's js_malloc etc.
+/* Custom allocator -- prefixed s3_ to avoid clashing with quickjs.h's js_malloc.
+   JS_SetMemoryLimit() only stores the limit; QuickJS expects the allocator to
+   enforce it and to maintain malloc_size/malloc_count, exactly as js_def_malloc
+   does. Without that the limit has no effect and the GC threshold, which is
+   derived from malloc_size, never triggers either -- a script could take the
+   shared PSRAM rather than its own budget. */
 static void *s3_js_malloc(JSMallocState *s, size_t n)
-    { return heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); }
+{
+    if (s->malloc_size + n > s->malloc_limit) return NULL;
+    void *p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) return NULL;
+    s->malloc_count++;
+    s->malloc_size += heap_caps_get_allocated_size(p);
+    return p;
+}
 
 static void s3_js_free(JSMallocState *s, void *p)
-    { free(p); }
+{
+    if (!p) return;
+    s->malloc_count--;
+    s->malloc_size -= heap_caps_get_allocated_size(p);
+    free(p);
+}
 
 static void *s3_js_realloc(JSMallocState *s, void *p, size_t n)
-    { return heap_caps_realloc(p, n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); }
+{
+    size_t old_size = p ? heap_caps_get_allocated_size(p) : 0;
+
+    if (!n) {                      /* realloc(p, 0) frees */
+        if (p) { s->malloc_count--; s->malloc_size -= old_size; free(p); }
+        return NULL;
+    }
+    if (!p) return s3_js_malloc(s, n);
+    if (s->malloc_size + n - old_size > s->malloc_limit) return NULL;
+
+    void *q = heap_caps_realloc(p, n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!q) return NULL;           /* p stays valid and accounted for */
+    s->malloc_size += heap_caps_get_allocated_size(q) - old_size;
+    return q;
+}
 
 static size_t s3_js_usable_size(const void *p)
     { return heap_caps_get_allocated_size((void *)p); }
