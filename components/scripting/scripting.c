@@ -95,6 +95,29 @@ static uint32_t     s_next_timer_id = 1;
    timer it asked for. */
 static uint32_t     s_timer_full_count;
 
+/* Result of the last finished reload, so the HTTP handler can report what
+   actually happened instead of acknowledging a request it cannot see through.
+   Guarded because the engine writes it while the web server reads it. */
+static scripting_reload_status_t s_reload_status;
+static SemaphoreHandle_t         s_reload_lock;
+
+static void publish_reload_result(bool ok, const char *message)
+{
+    if (s_reload_lock) xSemaphoreTake(s_reload_lock, portMAX_DELAY);
+    s_reload_status.ok = ok;
+    strlcpy(s_reload_status.message, message ? message : "", sizeof(s_reload_status.message));
+    s_reload_status.generation++;
+    if (s_reload_lock) xSemaphoreGive(s_reload_lock);
+}
+
+void scripting_reload_status(scripting_reload_status_t *out)
+{
+    if (!out) return;
+    if (s_reload_lock) xSemaphoreTake(s_reload_lock, portMAX_DELAY);
+    *out = s_reload_status;
+    if (s_reload_lock) xSemaphoreGive(s_reload_lock);
+}
+
 static timer_slot_t *timer_find(uint32_t id)
 {
     for (int i = 0; i < MAX_TIMERS; i++)
@@ -272,8 +295,10 @@ static void drain_jobs(JSRuntime *rt)
     while (JS_ExecutePendingJob(rt, &ctx2) > 0) {}
 }
 
-/* Same as eval_or_log(), but says whether it worked. */
-static bool eval_check(JSContext *ctx, const char *src, const char *name)
+/* Same as eval_or_log(), but says whether it worked and hands back the error
+   so the caller can report it rather than only logging it. */
+static bool eval_check(JSContext *ctx, const char *src, const char *name,
+                       char *err, size_t err_len)
 {
     JSValue result = JS_Eval(ctx, src, strlen(src), name, JS_EVAL_TYPE_GLOBAL);
     bool ok = !JS_IsException(result);
@@ -281,6 +306,7 @@ static bool eval_check(JSContext *ctx, const char *src, const char *name)
         JSValue exc = JS_GetException(ctx);
         const char *msg = JS_ToCString(ctx, exc);
         ESP_LOGE(TAG, "JS error in %s: %s", name, msg ? msg : "(unknown)");
+        if (err && err_len) strlcpy(err, msg ? msg : "(unknown)", err_len);
         JS_FreeCString(ctx, msg);
         JS_FreeValue(ctx, exc);
     }
@@ -457,10 +483,12 @@ static void scripting_task(void *arg)
                    The new context is built and the script evaluated into it
                    first. Only if that works is it swapped in; otherwise the old
                    one carries on serving the rules it already has. */
+                char err[96] = "";
                 JSContext *nctx = JS_NewContext(rt);
                 if (!nctx) {
                     ESP_LOGE(TAG, "reload: out of memory, rules unchanged");
                     free(ev.reload.script);
+                    publish_reload_result(false, "out of memory");
                     break;
                 }
 
@@ -475,10 +503,10 @@ static void scripting_task(void *arg)
                 uint32_t full_before = s_timer_full_count;
 
                 budget_start();
-                bool ok = eval_check(nctx, dsl_js_start, "<dsl>");
+                bool ok = eval_check(nctx, dsl_js_start, "<dsl>", err, sizeof(err));
                 if (ok) {
                     budget_start();   /* the user script gets a budget of its own */
-                    ok = eval_check(nctx, ev.reload.script, "<user>");
+                    ok = eval_check(nctx, ev.reload.script, "<user>", err, sizeof(err));
                 }
                 free(ev.reload.script);
 
@@ -490,6 +518,8 @@ static void scripting_task(void *arg)
                 if (ok && s_timer_full_count != full_before) {
                     ESP_LOGE(TAG, "reload needs more timers than are free (%d total)",
                              MAX_TIMERS);
+                    snprintf(err, sizeof(err),
+                             "more timers needed than are free (%d total)", MAX_TIMERS);
                     ok = false;
                 }
 
@@ -502,6 +532,7 @@ static void scripting_task(void *arg)
                     clear_timers(nctx, theirs);
                     JS_FreeContext(nctx);
                     ESP_LOGE(TAG, "rules not applied, previous rules still running");
+                    publish_reload_result(false, err);
                     break;
                 }
 
@@ -516,6 +547,7 @@ static void scripting_task(void *arg)
                 ctx = nctx;
                 bind_handlers(ctx, &on_mqtt, &on_input, &on_time_sync, &on_activity);
                 ESP_LOGI(TAG, "Rules reloaded");
+                publish_reload_result(true, "");
                 break;
             }
             case EVT_TIMER:
@@ -555,6 +587,12 @@ esp_err_t scripting_init(const char *user_script, const scripting_io_t *io)
 {
     s_user_script  = user_script;
     g_scripting_io = io;
+
+    s_reload_lock = xSemaphoreCreateMutex();
+    if (!s_reload_lock) {
+        ESP_LOGE(TAG, "Failed to create reload status lock");
+        return ESP_ERR_NO_MEM;
+    }
 
     s_queue = xQueueCreate(QUEUE_DEPTH, sizeof(scripting_evt_t));
     if (!s_queue) {

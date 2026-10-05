@@ -48,6 +48,11 @@ extern const char DEMO_SCRIPT[];
 
 /* Total time a request body may take to arrive. */
 #define BODY_RECV_TIMEOUT_MS 5000
+
+/* How long POST /api/rules waits for the rule engine to accept or refuse the
+   script. Handlers run on the server task, so this caps how long one request
+   can hold up the others. */
+#define RULES_APPLY_TIMEOUT_MS 1000
 #define WWW_BASE   "/www"
 #define CHUNK_SIZE  4096
 #define BODY_MAX    2048  /* names add ~768 bytes to the di/dout arrays */
@@ -1100,9 +1105,51 @@ static esp_err_t api_rules_post(httpd_req_t *req)
         return ESP_OK;
     }
 
-    scripting_reload(script[0] ? script : DEMO_SCRIPT);
+    /* Wait for the engine's verdict instead of acknowledging a request we
+       cannot see through. A reload can be refused -- a syntax error, a global
+       const clashing with the previous script, no free timers -- and the rules
+       already running then stay in place, which the caller has to be told.
 
+       Bounded on purpose: handlers run on the server's own task, so a long
+       wait here would hold up every other request. A reload normally finishes
+       in milliseconds; if it has not after RULES_APPLY_TIMEOUT_MS the request
+       is answered with 202 and the outcome is left to the log. */
+    scripting_reload_status_t before;
+    scripting_reload_status(&before);
+
+    scripting_reload(script[0] ? script : DEMO_SCRIPT);
     cJSON_Delete(root);
+
+    scripting_reload_status_t now = before;
+    for (int waited = 0; waited < RULES_APPLY_TIMEOUT_MS; waited += 10) {
+        scripting_reload_status(&now);
+        if (now.generation != before.generation) break;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    if (now.generation == before.generation) {
+        httpd_resp_set_status(req, "202 Accepted");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"status\":\"accepted\"}");
+        return ESP_OK;
+    }
+
+    if (!now.ok) {
+        /* Stored but not running: say so plainly, including that the previous
+           rules are the ones still in effect. */
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddStringToObject(resp, "status", "rejected");
+        cJSON_AddStringToObject(resp, "error", now.message);
+        cJSON_AddStringToObject(resp, "detail", "previous rules still running");
+        char *body_out = cJSON_PrintUnformatted(resp);
+        cJSON_Delete(resp);
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, body_out ? body_out : "{\"status\":\"rejected\"}");
+        free(body_out);
+        return ESP_OK;
+    }
+
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
     return ESP_OK;
