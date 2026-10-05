@@ -40,6 +40,11 @@ extern const char DEMO_SCRIPT[];
 #include "mbedtls/base64.h"
 
 #define TAG        "web_server"
+
+/* Longest password whose HTTP Basic header still fits check_auth()'s 160-byte
+   buffer: "Basic " + base64(":" + password) must stay within 159 characters,
+   which 113 does at 158 and 114 exceeds at 162. */
+#define APP_CFG_PASSWORD_MAX 113
 #define WWW_BASE   "/www"
 #define CHUNK_SIZE  4096
 #define BODY_MAX    2048  /* names add ~768 bytes to the di/dout arrays */
@@ -263,6 +268,16 @@ static esp_err_t api_auth_set_password(httpd_req_t *req)
         return ESP_OK;
     }
 
+    /* The Basic-auth parser reads the header into a 160-byte buffer, so a
+       password that cannot fit there could be set and would then lock the user
+       out of the very API that set it. "Basic " plus base64 of ":" + password
+       must stay within that buffer -- see APP_CFG_PASSWORD_MAX. */
+    if (strlen(pw_j->valuestring) > APP_CFG_PASSWORD_MAX) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "password too long (max 113 characters)");
+        return ESP_OK;
+    }
     if (strlen(pw_j->valuestring) < 8) {
         cJSON_Delete(root);
         httpd_resp_set_status(req, "400 Bad Request");
