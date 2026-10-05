@@ -58,6 +58,39 @@ static IRAM_ATTR bool rx_done_cb(twai_node_handle_t node,
 
 static uint16_t s_base;
 
+/* twai_node_transmit() does not copy the frame. The driver keeps a pointer to
+   it and to its buffer until the transmission completes -- esp_twai_onchip.c
+   either sets p_curr_tx = frame or queues &frame in tx_mount_queue. A frame
+   built on the stack is therefore still being read after the sender has
+   returned and the stack slot has been reused.
+
+   Observed on the wire with a CAN analyser: of two frames sent back to back,
+   the first (hardware idle, sent at once) arrives correctly, while the second
+   (queued, sent later) goes out as 4C5 [0] instead of 102 [2] -- a corrupted
+   id and length. One frame per second is always clean.
+
+   A ring as deep as the driver's TX queue keeps every frame in flight alive.
+   All senders run on the CAN worker task, so the index needs no locking. */
+#define TX_SLOTS 16
+
+static struct {
+    twai_frame_t f;
+    uint8_t      buf[8];
+} s_tx[TX_SLOTS];
+static uint8_t s_tx_next;
+
+static twai_frame_t *tx_claim(const uint8_t *data, uint8_t dlc, uint8_t fill)
+{
+    __typeof__(s_tx[0]) *slot = &s_tx[s_tx_next];
+    s_tx_next = (uint8_t)((s_tx_next + 1u) % TX_SLOTS);
+
+    memset(slot->buf, fill, sizeof(slot->buf));
+    if (dlc && data) memcpy(slot->buf, data, dlc);
+    slot->f.buffer     = slot->buf;
+    slot->f.buffer_len = dlc;
+    return &slot->f;
+}
+
 /* A rejected transmit used to vanish: basic_send() discarded the result and
    n2k_send_frame() logged at DEBUG, which is below the configured level. That
    is how an every-frame failure stayed invisible. Rate-limited so a
@@ -80,16 +113,13 @@ static void tx_failed(uint32_t id, esp_err_t err)
 
 static void basic_send(uint16_t id, const uint8_t *data, uint8_t dlc)
 {
-    uint8_t buf[8] = {0};
     if (dlc > 8) dlc = 8;
-    if (dlc && data) memcpy(buf, data, dlc);
-    twai_frame_t f = {
-        .header = { .id = id, .dlc = dlc, .ide = 0, .rtr = 0 },
-        /* Must describe the payload, not the buffer: the driver rejects the
-           frame unless header.dlc == twaifd_len2dlc(buffer_len). */
-        .buffer = buf, .buffer_len = dlc,
-    };
-    esp_err_t r = twai_node_transmit(s_node, &f, 5);
+    /* buffer_len must describe the payload, not the buffer: the driver rejects
+       the frame unless header.dlc == twaifd_len2dlc(buffer_len). */
+    twai_frame_t *f = tx_claim(data, dlc, 0x00);
+    f->header = (twai_frame_header_t){ .id = id, .dlc = dlc, .ide = 0, .rtr = 0 };
+    f->buffer_len = dlc;
+    esp_err_t r = twai_node_transmit(s_node, f, 5);
     if (r != ESP_OK) tx_failed(id, r);
 }
 
@@ -204,15 +234,11 @@ static uint32_t n2k_decode_id(uint32_t can_id, uint8_t *src, uint8_t *dst)
 
 static void n2k_send_frame(uint32_t can_id, const uint8_t *data, uint8_t dlc)
 {
-    uint8_t buf[8];
-    memset(buf, 0xFF, 8);
     if (dlc > 8) dlc = 8;
-    if (dlc && data) memcpy(buf, data, dlc);
-    twai_frame_t f = {
-        .header = { .id = can_id, .dlc = dlc, .ide = 1, .rtr = 0 },
-        .buffer = buf, .buffer_len = dlc,   /* see basic_send() */
-    };
-    esp_err_t r = twai_node_transmit(s_node, &f, 5);
+    twai_frame_t *f = tx_claim(data, dlc, 0xFF);   /* see basic_send() */
+    f->header = (twai_frame_header_t){ .id = can_id, .dlc = dlc, .ide = 1, .rtr = 0 };
+    f->buffer_len = dlc;
+    esp_err_t r = twai_node_transmit(s_node, f, 5);
     if (r != ESP_OK) tx_failed(can_id, r);
 }
 
