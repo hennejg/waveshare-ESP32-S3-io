@@ -14,6 +14,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 #define TAG         "mb_server"
 #define MB_UART     UART_NUM_1
@@ -27,160 +28,209 @@
    it can then neither answer nor hear anyone else. */
 #define MB_RTS_GPIO GPIO_NUM_21
 
-/* ---------------------------------------------------------------- data stores */
+/* ------------------------------------------------------------ register layout */
 
-/* Coils (RW): DO1-DO8, bit 0 = DO1 */
-static struct { uint8_t b[1]; } s_coils;
+#define MB_NUM_COILS     8     /* DO1-DO8, bit 0 = DO1            */
+#define MB_NUM_DISCRETE  8     /* DI1-DI8, bit 0 = DI1            */
+#define MB_NUM_HOLDING   2     /* [0] LED colour RGB252, [1] buzzer Hz */
 
-/* Discrete inputs (RO): DI1-DI8, bit 0 = DI1 */
-static struct { uint8_t b[1]; } s_di;
-
-/* Holding registers (RW):
-   HR40001 [0] = LED colour RGB252
-   HR40002 [1] = Buzzer frequency (Hz); write triggers 200 ms beep */
-static struct { uint16_t r[2]; } s_hr;
+/* The stack still wants descriptors for the areas it serves, but they are no
+   longer the data path: the access callbacks below are overridden, so nothing
+   reads or writes these buffers. Reads are answered from the live I/O state
+   and writes are captured as commands. */
+static struct { uint8_t  b[1]; } s_coils_unused;
+static struct { uint8_t  b[1]; } s_di_unused;
+static struct { uint16_t r[MB_NUM_HOLDING]; } s_hr_unused;
 
 static void *s_handle = NULL;
-static esp_timer_handle_t s_update_timer;
+
+/* ---------------------------------------------------------------- commands */
+
+/* A write as the master sent it: which area, which registers, and a copy of
+   the values. A pointer into the register image would not do -- the stack
+   writes the next command into that same memory, so by the time the command
+   ran the values could already belong to a later request. */
+typedef struct {
+    uint8_t  area;                      /* MB_PARAM_COIL or MB_PARAM_HOLDING */
+    uint16_t offset;                    /* zero-based first register/coil     */
+    uint16_t count;
+    uint8_t  bits;                      /* coils: absolute bit positions      */
+    uint16_t regs[MB_NUM_HOLDING];      /* holding: regs[i] is offset + i     */
+} mb_cmd_t;
+
+#define MB_CMD_QUEUE_DEPTH 8
+static QueueHandle_t s_cmd_q;
+
+/* Last values accepted for the holding registers, so a read gives back what
+   was written. Written and read on the Modbus task only. */
+static uint16_t s_hr_shadow[MB_NUM_HOLDING];
 
 /* ---------------------------------------------------------------- colour decode */
 
 /* RGB252: bits[15:14]=R(2), bits[13:9]=G(5), bits[8:7]=B(2), bits[6:0]=unused */
 static void apply_rgb252(uint16_t reg)
 {
-    uint8_t r_raw = (reg >> 14) & 0x03;
-    uint8_t g_raw = (reg >>  9) & 0x1F;
-    uint8_t b_raw = (reg >>  7) & 0x03;
-    uint8_t r = r_raw * 85;                        /* 0,85,170,255 */
-    uint8_t g = (g_raw << 3) | (g_raw >> 2);       /* 5-bit → 8-bit */
-    uint8_t b = b_raw * 85;
-    led_set_rgb(r, g, b);
+    uint8_t r = (reg >> 14) & 0x03;
+    uint8_t g = (reg >> 9)  & 0x1F;
+    uint8_t b = (reg >> 7)  & 0x03;
+    led_set_rgb((uint8_t)(r * 85), (uint8_t)(g * 8), (uint8_t)(b * 85));
 }
 
-/* ---------------------------------------------------------------- timer + task */
+/* ------------------------------------------------------- register access hooks
 
-/* What the refresher last stored in the coil image, so it can tell its own
-   value apart from one a master has written since. */
-static uint8_t s_coils_mirror;
-static bool    s_coils_mirror_valid;
+   mbc_reg_*_slave_cb are declared weak by the component, so these replace the
+   default implementations. That matters for three reasons:
 
-static void update_timer_cb(void *arg)
+   - A write is copied out here, while the master's frame is still the only
+     thing that has touched it, and queued as a command. Nothing can overwrite
+     it afterwards, and commands are executed in the order they arrived.
+   - Reads are answered from the live I/O state instead of from a buffer that
+     a timer has to keep refreshed, so there is no shared image for a refresh
+     and a command to fight over.
+   - If the command queue is full the master is told so, instead of receiving a
+     normal positive response for a command that was dropped.
+
+   These run on the Modbus port task. They take no I2C and publish nothing;
+   dout_get_all() and di_get() are cached reads behind a short mutex. The
+   switching itself happens later, on the command task.
+
+   Note that the default implementations are also what fed the stack's
+   parameter FIFO. With them replaced, nothing queues parameter records at all,
+   so that queue can no longer fill up and stall responses. */
+
+static mb_err_enum_t enqueue(const mb_cmd_t *cmd, const char *what)
 {
-    uint8_t di = 0;
-    for (int i = 0; i < 8; i++) if (di_get(i)) di |= (uint8_t)(1u << i);
-    uint8_t co = dout_get_all();   /* one consistent snapshot, not eight reads */
+    if (xQueueSend(s_cmd_q, cmd, 0) == pdTRUE) return MB_ENOERR;
 
-    mbc_slave_lock(s_handle);
-    s_di.b[0] = di;
-    /* The stack writes a master's command into this same byte and only then
-       signals the event, so event_task() may not have read it yet. Refreshing
-       unconditionally dropped commands the master had already been told were
-       accepted -- measured at 3 of 40 writes on the bench. Only refresh while
-       the image still holds what this function last put there. */
-    if (!s_coils_mirror_valid || s_coils.b[0] == s_coils_mirror) {
-        s_coils.b[0]         = co;
-        s_coils_mirror       = co;
-        s_coils_mirror_valid = true;
-    }
-    mbc_slave_unlock(s_handle);
+    /* MB_ETIMEDOUT is the one error the stack turns into exception 6, "slave
+       device busy" -- the canonical "I could not take this, try again". A
+       broadcast gets no response at all, so for those this log line is the
+       only trace; say so rather than pretend the command was carried out. */
+    ESP_LOGW(TAG, "command queue full, refused %s (a broadcast would be lost silently)",
+             what);
+    return MB_ETIMEDOUT;
 }
 
-static void apply_coil_write(const mb_param_info_t *info)
+mb_err_enum_t mbc_reg_coils_slave_cb(mb_base_t *inst, uint8_t *reg_buffer,
+                                     uint16_t address, uint16_t n_coils,
+                                     mb_reg_mode_enum_t mode)
 {
-    mbc_slave_lock(s_handle);
-    uint8_t co = s_coils.b[0];
-    mbc_slave_unlock(s_handle);
+    (void)inst;
+    if (!reg_buffer) return MB_EINVAL;
+    address--;                                   /* the stack passes it +1 */
+    if ((uint32_t)address + n_coils > MB_NUM_COILS) return MB_ENOREG;
 
-    /* Apply only the coils this request actually addressed. The buffer always
-       holds all eight bits, but the ones outside the request are a snapshot the
-       refresher left behind: if CAN, a rule or the web UI moved an output since,
-       writing them back would silently revert that change. FC05 therefore
-       touches exactly one output, FC15 exactly its range. */
-    unsigned first = info->mb_offset;
-    unsigned last  = first + (info->size ? info->size : 1u);
-    if (last > 8u) last = 8u;
-
-    /* Build the masks for the addressed range and apply them in one go, so the
-       coils of a single request switch together and the state cannot move
-       between reading it and writing it. */
-    uint8_t touched = 0;
-    for (unsigned i = first; i < last; i++) touched |= (uint8_t)(1u << i);
-    dout_modify((uint8_t)(co & touched), (uint8_t)(~co & touched), 0u);
-
-    /* Re-sync the image with what the outputs actually took — a write that
-       failed must not keep being reported back as the coil state — and hand
-       the refresher a fresh reference value. */
-    uint8_t actual = dout_get_all();
-    mbc_slave_lock(s_handle);
-    /* Only put the actual state back if nobody has written the image since we
-       read it. The stack writes a new command straight into this byte and only
-       afterwards queues its record, so an unconditional write-back erases a
-       command the master has already been told was accepted. If it differs,
-       leave it alone -- its record is queued and will be handled next. */
-    if (s_coils.b[0] == co) {
-        s_coils.b[0]         = actual;
-        s_coils_mirror       = actual;
-        s_coils_mirror_valid = true;
-    }
-    mbc_slave_unlock(s_handle);
-
-    ESP_LOGD(TAG, "Coil write: coils %u..%u from 0x%02x, outputs 0x%02x",
-             first, last - 1u, co, actual);
-}
-
-static void apply_hr_write(const mb_param_info_t *info)
-{
-    mbc_slave_lock(s_handle);
-    uint16_t led_val    = s_hr.r[0];
-    uint16_t buzzer_val = s_hr.r[1];
-    mbc_slave_unlock(s_handle);
-
-    /* One FC16 can cover both registers, so test each register against the
-       written range instead of dispatching on the start offset alone. With
-       the old if/else-if a write of HR40001+HR40002 only ever drove the LED. */
-    unsigned first = info->mb_offset;
-    unsigned last  = first + (info->size ? info->size : 1u);   /* [first, last) */
-
-    if (first <= 0u && 0u < last) {
-        apply_rgb252(led_val);
-        ESP_LOGD(TAG, "HR40001 LED: 0x%04x", led_val);
-    }
-    if (first <= 1u && 1u < last && buzzer_val > 0) {
-        buzzer_beep_once(buzzer_val, 200);
-        ESP_LOGD(TAG, "HR40002 Buzzer: %u Hz", buzzer_val);
-    }
-}
-
-/* Drains the stack's parameter FIFO and carries out the writes it reports. */
-static void event_task(void *arg)
-{
-    for (;;) {
-        mb_param_info_t info;
-
-        /* Block on the parameter FIFO itself, not on the write event bits.
-           Every access the stack serves queues a record here -- the six read
-           types included -- and nothing else drains them. Waiting for write
-           bits alone left the 20-deep queue permanently full after twenty
-           requests from a master that only polls, and from then on the stack
-           blocks for MB_PAR_INFO_TOUT before sending each further response:
-           that constant is 10 *ticks*, which is 100 ms at the configured
-           CONFIG_FREERTOS_HZ=100, so throughput collapses to about ten
-           requests per second.
-
-           Draining here also means a write is always dispatched on its own
-           record instead of on whatever happened to be at the front of the
-           queue, and it keeps the gap between the stack writing a command into
-           the shared buffer and this task reading it down to the scheduler's
-           latency. */
-        if (mbc_slave_get_param_info(s_handle, &info, 1000) != ESP_OK) continue;
-
-        if (info.type & MB_EVENT_HOLDING_REG_WR) {
-            apply_hr_write(&info);
-        } else if (info.type & MB_EVENT_COILS_WR) {
-            apply_coil_write(&info);
-        } else {
-            continue;   /* a read: consumed so the queue cannot fill up */
+    if (mode == MB_REG_READ) {
+        uint8_t live = dout_get_all();
+        for (uint16_t i = 0; i < n_coils; i++) {
+            uint16_t src = (uint16_t)(address + i);
+            if (live & (1u << src)) reg_buffer[i >> 3] |=  (uint8_t)(1u << (i & 7));
+            else                    reg_buffer[i >> 3] &= (uint8_t)~(1u << (i & 7));
         }
+        return MB_ENOERR;
+    }
+
+    mb_cmd_t cmd = { .area = MB_PARAM_COIL, .offset = address, .count = n_coils };
+    for (uint16_t i = 0; i < n_coils; i++)
+        if (reg_buffer[i >> 3] & (1u << (i & 7)))
+            cmd.bits |= (uint8_t)(1u << (address + i));
+    return enqueue(&cmd, "coil write");
+}
+
+mb_err_enum_t mbc_reg_discrete_slave_cb(mb_base_t *inst, uint8_t *reg_buffer,
+                                        uint16_t address, uint16_t n_discrete)
+{
+    (void)inst;
+    if (!reg_buffer) return MB_EINVAL;
+    address--;
+    if ((uint32_t)address + n_discrete > MB_NUM_DISCRETE) return MB_ENOREG;
+
+    for (uint16_t i = 0; i < n_discrete; i++) {
+        if (di_get((uint8_t)(address + i))) reg_buffer[i >> 3] |=  (uint8_t)(1u << (i & 7));
+        else                                reg_buffer[i >> 3] &= (uint8_t)~(1u << (i & 7));
+    }
+    return MB_ENOERR;
+}
+
+mb_err_enum_t mbc_reg_holding_slave_cb(mb_base_t *inst, uint8_t *reg_buffer,
+                                       uint16_t address, uint16_t n_regs,
+                                       mb_reg_mode_enum_t mode)
+{
+    (void)inst;
+    if (!reg_buffer) return MB_EINVAL;
+    address--;
+    if ((uint32_t)address + n_regs > MB_NUM_HOLDING) return MB_ENOREG;
+
+    if (mode == MB_REG_READ) {
+        for (uint16_t i = 0; i < n_regs; i++) {           /* big endian on the wire */
+            uint16_t v = s_hr_shadow[address + i];
+            reg_buffer[i * 2]     = (uint8_t)(v >> 8);
+            reg_buffer[i * 2 + 1] = (uint8_t)(v & 0xFF);
+        }
+        return MB_ENOERR;
+    }
+
+    mb_cmd_t cmd = { .area = MB_PARAM_HOLDING, .offset = address, .count = n_regs };
+    for (uint16_t i = 0; i < n_regs; i++)
+        cmd.regs[i] = (uint16_t)((reg_buffer[i * 2] << 8) | reg_buffer[i * 2 + 1]);
+
+    mb_err_enum_t err = enqueue(&cmd, "holding register write");
+    if (err == MB_ENOERR)                                  /* read-back follows the command */
+        for (uint16_t i = 0; i < n_regs; i++) s_hr_shadow[address + i] = cmd.regs[i];
+    return err;
+}
+
+mb_err_enum_t mbc_reg_input_slave_cb(mb_base_t *inst, uint8_t *reg_buffer,
+                                     uint16_t address, uint16_t n_regs)
+{
+    (void)inst; (void)reg_buffer; (void)address; (void)n_regs;
+    return MB_ENOREG;          /* no input registers on this device */
+}
+
+/* ---------------------------------------------------------------- command task */
+
+static void run_coil_cmd(const mb_cmd_t *cmd)
+{
+    uint8_t mask = 0;
+    for (uint16_t i = 0; i < cmd->count; i++) mask |= (uint8_t)(1u << (cmd->offset + i));
+
+    /* Only the addressed coils, and all of them in one transfer. */
+    esp_err_t ret = dout_modify((uint8_t)(cmd->bits & mask),
+                                (uint8_t)(~cmd->bits & mask), 0u);
+    if (ret != ESP_OK)
+        ESP_LOGW(TAG, "coil write %u..%u failed: %s",
+                 cmd->offset + 1u, cmd->offset + cmd->count, esp_err_to_name(ret));
+}
+
+static void run_holding_cmd(const mb_cmd_t *cmd)
+{
+    /* A single FC16 can cover both registers, so test each one against the
+       written range rather than dispatching on the start offset alone. */
+    for (uint16_t i = 0; i < cmd->count; i++) {
+        uint16_t reg = (uint16_t)(cmd->offset + i);
+        uint16_t val = cmd->regs[i];
+        if (reg == 0) {
+            apply_rgb252(val);
+            ESP_LOGD(TAG, "HR40001 LED: 0x%04x", val);
+        } else if (reg == 1 && val > 0) {
+            buzzer_beep_once(val, 200);
+            ESP_LOGD(TAG, "HR40002 Buzzer: %u Hz", val);
+        }
+    }
+}
+
+/* Carries out accepted commands in the order they arrived. Runs outside the
+   stack entirely, so the I2C transfer and any MQTT publishing it triggers
+   cannot delay a Modbus response or sit inside one of its locked sections. */
+static void command_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        mb_cmd_t cmd;
+        if (xQueueReceive(s_cmd_q, &cmd, portMAX_DELAY) != pdTRUE) continue;
+
+        if (cmd.area == MB_PARAM_COIL) run_coil_cmd(&cmd);
+        else                           run_holding_cmd(&cmd);
 
         /* An upstream control command — feed the rule engine's MODBUS
            command-health source (modbus(ms) in the DSL). */
@@ -225,28 +275,28 @@ esp_err_t mb_server_init(void)
     /* Register data areas */
     mb_register_area_descriptor_t area = {0};
 
-    area.type = MB_PARAM_COIL;  area.start_offset = 0;
-    area.address = &s_coils;    area.size = sizeof(s_coils);
+    area.type = MB_PARAM_COIL;     area.start_offset = 0;
+    area.address = &s_coils_unused; area.size = sizeof(s_coils_unused);
     area.access  = MB_ACCESS_RW;
     ESP_RETURN_ON_ERROR(mbc_slave_set_descriptor(s_handle, area), TAG, "coil desc");
 
     area.type = MB_PARAM_DISCRETE;  area.start_offset = 0;
-    area.address = &s_di;           area.size = sizeof(s_di);
+    area.address = &s_di_unused;    area.size = sizeof(s_di_unused);
     area.access  = MB_ACCESS_RO;
     ESP_RETURN_ON_ERROR(mbc_slave_set_descriptor(s_handle, area), TAG, "di desc");
 
     area.type = MB_PARAM_HOLDING;  area.start_offset = 0;
-    area.address = &s_hr;          area.size = sizeof(s_hr);
+    area.address = &s_hr_unused;   area.size = sizeof(s_hr_unused);
     area.access  = MB_ACCESS_RW;
     ESP_RETURN_ON_ERROR(mbc_slave_set_descriptor(s_handle, area), TAG, "hr desc");
 
+    /* Ready to accept commands before the stack can deliver any. */
+    s_cmd_q = xQueueCreate(MB_CMD_QUEUE_DEPTH, sizeof(mb_cmd_t));
+    ESP_RETURN_ON_FALSE(s_cmd_q, ESP_ERR_NO_MEM, TAG, "command queue");
+    ESP_RETURN_ON_FALSE(xTaskCreate(command_task, "mb_cmd", 4096, NULL, 5, NULL) == pdPASS,
+                        ESP_ERR_NO_MEM, TAG, "command task");
+
     ESP_RETURN_ON_ERROR(mbc_slave_start(s_handle), TAG, "start");
-
-    esp_timer_create_args_t ta = { .callback = update_timer_cb, .name = "mb_update" };
-    ESP_RETURN_ON_ERROR(esp_timer_create(&ta, &s_update_timer), TAG, "timer create");
-    ESP_RETURN_ON_ERROR(esp_timer_start_periodic(s_update_timer, 10000), TAG, "timer start");
-
-    xTaskCreate(event_task, "mb_event", 4096, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "Modbus RTU slave started — addr=%u baud=%"PRIu32,
              cfg->modbus.address, cfg->modbus.baudrate);
