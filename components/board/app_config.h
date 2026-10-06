@@ -35,6 +35,17 @@
    device, so it is unlikely to shadow one on the segment. */
 #define MB_TCP_UID_DEFAULT  247
 
+/* How long the master waits for a device on the segment.
+   MODBUS over serial line V1.02 §2.4.1 leaves the value to the application
+   and calls 1 s to several seconds typical at 9600 bps, so this is the floor
+   of that range rather than something faster: the connection workers mean a
+   slow device no longer delays anything else, and answering 0x0B for a device
+   that would have replied is worse than waiting. The stack adds its own
+   cooldown on top (CONFIG_FMB_MASTER_TIMEOUT_COOLDOWN_MS, 150 ms). */
+#define MB_RS485_TOUT_DEFAULT_MS  1000
+#define MB_RS485_TOUT_MIN_MS        50
+#define MB_RS485_TOUT_MAX_MS     10000
+
 /* Per-input / per-output configuration (shared layout for DI and DO).
    Stored as a fixed-size NVS blob.  If the blob size changes the old data is
    silently discarded and defaults apply.
@@ -91,6 +102,8 @@ typedef struct {
         uint8_t  tcp_server; /* 1 = answer Modbus TCP on port 502          */
         uint8_t  tcp_uid;    /* unit ID the board answers to over TCP, 1–247 */
         uint8_t  _pad2;
+        uint16_t rs485_tout_ms;  /* master: how long a device may take, 50–10000 */
+        uint8_t  _pad3[2];
     } modbus;
 
     /* SNTP time synchronisation */

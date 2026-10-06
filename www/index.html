@@ -288,6 +288,14 @@
         </select>
       </label>
 
+      <label id="mb_tout_row">Response timeout of the devices on the segment (ms)
+        <input type="number" id="mb_tout" min="50" max="10000" step="50" value="1000">
+      </label>
+      <p class="hint" id="mb_tout_hint">How long a device may take to answer before it is
+      reported as not responding. The Modbus serial specification leaves this to the
+      application and calls 1 s to several seconds typical at 9600 baud; lower it only for a
+      segment you know is faster.</p>
+
       <h2 style="margin-top:1.5rem">Modbus TCP (port 502)</h2>
       <label style="display:flex;align-items:center;gap:.5rem;font-weight:600;color:#555">
         <input type="checkbox" id="mb_tcp_server" onchange="updateModbusFields()"> Answer Modbus TCP
@@ -675,6 +683,7 @@ rule('my-rule')
           document.getElementById('mb_role').value      = cfg.modbus.rs485_role ?? 'slave';
           document.getElementById('mb_tcp_server').checked = !!cfg.modbus.tcp_server;
           document.getElementById('mb_tcp_uid').value   = cfg.modbus.tcp_uid ?? 247;
+          document.getElementById('mb_tout').value      = cfg.modbus.rs485_tout_ms ?? 1000;
           updateModbusFields();
         }
         if (cfg.sntp) {
@@ -779,6 +788,7 @@ rule('my-rule')
             rs485_role: document.getElementById('mb_role').value,
             tcp_server: document.getElementById('mb_tcp_server').checked,
             tcp_uid:    parseInt(document.getElementById('mb_tcp_uid').value, 10),
+            rs485_tout_ms: parseInt(document.getElementById('mb_tout').value, 10),
           },
           sntp: {
             enable: document.getElementById('sntp_enable').checked,
@@ -823,25 +833,41 @@ rule('my-rule')
     // server, and a local unit ID below 247 that would shadow a real device on
     // the segment. Rather than let someone fill in a form that will be
     // rejected, the fields that cannot apply are taken away.
+    let mbSavedTcp = null;   // what the TCP fields held before 'master' took them over
+
     function updateModbusFields() {
       const on     = document.getElementById('mb_enable').checked;
       const master = document.getElementById('mb_role').value === 'master';
       const tcp    = document.getElementById('mb_tcp_server');
       const uid    = document.getElementById('mb_tcp_uid');
 
-      for (const id of ['mb_role', 'mb_address', 'mb_baudrate', 'mb_tcp_server', 'mb_tcp_uid'])
+      for (const id of ['mb_role', 'mb_address', 'mb_baudrate', 'mb_tcp_server',
+                        'mb_tcp_uid', 'mb_tout'])
         document.getElementById(id).disabled = !on;
+
+      // Only the master waits for anybody.
+      document.getElementById('mb_tout_row').style.display  = master ? '' : 'none';
+      document.getElementById('mb_tout_hint').style.display = master ? '' : 'none';
 
       // As a master the device has no address of its own on the segment.
       document.getElementById('mb_address_row').style.display = master ? 'none' : '';
 
       if (master) {
+        // Master forces both, so remember what was there to put back if the
+        // role is changed again -- otherwise a look at 'master' would leave
+        // Modbus TCP switched on behind the user.
+        if (mbSavedTcp === null) mbSavedTcp = { on: tcp.checked, uid: uid.value };
         tcp.checked  = true;             // nothing else would drive the segment
         tcp.disabled = true;
         uid.value    = 247;              // every lower ID belongs to the segment
         uid.disabled = true;
-      } else if (on) {
-        uid.disabled = false;
+      } else {
+        if (mbSavedTcp !== null) {
+          tcp.checked = mbSavedTcp.on;
+          uid.value   = mbSavedTcp.uid;
+          mbSavedTcp  = null;
+        }
+        uid.disabled = !on;
       }
 
       document.getElementById('mb_tcp_hint').textContent = master

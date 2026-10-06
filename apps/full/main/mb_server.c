@@ -333,8 +333,16 @@ static esp_err_t start_command_task(void)
     if (s_cmd_q) return ESP_OK;
     s_cmd_q = xQueueCreate(MB_CMD_QUEUE_DEPTH, sizeof(mb_cmd_t));
     ESP_RETURN_ON_FALSE(s_cmd_q, ESP_ERR_NO_MEM, TAG, "command queue");
-    ESP_RETURN_ON_FALSE(xTaskCreate(command_task, "mb_cmd", 4096, NULL, 5, NULL) == pdPASS,
-                        ESP_ERR_NO_MEM, TAG, "command task");
+
+    if (xTaskCreate(command_task, "mb_cmd", 4096, NULL, 5, NULL) != pdPASS) {
+        /* The queue has to go with it. Left behind, the guard above would
+           report success on the next call and every write would be accepted
+           into a queue nobody empties -- answered positively, read back from
+           the shadow registers as if it had happened, and never carried out. */
+        vQueueDelete(s_cmd_q);
+        s_cmd_q = NULL;
+        ESP_RETURN_ON_FALSE(false, ESP_ERR_NO_MEM, TAG, "command task");
+    }
     return ESP_OK;
 }
 
@@ -412,8 +420,12 @@ esp_err_t mb_server_init(void)
 
         /* The TCP server that feeds it needs a working IP stack, which
            app_main() does not have yet; mb_server_net_start() finishes up. */
+        uint16_t tout = cfg->modbus.rs485_tout_ms;
+        if (tout < MB_RS485_TOUT_MIN_MS || tout > MB_RS485_TOUT_MAX_MS)
+            tout = MB_RS485_TOUT_DEFAULT_MS;   /* stored before the field existed */
+
         return mb_gateway_start(MB_UART, cfg->modbus.baudrate,
-                                MB_TX_GPIO, MB_RX_GPIO, MB_RTS_GPIO);
+                                MB_TX_GPIO, MB_RX_GPIO, MB_RTS_GPIO, tout);
     }
 
     return start_rtu_slave(cfg);

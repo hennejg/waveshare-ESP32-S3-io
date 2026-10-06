@@ -17,7 +17,8 @@
    decision that the port is free: the RTU slave and this master cannot both
    have it. */
 esp_err_t mb_gateway_start(uart_port_t uart, uint32_t baudrate,
-                           int tx_gpio, int rx_gpio, int rts_gpio);
+                           int tx_gpio, int rx_gpio, int rts_gpio,
+                           uint16_t response_tout_ms);
 
 bool mb_gateway_is_running(void);
 

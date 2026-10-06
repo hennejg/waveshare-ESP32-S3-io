@@ -22,6 +22,13 @@ The segment has one master, and the board is either it or a slave on it:
 - **Master** — drives the segment for Modbus TCP clients. The board has no
   address of its own then, and nothing else may be master.
 
+As master the board also needs to know how long a device may take to answer.
+*MODBUS over serial line V1.02* §2.4.1 leaves the value to the application and
+calls 1 s to several seconds typical at 9600 baud, which is the default here;
+it is adjustable from 50 ms to 10 s. Lower it only for a segment you know is
+faster — a device that would have answered is otherwise reported as
+`0x0B`, not responding.
+
 ## Modbus TCP
 
 Off by default. Enabled, the board answers on **port 502**, up to eight
@@ -50,7 +57,7 @@ including its exception code. Two codes are the gateway's own:
 
 | Exception | Meaning                                                   |
 |-----------|-----------------------------------------------------------|
-| `0x0B`    | The device did not answer within 500 ms                    |
+| `0x0B`    | The device did not answer within the configured timeout    |
 | `0x0A`    | There is no route to it — RS-485 is not in master mode     |
 | `0x06`    | Every worker is busy on the segment; retry                 |
 
@@ -58,6 +65,19 @@ A request the board answers itself is never delayed by the segment: measured
 on the bench, a local read stays at 3 ms while six requests to devices that
 never answer are in flight. The segment itself carries one transaction at a
 time, so forwarded requests queue behind each other.
+
+### Limits
+
+| | |
+|---|---|
+| Connections served at once | 8; a ninth is closed immediately |
+| Requests forwarded at once | 4; beyond that the answer is `0x06`, retry |
+| Time to receive one frame  | 200 ms, then the connection is closed |
+| Time to send one response  | 500 ms, then the connection is closed |
+
+A connection is kept open for as long as the client wants it. One whose peer
+has disappeared without closing is found by TCP keepalive after about 90 s and
+its slot released.
 
 ---
 

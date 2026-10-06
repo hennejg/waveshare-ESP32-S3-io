@@ -5,29 +5,28 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "app_config.h"
 #include "mbcontroller.h"
 
 #define TAG "mb_gw"
 
 /* A read can ask for 2000 coils (250 bytes) or 125 registers (250 bytes), a
    write for 1968 coils or 123 registers. One size covers all four. */
+/* Large enough for every request the protocol allows: 2000 coils or 125
+   registers read, 1968 coils or 123 registers written -- 250 bytes at most.
+   The guards below are written against MB_DATA_MAX rather than this, because
+   that is the size of the caller's response buffer and the smaller of the
+   two; checking against the local one would let a 128-register read write six
+   bytes past the end of it. */
 #define GW_BUF_BYTES 256
 
-/* How long a device on the segment gets to answer. The component's default is
-   five seconds, which suits a master that polls on its own schedule; here a
-   TCP client is waiting for the answer, so a silent device has to be given up
-   on quickly. 500 ms is well above the wire time of the longest request at
-   9600 baud. The stack adds its own cooldown on a timeout
-   (CONFIG_FMB_MASTER_TIMEOUT_COOLDOWN_MS), so a silent device costs about
-   650 ms in total. */
-#define GW_RESPONSE_TOUT_MS 500
-
 /* How long a request waits for its turn on the segment before being turned
-   away. Long enough that a queue of legitimate requests always gets through
-   -- the worst case per transaction is the timeout plus the cooldown, and
-   there are only a handful of connection workers -- and short enough that a
-   client is told to retry rather than left hanging. */
-#define GW_BUS_WAIT_MS 4000
+   away. It has to clear the worst case of every other worker ahead of it
+   timing out first -- four workers, the longest timeout the configuration
+   allows plus the stack's cooldown -- or a queue of perfectly legitimate
+   requests would be refused. Beyond that the client is told to retry rather
+   than left hanging. */
+#define GW_BUS_WAIT_MS ((MB_RS485_TOUT_MAX_MS + 200) * 4)
 
 static void             *s_master = NULL;
 static SemaphoreHandle_t s_bus;
@@ -56,8 +55,30 @@ bool mb_gateway_is_running(void)
     return s_master != NULL;
 }
 
+/* Takes back a half-finished start. This matters more than it looks: the
+   controller fills in s_master at create time, so leaving it set after a
+   later step failed would make mb_gateway_is_running() say yes and the TCP
+   server forward requests into a master that was never started -- or whose
+   UART pins were never applied, which leaves the board holding the bus. */
+static void gateway_unwind(void)
+{
+    s_master = NULL;
+    if (s_bus) { vSemaphoreDelete(s_bus); s_bus = NULL; }
+}
+
+#define GW_START_CHECK(expr, what)                                   \
+    do {                                                             \
+        esp_err_t _e = (expr);                                       \
+        if (_e != ESP_OK) {                                          \
+            ESP_LOGE(TAG, "%s: %s", (what), esp_err_to_name(_e));    \
+            gateway_unwind();                                        \
+            return _e;                                               \
+        }                                                            \
+    } while (0)
+
 esp_err_t mb_gateway_start(uart_port_t uart, uint32_t baudrate,
-                           int tx_gpio, int rx_gpio, int rts_gpio)
+                           int tx_gpio, int rx_gpio, int rts_gpio,
+                           uint16_t response_tout_ms)
 {
     ESP_RETURN_ON_FALSE(!s_master, ESP_ERR_INVALID_STATE, TAG, "already running");
 
@@ -72,27 +93,23 @@ esp_err_t mb_gateway_start(uart_port_t uart, uint32_t baudrate,
         .ser_opts.parity           = MB_PARITY_NONE,
         .ser_opts.data_bits        = UART_DATA_8_BITS,
         .ser_opts.stop_bits        = UART_STOP_BITS_1,
-        .ser_opts.response_tout_ms = GW_RESPONSE_TOUT_MS,
+        .ser_opts.response_tout_ms = response_tout_ms,
     };
 
-    ESP_RETURN_ON_ERROR(mbc_master_create_serial(&comm, &s_master),
-                        TAG, "create serial master");
+    GW_START_CHECK(mbc_master_create_serial(&comm, &s_master), "create serial master");
 
     /* Same reason as on the slave side: the controller installs the UART
        driver itself, so the pins and the half-duplex direction control have
        to be patched in afterwards. Without RTS on the transceiver's driver
        enable the board holds the bus and hears nothing. */
-    ESP_RETURN_ON_ERROR(uart_set_pin(uart, tx_gpio, rx_gpio, rts_gpio,
-                                     UART_PIN_NO_CHANGE),
-                        TAG, "uart_set_pin");
-    ESP_RETURN_ON_ERROR(uart_set_mode(uart, UART_MODE_RS485_HALF_DUPLEX),
-                        TAG, "uart_set_mode");
+    GW_START_CHECK(uart_set_pin(uart, tx_gpio, rx_gpio, rts_gpio, UART_PIN_NO_CHANGE),
+                   "uart_set_pin");
+    GW_START_CHECK(uart_set_mode(uart, UART_MODE_RS485_HALF_DUPLEX), "uart_set_mode");
+    GW_START_CHECK(mbc_master_set_descriptor(s_master, s_unused_descr, 1), "descriptor");
+    GW_START_CHECK(mbc_master_start(s_master), "start");
 
-    ESP_RETURN_ON_ERROR(mbc_master_set_descriptor(s_master, s_unused_descr, 1),
-                        TAG, "descriptor");
-    ESP_RETURN_ON_ERROR(mbc_master_start(s_master), TAG, "start");
-
-    ESP_LOGI(TAG, "RTU master on UART%d, %"PRIu32" baud", (int)uart, baudrate);
+    ESP_LOGI(TAG, "RTU master on UART%d, %"PRIu32" baud, %u ms response timeout",
+             (int)uart, baudrate, response_tout_ms);
     return ESP_OK;
 }
 
@@ -176,7 +193,7 @@ uint8_t mb_gateway_handle(uint8_t uid, const mb_request_t *req,
     case MB_FUNC_READ_COILS:
     case MB_FUNC_READ_DISCRETE_INPUTS: {
         size_t bytes = (size_t)((req->count + 7u) / 8u);
-        if (bytes > GW_BUF_BYTES) return MB_EXC_ILLEGAL_VALUE;
+        if (bytes > MB_DATA_MAX) return MB_EXC_ILLEGAL_VALUE;
         /* The master copies into a buffer of its own, so the response slice
            cannot be handed to it directly. Both sides use the same packed
            layout though -- bit 0 is the first coil of the request -- so the
@@ -189,7 +206,7 @@ uint8_t mb_gateway_handle(uint8_t uid, const mb_request_t *req,
 
     case MB_FUNC_READ_HOLDING_REGISTER:
     case MB_FUNC_READ_INPUT_REGISTER: {
-        if ((size_t)req->count * 2u > GW_BUF_BYTES) return MB_EXC_ILLEGAL_VALUE;
+        if ((size_t)req->count * 2u > MB_DATA_MAX) return MB_EXC_ILLEGAL_VALUE;
         uint16_t tmp[GW_BUF_BYTES / 2];
         uint8_t exc = transact(uid, req->fc, req->addr, req->count, tmp);
         if (exc == MB_EXC_NONE) {
@@ -213,14 +230,14 @@ uint8_t mb_gateway_handle(uint8_t uid, const mb_request_t *req,
 
     case MB_FUNC_WRITE_MULTIPLE_COILS: {
         size_t bytes = (size_t)((req->count + 7u) / 8u);
-        if (bytes > GW_BUF_BYTES) return MB_EXC_ILLEGAL_VALUE;
+        if (bytes > MB_DATA_MAX) return MB_EXC_ILLEGAL_VALUE;
         uint8_t tmp[GW_BUF_BYTES];
         memcpy(tmp, req->data, bytes);
         return transact(uid, req->fc, req->addr, req->count, tmp);
     }
 
     case MB_FUNC_WRITE_MULTIPLE_REGISTERS: {
-        if ((size_t)req->count * 2u > GW_BUF_BYTES) return MB_EXC_ILLEGAL_VALUE;
+        if ((size_t)req->count * 2u > MB_DATA_MAX) return MB_EXC_ILLEGAL_VALUE;
         uint16_t tmp[GW_BUF_BYTES / 2];
         wire_to_regs(tmp, req->data, req->count);
         return transact(uid, req->fc, req->addr, req->count, tmp);

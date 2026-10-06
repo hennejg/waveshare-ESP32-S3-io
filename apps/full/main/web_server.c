@@ -348,6 +348,9 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON_AddBoolToObject  (mb, "tcp_server", cfg->modbus.tcp_server);
     cJSON_AddNumberToObject(mb, "tcp_uid",
                             cfg->modbus.tcp_uid ? cfg->modbus.tcp_uid : MB_TCP_UID_DEFAULT);
+    cJSON_AddNumberToObject(mb, "rs485_tout_ms",
+                            cfg->modbus.rs485_tout_ms ? cfg->modbus.rs485_tout_ms
+                                                      : MB_RS485_TOUT_DEFAULT_MS);
 
     cJSON *sntp = cJSON_AddObjectToObject(root, "sntp");
     cJSON_AddBoolToObject  (sntp, "enable", cfg->sntp.enable);
@@ -518,6 +521,11 @@ static esp_err_t api_config_post(httpd_req_t *req)
         if ((v = cJSON_GetObjectItem(mb, "tcp_uid")) && cJSON_IsNumber(v)) {
             uint32_t u = (uint32_t)v->valuedouble;
             if (u >= 1 && u <= 247) cfg.modbus.tcp_uid = (uint8_t)u;
+        }
+        if ((v = cJSON_GetObjectItem(mb, "rs485_tout_ms")) && cJSON_IsNumber(v)) {
+            uint32_t t = (uint32_t)v->valuedouble;
+            if (t >= MB_RS485_TOUT_MIN_MS && t <= MB_RS485_TOUT_MAX_MS)
+                cfg.modbus.rs485_tout_ms = (uint16_t)t;
         }
 
         /* Two combinations are worth refusing rather than quietly accepting.

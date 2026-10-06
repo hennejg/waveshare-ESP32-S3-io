@@ -37,7 +37,8 @@ static app_config_t s_cfg = {
        been. */
     .modbus = { .enable = 0, .address = 1, .baudrate = 9600,
                 .rs485_role = MB_ROLE_SLAVE, .tcp_server = 0,
-                .tcp_uid = MB_TCP_UID_DEFAULT },
+                .tcp_uid = MB_TCP_UID_DEFAULT,
+                .rs485_tout_ms = MB_RS485_TOUT_DEFAULT_MS },
     .can    = { .mode = 0, .n2k_addr = 0x50, .base_id = 0x100,
                 .bitrate = 250000, .tx_interval_ms = 1000 },
     .sntp   = { .enable = 1, .server = "pool.ntp.org" },

@@ -60,11 +60,44 @@
 #define MBAP_HDR              6           /* the part before uid         */
 #define FRAME_MAX             (MBAP_LEN + MB_PDU_MAX)
 
-/* How long the rest of a frame may take once its first bytes have arrived. On
-   a local segment a 260-byte frame is one or two packets; a client that
-   cannot finish one in this time is broken, and waiting longer would hold up
-   every other connection, since this runs on the polling task. */
+/* How long a whole frame may take once its first bytes have arrived. On a
+   local segment a 260-byte frame is one or two packets; a client that cannot
+   finish one in this time is broken, and waiting longer would hold up every
+   other connection, since this runs on the polling task.
+
+   The socket's own timeout is much shorter so that no single recv() can
+   overrun the deadline by more than a little: the deadline is checked between
+   calls, so without this the last recv() could add a further whole
+   FRAME_WAIT_MS, and with every connection doing it the poll loop would stall
+   for a multiple of it. */
 #define FRAME_WAIT_MS         200
+#define RECV_SLICE_MS          20
+
+/* A peer that is switched off or dropped by a NAT never closes its end, and
+   select() never reports its connection readable again, so without this its
+   slot would be held until the board reboots. Modbus clients do hold a
+   connection open for hours while idle, which is why the dead ones are found
+   by keepalive rather than by an idle timeout. */
+#define KEEPALIVE_IDLE_S      60
+#define KEEPALIVE_INTVL_S     10
+#define KEEPALIVE_COUNT        3
+
+/* A response the peer never reads fills the socket buffer, and a blocking
+   send() then waits for as long as the peer likes -- on the polling task for
+   a local request, or on a worker with the connection's slot left occupied.
+   Measured on the bench: a client that sends 8000 requests and reads none
+   gets 200 responses and the rest only when it finally reads. One such client
+   stops the server for good.
+
+   This bounds it. The value is a compromise and was measured rather than
+   guessed: at 2000 ms one such client still stalled the whole poll loop for
+   2.7 s, because the polling task answers local requests itself. A response
+   is at most 260 bytes, so half a second is already a hundred times what a
+   peer that is reading at all needs; one that cannot take it in that time is
+   not going to. The connection is then ended -- there is no way to resync a
+   half-written response anyway. */
+#define SEND_WAIT_MS         500
+#define SEND_SLICE_MS         50
 
 
 enum { SLOT_FREE = 0, SLOT_IDLE, SLOT_BUSY, SLOT_DEAD };
@@ -214,13 +247,25 @@ static bool is_local(uint8_t uid)
     return (uid == s_local_uid) || (uid == 0) || (uid == 255);
 }
 
+/* The socket timeout bounds one send(), not the loop: a peer that takes a few
+   bytes each time would otherwise stretch one response over as many timeouts
+   as it has patience for. Measured before this deadline existed, one such
+   client held the poll loop for 1.3 s against a 500 ms socket timeout.
+
+   Giving up part way ends the connection, which is the only thing left to do
+   once half a response is on the wire. */
 static bool send_all(int fd, const uint8_t *buf, size_t len)
 {
-    size_t sent = 0;
+    int64_t deadline = esp_timer_get_time() + (int64_t)SEND_WAIT_MS * 1000;
+    size_t  sent = 0;
+
     while (sent < len) {
+        if (esp_timer_get_time() > deadline) return false;
         int n = send(fd, buf + sent, len - sent, 0);
-        if (n <= 0) return false;
-        sent += (size_t)n;
+        if (n > 0) { sent += (size_t)n; continue; }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            continue;                              /* a slice passed, not the deadline */
+        return false;
     }
     return true;
 }
@@ -265,12 +310,12 @@ static uint16_t process(const uint8_t *frame, uint16_t len, uint8_t *out)
    kilobyte each, and the whole esp-modbus request chain below them. Rather
    than guess the headroom and find out from a corrupted stack, say so while
    there is still some left. */
-static void check_stack(const char *who)
+static void check_stack(const char *who, bool *warned)
 {
-    static bool warned;
+    if (*warned) return;
     UBaseType_t left = uxTaskGetStackHighWaterMark(NULL);
-    if (left < 512 && !warned) {
-        warned = true;
+    if (left < 512) {
+        *warned = true;
         ESP_LOGW(TAG, "%s stack down to %u bytes — raise it", who, (unsigned)left);
     }
 }
@@ -280,6 +325,7 @@ static void worker_task(void *arg)
     (void)arg;
     job_t *job = malloc(sizeof(job_t));
     configASSERT(job);
+    bool warned = false;        /* one task, one warning */
 
     for (;;) {
         if (xQueueReceive(s_jobs, job, portMAX_DELAY) != pdTRUE) continue;
@@ -294,7 +340,7 @@ static void worker_task(void *arg)
         uint64_t one = 1;                     /* the connection can be polled again */
         (void)write(s_wake_fd, &one, sizeof(one));
 
-        check_stack("worker");
+        check_stack("worker", &warned);
     }
 }
 
@@ -314,8 +360,11 @@ static bool recv_exact(int fd, uint8_t *buf, size_t len)
     while (got < len) {
         if (esp_timer_get_time() > deadline) return false;
         int n = recv(fd, buf + got, len - got, 0);
-        if (n <= 0) return false;
-        got += (size_t)n;
+        if (n > 0) { got += (size_t)n; continue; }
+        if (n == 0) return false;                      /* the peer closed */
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+            continue;                                  /* a slice passed, not the deadline */
+        return false;
     }
     return true;
 }
@@ -347,6 +396,11 @@ static void accept_one(void)
     int fd = accept(s_listen_fd, (struct sockaddr *)&peer, &plen);
     if (fd < 0) return;
 
+    /* A slot a worker gave up on in this same iteration is free in all but
+       name; reclaim it before turning anyone away. */
+    for (int i = 0; i < MB_TCP_MAX_CONN; i++)
+        if (s_conn[i].state == SLOT_DEAD) close_slot(i);
+
     int slot = -1;
     for (int i = 0; i < MB_TCP_MAX_CONN; i++)
         if (s_conn[i].state == SLOT_FREE) { slot = i; break; }
@@ -363,9 +417,17 @@ static void accept_one(void)
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
-    struct timeval tv = { .tv_sec = FRAME_WAIT_MS / 1000,
-                          .tv_usec = (FRAME_WAIT_MS % 1000) * 1000 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct timeval rtv = { .tv_sec = 0, .tv_usec = RECV_SLICE_MS * 1000 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+
+    struct timeval stv = { .tv_sec = 0, .tv_usec = SEND_SLICE_MS * 1000 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof(stv));
+
+    int ka = 1, idle = KEEPALIVE_IDLE_S, intvl = KEEPALIVE_INTVL_S, cnt = KEEPALIVE_COUNT;
+    setsockopt(fd, SOL_SOCKET,  SO_KEEPALIVE,  &ka,    sizeof(ka));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
 
     s_conn[slot].fd    = fd;
     s_conn[slot].state = SLOT_IDLE;
@@ -385,11 +447,7 @@ static void serve_slot(int i, job_t *job)
 {
     int fd = s_conn[i].fd;
 
-    int n = recv(fd, job->frame, MBAP_HDR, 0);
-    if (n <= 0) { close_slot(i); return; }          /* closed or timed out */
-    if (n < MBAP_HDR && !recv_exact(fd, job->frame + n, MBAP_HDR - n)) {
-        close_slot(i); return;
-    }
+    if (!recv_exact(fd, job->frame, MBAP_HDR)) { close_slot(i); return; }
 
     uint16_t pid = be16(&job->frame[2]);
     uint16_t len = be16(&job->frame[4]);            /* unit id plus PDU */
@@ -433,6 +491,7 @@ static void poller_task(void *arg)
     (void)arg;
     job_t *job = malloc(sizeof(job_t));
     configASSERT(job);
+    bool warned = false;
 
     for (;;) {
         fd_set rd;
@@ -453,7 +512,15 @@ static void poller_task(void *arg)
         /* No timeout: the only things that can change are a packet, a new
            connection, or a worker finishing -- and all three are in the set. */
         int ready = select(maxfd + 1, &rd, NULL, NULL, NULL);
-        if (ready <= 0) continue;
+        if (ready < 0) {
+            /* With no timeout select() cannot return 0, so this is a real
+               failure. Spinning on it at this priority would starve the
+               workers in silence. */
+            ESP_LOGE(TAG, "select: errno %d", errno);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        if (ready == 0) continue;
 
         if (FD_ISSET(s_wake_fd, &rd)) {
             uint64_t v;
@@ -465,11 +532,28 @@ static void poller_task(void *arg)
             if (s_conn[i].state == SLOT_IDLE && FD_ISSET(s_conn[i].fd, &rd))
                 serve_slot(i, job);
 
-        check_stack("poller");
+        check_stack("poller", &warned);
     }
 }
 
 /* ------------------------------------------------------------------ public */
+
+/* Undoes a partial start, in the right order: the tasks go first, because a
+   worker is blocked on the job queue and deleting the queue under it would
+   take the board down. Everything here tolerates not having been created, so
+   one path can clean up after any of the failures below.
+
+   A worker deleted this way leaks its frame buffer. The only way to get here
+   is a failed task creation, which means the board is already out of memory
+   and about to say so; chasing the quarter kilobyte is not worth the code. */
+static void start_unwind(int fd, TaskHandle_t *tasks, int n_tasks)
+{
+    for (int i = 0; i < n_tasks; i++)
+        if (tasks[i]) vTaskDelete(tasks[i]);
+    if (fd >= 0)          close(fd);
+    if (s_wake_fd >= 0) { close(s_wake_fd); s_wake_fd = -1; }
+    if (s_jobs)         { vQueueDelete(s_jobs); s_jobs = NULL; }
+}
 
 esp_err_t mb_tcp_server_start(uint16_t port, uint8_t local_uid)
 {
@@ -488,13 +572,22 @@ esp_err_t mb_tcp_server_start(uint16_t port, uint8_t local_uid)
     esp_err_t efd_err = esp_vfs_eventfd_register(&efd_cfg);
     if (efd_err != ESP_OK && efd_err != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "eventfd vfs: %s", esp_err_to_name(efd_err));
+        start_unwind(-1, NULL, 0);
         return efd_err;
     }
     s_wake_fd = eventfd(0, 0);
-    ESP_RETURN_ON_FALSE(s_wake_fd >= 0, ESP_FAIL, TAG, "eventfd: errno %d", errno);
+    if (s_wake_fd < 0) {
+        ESP_LOGE(TAG, "eventfd: errno %d", errno);
+        start_unwind(-1, NULL, 0);
+        return ESP_FAIL;
+    }
 
     int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    ESP_RETURN_ON_FALSE(fd >= 0, ESP_FAIL, TAG, "socket: errno %d", errno);
+    if (fd < 0) {
+        ESP_LOGE(TAG, "socket: errno %d", errno);
+        start_unwind(-1, NULL, 0);
+        return ESP_FAIL;
+    }
 
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
@@ -506,26 +599,37 @@ esp_err_t mb_tcp_server_start(uint16_t port, uint8_t local_uid)
     };
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         ESP_LOGE(TAG, "bind port %u: errno %d", port, errno);
-        close(fd);
+        start_unwind(fd, NULL, 0);
         return ESP_FAIL;
     }
     if (listen(fd, MB_TCP_MAX_CONN) < 0) {
         ESP_LOGE(TAG, "listen: errno %d", errno);
-        close(fd);
+        start_unwind(fd, NULL, 0);
         return ESP_FAIL;
     }
-    s_listen_fd = fd;
 
+    /* The workers block on a queue nobody feeds until the poller runs, and
+       the poller is the one that needs the listening socket, so the socket is
+       published last. Half a server that reports success would be worse than
+       none: the guard at the top would then make every later attempt return
+       ESP_OK on something that answers nobody. */
+    TaskHandle_t tasks[MB_TCP_WORKERS + 1] = {0};
     for (int i = 0; i < MB_TCP_WORKERS; i++) {
         char name[16];
         snprintf(name, sizeof(name), "mb_tcp_w%d", i);
-        ESP_RETURN_ON_FALSE(
-            xTaskCreate(worker_task, name, 5120, NULL, 5, NULL) == pdPASS,
-            ESP_ERR_NO_MEM, TAG, "worker task");
+        if (xTaskCreate(worker_task, name, 5120, NULL, 5, &tasks[i]) != pdPASS) {
+            ESP_LOGE(TAG, "worker task %d", i);
+            start_unwind(fd, tasks, MB_TCP_WORKERS + 1);
+            return ESP_ERR_NO_MEM;
+        }
     }
-    ESP_RETURN_ON_FALSE(
-        xTaskCreate(poller_task, "mb_tcp_poll", 5120, NULL, 6, NULL) == pdPASS,
-        ESP_ERR_NO_MEM, TAG, "poller task");
+    if (xTaskCreate(poller_task, "mb_tcp_poll", 5120, NULL, 6,
+                    &tasks[MB_TCP_WORKERS]) != pdPASS) {
+        ESP_LOGE(TAG, "poller task");
+        start_unwind(fd, tasks, MB_TCP_WORKERS + 1);
+        return ESP_ERR_NO_MEM;
+    }
+    s_listen_fd = fd;
 
     ESP_LOGI(TAG, "listening on port %u — %d connections, %d workers",
              port, MB_TCP_MAX_CONN, MB_TCP_WORKERS);
