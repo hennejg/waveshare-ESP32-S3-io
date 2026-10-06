@@ -11,4 +11,5 @@ dependencies.lock
 
 # Host test binaries
 /test/host/test_mb_pdu
+/test/host/test_mb_client
 /test/host/*.dSYM
