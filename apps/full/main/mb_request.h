@@ -54,6 +54,38 @@ typedef uint8_t (*mb_handler_fn)(const mb_request_t *req,
 #define MB_FC_WRITE_REGISTER    0x06
 #define MB_FC_WRITE_COILS       0x0F
 #define MB_FC_WRITE_REGISTERS   0x10
+#define MB_FC_DEVICE_ID         0x2B   /* Encapsulated Interface Transport */
+
+/* FC 43 carries sub-protocols selected by the MEI type; the only one this
+   firmware speaks is 14, Read Device Identification (Modbus Application
+   Protocol V1.1b3 section 6.21). The request is four bytes: function code,
+   MEI type, read code, object id. mb_parse_pdu() puts the read code into
+   req->count and the object id into req->addr, so a handler sees the same
+   two fields a register read would give it. */
+#define MB_MEI_DEVICE_ID        0x0E
+#define MB_DEVID_BASIC          0x01   /* stream: VendorName..MajorMinorRevision */
+#define MB_DEVID_REGULAR        0x02   /* stream: VendorUrl..UserApplicationName */
+#define MB_DEVID_EXTENDED       0x03   /* stream: the private objects 0x80..0xFF */
+#define MB_DEVID_INDIVIDUAL     0x04   /* one object, any category */
+
+/* The standard object ids. 0x00..0x02 are mandatory for every device. */
+#define MB_DEVID_OBJ_VENDOR_NAME       0x00
+#define MB_DEVID_OBJ_PRODUCT_CODE      0x01
+#define MB_DEVID_OBJ_REVISION          0x02
+#define MB_DEVID_OBJ_VENDOR_URL        0x03
+#define MB_DEVID_OBJ_PRODUCT_NAME      0x04
+#define MB_DEVID_OBJ_MODEL_NAME        0x05
+#define MB_DEVID_OBJ_USER_APP_NAME     0x06
+#define MB_DEVID_OBJ_PRIVATE_FIRST     0x80
+
+/* One identification object: an id and an ASCII value. The value may be up
+   to 255 bytes on the wire, but one that does not fit a PDU together with
+   the response header can never be delivered, so the encoder refuses to
+   build a table containing one -- see mb_devid_encode(). */
+typedef struct {
+    uint8_t     id;
+    const char *value;
+} mb_devid_obj_t;
 
 /* Coils travel packed, eight to a byte, with the last byte padded. Both the
    request count and the response length are derived from this, in enough

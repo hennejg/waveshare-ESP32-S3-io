@@ -22,6 +22,30 @@ uint16_t mb_build_response(const mb_request_t *req, const uint8_t *pdu,
                            const uint8_t *data, uint16_t data_len,
                            uint8_t exc, uint8_t *out);
 
+/* --------------------------------------------------- identification data
+
+   Writes a string into nregs registers, two characters per register with the
+   first in the high byte, NUL padded, cut off when it does not fit. This is
+   how SunSpec and most meters lay text out, and how the identification block
+   below carries its strings. Returns the number of bytes written, nregs*2. */
+uint16_t mb_ascii_to_regs(const char *s, uint16_t nregs, uint8_t *out);
+
+/* Builds the data part of a Read Device Identification response -- everything
+   after the function code -- from a table of objects, for the read code and
+   start object the client asked for (req->count and req->addr as
+   mb_parse_pdu() leaves them). out needs MB_DATA_MAX bytes. Returns 0 and
+   sets *out_len, or the exception to answer with.
+
+   Stream reads deliver the objects of one category from the start object
+   on; a start object the category does not have restarts at its first one,
+   as the specification asks. Individual reads deliver exactly one object of
+   any category and refuse one the table lacks. When the objects do not fit
+   one PDU, "more follows" is set and the next object id tells the client
+   where to continue. The table must be sorted by id. */
+uint8_t mb_devid_encode(const mb_devid_obj_t *objs, uint16_t n,
+                        uint8_t read_code, uint8_t start_id,
+                        uint8_t *out, uint16_t *out_len);
+
 /* ------------------------------------------------------ reading a value out
 
    How many registers one of the MB_VAL_* types occupies, and how to turn

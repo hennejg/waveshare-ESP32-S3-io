@@ -181,7 +181,7 @@ static void test_unknown_function_codes(void)
 {
     uint8_t pdu[8];
     mb_request_t r;
-    const uint8_t known[] = { 1, 2, 3, 4, 5, 6, 15, 16 };
+    const uint8_t known[] = { 1, 2, 3, 4, 5, 6, 15, 16, 43 };
 
     for (unsigned fc = 0; fc < 256; fc++) {
         bool is_known = false;
@@ -231,6 +231,152 @@ static void test_responses(void)
     CHECK(out[0] == 0x81 && out[1] == 0x02, "Ausnahmeantwort falsch");
 }
 
+/* -------------------------------------------------- device identification */
+
+static void test_device_id_parse(void)
+{
+    uint8_t pdu[8];
+    mb_request_t r;
+
+    /* The one well-formed shape: four bytes, MEI 14, read code 1..4. */
+    for (uint8_t code = 1; code <= 4; code++) {
+        pdu[0] = 0x2B; pdu[1] = 0x0E; pdu[2] = code; pdu[3] = 0x81;
+        uint8_t exc = mb_parse_pdu(pdu, 4, &r);
+        CHECK(exc == 0, "FC43 Lesecode %u abgelehnt mit 0x%02X", code, exc);
+        CHECK(r.fc == MB_FC_DEVICE_ID && r.count == code && r.addr == 0x81,
+              "FC43 Felder falsch (fc %u code %u id %u)", r.fc, r.count, r.addr);
+        CHECK(r.data == &pdu[1] && r.data_len == 3, "FC43 Datenzeiger falsch");
+    }
+
+    /* Read code 0 and 5 are bad values; MEI 13 is a function we lack. */
+    pdu[0] = 0x2B; pdu[1] = 0x0E; pdu[2] = 0; pdu[3] = 0;
+    CHECK(mb_parse_pdu(pdu, 4, &r) == MB_EXC_ILLEGAL_VALUE, "FC43 Lesecode 0 angenommen");
+    pdu[2] = 5;
+    CHECK(mb_parse_pdu(pdu, 4, &r) == MB_EXC_ILLEGAL_VALUE, "FC43 Lesecode 5 angenommen");
+    pdu[2] = 1; pdu[1] = 0x0D;
+    CHECK(mb_parse_pdu(pdu, 4, &r) == MB_EXC_ILLEGAL_FUNC, "FC43 MEI 13 nicht als unbekannt gemeldet");
+
+    /* Any other length is wrong, including the five bytes a register read has. */
+    pdu[1] = 0x0E;
+    for (uint16_t bad = 0; bad < 8; bad++) {
+        if (bad == 4) continue;
+        CHECK(mb_parse_pdu(pdu, bad, &r) != 0, "FC43 Laenge %u angenommen", bad);
+    }
+}
+
+/* Reads the objects out of an encoded response, checking the framing on the
+   way: the list must end exactly where the length says it does. */
+static unsigned devid_objects(const uint8_t *d, uint16_t len, uint8_t *ids, unsigned max)
+{
+    unsigned n = 0;
+    uint16_t pos = 6;
+    while (pos < len && n < max) {
+        if (pos + 2 > len) return 9999;
+        uint8_t id = d[pos], l = d[pos + 1];
+        if (pos + 2 + l > len) return 9999;
+        ids[n++] = id;
+        pos = (uint16_t)(pos + 2 + l);
+    }
+    return (pos == len && n == d[5]) ? n : 9999;
+}
+
+static void test_device_id_encode(void)
+{
+    const mb_devid_obj_t tbl[] = {
+        { 0x00, "Vendor" }, { 0x01, "Product" }, { 0x02, "1.2.3" },
+        { 0x03, "https://example.invalid" }, { 0x04, "Name" }, { 0x05, "Model" }, { 0x06, "App" },
+        { 0x80, "SERIAL" }, { 0x81, "00:11:22:33:44:55" },
+    };
+    const uint16_t N = sizeof(tbl) / sizeof(tbl[0]);
+    uint8_t out[MB_DATA_MAX], ids[16];
+    uint16_t len;
+
+    /* Basic stream from the start: the three mandatory objects, no more. */
+    CHECK(mb_devid_encode(tbl, N, MB_DEVID_BASIC, 0, out, &len) == 0, "Basisstrom abgelehnt");
+    CHECK(out[0] == 0x0E && out[1] == 1 && out[2] == 0x83 && out[3] == 0 && out[4] == 0,
+          "Basisstrom Kopf falsch (%02X %02X %02X %02X %02X)", out[0], out[1], out[2], out[3], out[4]);
+    CHECK(devid_objects(out, len, ids, 16) == 3 && ids[0] == 0 && ids[2] == 2, "Basisstrom Objekte falsch");
+
+    /* A regular stream asked for from object 0 restarts at the category's first. */
+    CHECK(mb_devid_encode(tbl, N, MB_DEVID_REGULAR, 0, out, &len) == 0, "Regulaerstrom abgelehnt");
+    CHECK(devid_objects(out, len, ids, 16) == 4 && ids[0] == 3 && ids[3] == 6, "Regulaerstrom Objekte falsch");
+    /* ...and from the middle, only what follows. */
+    CHECK(mb_devid_encode(tbl, N, MB_DEVID_REGULAR, 5, out, &len) == 0, "Regulaerstrom ab 5 abgelehnt");
+    CHECK(devid_objects(out, len, ids, 16) == 2 && ids[0] == 5 && ids[1] == 6, "Regulaerstrom ab 5 falsch");
+
+    /* Extended: the private objects. */
+    CHECK(mb_devid_encode(tbl, N, MB_DEVID_EXTENDED, 0, out, &len) == 0, "Erweiterter Strom abgelehnt");
+    CHECK(devid_objects(out, len, ids, 16) == 2 && ids[0] == 0x80 && ids[1] == 0x81, "Erweiterter Strom falsch");
+
+    /* Individual: one object of any category, and an unknown one is refused. */
+    CHECK(mb_devid_encode(tbl, N, MB_DEVID_INDIVIDUAL, 0x81, out, &len) == 0, "Einzelobjekt abgelehnt");
+    CHECK(devid_objects(out, len, ids, 16) == 1 && ids[0] == 0x81, "Einzelobjekt falsch");
+    CHECK(memcmp(&out[8], "00:11:22:33:44:55", 17) == 0 && out[7] == 17, "Einzelobjekt Wert falsch");
+    CHECK(mb_devid_encode(tbl, N, MB_DEVID_INDIVIDUAL, 0x42, out, &len) == MB_EXC_ILLEGAL_ADDR,
+          "unbekanntes Einzelobjekt angenommen");
+    CHECK(len == 0, "Ausnahme hinterlaesst Laenge %u", len);
+    CHECK(mb_devid_encode(tbl, N, 0, 0, out, &len) == MB_EXC_ILLEGAL_VALUE, "Lesecode 0 kodiert");
+
+    /* Conformity follows the table: without private objects it is 0x82,
+       with only the mandatory three 0x81. */
+    CHECK(mb_devid_encode(tbl, 7, MB_DEVID_BASIC, 0, out, &len) == 0 && out[2] == 0x82, "Konformitaet ohne Privatobjekte");
+    CHECK(mb_devid_encode(tbl, 3, MB_DEVID_BASIC, 0, out, &len) == 0 && out[2] == 0x81, "Konformitaet nur Basis");
+    /* A category the table does not have at all. */
+    CHECK(mb_devid_encode(tbl, 3, MB_DEVID_EXTENDED, 0, out, &len) == MB_EXC_ILLEGAL_ADDR, "leere Kategorie geliefert");
+
+    /* Segmentation: private objects too long for one PDU. The client walks
+       the "next object id" chain and must see every object exactly once. */
+    char big[8][120];
+    mb_devid_obj_t many[3 + 8];
+    memcpy(many, tbl, 3 * sizeof(tbl[0]));
+    for (unsigned i = 0; i < 8; i++) {
+        memset(big[i], 'A' + (int)i, 119); big[i][119] = 0;
+        many[3 + i].id = (uint8_t)(0x80 + i); many[3 + i].value = big[i];
+    }
+    uint8_t next = 0; unsigned seen = 0, rounds = 0;
+    do {
+        CHECK(mb_devid_encode(many, 11, MB_DEVID_EXTENDED, next, out, &len) == 0, "Segment abgelehnt");
+        CHECK(len <= MB_DATA_MAX, "Segment %u Byte, Puffer %u", len, MB_DATA_MAX);
+        unsigned n = devid_objects(out, len, ids, 16);
+        CHECK(n != 9999 && n >= 1, "Segment unlesbar");
+        for (unsigned i = 0; i < n && n != 9999; i++)
+            CHECK(ids[i] == 0x80 + seen + i, "Objekt %u ausser der Reihe", ids[i]);
+        seen += (n == 9999) ? 0 : n;
+        next = out[4];
+        rounds++;
+    } while (out[3] == 0xFF && rounds < 10);
+    CHECK(seen == 8, "Segmentierung lieferte %u von 8 Objekten in %u Runden", seen, rounds);
+    CHECK(rounds == 4, "Segmentierung brauchte %u Runden statt 4", rounds);
+
+    /* A single value that cannot ever be delivered is refused outright. */
+    char huge[260]; memset(huge, 'x', 259); huge[259] = 0;
+    mb_devid_obj_t bad[] = { { 0x00, huge } };
+    CHECK(mb_devid_encode(bad, 1, MB_DEVID_BASIC, 0, out, &len) == MB_EXC_DEVICE_FAILURE, "unlieferbares Objekt angenommen");
+
+    /* The response framing puts the data straight behind the function code. */
+    uint8_t pdu[4] = { 0x2B, 0x0E, 0x01, 0x00 }, resp[2 + MB_DATA_MAX];
+    mb_request_t r;
+    mb_parse_pdu(pdu, 4, &r);
+    mb_devid_encode(tbl, N, r.count, (uint8_t)r.addr, out, &len);
+    uint16_t n = mb_build_response(&r, pdu, out, len, MB_EXC_NONE, resp);
+    CHECK(n == 1 + len && resp[0] == 0x2B && resp[1] == 0x0E, "FC43 Antwortrahmen falsch");
+    n = mb_build_response(&r, pdu, NULL, 0, MB_EXC_ILLEGAL_ADDR, resp);
+    CHECK(n == 2 && resp[0] == 0xAB && resp[1] == 0x02, "FC43 Ausnahmerahmen falsch");
+}
+
+static void test_ascii_regs(void)
+{
+    uint8_t out[8];
+    memset(out, 0xEE, sizeof(out));
+    CHECK(mb_ascii_to_regs("abc", 3, out) == 6, "Laenge falsch");
+    CHECK(out[0] == 'a' && out[1] == 'b' && out[2] == 'c' && out[3] == 0 && out[4] == 0 && out[5] == 0,
+          "Zeichen oder Auffuellung falsch");
+    CHECK(out[6] == 0xEE, "ueber die Register hinaus geschrieben");
+    memset(out, 0xEE, sizeof(out));
+    CHECK(mb_ascii_to_regs("abcdefgh", 2, out) == 4 && out[3] == 'd' && out[4] == 0xEE, "Abschneiden falsch");
+    CHECK(mb_ascii_to_regs(NULL, 1, out) == 2 && out[0] == 0 && out[1] == 0, "NULL nicht als leer behandelt");
+}
+
 /* ------------------------------------------------------------ random input */
 
 /* The parser must survive anything and, when it accepts, must leave a request
@@ -256,7 +402,7 @@ static void test_random(unsigned rounds)
            byte of it, which lands either side of every limit. */
         if (i % 3) {
             free(pdu);
-            const uint8_t known[] = { 1, 2, 3, 4, 5, 6, 15, 16 };
+            const uint8_t known[] = { 1, 2, 3, 4, 5, 6, 15, 16, 43 };
             uint8_t  fc   = known[rand() % sizeof(known)];
             uint16_t addr = (uint16_t)(rand() & 0xFFFF);
             uint16_t cnt;
@@ -270,7 +416,12 @@ static void test_random(unsigned rounds)
             default: cnt = (uint16_t)(1 + rand() % 2002); break;
             }
 
-            if (fc == 15 || fc == 16) {
+            if (fc == 43) {
+                scratch[0] = 43; scratch[1] = (uint8_t)(rand() % 3 ? 0x0E : rand());
+                scratch[2] = (uint8_t)(1 + rand() % 5);     /* 5 is just past the limit */
+                scratch[3] = (uint8_t)(rand() & 0xFF);
+                len = 4;
+            } else if (fc == 15 || fc == 16) {
                 uint16_t want = (fc == 15) ? (uint16_t)((cnt + 7) / 8) : (uint16_t)(cnt * 2);
                 if (want > 250) want = 250;            /* keep the frame legal in size */
                 len = (uint16_t)(6 + want);
@@ -511,6 +662,9 @@ int main(void)
     test_single_writes();
     test_multi_writes();
     test_unknown_function_codes();
+    test_device_id_parse();
+    test_device_id_encode();
+    test_ascii_regs();
     test_responses();
     test_random(200000);
     test_value_decode();

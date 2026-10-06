@@ -81,6 +81,21 @@ uint8_t mb_parse_pdu(const uint8_t *pdu, uint16_t len, mb_request_t *req)
         return MB_EXC_NONE;
     }
 
+    case MB_FC_DEVICE_ID:
+        /* Function code, MEI type, read code, object id -- nothing else. An
+           MEI type other than 14 is a function this device does not have,
+           which the specification answers with exception 01; a read code
+           outside 1..4 is a bad value in a function it does have, 03. */
+        if (len != 4) return MB_EXC_ILLEGAL_VALUE;
+        if (pdu[1] != MB_MEI_DEVICE_ID) return MB_EXC_ILLEGAL_FUNC;
+        if (pdu[2] < MB_DEVID_BASIC || pdu[2] > MB_DEVID_INDIVIDUAL)
+            return MB_EXC_ILLEGAL_VALUE;
+        req->count    = pdu[2];                /* read code  */
+        req->addr     = pdu[3];                /* object id  */
+        req->data     = &pdu[1];
+        req->data_len = 3;
+        return MB_EXC_NONE;
+
     default:
         return MB_EXC_ILLEGAL_FUNC;
     }
@@ -109,10 +124,118 @@ uint16_t mb_build_response(const mb_request_t *req, const uint8_t *pdu,
         memcpy(&out[2], data, data_len);
         return (uint16_t)(2 + data_len);
 
+    case MB_FC_DEVICE_ID:
+        /* The handler built everything after the function code itself: the
+           MEI type, the read code and the object list have no byte count in
+           front of them. */
+        out[0] = req->fc;
+        memcpy(&out[1], data, data_len);
+        return (uint16_t)(1 + data_len);
+
     default:                      /* FC05, FC06, FC15, FC16 all echo five bytes */
         memcpy(out, pdu, 5);
         return 5;
     }
+}
+
+/* --------------------------------------------------- identification data */
+
+uint16_t mb_ascii_to_regs(const char *s, uint16_t nregs, uint8_t *out)
+{
+    uint16_t bytes = (uint16_t)(nregs * 2u);
+    size_t   n     = s ? strlen(s) : 0;
+    if (n > bytes) n = bytes;
+    memcpy(out, s, n);
+    memset(out + n, 0, bytes - n);
+    return bytes;
+}
+
+/* The three categories of the specification: which object ids belong to a
+   stream read code. Private objects are the extended category. */
+static bool devid_in_category(uint8_t read_code, uint8_t id)
+{
+    switch (read_code) {
+    case MB_DEVID_BASIC:    return id <= MB_DEVID_OBJ_REVISION;
+    case MB_DEVID_REGULAR:  return id >= MB_DEVID_OBJ_VENDOR_URL &&
+                                   id <= MB_DEVID_OBJ_USER_APP_NAME;
+    case MB_DEVID_EXTENDED: return id >= MB_DEVID_OBJ_PRIVATE_FIRST;
+    default:                return false;
+    }
+}
+
+/* What the device can be asked for, derived from the table rather than
+   declared next to it, so the two cannot disagree: 0x81 basic, 0x82 regular,
+   0x83 extended, each "with individual access". */
+static uint8_t devid_conformity(const mb_devid_obj_t *objs, uint16_t n)
+{
+    uint8_t level = 0x81;
+    for (uint16_t i = 0; i < n; i++) {
+        if (objs[i].id >= MB_DEVID_OBJ_PRIVATE_FIRST) return 0x83;
+        if (objs[i].id >= MB_DEVID_OBJ_VENDOR_URL)    level = 0x82;
+    }
+    return level;
+}
+
+#define DEVID_HDR  6          /* MEI, read code, conformity, more, next, count */
+
+uint8_t mb_devid_encode(const mb_devid_obj_t *objs, uint16_t n,
+                        uint8_t read_code, uint8_t start_id,
+                        uint8_t *out, uint16_t *out_len)
+{
+    *out_len = 0;
+    if (!objs || !out) return MB_EXC_DEVICE_FAILURE;
+    if (read_code < MB_DEVID_BASIC || read_code > MB_DEVID_INDIVIDUAL)
+        return MB_EXC_ILLEGAL_VALUE;
+
+    /* A value that cannot be delivered in any PDU is a table error, and
+       refusing the whole request is better than silently cutting it: the
+       client would read a truncated serial number as the real one. */
+    for (uint16_t i = 0; i < n; i++) {
+        size_t vl = objs[i].value ? strlen(objs[i].value) : 0;
+        if (vl > 255 || DEVID_HDR + 2 + vl > MB_DATA_MAX) return MB_EXC_DEVICE_FAILURE;
+    }
+
+    /* Where to begin. For a stream, the first object of the category at or
+       after the requested id, or the category's first object when the id is
+       not one of its own (restart from the beginning, per specification). */
+    uint16_t first = n, last = n;         /* [first, last) are candidates */
+    if (read_code == MB_DEVID_INDIVIDUAL) {
+        for (uint16_t i = 0; i < n; i++)
+            if (objs[i].id == start_id) { first = i; last = (uint16_t)(i + 1); break; }
+        if (first == n) return MB_EXC_ILLEGAL_ADDR;
+    } else {
+        uint16_t cat_first = n;
+        for (uint16_t i = 0; i < n; i++) {
+            if (!devid_in_category(read_code, objs[i].id)) continue;
+            if (cat_first == n) cat_first = i;
+            if (first == n && objs[i].id >= start_id) first = i;
+            last = (uint16_t)(i + 1);
+        }
+        if (cat_first == n) return MB_EXC_ILLEGAL_ADDR;   /* nothing of that kind */
+        if (first == n) first = cat_first;
+    }
+
+    uint8_t *p = out + DEVID_HDR;
+    uint8_t  count = 0;
+    uint16_t i = first;
+    for (; i < last; i++) {
+        size_t vl = objs[i].value ? strlen(objs[i].value) : 0;
+        if ((size_t)(p - out) + 2 + vl > MB_DATA_MAX) break;     /* next PDU */
+        *p++ = objs[i].id;
+        *p++ = (uint8_t)vl;
+        memcpy(p, objs[i].value, vl);
+        p += vl;
+        count++;
+    }
+
+    out[0] = MB_MEI_DEVICE_ID;
+    out[1] = read_code;
+    out[2] = devid_conformity(objs, n);
+    out[3] = (i < last) ? 0xFF : 0x00;            /* more follows */
+    out[4] = (i < last) ? objs[i].id : 0x00;      /* next object id */
+    out[5] = count;
+    *out_len = (uint16_t)(p - out);
+    return MB_EXC_NONE;
 }
 
 /* ------------------------------------------------------ reading a value out */

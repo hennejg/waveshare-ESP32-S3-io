@@ -46,6 +46,9 @@ Which device a request is for is decided by the MBAP unit identifier:
 | 0 and 255          | This board as well; a client with nothing to address sends one of them |
 | anything else      | The device with that address on RS-485, if the board is master |
 
+The board also answers FC 43/14, Read Device Identification, for its own
+unit ID — see "Read Device Identification" under the register map.
+
 With RS-485 set to slave there is nothing to forward to, and any other unit ID
 is answered with exception `0x0A`.
 
@@ -197,6 +200,74 @@ Writing sets the LED colour immediately. No sequence support via Modbus.
 | 100–10000 | Triggers a 200 ms beep at the given Hz |
 
 Writing a non-zero value triggers a single 200 ms beep. No sequence support via Modbus.
+
+### Input Registers (function code 04) — Device Identification
+
+Read-only. What the device is, which one of several it is, which firmware
+it runs and how it is reachable. Addresses are zero-based; the Modbus
+notation is 30001 + address. Numbers are big-endian; 32-bit values occupy
+two registers, high word first. Text is two ASCII characters per register,
+first character in the high byte, NUL padded. The whole block is 80
+registers and fits one request. Served over TCP and, as an RTU slave, over
+RS-485.
+
+| Address | Size | Content |
+|---|---|---|
+| 0 | 1 | Device type: 1 = Waveshare-ESP32-S3-POE-ETH-8DI-8DO |
+| 1–3 | 3 | Firmware version major, minor, patch |
+| 4–6 | 3 | MAC address, six bytes — the chip's identity from the eFuse |
+| 7–8 | 2 | Serial number as a 32-bit number: the last four bytes of the MAC |
+| 9–10 | 2 | Uptime in seconds |
+| 11–12 | 2 | IP address, four bytes in order (`192.168.1.10` reads as `0xC0A8 0x010A`) |
+| 13–14 | 2 | Netmask |
+| 15–16 | 2 | Gateway |
+| 17 | 1 | 1 = address obtained by DHCP, 0 = static |
+| 18–19 | 2 | Reserved, read as zero |
+| 20–39 | 20 | Model, text: `Waveshare-ESP32-S3-POE-ETH-8DI-8DO` |
+| 40–55 | 16 | Device name as configured in the web UI, text |
+| 56–63 | 8 | Serial number as text: the MAC as twelve hex digits, no separators |
+| 64–79 | 16 | Firmware version as text, as git describes it (`v1.1.13-3-gabc1234`) |
+
+A read that reaches past address 79 is answered with exception `0x02`.
+
+The serial number is the MAC because the ESP32-S3 has no serial number of
+its own: the MAC is unique per chip, burned at the factory, and survives
+every flash and every factory reset. The Ethernet interface uses a MAC
+derived from it (base + 3), which is what shows up in a DHCP lease table.
+
+### Read Device Identification (function code 43, MEI type 14)
+
+The standard's own way of asking a device what it is, the one tools such as
+`mbpoll`, `modpoll` and most SCADA drivers try first. Conformity level
+`0x83`: basic, regular and extended objects, stream and individual access.
+Answered over TCP for the board's own unit ID and over RS-485 as an RTU
+slave.
+
+| Object | Category | Content |
+|---|---|---|
+| `0x00` VendorName | basic | `Waveshare` |
+| `0x01` ProductCode | basic | `Waveshare-ESP32-S3-POE-ETH-8DI-8DO` |
+| `0x02` MajorMinorRevision | basic | firmware version, as git describes it |
+| `0x03` VendorUrl | regular | the project's repository |
+| `0x04` ProductName | regular | `Waveshare-ESP32-S3-POE-ETH-8DI-8DO` |
+| `0x05` ModelName | regular | `ESP32-S3-POE-ETH-8DI-8DO` |
+| `0x06` UserApplicationName | regular | the device name from the web UI |
+| `0x80` | extended | serial number, twelve hex digits |
+| `0x81` | extended | MAC, `AA:BB:CC:DD:EE:FF` |
+
+Example, the basic objects in one request:
+
+```
+>> 2B 0E 01 00
+<< 2B 0E 01 83 00 00 03  00 09 "Waveshare"  01 22 "Waveshare-ESP32-S3-POE-ETH-8DI-8DO"  02 07 "v1.1.13"
+```
+
+A request for another unit over TCP is **not relayed** to RS-485. The
+stack's serial master can send a custom function code, but only with a
+payload of even length and without handing the response back to the
+caller, and the FC 43 request is three bytes; relaying it needs an addition
+to the stack. Until then the client gets exception `0x01`, as it would
+from a device without the function.
 
 ---
 

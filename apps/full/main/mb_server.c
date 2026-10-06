@@ -10,6 +10,7 @@
 #include "scripting.h"
 #include "mb_gateway.h"
 #include "mb_tcp_server.h"
+#include "mb_ident.h"
 
 #include "mbcontroller.h"
 #include "driver/gpio.h"
@@ -46,6 +47,7 @@
 static struct { uint8_t  b[1]; } s_coils_unused;
 static struct { uint8_t  b[1]; } s_di_unused;
 static struct { uint16_t r[MB_NUM_HOLDING]; } s_hr_unused;
+static struct { uint16_t r[MB_IDENT_REG_COUNT]; } s_ir_unused;
 
 static void *s_handle = NULL;        /* the RTU slave instance, if any */
 
@@ -255,7 +257,12 @@ uint8_t mb_server_handle(const mb_request_t *req, uint8_t *resp, uint16_t *resp_
         return exc;
 
     case MB_FC_READ_INPUT:
-        return MB_EXC_ILLEGAL_ADDR;     /* no input registers on this device */
+        exc = mb_ident_read_input(req->addr, req->count, resp);
+        if (!exc) *resp_len = (uint16_t)(req->count * 2u);
+        return exc;
+
+    case MB_FC_DEVICE_ID:
+        return mb_ident_device_id(req, resp, resp_len);
 
     case MB_FC_WRITE_COIL: {
         /* The value arrives as the two bytes of the request: 0xFF00 on,
@@ -338,8 +345,33 @@ mb_err_enum_t mbc_reg_holding_slave_cb(mb_base_t *inst, uint8_t *reg_buffer,
 mb_err_enum_t mbc_reg_input_slave_cb(mb_base_t *inst, uint8_t *reg_buffer,
                                      uint16_t address, uint16_t n_regs)
 {
-    (void)inst; (void)reg_buffer; (void)address; (void)n_regs;
-    return MB_ENOREG;          /* no input registers on this device */
+    (void)inst;
+    if (!reg_buffer) return MB_EINVAL;
+    address--;
+    return exc_to_err(mb_ident_read_input(address, n_regs, reg_buffer));
+}
+
+/* FC 43 on RS-485. The stack has no idea of Read Device Identification but
+   lets a function code be given its own handler: the handler gets the request
+   PDU in the stack's frame buffer, leaves the response PDU in its place, and
+   returns the exception that the stack then frames itself. The same parser,
+   encoder and response builder as over TCP, so the two cannot drift apart. */
+static mb_exception_t rtu_device_id_handler(void *inst, uint8_t *frame, uint16_t *len)
+{
+    (void)inst;
+    if (!frame || !len) return MB_EX_SLAVE_DEVICE_FAILURE;
+
+    mb_request_t req;
+    uint8_t  data[MB_DATA_MAX];
+    uint16_t dlen = 0;
+    uint8_t exc = mb_parse_pdu(frame, *len, &req);
+    if (!exc) exc = mb_ident_device_id(&req, data, &dlen);
+    if (exc) return (mb_exception_t)exc;        /* same numbering on both sides */
+
+    uint8_t out[2 + MB_DATA_MAX];
+    *len = mb_build_response(&req, frame, data, dlen, MB_EXC_NONE, out);
+    memcpy(frame, out, *len);
+    return MB_EX_NONE;
 }
 
 /* ---------------------------------------------------------------- command task */
@@ -482,6 +514,14 @@ static esp_err_t start_rtu_slave(const app_config_t *cfg)
     area.access  = MB_ACCESS_RW;
     ESP_RETURN_ON_ERROR(mbc_slave_set_descriptor(s_handle, area), TAG, "hr desc");
 
+    area.type = MB_PARAM_INPUT;     area.start_offset = 0;
+    area.address = &s_ir_unused;    area.size = sizeof(s_ir_unused);
+    area.access  = MB_ACCESS_RO;
+    ESP_RETURN_ON_ERROR(mbc_slave_set_descriptor(s_handle, area), TAG, "ir desc");
+
+    ESP_RETURN_ON_ERROR(mbc_set_handler(s_handle, MB_FC_DEVICE_ID, rtu_device_id_handler),
+                        TAG, "fc43 handler");
+
     ESP_RETURN_ON_ERROR(mbc_slave_start(s_handle), TAG, "start");
 
     ESP_LOGI(TAG, "RS-485: RTU slave, address %u, %"PRIu32" baud",
@@ -492,6 +532,7 @@ static esp_err_t start_rtu_slave(const app_config_t *cfg)
 esp_err_t mb_server_init(void)
 {
     const app_config_t *cfg = app_config_get();
+    mb_ident_init();
     if (!cfg->modbus.enable) {
         ESP_LOGI(TAG, "Modbus disabled");
         return ESP_OK;
