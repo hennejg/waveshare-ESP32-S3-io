@@ -321,6 +321,177 @@ static void test_random(unsigned rounds)
     printf("  Zufallstest: %u Rahmen, davon %u angenommen\n", rounds, accepted);
 }
 
+/* --------------------------------------------------- reading a value out */
+
+/* The register bytes are written out by hand rather than built with the same
+   arithmetic the code under test uses -- a shared helper would agree with a
+   wrong implementation. */
+static void test_value_decode(void)
+{
+    double v;
+
+    CHECK(mb_value_regs(MB_VAL_U16) == 1 && mb_value_regs(MB_VAL_S16) == 1,
+          "16-Bit-Typen brauchen ein Register");
+    CHECK(mb_value_regs(MB_VAL_U32) == 2 && mb_value_regs(MB_VAL_S32) == 2 &&
+          mb_value_regs(MB_VAL_F32) == 2, "32-Bit-Typen brauchen zwei Register");
+    for (unsigned t = MB_VAL_COUNT; t < 256; t++)
+        CHECK(mb_value_regs((uint8_t)t) == 0, "Typ %u hat eine Registerzahl", t);
+
+    /* Unsigned and signed 16 bit. */
+    CHECK(mb_value_decode((const uint8_t[]){0x00, 0x00}, MB_VAL_U16, false, &v) && v == 0, "U16 0");
+    CHECK(mb_value_decode((const uint8_t[]){0x12, 0x34}, MB_VAL_U16, false, &v) && v == 4660, "U16 0x1234");
+    CHECK(mb_value_decode((const uint8_t[]){0xFF, 0xFF}, MB_VAL_U16, false, &v) && v == 65535, "U16 max");
+    CHECK(mb_value_decode((const uint8_t[]){0xFF, 0xFF}, MB_VAL_S16, false, &v) && v == -1, "S16 -1");
+    CHECK(mb_value_decode((const uint8_t[]){0x80, 0x00}, MB_VAL_S16, false, &v) && v == -32768, "S16 min");
+    CHECK(mb_value_decode((const uint8_t[]){0x7F, 0xFF}, MB_VAL_S16, false, &v) && v == 32767, "S16 max");
+    /* The word-swap flag must not touch a one-register value. */
+    CHECK(mb_value_decode((const uint8_t[]){0x12, 0x34}, MB_VAL_U16, true, &v) && v == 4660,
+          "U16 vom Wortsupplement veraendert");
+
+    /* 32 bit, both word orders. 0x12345678 = 305419896. */
+    CHECK(mb_value_decode((const uint8_t[]){0x12,0x34,0x56,0x78}, MB_VAL_U32, false, &v)
+          && v == 305419896.0, "U32 ABCD");
+    CHECK(mb_value_decode((const uint8_t[]){0x56,0x78,0x12,0x34}, MB_VAL_U32, true, &v)
+          && v == 305419896.0, "U32 CDAB");
+    CHECK(mb_value_decode((const uint8_t[]){0xFF,0xFF,0xFF,0xFF}, MB_VAL_U32, false, &v)
+          && v == 4294967295.0, "U32 max");
+    CHECK(mb_value_decode((const uint8_t[]){0xFF,0xFF,0xFF,0xFF}, MB_VAL_S32, false, &v)
+          && v == -1.0, "S32 -1");
+    CHECK(mb_value_decode((const uint8_t[]){0x80,0x00,0x00,0x00}, MB_VAL_S32, false, &v)
+          && v == -2147483648.0, "S32 min");
+    CHECK(mb_value_decode((const uint8_t[]){0x00,0x00,0x80,0x00}, MB_VAL_S32, true, &v)
+          && v == -2147483648.0, "S32 min CDAB");
+
+    /* IEEE 754: 0x42C80000 = 100.0, 0x43670000 = 231.0, 0xC2C80000 = -100.0 */
+    CHECK(mb_value_decode((const uint8_t[]){0x42,0xC8,0x00,0x00}, MB_VAL_F32, false, &v)
+          && v == 100.0, "F32 100 ABCD");
+    CHECK(mb_value_decode((const uint8_t[]){0x00,0x00,0x42,0xC8}, MB_VAL_F32, true, &v)
+          && v == 100.0, "F32 100 CDAB");
+    CHECK(mb_value_decode((const uint8_t[]){0xC2,0xC8,0x00,0x00}, MB_VAL_F32, false, &v)
+          && v == -100.0, "F32 -100");
+    CHECK(mb_value_decode((const uint8_t[]){0x00,0x00,0x00,0x00}, MB_VAL_F32, false, &v)
+          && v == 0.0, "F32 0");
+
+    /* Values a meter really sends, taken from the bench twins. */
+    CHECK(mb_value_decode((const uint8_t[]){0x43,0x67,0xD8,0x35}, MB_VAL_F32, false, &v)
+          && v > 231.84 && v < 231.85, "F32 Spannung L1 (231,845)");
+    CHECK(mb_value_decode((const uint8_t[]){0x42,0x70,0x00,0x00}, MB_VAL_F32, false, &v)
+          && v == 60.0, "F32 Pulsbreite 60");
+
+    /* Nonsense in, false out -- and the output untouched. */
+    v = 12345.0;
+    CHECK(!mb_value_decode((const uint8_t[]){0,0,0,0}, MB_VAL_COUNT, false, &v) && v == 12345.0,
+          "unbekannter Typ liefert einen Wert");
+    CHECK(!mb_value_decode(NULL, MB_VAL_U16, false, &v), "NULL-Register angenommen");
+    CHECK(!mb_value_decode((const uint8_t[]){0,0}, MB_VAL_U16, false, NULL),
+          "NULL-Ausgabe angenommen");
+}
+
+/* Every byte pattern, both word orders, every type: the decoder must either
+   refuse or produce a number, never read outside the registers it was given. */
+static void test_value_random(unsigned rounds)
+{
+    for (unsigned i = 0; i < rounds; i++) {
+        uint8_t type = (uint8_t)(rand() % (MB_VAL_COUNT + 2));
+        uint16_t n = mb_value_regs(type);
+        size_t bytes = n ? (size_t)n * 2 : 2;
+        uint8_t *regs = malloc(bytes);          /* exact size: ASAN sees overruns */
+        for (size_t j = 0; j < bytes; j++) regs[j] = (uint8_t)(rand() & 0xFF);
+
+        double v = 0.0;
+        bool ok = mb_value_decode(regs, type, (rand() & 1) != 0, &v);
+        CHECK(ok == (n != 0), "Typ %u: Annahme %d, erwartet %d", type, ok, n != 0);
+        if (ok) CHECK(v == v || type == MB_VAL_F32,
+                      "Typ %u ergab keinen Wert", type);   /* NaN nur bei float */
+        free(regs);
+    }
+    printf("  Zufallstest Werte: %u Muster\n", rounds);
+}
+
+/* ------------------------------------------- asking somebody else for data */
+
+static void test_client_framing(void)
+{
+    uint8_t req[16];
+    uint16_t n = mb_build_read_request(req, 0xBEEF, 11, MB_FC_READ_HOLDING, 0x0102, 2);
+    CHECK(n == 12, "Anfrage %u statt 12 Byte", n);
+    const uint8_t want[] = { 0xBE,0xEF, 0x00,0x00, 0x00,0x06, 11, 0x03, 0x01,0x02, 0x00,0x02 };
+    CHECK(memcmp(req, want, 12) == 0, "Anfrage weicht ab");
+
+    /* A good answer: two registers of data. */
+    uint8_t rsp[32];
+    const uint8_t good[] = { 0xBE,0xEF, 0x00,0x00, 0x00,0x07, 11, 0x03, 0x04,
+                             0x42,0xC8,0x00,0x00 };
+    const uint8_t *data; uint8_t exc;
+    memcpy(rsp, good, sizeof(good));
+    CHECK(mb_parse_read_response(rsp, sizeof(good), 0xBEEF, 11, 0x03, 2, &data, &exc)
+          == MB_RSP_OK, "gute Antwort abgelehnt");
+    CHECK(data == rsp + 9, "Datenzeiger falsch");
+    double v;
+    CHECK(mb_value_decode(data, MB_VAL_F32, false, &v) && v == 100.0, "Wert falsch");
+
+    /* An exception. */
+    const uint8_t ex[] = { 0xBE,0xEF, 0x00,0x00, 0x00,0x03, 11, 0x83, 0x02 };
+    memcpy(rsp, ex, sizeof(ex));
+    CHECK(mb_parse_read_response(rsp, sizeof(ex), 0xBEEF, 11, 0x03, 2, &data, &exc)
+          == MB_RSP_EXCEPTION && exc == 0x02, "Ausnahme nicht erkannt");
+
+    /* Everything that must be refused. Each case changes one thing about an
+       otherwise good answer -- the stale transaction id above all, which is
+       the failure that would otherwise produce a plausible wrong number. */
+    struct { const char *what; int off; uint8_t val; uint16_t len; } bad[] = {
+        { "alte Transaktionsnummer", 1, 0xEE, 13 },
+        { "fremde Unit-ID",          6, 12,   13 },
+        { "falscher Funktionscode",  7, 0x04, 13 },
+        { "Protokoll-ID ungleich 0", 3, 0x01, 13 },
+        { "Bytezahl passt nicht",    8, 0x02, 13 },
+        { "Laenge passt nicht",     -1, 0,    12 },
+        { "Laengenfeld luegt",       5, 0x09, 13 },
+    };
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        memcpy(rsp, good, sizeof(good));
+        if (bad[i].off >= 0) rsp[bad[i].off] = bad[i].val;
+        mb_rsp_t r = mb_parse_read_response(rsp, bad[i].len, 0xBEEF, 11, 0x03, 2, &data, &exc);
+        CHECK(r == MB_RSP_MALFORMED, "%s wurde angenommen", bad[i].what);
+    }
+
+    /* Too short, at every length. */
+    for (uint16_t l = 0; l < sizeof(good); l++) {
+        memcpy(rsp, good, sizeof(good));
+        if (l == sizeof(good)) continue;
+        mb_rsp_t r = mb_parse_read_response(rsp, l, 0xBEEF, 11, 0x03, 2, &data, &exc);
+        CHECK(r == MB_RSP_MALFORMED, "Laenge %u angenommen", l);
+    }
+}
+
+/* Random frames into the response parser: it must never read past what it was
+   given, and must never report OK with a data pointer outside the frame. */
+static void test_client_random(unsigned rounds)
+{
+    unsigned ok = 0;
+    for (unsigned i = 0; i < rounds; i++) {
+        uint16_t len = (uint16_t)(rand() % 40);
+        uint8_t *f = malloc(len ? len : 1);
+        for (uint16_t j = 0; j < len; j++) f[j] = (uint8_t)(rand() & 0xFF);
+        if (len >= 8 && (i & 1)) {            /* bias towards plausible answers */
+            f[0] = 0xBE; f[1] = 0xEF; f[2] = 0; f[3] = 0;
+            f[4] = 0; f[5] = (uint8_t)(len - 6);
+            f[6] = 11; f[7] = (rand() & 1) ? 0x03 : 0x83;
+            if (len >= 9) f[8] = (uint8_t)(rand() % 6);
+        }
+        const uint8_t *data; uint8_t exc;
+        mb_rsp_t r = mb_parse_read_response(f, len, 0xBEEF, 11, 0x03, 2, &data, &exc);
+        if (r == MB_RSP_OK) {
+            ok++;
+            CHECK(data >= f && data + 4 <= f + len, "Daten liegen ausserhalb des Rahmens");
+        } else {
+            CHECK(data == NULL || r == MB_RSP_EXCEPTION, "Datenzeiger trotz Fehler gesetzt");
+        }
+        free(f);
+    }
+    printf("  Zufallstest Antworten: %u Rahmen, davon %u gueltig\n", rounds, ok);
+}
+
 int main(void)
 {
     printf("Modbus-Rahmenpruefung\n");
@@ -330,6 +501,10 @@ int main(void)
     test_unknown_function_codes();
     test_responses();
     test_random(200000);
+    test_value_decode();
+    test_value_random(100000);
+    test_client_framing();
+    test_client_random(200000);
     printf("%d Pruefungen, %d Fehler\n", checks, failures);
     return failures ? 1 : 0;
 }

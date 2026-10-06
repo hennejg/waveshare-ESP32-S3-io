@@ -3,10 +3,11 @@
 #include <stdbool.h>
 #include <string.h>
 
-/* Modbus framing: taking a request PDU apart and putting a response PDU
-   together. Nothing here touches hardware, the network or the Modbus stack,
-   which is the point -- it is the part where an off-by-one is both easiest to
-   make and hardest to see, so it is kept where it can be tested on its own.
+/* Modbus on the wire: taking a request PDU apart, putting a response PDU
+   together, and reading a value out of a register pair. Nothing here touches
+   hardware, the network or the Modbus stack, which is the point -- these are
+   the parts where an off-by-one or a swapped word is both easiest to make and
+   hardest to see, so they are kept where they can be tested on their own.
    See test/host for that. */
 
 
@@ -112,4 +113,98 @@ uint16_t mb_build_response(const mb_request_t *req, const uint8_t *pdu,
         memcpy(out, pdu, 5);
         return 5;
     }
+}
+
+/* ------------------------------------------------------ reading a value out */
+
+uint16_t mb_value_regs(uint8_t type)
+{
+    switch (type) {
+    case MB_VAL_U16:
+    case MB_VAL_S16: return 1;
+    case MB_VAL_U32:
+    case MB_VAL_S32:
+    case MB_VAL_F32: return 2;
+    default:         return 0;
+    }
+}
+
+bool mb_value_decode(const uint8_t *regs, uint8_t type, bool word_swap, double *out)
+{
+    if (!regs || !out) return false;
+
+    uint16_t w0 = mb_be16(&regs[0]);
+    if (type == MB_VAL_U16) { *out = (double)w0; return true; }
+    if (type == MB_VAL_S16) { *out = (double)(int16_t)w0; return true; }
+    if (mb_value_regs(type) != 2) return false;
+
+    uint16_t w1 = mb_be16(&regs[2]);
+    /* Word swapped means the two registers arrive the other way round; the
+       bytes inside each register are big endian either way. */
+    uint32_t v = word_swap ? ((uint32_t)w1 << 16) | w0
+                           : ((uint32_t)w0 << 16) | w1;
+
+    switch (type) {
+    case MB_VAL_U32: *out = (double)v;              return true;
+    case MB_VAL_S32: *out = (double)(int32_t)v;     return true;
+    case MB_VAL_F32: {
+        /* Through memcpy rather than a cast: the two have different alignment
+           requirements and punning through a pointer is undefined. */
+        float f;
+        memcpy(&f, &v, sizeof(f));
+        *out = (double)f;
+        return true;
+    }
+    default: return false;
+    }
+}
+
+/* ------------------------------------------------- the other side of the wire */
+
+uint16_t mb_build_read_request(uint8_t *out, uint16_t tid, uint8_t uid,
+                               uint8_t fc, uint16_t reg, uint16_t count)
+{
+    out[0] = (uint8_t)(tid >> 8);  out[1] = (uint8_t)tid;
+    out[2] = 0;                    out[3] = 0;        /* protocol id */
+    out[4] = 0;                    out[5] = 6;        /* unit id plus five PDU bytes */
+    out[6] = uid;
+    out[7] = fc;
+    out[8] = (uint8_t)(reg >> 8);   out[9]  = (uint8_t)reg;
+    out[10] = (uint8_t)(count >> 8); out[11] = (uint8_t)count;
+    return MB_MBAP_LEN + 5;
+}
+
+mb_rsp_t mb_parse_read_response(const uint8_t *frame, uint16_t len,
+                                uint16_t tid, uint8_t uid, uint8_t fc,
+                                uint16_t count, const uint8_t **data, uint8_t *exc)
+{
+    if (!frame || !data || !exc) return MB_RSP_MALFORMED;
+    *data = NULL;
+    *exc  = MB_EXC_NONE;
+
+    if (len < MB_MBAP_LEN + 2) return MB_RSP_MALFORMED;
+    if (mb_be16(&frame[2]) != 0) return MB_RSP_MALFORMED;      /* protocol id */
+
+    /* The MBAP length counts the unit id and the PDU, and has to agree with
+       how many bytes actually arrived. */
+    uint16_t mbap_len = mb_be16(&frame[4]);
+    if (mbap_len < 2 || (uint32_t)mbap_len + MB_MBAP_LEN - 1 != len) return MB_RSP_MALFORMED;
+
+    if (mb_be16(&frame[0]) != tid) return MB_RSP_MALFORMED;    /* a stale answer */
+    if (frame[6] != uid)           return MB_RSP_MALFORMED;
+
+    uint8_t rsp_fc = frame[7];
+    if (rsp_fc == (uint8_t)(fc | 0x80u)) {
+        if (len != MB_MBAP_LEN + 2) return MB_RSP_MALFORMED;
+        *exc = frame[8];
+        return MB_RSP_EXCEPTION;
+    }
+    if (rsp_fc != fc) return MB_RSP_MALFORMED;
+
+    uint8_t byte_cnt = frame[8];
+    if (byte_cnt != (uint8_t)(count * 2u)) return MB_RSP_MALFORMED;
+    if (len != MB_MBAP_LEN + 2 + byte_cnt) return MB_RSP_MALFORMED;
+
+    *data = &frame[9];
+    return MB_RSP_OK;
 }

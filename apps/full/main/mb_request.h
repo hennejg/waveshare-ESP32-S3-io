@@ -51,6 +51,18 @@ typedef uint8_t (*mb_handler_fn)(const mb_request_t *req,
 #define MB_FC_WRITE_COILS       0x0F
 #define MB_FC_WRITE_REGISTERS   0x10
 
+/* How a register pair is to be read. Meters disagree about this more than
+   about anything else in the protocol, so it is per value, not per device.
+   A 32-bit quantity occupies two registers; "word swapped" is the CDAB order
+   some devices use, where the two registers are the other way round while the
+   bytes inside each stay big endian. */
+#define MB_VAL_U16   0
+#define MB_VAL_S16   1
+#define MB_VAL_U32   2
+#define MB_VAL_S32   3
+#define MB_VAL_F32   4
+#define MB_VAL_COUNT 5
+
 /* The largest PDU the protocol allows, and the largest data part inside one. */
 #define MB_PDU_MAX              253
 #define MB_DATA_MAX             250

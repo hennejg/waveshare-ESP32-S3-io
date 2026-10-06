@@ -307,6 +307,34 @@
         <input type="number" id="mb_tcp_uid" min="1" max="247" value="247">
       </label>
       <p class="hint" id="mb_tcp_hint"></p>
+
+      <h2 style="margin-top:1.5rem">Read other Modbus TCP devices</h2>
+      <p class="hint">Each row is one value this device fetches by itself. It is published on
+      MQTT as <code>modbus/&lt;name&gt;</code> and is readable in a rule as
+      <code>mqtt('modbus/&lt;name&gt;')</code> — that works even with no broker configured.
+      Reading only; nothing is ever written to the other device. Independent of the settings
+      above: this works whether RS485 is a slave or the master.</p>
+      <div style="overflow-x:auto">
+        <table id="mbm_table" style="border-collapse:collapse;font-size:.85rem;min-width:52rem">
+          <thead><tr>
+            <th style="padding:.2rem .4rem"></th>
+            <th style="padding:.2rem .4rem;text-align:left">Name</th>
+            <th style="padding:.2rem .4rem;text-align:left">Host</th>
+            <th style="padding:.2rem .4rem">Port</th>
+            <th style="padding:.2rem .4rem">Unit</th>
+            <th style="padding:.2rem .4rem">Register</th>
+            <th style="padding:.2rem .4rem">Type</th>
+            <th style="padding:.2rem .4rem" title="The two registers of a 32-bit value the other way round (CDAB)">Swap</th>
+            <th style="padding:.2rem .4rem">Scale</th>
+            <th style="padding:.2rem .4rem">Every (ms)</th>
+            <th style="padding:.2rem .4rem;text-align:left">Last read</th>
+          </tr></thead>
+          <tbody id="mbm_rows"></tbody>
+        </table>
+      </div>
+      <p class="hint">The register number is the zero-based one from the device's manual — the
+      same number a Modbus master would put on the wire, not the 4xxxx form. If a 32-bit value
+      comes out as nonsense, the device most likely uses the other word order: tick Swap.</p>
     </div>
 
     <!-- ── Time (SNTP / RTC) ── -->
@@ -686,6 +714,9 @@ rule('my-rule')
           document.getElementById('mb_tout').value      = cfg.modbus.rs485_tout_ms ?? 1000;
           updateModbusFields();
         }
+        renderMbm(cfg.mbm);
+        refreshMbmStatus();
+        if (!window._mbmTimer) window._mbmTimer = setInterval(refreshMbmStatus, 5000);
         if (cfg.sntp) {
           document.getElementById('sntp_enable').checked = !!cfg.sntp.enable;
           document.getElementById('sntp_server').value   = cfg.sntp.server ?? '';
@@ -790,6 +821,7 @@ rule('my-rule')
             tcp_uid:    parseInt(document.getElementById('mb_tcp_uid').value, 10),
             rs485_tout_ms: parseInt(document.getElementById('mb_tout').value, 10),
           },
+          mbm: collectMbm(),
           sntp: {
             enable: document.getElementById('sntp_enable').checked,
             server: document.getElementById('sntp_server').value.trim(),
@@ -833,6 +865,91 @@ rule('my-rule')
     // server, and a local unit ID below 247 that would shadow a real device on
     // the segment. Rather than let someone fill in a form that will be
     // rejected, the fields that cannot apply are taken away.
+    // ── Modbus TCP master table ───────────────────────────────────────────────
+    // Eight fixed rows rather than add/remove buttons: the firmware stores a
+    // fixed-size table anyway, and a row left empty costs nothing.
+    const MBM_ROWS  = 8;
+    const MBM_TYPES = [['u16','u16'], ['s16','s16'], ['u32','u32'],
+                       ['s32','s32'], ['f32','float32']];
+
+    function _mbmCell(html) { return '<td style="padding:.15rem .3rem">' + html + '</td>'; }
+
+    function renderMbm(list) {
+      list = list || [];
+      var tb = document.getElementById('mbm_rows');
+      tb.innerHTML = '';
+      for (var i = 0; i < MBM_ROWS; i++) {
+        var e = list[i] || {};
+        var tr = document.createElement('tr');
+        var opts = MBM_TYPES.map(function (t) {
+          return '<option value="' + t[0] + '"' +
+                 ((e.type || 'u16') === t[0] ? ' selected' : '') + '>' + t[1] + '</option>';
+        }).join('');
+        tr.innerHTML =
+          _mbmCell('<input type="checkbox" id="mbm_en_' + i + '"' + (e.enable ? ' checked' : '') + '>') +
+          _mbmCell('<input type="text" id="mbm_name_' + i + '" size="10" maxlength="20" value="">') +
+          _mbmCell('<input type="text" id="mbm_host_' + i + '" size="14" maxlength="48" value="">') +
+          _mbmCell('<input type="number" id="mbm_port_' + i + '" style="width:4.5rem" min="1" max="65535" value="' + (e.port || 502) + '">') +
+          _mbmCell('<input type="number" id="mbm_uid_'  + i + '" style="width:3.5rem" min="1" max="247" value="' + (e.unit_id || 1) + '">') +
+          _mbmCell('<select id="mbm_fc_' + i + '">' +
+                   '<option value="holding"' + (e.fc !== 'input' ? ' selected' : '') + '>holding</option>' +
+                   '<option value="input"'   + (e.fc === 'input' ? ' selected' : '') + '>input</option></select> ' +
+                   '<input type="number" id="mbm_reg_' + i + '" style="width:5rem" min="0" max="65535" value="' + (e.reg || 0) + '">') +
+          _mbmCell('<select id="mbm_type_' + i + '">' + opts + '</select>') +
+          _mbmCell('<input type="checkbox" id="mbm_sw_' + i + '"' + (e.word_swap ? ' checked' : '') + '>') +
+          _mbmCell('<input type="number" id="mbm_scale_' + i + '" style="width:5rem" step="any" value="' + (e.scale != null ? e.scale : 1) + '">') +
+          _mbmCell('<input type="number" id="mbm_int_' + i + '" style="width:5.5rem" min="200" step="100" value="' + (e.interval_ms || 5000) + '">') +
+          '<td style="padding:.15rem .3rem;white-space:nowrap" id="mbm_stat_' + i + '">—</td>';
+        tb.appendChild(tr);
+        // Text fields are filled through .value, never through markup, so a
+        // name or host cannot smuggle HTML into the page.
+        document.getElementById('mbm_name_' + i).value = e.name || '';
+        document.getElementById('mbm_host_' + i).value = e.host || '';
+      }
+    }
+
+    function collectMbm() {
+      var out = [];
+      for (var i = 0; i < MBM_ROWS; i++) {
+        var name = document.getElementById('mbm_name_' + i).value.trim();
+        var host = document.getElementById('mbm_host_' + i).value.trim();
+        var on   = document.getElementById('mbm_en_' + i).checked;
+        if (!on && !name && !host) continue;          // an untouched row is not sent
+        out.push({
+          enable:      on,
+          name:        name,
+          host:        host,
+          port:        parseInt(document.getElementById('mbm_port_'  + i).value, 10),
+          unit_id:     parseInt(document.getElementById('mbm_uid_'   + i).value, 10),
+          fc:          document.getElementById('mbm_fc_' + i).value,
+          reg:         parseInt(document.getElementById('mbm_reg_'   + i).value, 10),
+          type:        document.getElementById('mbm_type_' + i).value,
+          word_swap:   document.getElementById('mbm_sw_' + i).checked,
+          scale:       parseFloat(document.getElementById('mbm_scale_' + i).value),
+          interval_ms: parseInt(document.getElementById('mbm_int_'  + i).value, 10),
+        });
+      }
+      return out;
+    }
+
+    // Shows what each row last actually read, which is the only way to tell a
+    // wrong register from a device that is not answering.
+    function refreshMbmStatus() {
+      fetch('/api/modbus/status').then(function (r) {
+        return r.ok ? r.json() : null;
+      }).then(function (d) {
+        if (!d || !d.tcp_master) return;
+        d.tcp_master.forEach(function (m, i) {
+          var cell = document.getElementById('mbm_stat_' + i);
+          if (!cell) return;
+          if (!m.enabled)            cell.textContent = '—';
+          else if (m.last_error)     cell.textContent = m.last_error;
+          else if (m.value == null)  cell.textContent = 'waiting…';
+          else cell.textContent = m.value + '  (' + Math.round(m.age_ms / 1000) + ' s ago)';
+        });
+      }).catch(function () { /* the page is still usable without it */ });
+    }
+
     let mbSavedTcp = null;   // what the TCP fields held before 'master' took them over
 
     function updateModbusFields() {

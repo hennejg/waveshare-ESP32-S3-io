@@ -79,6 +79,51 @@ A connection is kept open for as long as the client wants it. One whose peer
 has disappeared without closing is found by TCP keepalive after about 90 s and
 its slot released.
 
+## Reading other Modbus TCP devices
+
+Independent of everything above: whatever the RS485 side is doing, the board
+can fetch values from other Modbus TCP devices by itself. Up to eight, each
+configured in the web UI (**Modbus** tab) with where the value lives and how to
+read it.
+
+| Field | Meaning |
+|---|---|
+| Name | what the value is called; becomes the MQTT topic and the rule key |
+| Host, Port | the other device; port is usually 502 |
+| Unit | its Modbus unit ID |
+| Register | **zero-based**, the number a master puts on the wire — not the 4xxxx form |
+| holding / input | function code 3 or 4 |
+| Type | `u16`, `s16`, `u32`, `s32` or `float32` |
+| Swap | the two registers of a 32-bit value the other way round (CDAB) |
+| Scale | the raw value is multiplied by this |
+| Every | poll interval, 200 ms to a day |
+
+Reading only. Nothing is ever written to the other device.
+
+### Where the value goes
+
+Each successful read publishes on MQTT as `modbus/<name>` (under the configured
+topic prefix) and is handed to the rule engine under the same name. A rule picks
+it up with `mqtt('modbus/<name>')`, and that works **whether or not a broker is
+configured** — the value does not travel through one:
+
+```js
+rule('shed load')
+  .when(mqtt('modbus/grid_power').is(function (w) { return Number(w) > 8000; }))
+  .then(function () { output(0).off(); });
+```
+
+### When it goes wrong
+
+A device that does not answer is retried with a widening gap — 2 s, then 4, 8,
+up to a minute — rather than at its poll interval, so a switched-off device does
+not dial continuously. The first failure is logged, repeats are not. The table in
+the web UI shows each row's last value and age, or the reason it has none, which
+is the only way to tell a wrong register from a device that is not there.
+`GET /api/modbus/status` returns the same, along with the TCP server's counters.
+
+Connections are held open between polls and dropped after a minute idle.
+
 ---
 
 ## Register Map

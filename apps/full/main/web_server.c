@@ -10,6 +10,8 @@
 #include "matter.h"
 #endif
 #include "app_rtc.h"
+#include "mb_tcp_server.h"
+#include "mb_tcp_master.h"
 #include "scripting.h"
 #include "sntp_sync.h"
 
@@ -318,6 +320,29 @@ static esp_err_t api_auth_set_password(httpd_req_t *req)
 
 /* ----------------------------------------------------------------- /api/config */
 
+/* The value types and the two readable function codes travel as names rather
+   than numbers: a configuration is read by people, and "f32" says what 4 does
+   not. */
+static const char *mbm_type_name(uint8_t t)
+{
+    switch (t) {
+    case MBM_VAL_S16: return "s16";
+    case MBM_VAL_U32: return "u32";
+    case MBM_VAL_S32: return "s32";
+    case MBM_VAL_F32: return "f32";
+    default:          return "u16";
+    }
+}
+
+static void mbm_type_value(const char *s, uint8_t *out)
+{
+    if      (!strcmp(s, "s16")) *out = MBM_VAL_S16;
+    else if (!strcmp(s, "u32")) *out = MBM_VAL_U32;
+    else if (!strcmp(s, "s32")) *out = MBM_VAL_S32;
+    else if (!strcmp(s, "f32")) *out = MBM_VAL_F32;
+    else                        *out = MBM_VAL_U16;
+}
+
 static esp_err_t api_config_get(httpd_req_t *req)
 {
     if (!check_auth(req)) return send_401(req);
@@ -348,6 +373,24 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON_AddBoolToObject  (mb, "tcp_server", cfg->modbus.tcp_server);
     cJSON_AddNumberToObject(mb, "tcp_uid",
                             cfg->modbus.tcp_uid ? cfg->modbus.tcp_uid : MB_TCP_UID_DEFAULT);
+    cJSON *mbm = cJSON_AddArrayToObject(root, "mbm");
+    for (int i = 0; i < APP_CFG_MBM_COUNT; i++) {
+        const mbm_poll_t *e = &cfg->mbm[i];
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddBoolToObject  (o, "enable",      e->enable);
+        cJSON_AddStringToObject(o, "name",        e->name);
+        cJSON_AddStringToObject(o, "host",        e->host);
+        cJSON_AddNumberToObject(o, "port",        e->port ? e->port : 502);
+        cJSON_AddNumberToObject(o, "unit_id",     e->unit_id ? e->unit_id : 1);
+        cJSON_AddStringToObject(o, "fc",          e->fc == 4 ? "input" : "holding");
+        cJSON_AddNumberToObject(o, "reg",         e->reg);
+        cJSON_AddStringToObject(o, "type",        mbm_type_name(e->type));
+        cJSON_AddBoolToObject  (o, "word_swap",   e->word_swap);
+        cJSON_AddNumberToObject(o, "scale",       e->scale != 0.0f ? e->scale : 1.0);
+        cJSON_AddNumberToObject(o, "interval_ms", e->interval_ms ? e->interval_ms : 5000);
+        cJSON_AddItemToArray(mbm, o);
+    }
+
     cJSON_AddNumberToObject(mb, "rs485_tout_ms",
                             cfg->modbus.rs485_tout_ms ? cfg->modbus.rs485_tout_ms
                                                       : MB_RS485_TOUT_DEFAULT_MS);
@@ -545,6 +588,73 @@ static esp_err_t api_config_post(httpd_req_t *req)
                 cJSON_Delete(root);
                 httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, why);
                 return ESP_OK;
+            }
+        }
+    }
+
+    cJSON *mbm_j = cJSON_GetObjectItem(root, "mbm");
+    if (cJSON_IsArray(mbm_j)) {
+        /* The array replaces the table wholesale rather than being merged into
+           it: a partial update would leave an entry the user deleted in the
+           UI still being polled. Entries past the end are cleared. */
+        memset(cfg.mbm, 0, sizeof(cfg.mbm));
+        int n = cJSON_GetArraySize(mbm_j);
+        if (n > APP_CFG_MBM_COUNT) n = APP_CFG_MBM_COUNT;
+
+        for (int i = 0; i < n; i++) {
+            cJSON *o = cJSON_GetArrayItem(mbm_j, i);
+            if (!cJSON_IsObject(o)) continue;
+            mbm_poll_t *e = &cfg.mbm[i];
+            cJSON *v;
+
+            e->port = 502; e->unit_id = 1; e->fc = 3;
+            e->scale = 1.0f; e->interval_ms = 5000;
+
+            if ((v = cJSON_GetObjectItem(o, "enable")) && cJSON_IsBool(v))
+                e->enable = cJSON_IsTrue(v) ? 1 : 0;
+            if ((v = cJSON_GetObjectItem(o, "name")) && cJSON_IsString(v))
+                strlcpy(e->name, v->valuestring, sizeof(e->name));
+            if ((v = cJSON_GetObjectItem(o, "host")) && cJSON_IsString(v))
+                strlcpy(e->host, v->valuestring, sizeof(e->host));
+            if ((v = cJSON_GetObjectItem(o, "port")) && cJSON_IsNumber(v)) {
+                uint32_t p = (uint32_t)v->valuedouble;
+                if (p >= 1 && p <= 65535) e->port = (uint16_t)p;
+            }
+            if ((v = cJSON_GetObjectItem(o, "unit_id")) && cJSON_IsNumber(v)) {
+                uint32_t u = (uint32_t)v->valuedouble;
+                if (u >= 1 && u <= 247) e->unit_id = (uint8_t)u;
+            }
+            if ((v = cJSON_GetObjectItem(o, "fc")) && cJSON_IsString(v))
+                e->fc = strcmp(v->valuestring, "input") == 0 ? 4 : 3;
+            if ((v = cJSON_GetObjectItem(o, "reg")) && cJSON_IsNumber(v)) {
+                uint32_t r = (uint32_t)v->valuedouble;
+                if (r <= 65535) e->reg = (uint16_t)r;
+            }
+            if ((v = cJSON_GetObjectItem(o, "type")) && cJSON_IsString(v))
+                mbm_type_value(v->valuestring, &e->type);
+            if ((v = cJSON_GetObjectItem(o, "word_swap")) && cJSON_IsBool(v))
+                e->word_swap = cJSON_IsTrue(v) ? 1 : 0;
+            if ((v = cJSON_GetObjectItem(o, "scale")) && cJSON_IsNumber(v))
+                e->scale = (float)v->valuedouble;
+            if ((v = cJSON_GetObjectItem(o, "interval_ms")) && cJSON_IsNumber(v)) {
+                uint32_t t = (uint32_t)v->valuedouble;
+                if (t >= MBM_INTERVAL_MIN_MS && t <= MBM_INTERVAL_MAX_MS)
+                    e->interval_ms = t;
+            }
+
+            /* A name that is empty or carries MQTT syntax would make a topic
+               nothing can subscribe to, so the entry is refused rather than
+               quietly polled into nowhere. */
+            if (e->enable) {
+                const char *why = NULL;
+                if (!e->name[0])                  why = "a Modbus master entry needs a name";
+                else if (strpbrk(e->name, "#+/")) why = "a Modbus master name must not contain '#', '+' or '/'";
+                else if (!e->host[0])             why = "a Modbus master entry needs a host";
+                if (why) {
+                    cJSON_Delete(root);
+                    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, why);
+                    return ESP_OK;
+                }
             }
         }
     }
@@ -1218,6 +1328,58 @@ static esp_err_t api_version(httpd_req_t *req)
 
 /* -------------------------------------------------------------- start / stop */
 
+/* What the two Modbus sides are doing, as opposed to how they are set up.
+   Without it a value that never arrives looks the same as one that arrives
+   wrong. */
+static esp_err_t api_modbus_status(httpd_req_t *req)
+{
+    if (!check_auth(req)) return send_401(req);
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_OK;
+    }
+
+    mb_tcp_stats_t st;
+    mb_tcp_server_get_stats(&st);
+    cJSON *srv = cJSON_AddObjectToObject(root, "tcp_server");
+    cJSON_AddNumberToObject(srv, "accepted",   st.accepted);
+    cJSON_AddNumberToObject(srv, "refused",    st.refused);
+    cJSON_AddNumberToObject(srv, "requests",   st.requests);
+    cJSON_AddNumberToObject(srv, "exceptions", st.exceptions);
+    cJSON_AddNumberToObject(srv, "forwarded",  st.forwarded);
+    cJSON_AddNumberToObject(srv, "overloaded", st.overloaded);
+    cJSON_AddNumberToObject(srv, "malformed",  st.malformed);
+
+    mbm_status_t ms[APP_CFG_MBM_COUNT];
+    uint8_t n = mb_tcp_master_get_status(ms, APP_CFG_MBM_COUNT);
+    const app_config_t *cfg = app_config_get();
+    cJSON *arr = cJSON_AddArrayToObject(root, "tcp_master");
+    for (uint8_t i = 0; i < n; i++) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "name",    cfg->mbm[i].name);
+        cJSON_AddBoolToObject  (o, "enabled", ms[i].enabled);
+        if (ms[i].valid) {
+            cJSON_AddNumberToObject(o, "value",  ms[i].value);
+            cJSON_AddNumberToObject(o, "age_ms", (double)ms[i].age_ms);
+        } else {
+            cJSON_AddNullToObject(o, "value");
+        }
+        cJSON_AddNumberToObject(o, "reads",  ms[i].reads);
+        cJSON_AddNumberToObject(o, "errors", ms[i].errors);
+        if (ms[i].last_error[0]) cJSON_AddStringToObject(o, "last_error", ms[i].last_error);
+        cJSON_AddItemToArray(arr, o);
+    }
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json ? json : "{}");
+    cJSON_free(json);
+    return ESP_OK;
+}
+
 static const httpd_uri_t s_handlers[] = {
     { .uri = "/api/auth/status",       .method = HTTP_GET,  .handler = api_auth_status       },
     { .uri = "/api/auth/begin",        .method = HTTP_POST, .handler = api_auth_begin        },
@@ -1226,6 +1388,7 @@ static const httpd_uri_t s_handlers[] = {
     { .uri = "/api/config",            .method = HTTP_GET,  .handler = api_config_get        },
     { .uri = "/api/config",            .method = HTTP_POST, .handler = api_config_post       },
     { .uri = "/api/io/state",          .method = HTTP_GET,  .handler = api_io_state          },
+    { .uri = "/api/modbus/status",     .method = HTTP_GET,  .handler = api_modbus_status     },
     { .uri = "/api/io/output",         .method = HTTP_POST, .handler = api_io_output         },
     { .uri = "/api/io/led",            .method = HTTP_POST, .handler = api_io_led            },
     { .uri = "/api/io/buzzer",         .method = HTTP_POST, .handler = api_io_buzzer         },

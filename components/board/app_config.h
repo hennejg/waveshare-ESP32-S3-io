@@ -46,6 +46,42 @@
 #define MB_RS485_TOUT_MIN_MS        50
 #define MB_RS485_TOUT_MAX_MS     10000
 
+/* Modbus TCP master: registers this board reads from other people's devices.
+   Each entry is one value -- a name, where to get it, and how to read it. */
+#define APP_CFG_MBM_COUNT      8
+#define APP_CFG_MBM_NAME_LEN  20
+#define APP_CFG_MBM_HOST_LEN  48
+
+/* How a register pair is to be read. These are the MB_VAL_* values from
+   mb_request.h, repeated here because this header belongs to the board and
+   must not depend on the application; mb_tcp_master.c asserts that the two
+   still agree. */
+#define MBM_VAL_U16   0
+#define MBM_VAL_S16   1
+#define MBM_VAL_U32   2
+#define MBM_VAL_S32   3
+#define MBM_VAL_F32   4
+
+#define MBM_INTERVAL_MIN_MS   200
+#define MBM_INTERVAL_MAX_MS 86400000   /* a day */
+
+typedef struct {
+    uint8_t  enable;
+    uint8_t  unit_id;      /* 1–247                                          */
+    uint8_t  fc;           /* 3 = holding register, 4 = input register       */
+    uint8_t  type;         /* MBM_VAL_*                                      */
+    uint8_t  word_swap;    /* 1 = the two registers of a 32-bit value swapped */
+    uint8_t  _pad;
+    uint16_t reg;          /* zero-based, as on the wire                     */
+    uint16_t port;         /* usually 502                                    */
+    uint16_t _pad2;
+    uint32_t interval_ms;
+    float    scale;        /* the raw value is multiplied by this            */
+    char     name[APP_CFG_MBM_NAME_LEN + 1];  /* MQTT topic and rule key     */
+    char     host[APP_CFG_MBM_HOST_LEN + 1];  /* address or hostname         */
+    uint8_t  _pad3[2];
+} mbm_poll_t;
+
 /* Per-input / per-output configuration (shared layout for DI and DO).
    Stored as a fixed-size NVS blob.  If the blob size changes the old data is
    silently discarded and defaults apply.
@@ -105,6 +141,10 @@ typedef struct {
         uint16_t rs485_tout_ms;  /* master: how long a device may take, 50–10000 */
         uint8_t  _pad3[2];
     } modbus;
+
+    /* Modbus TCP master. Stored as its own blob, so it grows and shrinks
+       without touching anything else. */
+    mbm_poll_t mbm[APP_CFG_MBM_COUNT];
 
     /* SNTP time synchronisation */
     struct {

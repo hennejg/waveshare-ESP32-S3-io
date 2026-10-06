@@ -24,6 +24,7 @@
 #include "led.h"
 #include "can_server.h"
 #include "mb_server.h"
+#include "mb_tcp_master.h"
 #include "web_server.h"
 #ifdef CONFIG_APP_MATTER_ENABLE
 #include "matter.h"
@@ -137,6 +138,9 @@ static void on_network_ready(const char *iface)
     esp_err_t mbn_ret = mb_server_net_start();
     if (mbn_ret != ESP_OK)
         ESP_LOGE(TAG, "Modbus TCP start failed: %s", esp_err_to_name(mbn_ret));
+    esp_err_t mbm_ret = mb_tcp_master_start();
+    if (mbm_ret != ESP_OK)
+        ESP_LOGE(TAG, "Modbus TCP master start failed: %s", esp_err_to_name(mbm_ret));
     app_mqtt_set_connected_callback(on_mqtt_connected);
     app_mqtt_set_disconnected_callback(on_mqtt_disconnected);
     app_mqtt_set_msg_callback(on_mqtt_message);
