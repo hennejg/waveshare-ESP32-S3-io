@@ -50,6 +50,7 @@ HARNESS = r'''
 #define MB_TCP_MAX_CONN     8
 #define pdTRUE              1
 #define MSG_DONTWAIT     0x08
+#define SEND_WAIT_MS      500
 #define ESP_LOGW(...)    ((void)0)
 
 enum { SLOT_FREE = 0, SLOT_IDLE, SLOT_BUSY, SLOT_DEAD };
@@ -61,6 +62,10 @@ typedef struct {
     uint16_t         want;
     int64_t          deadline_us;
     uint8_t          frame[FRAME_MAX];
+    uint8_t          out[MBAP_LEN + MB_PDU_MAX];
+    uint16_t         out_len;
+    uint16_t         out_sent;
+    int64_t          out_deadline_us;
 } conn_t;
 
 typedef struct { int slot; uint16_t len; uint8_t frame[FRAME_MAX]; } job_t;
@@ -99,9 +104,22 @@ static int recv(int fd, void *buf, size_t n, int flags)
 static int  close(int fd)                                   { (void)fd; closes++; return 0; }
 static bool is_local(uint8_t uid)                           { return uid == 247; }
 static uint16_t process(const uint8_t *f, uint16_t n, uint8_t *o)
-{ (void)f; (void)o; assert(n == sizeof FRAME); answers++; return 3; }
-static bool send_all(int fd, const uint8_t *b, size_t n)    { (void)fd; (void)b; (void)n; return true; }
-static bool answer_busy(int fd, const uint8_t *f)           { (void)fd; (void)f; return true; }
+{ (void)f; assert(n == sizeof FRAME); answers++; memset(o, 0xA5, 9); return 9; }
+/* Per fd: how many bytes its receive window will still take. A send is
+   non-blocking by contract and never advances the clock, so a test that ends
+   with time on it means the code under test waited. */
+static int      window[MB_TCP_MAX_CONN];
+static unsigned sent_bytes[MB_TCP_MAX_CONN];
+
+static int send(int fd, const void *buf, size_t n, int flags)
+{
+    (void)buf; (void)flags;
+    if (window[fd] <= 0) { errno = EAGAIN; return -1; }
+    if ((int)n > window[fd]) n = (size_t)window[fd];
+    window[fd] -= (int)n;
+    sent_bytes[fd] += (unsigned)n;
+    return (int)n;
+}
 static int  xQueueSend(void *q, const void *j, int t)       { (void)q; (void)j; (void)t; return 0; }
 
 /* --- cut from mb_tcp_server.c ------------------------------------------ */
@@ -118,8 +136,12 @@ static void reset(void)
     memset(pos, 0, sizeof pos);
     memset(give, 0, sizeof give);
     memset(ready_at, 0, sizeof ready_at);
+    memset(sent_bytes, 0, sizeof sent_bytes);
     clock_us = 0; answers = 0; closes = 0; s_stats.malformed = 0;
-    for (int i = 0; i < MB_TCP_MAX_CONN; i++) { s_conn[i].fd = i; s_conn[i].state = SLOT_IDLE; }
+    for (int i = 0; i < MB_TCP_MAX_CONN; i++) {
+        s_conn[i].fd = i; s_conn[i].state = SLOT_IDLE;
+        window[i] = 1 << 20;                    /* takes everything by default */
+    }
 }
 
 int main(void)
@@ -153,7 +175,7 @@ int main(void)
     CHECK(answers == 0, "unvollstaendiger Rahmen beantwortet");
 
     clock_us = 210000;                      /* past the deadline */
-    sweep_partial_frames();
+    sweep_deadlines();
     CHECK(s_conn[0].state == SLOT_FREE, "Verbindung nach Fristablauf nicht geschlossen");
     CHECK(s_stats.malformed == 1, "Fristablauf nicht gezaehlt");
 
@@ -179,7 +201,7 @@ int main(void)
     pump_slot(0, &j);
     CHECK(answers == 1, "Anfrage nicht beantwortet");
     clock_us = 3600LL * 1000000;            /* an hour later */
-    sweep_partial_frames();
+    sweep_deadlines();
     CHECK(s_conn[0].state == SLOT_IDLE, "ruhende Verbindung wurde geschlossen");
     CHECK(closes == 0, "ruhende Verbindung wurde geschlossen");
     printf("  ruhende Verbindung nach einer Stunde noch offen\n");
@@ -194,6 +216,52 @@ int main(void)
     CHECK(answers == 1, "gueltiger Rahmen nicht beantwortet");
     printf("  gueltiger Rahmen weiterhin beantwortet\n");
 
+    /* 6. A client that has stopped reading must not hold the poll loop, and
+          must not let another connection's frame deadline slip past unseen.
+          Both were demonstrated against the previous version: the next client
+          was served at 550 ms and a frame 160 ms over its deadline was still
+          executed. */
+    reset();
+    window[0] = 0;                        /* slot 0 takes nothing at all */
+    give[0] = sizeof FRAME;
+    pump_slot(0, &j);                     /* answers, cannot send it */
+    CHECK(clock_us == 0, "der Poller hat auf den Sendepuffer gewartet: %lld ms",
+          (long long)(clock_us / 1000));
+    CHECK(s_conn[0].out_len != 0, "die unversandte Antwort wurde nicht gepuffert");
+    CHECK(s_conn[0].state == SLOT_IDLE, "Verbindung zu frueh geschlossen");
+
+    give[1] = 1;                          /* slot 1 begins a frame at t = 0 */
+    pump_slot(1, &j);
+    CHECK(s_conn[1].got == 1, "erstes Byte von Slot 1 nicht angenommen");
+
+    clock_us = 360000;                    /* later than slot 1's deadline */
+    give[1] = sizeof FRAME;               /* the rest arrives too late */
+    unsigned before = answers;
+    pump_slot(1, &j);
+    CHECK(answers == before, "verspaeteter Rahmen wurde doch ausgefuehrt");
+    CHECK(s_conn[1].state == SLOT_FREE, "verspaetete Verbindung nicht geschlossen");
+    printf("  blockierter Sender haelt niemanden auf, verspaeteter Rahmen abgewiesen\n");
+
+    /* 7. The blocked connection itself is dropped once its own deadline has
+          passed -- it is holding a buffer nobody is taking. */
+    clock_us = 600000;
+    sweep_deadlines();
+    CHECK(s_conn[0].state == SLOT_FREE, "blockierte Verbindung nicht geschlossen");
+    printf("  blockierte Verbindung nach %d ms beendet\n", SEND_WAIT_MS);
+
+    /* 8. A partially accepted answer finishes when the window opens, and the
+          connection is then usable again. */
+    reset();
+    window[0] = 4;                        /* takes four of the nine bytes */
+    give[0] = sizeof FRAME;
+    pump_slot(0, &j);
+    CHECK(s_conn[0].out_len && s_conn[0].out_sent == 4, "Teilversand nicht vermerkt");
+    window[0] = 1 << 20;
+    CHECK(flush_out(0), "Rest konnte nicht gesendet werden");
+    CHECK(s_conn[0].out_len == 0, "Ausgabe nicht als erledigt vermerkt");
+    CHECK(sent_bytes[0] == 9, "nicht alle Bytes gesendet (%u)", sent_bytes[0]);
+    printf("  Teilversand wird fortgesetzt, sobald das Fenster aufgeht\n");
+
     printf("%s\n", failures ? "FEHLER" : "alles in Ordnung");
     return failures ? 1 : 0;
 }
@@ -201,7 +269,10 @@ int main(void)
 
 cuts = "".join(cut(sig) for sig in (
     "static void close_slot(int i)",
-    "static void sweep_partial_frames(void)",
+    "static void queue_out(int i, const uint8_t *buf, uint16_t len)",
+    "static bool flush_out(int i)",
+    "static void sweep_deadlines(void)",
+    "static uint16_t build_busy(const uint8_t *frame, uint8_t *out)",
     "static void pump_slot(int i, job_t *job)",
 ))
 out = pathlib.Path(__file__).with_name("test_mb_poller.c")

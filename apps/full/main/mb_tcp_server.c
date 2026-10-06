@@ -38,8 +38,9 @@
  * So connections and requests are separated. One task polls every connection
  * and never blocks on receiving at all -- it takes what has arrived and comes
  * back -- and the work goes to a pool of workers, one request at a time. It
- * can still wait on a send, bounded by SEND_WAIT_MS, for a client that has
- * stopped reading its own answers; that connection is then dropped. A worker occupied with the segment holds up
+ * never waits on a send either: what is left of an answer stays with its
+ * connection and goes out when the socket can take it, and a client that has
+ * not taken its answer within SEND_WAIT_MS is dropped. A worker occupied with the segment holds up
  * nothing else, and an idle connection occupies no worker at all -- which is
  * why the pool is per request and not per connection: Modbus clients keep
  * their connections open for hours.
@@ -120,6 +121,17 @@ typedef struct {
     uint16_t         want;         /* bytes expected in total; 0 = idle   */
     int64_t          deadline_us;
     uint8_t          frame[FRAME_MAX];
+
+    /* Sending is a state machine too, for the same reason. A client whose
+       receive window has closed would otherwise hold the polling task for
+       the whole send deadline while every other connection waits. What is
+       left of a response sits here and goes out when the socket says it can
+       take it. A worker does not use this -- it has a task of its own and
+       may block on its own connection. */
+    uint8_t          out[MBAP_LEN + MB_PDU_MAX];
+    uint16_t         out_len;      /* 0 = nothing pending                 */
+    uint16_t         out_sent;
+    int64_t          out_deadline_us;
 } conn_t;
 
 typedef struct {
@@ -259,26 +271,60 @@ static void worker_task(void *arg)
 
 /* ------------------------------------------------------------------ poller */
 
+/* Hands a response to the connection and pushes out as much of it as the
+   socket will take. Whatever is left goes when select() says the socket is
+   writable again. */
+static void queue_out(int i, const uint8_t *buf, uint16_t len)
+{
+    /* Never overwrites an answer still going out: the poll loop reads from a
+       connection only once its previous answer has left, so a second request
+       cannot be taken in before the first is finished with. */
+    conn_t *c = &s_conn[i];
+    memcpy(c->out, buf, len);
+    c->out_len  = len;
+    c->out_sent = 0;
+    c->out_deadline_us = esp_timer_get_time() + (int64_t)SEND_WAIT_MS * 1000;
+}
+
+/* Returns false if the connection is finished -- either the peer is gone or
+   it has not taken the response within SEND_WAIT_MS. Half a response cannot
+   be taken back, so there is nothing else to do with such a connection. */
+static bool flush_out(int i)
+{
+    conn_t *c = &s_conn[i];
+
+    while (c->out_sent < c->out_len) {
+        int n = send(c->fd, c->out + c->out_sent,
+                     c->out_len - c->out_sent, MSG_DONTWAIT);
+        if (n > 0) { c->out_sent = (uint16_t)(c->out_sent + n); continue; }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return esp_timer_get_time() <= c->out_deadline_us;
+        return false;
+    }
+    c->out_len = 0;                       /* the whole answer is away */
+    return true;
+}
+
 static void close_slot(int i)
 {
     if (s_conn[i].fd >= 0) close(s_conn[i].fd);
     s_conn[i].fd    = -1;
     s_conn[i].state = SLOT_FREE;
-    s_conn[i].want  = 0;
-    s_conn[i].got   = 0;
+    s_conn[i].want    = 0;
+    s_conn[i].got     = 0;
+    s_conn[i].out_len = 0;
 }
 
 /* Answers without going near a worker. Used when the pool is saturated: the
    client is told to retry rather than left waiting for a slot. */
-static bool answer_busy(int fd, const uint8_t *frame)
+static uint16_t build_busy(const uint8_t *frame, uint8_t *out)
 {
-    uint8_t out[MBAP_LEN + 2];
     memcpy(out, frame, 4);
     out[4] = 0; out[5] = 3;
     out[6] = frame[6];
     out[7] = (uint8_t)(frame[MBAP_LEN] | 0x80u);
     out[8] = MB_EXC_DEVICE_BUSY;
-    return send_all(fd, out, sizeof(out));
+    return MBAP_LEN + 2;
 }
 
 static void accept_one(void)
@@ -344,6 +390,18 @@ static void pump_slot(int i, job_t *job)
 {
     conn_t *c = &s_conn[i];
 
+    /* The periodic sweep runs once per pass of the poll loop, and a slot
+       served earlier in the same pass can have used up the time since. A
+       frame whose deadline has gone must not be served just because its last
+       bytes happened to arrive. */
+    if (c->got && esp_timer_get_time() > c->deadline_us) {
+        s_stats.malformed++;
+        ESP_LOGW(TAG, "slot %d: frame unfinished after %d ms — closing",
+                 i, FRAME_WAIT_MS);
+        close_slot(i);
+        return;
+    }
+
     if (c->want == 0) c->want = MBAP_HDR;     /* nothing of a frame yet */
 
     /* Read until the socket is empty. Every call is non-blocking, so this
@@ -394,7 +452,8 @@ static void pump_slot(int i, job_t *job)
     if (is_local(c->frame[6])) {
         uint8_t  out[MBAP_LEN + MB_PDU_MAX];
         uint16_t out_len = process(c->frame, len, out);
-        if (!send_all(c->fd, out, out_len)) close_slot(i);
+        queue_out(i, out, out_len);
+        if (!flush_out(i)) close_slot(i);
         return;
     }
 
@@ -408,11 +467,11 @@ static void pump_slot(int i, job_t *job)
            bound, say so: "slave device busy" is the one answer a client knows
            to retry. */
         s_stats.overloaded++;
-        /* The same rule as everywhere else: half a response on the wire
-           cannot be taken back, so the connection ends rather than being put
-           back into service with the client's framing four bytes adrift. */
-        if (answer_busy(c->fd, job->frame)) s_conn[i].state = SLOT_IDLE;
-        else                                close_slot(i);
+        uint8_t  busy[MBAP_LEN + 2];
+        uint16_t busy_len = build_busy(job->frame, busy);
+        s_conn[i].state = SLOT_IDLE;
+        queue_out(i, busy, busy_len);
+        if (!flush_out(i)) close_slot(i);
     }
 }
 
@@ -420,17 +479,25 @@ static void pump_slot(int i, job_t *job)
    Separate from the poll loop so it can be tested on its own -- a client that
    sends one byte and stops is never reported readable again, so this is the
    only thing that ends such a connection before keepalive would. */
-static void sweep_partial_frames(void)
+static void sweep_deadlines(void)
 {
     int64_t now = esp_timer_get_time();
-    for (int i = 0; i < MB_TCP_MAX_CONN; i++)
-        if (s_conn[i].state == SLOT_IDLE && s_conn[i].got &&
-            now > s_conn[i].deadline_us) {
+    for (int i = 0; i < MB_TCP_MAX_CONN; i++) {
+        if (s_conn[i].state != SLOT_IDLE) continue;
+
+        if (s_conn[i].out_len && now > s_conn[i].out_deadline_us) {
+            ESP_LOGW(TAG, "slot %d: answer not taken within %d ms — closing",
+                     i, SEND_WAIT_MS);
+            close_slot(i);
+            continue;
+        }
+        if (s_conn[i].got && now > s_conn[i].deadline_us) {
             s_stats.malformed++;
             ESP_LOGW(TAG, "slot %d: frame unfinished after %d ms — closing",
                      i, FRAME_WAIT_MS);
             close_slot(i);
         }
+    }
 }
 
 static void poller_task(void *arg)
@@ -441,20 +508,33 @@ static void poller_task(void *arg)
     bool warned = false;
 
     for (;;) {
-        fd_set rd;
+        fd_set rd, wr;
         FD_ZERO(&rd);
+        FD_ZERO(&wr);
         FD_SET(s_listen_fd, &rd);
         FD_SET(s_wake_fd, &rd);
         int  maxfd   = (s_listen_fd > s_wake_fd) ? s_listen_fd : s_wake_fd;
         bool partial = false;
 
         for (int i = 0; i < MB_TCP_MAX_CONN; i++) {
-            if (s_conn[i].state == SLOT_IDLE) {
-                FD_SET(s_conn[i].fd, &rd);
-                if (s_conn[i].fd > maxfd) maxfd = s_conn[i].fd;
-                if (s_conn[i].got) partial = true;
-            } else if (s_conn[i].state == SLOT_DEAD) {
+            if (s_conn[i].state == SLOT_DEAD) {
                 close_slot(i);                       /* a worker could not answer */
+                continue;
+            }
+            if (s_conn[i].state != SLOT_IDLE) continue;
+
+            if (s_conn[i].fd > maxfd) maxfd = s_conn[i].fd;
+
+            if (s_conn[i].out_len) {
+                /* An answer is still going out. Nothing new is read from this
+                   connection until it has: Modbus is one request at a time,
+                   and anything the client sends meanwhile keeps in the
+                   socket. */
+                FD_SET(s_conn[i].fd, &wr);
+                partial = true;
+            } else {
+                FD_SET(s_conn[i].fd, &rd);
+                if (s_conn[i].got) partial = true;
             }
         }
 
@@ -464,7 +544,7 @@ static void poller_task(void *arg)
            it will never be reported readable again if the client has simply
            stopped, so its deadline has to be looked at on a clock. */
         struct timeval tv = { .tv_sec = 0, .tv_usec = PARTIAL_POLL_MS * 1000 };
-        int ready = select(maxfd + 1, &rd, NULL, NULL, partial ? &tv : NULL);
+        int ready = select(maxfd + 1, &rd, &wr, NULL, partial ? &tv : NULL);
         if (ready < 0) {
             /* With no timeout select() cannot return 0, so this is a real
                failure. Spinning on it at this priority would starve the
@@ -477,7 +557,7 @@ static void poller_task(void *arg)
         }
         /* Sweep first: a half-finished frame whose client fell silent is
            closed on time whether or not anything else happened. */
-        if (partial) sweep_partial_frames();
+        if (partial) sweep_deadlines();
         if (ready == 0) continue;
 
         if (FD_ISSET(s_wake_fd, &rd)) {
@@ -486,8 +566,16 @@ static void poller_task(void *arg)
         }
         if (FD_ISSET(s_listen_fd, &rd)) accept_one();
 
+        /* Outgoing first: a connection waiting to be written to is holding a
+           buffer and a deadline, and finishing it frees both. */
         for (int i = 0; i < MB_TCP_MAX_CONN; i++)
-            if (s_conn[i].state == SLOT_IDLE && FD_ISSET(s_conn[i].fd, &rd))
+            if (s_conn[i].state == SLOT_IDLE && s_conn[i].out_len &&
+                FD_ISSET(s_conn[i].fd, &wr) && !flush_out(i))
+                close_slot(i);
+
+        for (int i = 0; i < MB_TCP_MAX_CONN; i++)
+            if (s_conn[i].state == SLOT_IDLE && !s_conn[i].out_len &&
+                FD_ISSET(s_conn[i].fd, &rd))
                 pump_slot(i, job);
 
         check_stack("poller", &warned);

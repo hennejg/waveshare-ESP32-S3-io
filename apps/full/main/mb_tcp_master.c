@@ -376,20 +376,31 @@ static void publish(const mbm_poll_t *e, double value)
 /* e is a copy, not a pointer into the live configuration: the HTTP task
    overwrites that table in place, and a read in progress would otherwise
    finish against an entry that describes a different device. */
-static void poll_entry(const mbm_poll_t *e, entry_state_t *st, uint32_t gen)
+/* Returns false when the answer was thrown away because the configuration
+   changed while it was in flight. The caller must then leave the entry's
+   schedule alone: the reload has set it to "due now" deliberately, and
+   writing a new due date from the old snapshot's interval would undo that --
+   an entry repointed from a daily poll to a 200 ms one would wait a day.
+
+   The generation is compared under the same lock that the reload resets the
+   state and bumps it under. Comparing first and locking afterwards leaves a
+   gap in which the reload can complete, and the stale value then lands in the
+   slot it has just cleared. */
+static bool poll_entry(const mbm_poll_t *e, entry_state_t *st, uint32_t gen)
 {
     double value = 0;
     char   err[sizeof(st->last_error)];
     bool   ok = read_value(e, &value, err, sizeof(err));
 
+    ST_LOCK();
     if (gen != s_generation) {
+        ST_UNLOCK();
         ESP_LOGD(TAG, "%s: answer arrived after a configuration change, dropped",
                  e->name);
-        return;
+        return false;
     }
 
     if (ok) {
-        ST_LOCK();
         st->value      = value;
         st->value_ms   = now_ms();
         st->valid      = true;
@@ -398,9 +409,8 @@ static void poll_entry(const mbm_poll_t *e, entry_state_t *st, uint32_t gen)
         st->last_error[0] = '\0';
         ST_UNLOCK();
         publish(e, value);
-        ESP_LOGD(TAG, "%s = %.6g", e->name, value);
+        ESP_LOGD(TAG, "%s = %.10g", e->name, value);
     } else {
-        ST_LOCK();
         st->errors++;
         st->backoff_ms = st->backoff_ms ? (st->backoff_ms * 2) : BACKOFF_FIRST_MS;
         if (st->backoff_ms > BACKOFF_MAX_MS) st->backoff_ms = BACKOFF_MAX_MS;
@@ -413,6 +423,7 @@ static void poll_entry(const mbm_poll_t *e, entry_state_t *st, uint32_t gen)
             ESP_LOGW(TAG, "%s: %s", e->name, err);
         }
     }
+    return true;
 }
 
 static void master_task(void *arg)
@@ -427,24 +438,38 @@ static void master_task(void *arg)
         int64_t next = now + 1000;
 
         for (int i = 0; i < APP_CFG_MBM_COUNT; i++) {
-            /* Copied before anything blocks, and used for the whole poll:
-               the HTTP task overwrites this table in place. */
-            mbm_poll_t     snap = cfg->mbm[i];
+            /* The generation is read FIRST. Taken afterwards, a change
+               landing between the two lines would stamp an old snapshot --
+               or a half-copied one, since the writer memcpy's the whole
+               struct -- with the generation that is about to be current, and
+               the result would be kept instead of thrown away. This way any
+               change after this point makes the comparison fail. */
             uint32_t       gen  = s_generation;
+            mbm_poll_t     snap = cfg->mbm[i];
             entry_state_t *st   = &s_state[i];
             if (!snap.enable || !snap.name[0] || !snap.host[0]) continue;
 
             if (now >= st->due_ms) {
-                poll_entry(&snap, st, gen);
+                bool kept = poll_entry(&snap, st, gen);
                 now = now_ms();
-                /* The backoff widens the gap after a failure; it must never
-                   narrow it. An entry polled once a day that fails once would
-                   otherwise be retried every minute from then on -- more
-                   traffic to a dead device than the working one ever caused. */
-                uint32_t wait = snap.interval_ms;
-                if (st->backoff_ms > wait)      wait = st->backoff_ms;
-                if (wait < MBM_INTERVAL_MIN_MS) wait = MBM_INTERVAL_MIN_MS;
-                st->due_ms = now + wait;
+
+                /* A discarded answer leaves the schedule as the reload set
+                   it: due now, under the new configuration. */
+                if (kept) {
+                    ST_LOCK();
+                    if (gen == s_generation) {
+                        /* The backoff widens the gap after a failure; it must
+                           never narrow it. An entry polled once a day that
+                           failed once would otherwise be retried every minute
+                           from then on -- more traffic to a dead device than
+                           the working one ever caused. */
+                        uint32_t wait = snap.interval_ms;
+                        if (st->backoff_ms > wait)      wait = st->backoff_ms;
+                        if (wait < MBM_INTERVAL_MIN_MS) wait = MBM_INTERVAL_MIN_MS;
+                        st->due_ms = now + wait;
+                    }
+                    ST_UNLOCK();
+                }
             }
             if (st->due_ms < next) next = st->due_ms;
         }
@@ -477,8 +502,8 @@ esp_err_t mb_tcp_master_reload(void)
     memset(s_state, 0, sizeof(s_state));
     int64_t now = now_ms();
     for (int i = 0; i < APP_CFG_MBM_COUNT; i++) s_state[i].due_ms = now;
-    ST_UNLOCK();
     s_generation++;        /* anything already in flight is now stale */
+    ST_UNLOCK();
     s_drop_conns = true;
 
     /* And if this is the first entry anyone has enabled, there is no task

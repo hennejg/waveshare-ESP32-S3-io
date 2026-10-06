@@ -75,6 +75,9 @@ time, so forwarded requests queue behind each other.
 | Time to receive one frame  | 200 ms from its first byte, then the connection is closed |
 | Time to send one response  | 500 ms, then the connection is closed |
 
+Neither limit is a limit on anybody else: receiving and sending are both done
+a step at a time, so a connection that stalls holds up only itself.
+
 A connection is kept open for as long as the client wants it. One whose peer
 has disappeared without closing is found by TCP keepalive after about 90 s and
 its slot released.
