@@ -39,6 +39,18 @@ typedef uint8_t (*mb_handler_fn)(const mb_request_t *req,
 #define MB_EXC_GW_PATH          0x0A   /* no route to the target            */
 #define MB_EXC_GW_TARGET        0x0B   /* target did not answer             */
 
+/* Function codes. Numerically the same as the component's own enumerators,
+   under names of their own so the two can be included side by side -- and so
+   that the framing can be built and tested without the component at all. */
+#define MB_FC_READ_COILS        0x01
+#define MB_FC_READ_DISCRETE     0x02
+#define MB_FC_READ_HOLDING      0x03
+#define MB_FC_READ_INPUT        0x04
+#define MB_FC_WRITE_COIL        0x05
+#define MB_FC_WRITE_REGISTER    0x06
+#define MB_FC_WRITE_COILS       0x0F
+#define MB_FC_WRITE_REGISTERS   0x10
+
 /* The largest PDU the protocol allows, and the largest data part inside one. */
 #define MB_PDU_MAX              253
 #define MB_DATA_MAX             250

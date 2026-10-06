@@ -1,6 +1,6 @@
 set(SRCS
     "main.c" "app_mqtt.c" "app_time.c" "web_server.c"
-    "can_server.c" "mb_server.c" "mb_gateway.c" "mb_tcp_server.c"
+    "can_server.c" "mb_server.c" "mb_gateway.c" "mb_tcp_server.c" "mb_pdu.c"
 )
 
 idf_component_register(

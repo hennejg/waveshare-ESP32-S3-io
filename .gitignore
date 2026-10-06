@@ -8,3 +8,7 @@ managed_components/espressif__mqtt/*
 dependencies.lock
 *.zip
 .idea/
+
+# Host test binaries
+/test/host/test_mb_pdu
+/test/host/*.dSYM
