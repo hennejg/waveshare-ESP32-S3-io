@@ -3,21 +3,34 @@
 #include <string.h>
 #include "esp_check.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "mbcontroller.h"
 
 #define TAG "mb_gw"
 
 /* A read can ask for 2000 coils (250 bytes) or 125 registers (250 bytes), a
-   write for 1968 coils or 123 registers. One buffer covers all four. */
+   write for 1968 coils or 123 registers. One size covers all four. */
 #define GW_BUF_BYTES 256
 
 /* How long a device on the segment gets to answer. The component's default is
    five seconds, which suits a master that polls on its own schedule; here a
-   TCP client is waiting for the answer and the slave task is blocked until it
-   comes, so a silent device has to be given up on quickly. 500 ms is well
-   above the wire time of the longest request at 9600 baud. */
+   TCP client is waiting for the answer, so a silent device has to be given up
+   on quickly. 500 ms is well above the wire time of the longest request at
+   9600 baud. The stack adds its own cooldown on a timeout
+   (CONFIG_FMB_MASTER_TIMEOUT_COOLDOWN_MS), so a silent device costs about
+   650 ms in total. */
 #define GW_RESPONSE_TOUT_MS 500
 
-static void *s_master = NULL;
+/* How long a request waits for its turn on the segment before being turned
+   away. Long enough that a queue of legitimate requests always gets through
+   -- the worst case per transaction is the timeout plus the cooldown, and
+   there are only a handful of connection workers -- and short enough that a
+   client is told to retry rather than left hanging. */
+#define GW_BUS_WAIT_MS 4000
+
+static void             *s_master = NULL;
+static SemaphoreHandle_t s_bus;
 
 /* mbc_master_start() refuses to start without a parameter descriptor table,
    and the table is only consulted by mbc_master_get/set_parameter(). The
@@ -48,14 +61,17 @@ esp_err_t mb_gateway_start(uart_port_t uart, uint32_t baudrate,
 {
     ESP_RETURN_ON_FALSE(!s_master, ESP_ERR_INVALID_STATE, TAG, "already running");
 
+    s_bus = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(s_bus, ESP_ERR_NO_MEM, TAG, "bus mutex");
+
     mb_communication_info_t comm = {
-        .ser_opts.mode      = MB_RTU,
-        .ser_opts.port      = uart,
-        .ser_opts.uid       = 0,            /* a master has no address of its own */
-        .ser_opts.baudrate  = baudrate,
-        .ser_opts.parity    = MB_PARITY_NONE,
-        .ser_opts.data_bits = UART_DATA_8_BITS,
-        .ser_opts.stop_bits = UART_STOP_BITS_1,
+        .ser_opts.mode             = MB_RTU,
+        .ser_opts.port             = uart,
+        .ser_opts.uid              = 0,      /* a master has no address of its own */
+        .ser_opts.baudrate         = baudrate,
+        .ser_opts.parity           = MB_PARITY_NONE,
+        .ser_opts.data_bits        = UART_DATA_8_BITS,
+        .ser_opts.stop_bits        = UART_STOP_BITS_1,
         .ser_opts.response_tout_ms = GW_RESPONSE_TOUT_MS,
     };
 
@@ -82,43 +98,30 @@ esp_err_t mb_gateway_start(uart_port_t uart, uint32_t baudrate,
 
 /* ------------------------------------------------------------- forwarding */
 
-/* Turns the outcome of one RTU transaction into what the TCP client should
-   see. Three cases, and they have to stay apart:
-
-   - the device answered with an exception: that code goes back unchanged. A
-     client that asked for a register the device does not have must be told
-     "illegal data address", not something about the gateway.
-   - the device said nothing: 0x0B, gateway target device failed to respond.
-     This is the code the protocol reserves for exactly this.
-   - the gateway itself could not even try (busy, bad argument): 0x0A,
-     gateway path unavailable.
-
-   MB_ERR_EXCEPTION() is what carries a verbatim code out of a register
-   callback; the plain mb_err_enum_t return values can only produce 0x02,
-   0x04 and 0x06. */
-static mb_err_enum_t to_wire(esp_err_t err, uint8_t uid, uint8_t fc)
+/* One transaction, start to finish, with the segment held for its duration.
+ *
+ * The lock is not only about the wire. mbc_master_send_request() serialises
+ * itself, but the exception code it leaves behind lives on the master object
+ * and the next transaction clears it -- read outside the lock, a request
+ * could end up reporting the exception from somebody else's.
+ *
+ * Three outcomes, and they have to stay apart:
+ *   - the device answered with an exception: that code goes back unchanged. A
+ *     client that asked for a register the device does not have must be told
+ *     "illegal data address", not something about the gateway.
+ *   - the device said nothing: 0x0B, gateway target device failed to respond.
+ *   - the gateway could not even try: 0x0A, gateway path unavailable.
+ */
+static uint8_t transact(uint8_t uid, uint8_t fc, uint16_t addr,
+                        uint16_t count, void *data)
 {
-    if (err == ESP_OK) return MB_ENOERR;
+    if (!s_master) return MB_EXC_GW_PATH;
 
-    uint8_t ex = 0;
-    if (mbc_master_get_last_exception(s_master, &ex) == ESP_OK && ex != MB_EX_NONE) {
-        ESP_LOGD(TAG, "uid %u fc %u: slave exception 0x%02x passed on", uid, fc, ex);
-        return MB_ERR_EXCEPTION(ex);
+    if (xSemaphoreTake(s_bus, pdMS_TO_TICKS(GW_BUS_WAIT_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "uid %u fc %u: segment busy for %d ms, turned away",
+                 uid, fc, GW_BUS_WAIT_MS);
+        return MB_EXC_DEVICE_BUSY;
     }
-
-    if (err == ESP_ERR_TIMEOUT) {
-        ESP_LOGD(TAG, "uid %u fc %u: no answer", uid, fc);
-        return MB_ERR_EXCEPTION(MB_EX_GATEWAY_TGT_FAILED);
-    }
-
-    ESP_LOGW(TAG, "uid %u fc %u: forwarding failed: %s", uid, fc, esp_err_to_name(err));
-    return MB_ERR_EXCEPTION(MB_EX_GATEWAY_PATH_FAILED);
-}
-
-static mb_err_enum_t forward(uint8_t uid, uint8_t fc, uint16_t addr,
-                             uint16_t count, void *data)
-{
-    if (!s_master) return MB_ERR_EXCEPTION(MB_EX_GATEWAY_PATH_FAILED);
 
     mb_param_request_t req = {
         .slave_addr = uid,
@@ -126,97 +129,108 @@ static mb_err_enum_t forward(uint8_t uid, uint8_t fc, uint16_t addr,
         .reg_start  = addr,
         .reg_size   = count,
     };
-    return to_wire(mbc_master_send_request(s_master, &req, data), uid, fc);
-}
+    esp_err_t err = mbc_master_send_request(s_master, &req, data);
 
-mb_err_enum_t mb_gateway_coils(uint8_t uid, uint8_t *buf, uint16_t addr,
-                               uint16_t count, mb_reg_mode_enum_t mode)
-{
-    size_t bytes = (size_t)((count + 7u) / 8u);
-    if (bytes > GW_BUF_BYTES) return MB_ERR_EXCEPTION(MB_EX_ILLEGAL_DATA_VALUE);
-
-    /* The master's own callbacks copy into a buffer of their own, so the
-       slave's response slice cannot be handed to them directly. Both sides
-       use the same packed layout though -- bit 0 is the first coil of the
-       request -- so the copy is a straight memcpy. */
-    uint8_t tmp[GW_BUF_BYTES];
-
-    if (mode == MB_REG_READ) {
-        mb_err_enum_t err = forward(uid, MB_FUNC_READ_COILS, addr, count, tmp);
-        if (err == MB_ENOERR) memcpy(buf, tmp, bytes);
-        return err;
+    uint8_t exc = MB_EXC_NONE;
+    if (err != ESP_OK) {
+        uint8_t ex = 0;
+        if (mbc_master_get_last_exception(s_master, &ex) == ESP_OK && ex != 0) {
+            exc = ex;
+        } else if (err == ESP_ERR_TIMEOUT) {
+            exc = MB_EXC_GW_TARGET;
+        } else {
+            exc = MB_EXC_GW_PATH;
+        }
     }
+    xSemaphoreGive(s_bus);
 
-    memcpy(tmp, buf, bytes);
-    if (count == 1) {
-        /* A single coil goes out as FC05. Some devices implement it and not
-           FC15, and the client asked for one coil, so sending one is also the
-           more faithful relay. The stack reads the value as a uint16: 0xFF00
-           on, 0x0000 off. */
-        uint16_t v = (tmp[0] & 1u) ? 0xFF00u : 0x0000u;
-        return forward(uid, MB_FUNC_WRITE_SINGLE_COIL, addr, 1, &v);
-    }
-    return forward(uid, MB_FUNC_WRITE_MULTIPLE_COILS, addr, count, tmp);
+    if (exc != MB_EXC_NONE)
+        ESP_LOGD(TAG, "uid %u fc %u @%u x%u -> exception 0x%02x",
+                 uid, fc, addr, count, exc);
+    return exc;
 }
 
-mb_err_enum_t mb_gateway_discrete(uint8_t uid, uint8_t *buf, uint16_t addr,
-                                  uint16_t count)
-{
-    size_t bytes = (size_t)((count + 7u) / 8u);
-    if (bytes > GW_BUF_BYTES) return MB_ERR_EXCEPTION(MB_EX_ILLEGAL_DATA_VALUE);
-
-    uint8_t tmp[GW_BUF_BYTES];
-    mb_err_enum_t err = forward(uid, MB_FUNC_READ_DISCRETE_INPUTS, addr, count, tmp);
-    if (err == MB_ENOERR) memcpy(buf, tmp, bytes);
-    return err;
-}
-
-/* The master hands registers over as host-order uint16, the slave frame wants
-   them big endian, so neither direction is a memcpy. */
-static void regs_to_frame(uint8_t *frame, const uint16_t *regs, uint16_t count)
+/* The master hands registers over as host-order uint16, the wire wants them
+   big endian, so neither direction is a memcpy. */
+static void regs_to_wire(uint8_t *wire, const uint16_t *regs, uint16_t count)
 {
     for (uint16_t i = 0; i < count; i++) {
-        frame[i * 2]     = (uint8_t)(regs[i] >> 8);
-        frame[i * 2 + 1] = (uint8_t)(regs[i] & 0xFF);
+        wire[i * 2]     = (uint8_t)(regs[i] >> 8);
+        wire[i * 2 + 1] = (uint8_t)(regs[i] & 0xFF);
     }
 }
 
-static void frame_to_regs(uint16_t *regs, const uint8_t *frame, uint16_t count)
+static void wire_to_regs(uint16_t *regs, const uint8_t *wire, uint16_t count)
 {
     for (uint16_t i = 0; i < count; i++)
-        regs[i] = (uint16_t)((frame[i * 2] << 8) | frame[i * 2 + 1]);
+        regs[i] = (uint16_t)((wire[i * 2] << 8) | wire[i * 2 + 1]);
 }
 
-static mb_err_enum_t forward_regs(uint8_t uid, uint8_t *buf, uint16_t addr,
-                                  uint16_t count, mb_reg_mode_enum_t mode,
-                                  uint8_t read_fc)
+uint8_t mb_gateway_handle(uint8_t uid, const mb_request_t *req,
+                          uint8_t *resp, uint16_t *resp_len)
 {
-    if ((size_t)count * 2u > GW_BUF_BYTES)
-        return MB_ERR_EXCEPTION(MB_EX_ILLEGAL_DATA_VALUE);
+    *resp_len = 0;
 
-    uint16_t tmp[GW_BUF_BYTES / 2];
+    switch (req->fc) {
 
-    if (mode == MB_REG_READ) {
-        mb_err_enum_t err = forward(uid, read_fc, addr, count, tmp);
-        if (err == MB_ENOERR) regs_to_frame(buf, tmp, count);
-        return err;
+    case MB_FUNC_READ_COILS:
+    case MB_FUNC_READ_DISCRETE_INPUTS: {
+        size_t bytes = (size_t)((req->count + 7u) / 8u);
+        if (bytes > GW_BUF_BYTES) return MB_EXC_ILLEGAL_VALUE;
+        /* The master copies into a buffer of its own, so the response slice
+           cannot be handed to it directly. Both sides use the same packed
+           layout though -- bit 0 is the first coil of the request -- so the
+           copy back is a straight memcpy. */
+        uint8_t tmp[GW_BUF_BYTES];
+        uint8_t exc = transact(uid, req->fc, req->addr, req->count, tmp);
+        if (exc == MB_EXC_NONE) { memcpy(resp, tmp, bytes); *resp_len = bytes; }
+        return exc;
     }
 
-    frame_to_regs(tmp, buf, count);
-    if (count == 1)                     /* see the coil path for why FC06 */
-        return forward(uid, MB_FUNC_WRITE_REGISTER, addr, 1, &tmp[0]);
-    return forward(uid, MB_FUNC_WRITE_MULTIPLE_REGISTERS, addr, count, tmp);
-}
+    case MB_FUNC_READ_HOLDING_REGISTER:
+    case MB_FUNC_READ_INPUT_REGISTER: {
+        if ((size_t)req->count * 2u > GW_BUF_BYTES) return MB_EXC_ILLEGAL_VALUE;
+        uint16_t tmp[GW_BUF_BYTES / 2];
+        uint8_t exc = transact(uid, req->fc, req->addr, req->count, tmp);
+        if (exc == MB_EXC_NONE) {
+            regs_to_wire(resp, tmp, req->count);
+            *resp_len = (uint16_t)(req->count * 2u);
+        }
+        return exc;
+    }
 
-mb_err_enum_t mb_gateway_holding(uint8_t uid, uint8_t *buf, uint16_t addr,
-                                 uint16_t count, mb_reg_mode_enum_t mode)
-{
-    return forward_regs(uid, buf, addr, count, mode, MB_FUNC_READ_HOLDING_REGISTER);
-}
+    case MB_FUNC_WRITE_SINGLE_COIL: {
+        /* The stack takes the value as a uint16 and puts it on the wire as
+           0xFF00 or 0x0000; the request already carries exactly those bytes. */
+        uint16_t v = (uint16_t)((req->data[0] << 8) | req->data[1]);
+        return transact(uid, req->fc, req->addr, 1, &v);
+    }
 
-mb_err_enum_t mb_gateway_input(uint8_t uid, uint8_t *buf, uint16_t addr,
-                               uint16_t count)
-{
-    return forward_regs(uid, buf, addr, count, MB_REG_READ,
-                        MB_FUNC_READ_INPUT_REGISTER);
+    case MB_FUNC_WRITE_REGISTER: {
+        uint16_t v = (uint16_t)((req->data[0] << 8) | req->data[1]);
+        return transact(uid, req->fc, req->addr, 1, &v);
+    }
+
+    case MB_FUNC_WRITE_MULTIPLE_COILS: {
+        size_t bytes = (size_t)((req->count + 7u) / 8u);
+        if (bytes > GW_BUF_BYTES) return MB_EXC_ILLEGAL_VALUE;
+        uint8_t tmp[GW_BUF_BYTES];
+        memcpy(tmp, req->data, bytes);
+        return transact(uid, req->fc, req->addr, req->count, tmp);
+    }
+
+    case MB_FUNC_WRITE_MULTIPLE_REGISTERS: {
+        if ((size_t)req->count * 2u > GW_BUF_BYTES) return MB_EXC_ILLEGAL_VALUE;
+        uint16_t tmp[GW_BUF_BYTES / 2];
+        wire_to_regs(tmp, req->data, req->count);
+        return transact(uid, req->fc, req->addr, req->count, tmp);
+    }
+
+    default:
+        /* The controller's request API only reaches the eight function codes
+           above. Relaying anything else would mean driving the stack's frame
+           buffer directly, which is not worth it until something asks for it. */
+        ESP_LOGD(TAG, "uid %u: function code %u cannot be relayed", uid, req->fc);
+        return MB_EXC_ILLEGAL_FUNC;
+    }
 }
