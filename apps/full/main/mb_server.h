@@ -2,12 +2,7 @@
 #include "esp_err.h"
 #include "mb_request.h"
 
-/* SPIKE. Hard-coded until the configuration model lands. With MB_GW_SPIKE set
-   the board serves Modbus TCP and drives RS-485 as a master, instead of
-   sitting on the segment as an RTU slave. */
-#define MB_GW_SPIKE   1
-#define MB_LOCAL_UID  247      /* the unit ID this board answers to over TCP */
-#define MB_TCP_PORT   502
+#define MB_TCP_PORT   502      /* the port the protocol reserves */
 
 /* Initialise the Modbus server if enabled in app_config. Call after di_init(),
    dout_init(), led_init(), buzzer_init(). Configuration changes take effect on

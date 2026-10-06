@@ -343,6 +343,11 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON_AddBoolToObject  (mb, "enable",   cfg->modbus.enable);
     cJSON_AddNumberToObject(mb, "address",  cfg->modbus.address);
     cJSON_AddNumberToObject(mb, "baudrate", cfg->modbus.baudrate);
+    cJSON_AddStringToObject(mb, "rs485_role",
+                            cfg->modbus.rs485_role == MB_ROLE_MASTER ? "master" : "slave");
+    cJSON_AddBoolToObject  (mb, "tcp_server", cfg->modbus.tcp_server);
+    cJSON_AddNumberToObject(mb, "tcp_uid",
+                            cfg->modbus.tcp_uid ? cfg->modbus.tcp_uid : MB_TCP_UID_DEFAULT);
 
     cJSON *sntp = cJSON_AddObjectToObject(root, "sntp");
     cJSON_AddBoolToObject  (sntp, "enable", cfg->sntp.enable);
@@ -503,6 +508,36 @@ static esp_err_t api_config_post(httpd_req_t *req)
         if ((v = cJSON_GetObjectItem(mb, "baudrate")) && cJSON_IsNumber(v)) {
             uint32_t bd = (uint32_t)v->valuedouble;
             if (bd >= 1200 && bd <= 921600) cfg.modbus.baudrate = bd;
+        }
+        if ((v = cJSON_GetObjectItem(mb, "rs485_role")) && cJSON_IsString(v)) {
+            if      (!strcmp(v->valuestring, "slave"))  cfg.modbus.rs485_role = MB_ROLE_SLAVE;
+            else if (!strcmp(v->valuestring, "master")) cfg.modbus.rs485_role = MB_ROLE_MASTER;
+        }
+        if ((v = cJSON_GetObjectItem(mb, "tcp_server")) && cJSON_IsBool(v))
+            cfg.modbus.tcp_server = cJSON_IsTrue(v) ? 1 : 0;
+        if ((v = cJSON_GetObjectItem(mb, "tcp_uid")) && cJSON_IsNumber(v)) {
+            uint32_t u = (uint32_t)v->valuedouble;
+            if (u >= 1 && u <= 247) cfg.modbus.tcp_uid = (uint8_t)u;
+        }
+
+        /* Two combinations are worth refusing rather than quietly accepting.
+           A master with no TCP server has nobody to act for, and a local unit
+           ID in the range the gateway forwards would shadow the device that
+           really has that address -- a request meant for it would be answered
+           by this board's own two registers instead. */
+        if (cfg.modbus.enable && cfg.modbus.rs485_role == MB_ROLE_MASTER) {
+            const char *why = NULL;
+            if (!cfg.modbus.tcp_server)
+                why = "rs485_role 'master' needs tcp_server enabled — "
+                      "nothing else would drive the segment";
+            else if (cfg.modbus.tcp_uid < MB_TCP_UID_DEFAULT)
+                why = "tcp_uid below 247 would shadow the device with that "
+                      "address on the RS-485 segment";
+            if (why) {
+                cJSON_Delete(root);
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, why);
+                return ESP_OK;
+            }
         }
     }
 

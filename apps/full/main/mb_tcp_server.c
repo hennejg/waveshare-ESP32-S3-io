@@ -20,6 +20,7 @@
 
 #include "mbcontroller.h"      /* the MB_FUNC_* function codes */
 #include "mb_request.h"
+#include "app_config.h"
 #include "mb_server.h"
 #include "mb_gateway.h"
 
@@ -89,6 +90,7 @@ static int           s_listen_fd = -1;
    went from 3 ms with the connection idle between requests to 20 ms with it
    not. */
 static int           s_wake_fd = -1;
+static uint8_t       s_local_uid = MB_TCP_UID_DEFAULT;
 /* Written by every worker without a lock. A count can be lost when two
    workers finish in the same instant; these are for telling a busy segment
    from a broken one, not for billing. */
@@ -209,7 +211,7 @@ static uint16_t build_response(const mb_request_t *req, const uint8_t *pdu,
    broadcast. */
 static bool is_local(uint8_t uid)
 {
-    return (uid == MB_LOCAL_UID) || (uid == 0) || (uid == 255);
+    return (uid == s_local_uid) || (uid == 0) || (uid == 255);
 }
 
 static bool send_all(int fd, const uint8_t *buf, size_t len)
@@ -469,9 +471,11 @@ static void poller_task(void *arg)
 
 /* ------------------------------------------------------------------ public */
 
-esp_err_t mb_tcp_server_start(uint16_t port)
+esp_err_t mb_tcp_server_start(uint16_t port, uint8_t local_uid)
 {
     if (s_listen_fd >= 0) return ESP_OK;             /* a second interface came up */
+
+    s_local_uid = local_uid;
 
     for (int i = 0; i < MB_TCP_MAX_CONN; i++) { s_conn[i].fd = -1; s_conn[i].state = SLOT_FREE; }
 
@@ -523,8 +527,7 @@ esp_err_t mb_tcp_server_start(uint16_t port)
         xTaskCreate(poller_task, "mb_tcp_poll", 5120, NULL, 6, NULL) == pdPASS,
         ESP_ERR_NO_MEM, TAG, "poller task");
 
-    ESP_LOGI(TAG, "Modbus TCP on port %u — own I/Os at unit ID %u, "
-                  "%d connections, %d workers",
-             port, MB_LOCAL_UID, MB_TCP_MAX_CONN, MB_TCP_WORKERS);
+    ESP_LOGI(TAG, "listening on port %u — %d connections, %d workers",
+             port, MB_TCP_MAX_CONN, MB_TCP_WORKERS);
     return ESP_OK;
 }

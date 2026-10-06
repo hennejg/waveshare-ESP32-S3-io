@@ -264,10 +264,18 @@
     <!-- ── Modbus ── -->
     <div id="tab-modbus" class="tab-pane">
       <label style="display:flex;align-items:center;gap:.5rem;font-weight:600;color:#555;margin-top:1rem">
-        <input type="checkbox" id="mb_enable"> Enable Modbus RTU server
+        <input type="checkbox" id="mb_enable" onchange="updateModbusFields()"> Enable Modbus
       </label>
-      <p class="hint">RS485 on GPIO17/18. Changes take effect after reboot.</p>
-      <label>Slave Address (1–247)
+      <p class="hint">Changes take effect after reboot.</p>
+
+      <h2 style="margin-top:1rem">RS485 (GPIO17/18)</h2>
+      <label>This device is
+        <select id="mb_role" onchange="updateModbusFields()">
+          <option value="slave">a slave — it answers requests addressed to it</option>
+          <option value="master">the master — it reads other devices for Modbus TCP clients</option>
+        </select>
+      </label>
+      <label id="mb_address_row">Slave Address (1–247)
         <input type="number" id="mb_address" min="1" max="247" value="1">
       </label>
       <label>Baudrate
@@ -279,6 +287,18 @@
           <option value="115200">115200</option>
         </select>
       </label>
+
+      <h2 style="margin-top:1.5rem">Modbus TCP (port 502)</h2>
+      <label style="display:flex;align-items:center;gap:.5rem;font-weight:600;color:#555">
+        <input type="checkbox" id="mb_tcp_server" onchange="updateModbusFields()"> Answer Modbus TCP
+      </label>
+      <p class="hint" style="color:#a33">Modbus TCP has no password. Anything that can reach this
+      device can read its inputs and switch its outputs — and, with RS485 set to master, everything
+      on the RS485 segment as well. Only enable it on a network you control.</p>
+      <label>This device answers unit ID
+        <input type="number" id="mb_tcp_uid" min="1" max="247" value="247">
+      </label>
+      <p class="hint" id="mb_tcp_hint"></p>
     </div>
 
     <!-- ── Time (SNTP / RTC) ── -->
@@ -652,6 +672,10 @@ rule('my-rule')
           document.getElementById('mb_enable').checked  = !!cfg.modbus.enable;
           document.getElementById('mb_address').value   = cfg.modbus.address  ?? 1;
           document.getElementById('mb_baudrate').value  = cfg.modbus.baudrate ?? 9600;
+          document.getElementById('mb_role').value      = cfg.modbus.rs485_role ?? 'slave';
+          document.getElementById('mb_tcp_server').checked = !!cfg.modbus.tcp_server;
+          document.getElementById('mb_tcp_uid').value   = cfg.modbus.tcp_uid ?? 247;
+          updateModbusFields();
         }
         if (cfg.sntp) {
           document.getElementById('sntp_enable').checked = !!cfg.sntp.enable;
@@ -749,9 +773,12 @@ rule('my-rule')
             tx_interval_ms: parseInt(document.getElementById('can_tx_interval').value, 10),
           },
           modbus: {
-            enable:   document.getElementById('mb_enable').checked,
-            address:  parseInt(document.getElementById('mb_address').value, 10),
-            baudrate: parseInt(document.getElementById('mb_baudrate').value, 10),
+            enable:     document.getElementById('mb_enable').checked,
+            address:    parseInt(document.getElementById('mb_address').value, 10),
+            baudrate:   parseInt(document.getElementById('mb_baudrate').value, 10),
+            rs485_role: document.getElementById('mb_role').value,
+            tcp_server: document.getElementById('mb_tcp_server').checked,
+            tcp_uid:    parseInt(document.getElementById('mb_tcp_uid').value, 10),
           },
           sntp: {
             enable: document.getElementById('sntp_enable').checked,
@@ -792,6 +819,39 @@ rule('my-rule')
     updateCanFields();
 
     /* ── Timezone select / custom field ── */
+    // Keeps the Modbus tab honest: the firmware refuses a master with no TCP
+    // server, and a local unit ID below 247 that would shadow a real device on
+    // the segment. Rather than let someone fill in a form that will be
+    // rejected, the fields that cannot apply are taken away.
+    function updateModbusFields() {
+      const on     = document.getElementById('mb_enable').checked;
+      const master = document.getElementById('mb_role').value === 'master';
+      const tcp    = document.getElementById('mb_tcp_server');
+      const uid    = document.getElementById('mb_tcp_uid');
+
+      for (const id of ['mb_role', 'mb_address', 'mb_baudrate', 'mb_tcp_server', 'mb_tcp_uid'])
+        document.getElementById(id).disabled = !on;
+
+      // As a master the device has no address of its own on the segment.
+      document.getElementById('mb_address_row').style.display = master ? 'none' : '';
+
+      if (master) {
+        tcp.checked  = true;             // nothing else would drive the segment
+        tcp.disabled = true;
+        uid.value    = 247;              // every lower ID belongs to the segment
+        uid.disabled = true;
+      } else if (on) {
+        uid.disabled = false;
+      }
+
+      document.getElementById('mb_tcp_hint').textContent = master
+        ? 'Unit ID 247 reaches this device\u2019s own inputs and outputs. Every other unit ID is '
+          + 'forwarded to that address on RS485; a device that does not answer gives exception 0x0B.'
+        : 'Only this unit ID is answered. Unit IDs 0 and 255 reach this device as well, since a '
+          + 'client with nothing to address sends one of them. Any other gives exception 0x0A, '
+          + 'because the RS485 side is a slave and there is nothing to forward to.';
+    }
+
     function updateTzFields() {
       const isCustom = document.getElementById('tz_select').value === '__custom__';
       document.getElementById('tz_custom_wrap').style.display = isCustom ? '' : 'none';

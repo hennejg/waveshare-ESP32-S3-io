@@ -1,8 +1,11 @@
-# Modbus RTU API
+# Modbus API
 
 Target device: Waveshare ESP32-S3-POE-ETH-8DI-8DO
 
-## Connection
+The board speaks Modbus two ways, configured in the web UI (**Modbus** tab).
+Changes take effect after reboot.
+
+## RS-485
 
 | Parameter          | Details                                   |
 |--------------------|-------------------------------------------|
@@ -12,7 +15,49 @@ Target device: Waveshare ESP32-S3-POE-ETH-8DI-8DO
 | Parity             | None                                      |
 | Stop bits          | 1                                         |
 
-Slave address and baudrate are configured in the web UI (**Modbus RTU** section). Changes take effect after reboot.
+The segment has one master, and the board is either it or a slave on it:
+
+- **Slave** (default) — answers requests sent to its address. The register map
+  below is what it answers with.
+- **Master** — drives the segment for Modbus TCP clients. The board has no
+  address of its own then, and nothing else may be master.
+
+## Modbus TCP
+
+Off by default. Enabled, the board answers on **port 502**, up to eight
+connections at once.
+
+> Modbus TCP has no authentication. Anything that can reach the board can read
+> its inputs and switch its outputs — and, with RS-485 set to master,
+> everything on the segment as well. Only enable it on a network you control.
+
+Which device a request is for is decided by the MBAP unit identifier:
+
+| Unit ID            | Answered by                                              |
+|--------------------|----------------------------------------------------------|
+| 247 (configurable) | This board — the register map below                       |
+| 0 and 255          | This board as well; a client with nothing to address sends one of them |
+| anything else      | The device with that address on RS-485, if the board is master |
+
+With RS-485 set to slave there is nothing to forward to, and any other unit ID
+is answered with exception `0x0A`.
+
+### Forwarded requests
+
+Function codes 01, 02, 03, 04, 05, 06, 15 and 16 are relayed; anything else is
+answered with exception `0x01`. The answer comes back as the device gave it,
+including its exception code. Two codes are the gateway's own:
+
+| Exception | Meaning                                                   |
+|-----------|-----------------------------------------------------------|
+| `0x0B`    | The device did not answer within 500 ms                    |
+| `0x0A`    | There is no route to it — RS-485 is not in master mode     |
+| `0x06`    | Every worker is busy on the segment; retry                 |
+
+A request the board answers itself is never delayed by the segment: measured
+on the bench, a local read stays at 3 ms while six requests to devices that
+never answer are in flight. The segment itself carries one transaction at a
+time, so forwarded requests queue behind each other.
 
 ---
 
@@ -87,4 +132,6 @@ Writing a non-zero value triggers a single 200 ms beep. No sequence support via 
 - Register values are big-endian (standard Modbus).
 - The Modbus stack and MQTT/Ethernet operate concurrently. A coil write via Modbus will also publish the new DO state on
   the corresponding MQTT topic.
-- Modbus is disabled by default. Enable in web UI and reboot to activate.
+- Modbus is disabled by default. Enable in the web UI and reboot to activate.
+- The local unit ID must stay 247 while RS-485 is in master mode: a lower one
+  would shadow the device that really has that address on the segment.

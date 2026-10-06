@@ -25,6 +25,16 @@
 #define LED_MODE_IO     0   /* LED controlled via MQTT and Modbus */
 #define LED_MODE_STATUS 1   /* LED shows device connectivity state */
 
+/* What the board does on the RS-485 segment. The two cannot be combined: one
+   UART, and a half-duplex segment has exactly one master. */
+#define MB_ROLE_SLAVE   0   /* answers requests addressed to it            */
+#define MB_ROLE_MASTER  1   /* drives the segment on behalf of TCP clients */
+
+/* The unit ID the board answers to over TCP when nothing else is set. 247 is
+   the highest address the protocol allows and is almost never given to a real
+   device, so it is unlikely to shadow one on the segment. */
+#define MB_TCP_UID_DEFAULT  247
+
 /* Per-input / per-output configuration (shared layout for DI and DO).
    Stored as a fixed-size NVS blob.  If the blob size changes the old data is
    silently discarded and defaults apply.
@@ -63,12 +73,24 @@ typedef struct {
         uint8_t  _pad[2];
     } can;
 
-    /* Modbus RTU server */
+    /* Modbus.
+       The fields after baudrate were added later. They are appended rather
+       than inserted on purpose: nvs_get_blob() loads a shorter stored blob
+       into the longer struct and leaves the rest at the defaults above, so a
+       device that was configured before they existed keeps behaving exactly
+       as it did. Going back to a firmware without them is the one direction
+       that is not graceful -- the longer blob is refused and every Modbus
+       setting falls back to its default, the same as for the DI blob. */
     struct {
         uint8_t  enable;     /* 0 = disabled; changes take effect on reboot */
-        uint8_t  address;    /* slave address 1–247 */
+        uint8_t  address;    /* RTU slave address 1–247 */
         uint8_t  _pad[2];
         uint32_t baudrate;   /* 9600 / 19200 / 38400 / 57600 / 115200 */
+
+        uint8_t  rs485_role; /* MB_ROLE_SLAVE or MB_ROLE_MASTER            */
+        uint8_t  tcp_server; /* 1 = answer Modbus TCP on port 502          */
+        uint8_t  tcp_uid;    /* unit ID the board answers to over TCP, 1–247 */
+        uint8_t  _pad2;
     } modbus;
 
     /* SNTP time synchronisation */

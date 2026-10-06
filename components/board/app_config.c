@@ -30,7 +30,14 @@ static app_config_t s_cfg = {
     .mqtt_topic_prefix = "",
     /* di/dout names and invert default to zero */
     .led_mode = LED_MODE_STATUS,   /* status feedback on by default */
-    .modbus = { .enable = 0, .address = 1, .baudrate = 9600 },
+    /* Modbus TCP has no authentication of any kind: anything that can reach
+       the board can read its inputs and switch its outputs, and through the
+       gateway everything on the RS-485 segment as well. It is therefore off
+       until someone turns it on, and the RS-485 role stays what it has always
+       been. */
+    .modbus = { .enable = 0, .address = 1, .baudrate = 9600,
+                .rs485_role = MB_ROLE_SLAVE, .tcp_server = 0,
+                .tcp_uid = MB_TCP_UID_DEFAULT },
     .can    = { .mode = 0, .n2k_addr = 0x50, .base_id = 0x100,
                 .bitrate = 250000, .tx_interval_ms = 1000 },
     .sntp   = { .enable = 1, .server = "pool.ntp.org" },

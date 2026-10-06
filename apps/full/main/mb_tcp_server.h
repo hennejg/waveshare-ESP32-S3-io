@@ -3,8 +3,10 @@
 #include <stdint.h>
 
 /* Modbus TCP server. Needs a working IP stack, so call it once the network is
-   up; calling it again is harmless. */
-esp_err_t mb_tcp_server_start(uint16_t port);
+   up; calling it again is harmless. local_uid is the unit ID this board
+   answers to itself -- every other one is forwarded to the RS-485 segment,
+   or refused if nothing is driving it. */
+esp_err_t mb_tcp_server_start(uint16_t port, uint8_t local_uid);
 
 /* Counters, for the status API and for telling a busy segment from a broken
    one without a packet capture. */

@@ -41,13 +41,11 @@
    not the data path: the access callbacks below are overridden, so nothing
    reads or writes these buffers. Reads are answered from the live I/O state
    and writes are captured as commands. */
-#if !MB_GW_SPIKE
 static struct { uint8_t  b[1]; } s_coils_unused;
 static struct { uint8_t  b[1]; } s_di_unused;
 static struct { uint16_t r[MB_NUM_HOLDING]; } s_hr_unused;
 
-static void *s_handle = NULL;        /* the RTU slave instance */
-#endif
+static void *s_handle = NULL;        /* the RTU slave instance, if any */
 
 /* ---------------------------------------------------------------- commands */
 
@@ -340,26 +338,11 @@ static esp_err_t start_command_task(void)
     return ESP_OK;
 }
 
-esp_err_t mb_server_init(void)
+/* The board on the RS-485 segment: either answering as a slave, or driving it
+   as a master on behalf of TCP clients. One UART and one master per segment,
+   so it is one or the other. */
+static esp_err_t start_rtu_slave(const app_config_t *cfg)
 {
-    const app_config_t *cfg = app_config_get();
-    if (!cfg->modbus.enable) {
-        ESP_LOGI(TAG, "Modbus disabled");
-        return ESP_OK;
-    }
-
-    /* Ready to accept commands before anything can deliver one. */
-    ESP_RETURN_ON_ERROR(start_command_task(), TAG, "command task");
-
-#if MB_GW_SPIKE
-    /* The RS-485 port belongs to the master now; the two cannot share it. The
-       TCP server that feeds it needs a working IP stack, which app_main()
-       does not have yet -- mb_server_net_start() finishes the job. */
-    ESP_RETURN_ON_ERROR(mb_gateway_start(MB_UART, cfg->modbus.baudrate,
-                                         MB_TX_GPIO, MB_RX_GPIO, MB_RTS_GPIO),
-                        TAG, "gateway master");
-    return ESP_OK;
-#else
     mb_communication_info_t comm = {
         .ser_opts.mode      = MB_RTU,
         .ser_opts.port      = MB_UART,
@@ -403,18 +386,56 @@ esp_err_t mb_server_init(void)
 
     ESP_RETURN_ON_ERROR(mbc_slave_start(s_handle), TAG, "start");
 
-    ESP_LOGI(TAG, "Modbus RTU slave started — addr=%u baud=%"PRIu32,
+    ESP_LOGI(TAG, "RS-485: RTU slave, address %u, %"PRIu32" baud",
              cfg->modbus.address, cfg->modbus.baudrate);
     return ESP_OK;
-#endif
+}
+
+esp_err_t mb_server_init(void)
+{
+    const app_config_t *cfg = app_config_get();
+    if (!cfg->modbus.enable) {
+        ESP_LOGI(TAG, "Modbus disabled");
+        return ESP_OK;
+    }
+
+    /* Ready to accept commands before anything can deliver one. */
+    ESP_RETURN_ON_ERROR(start_command_task(), TAG, "command task");
+
+    if (cfg->modbus.rs485_role == MB_ROLE_MASTER) {
+        /* Nothing but the TCP server ever asks the master for anything, so
+           say plainly that the segment will sit idle rather than leave
+           someone wondering why their meters are not being read. */
+        if (!cfg->modbus.tcp_server)
+            ESP_LOGW(TAG, "RS-485 is set to master but the TCP server is off — "
+                          "nothing will drive the segment");
+
+        /* The TCP server that feeds it needs a working IP stack, which
+           app_main() does not have yet; mb_server_net_start() finishes up. */
+        return mb_gateway_start(MB_UART, cfg->modbus.baudrate,
+                                MB_TX_GPIO, MB_RX_GPIO, MB_RTS_GPIO);
+    }
+
+    return start_rtu_slave(cfg);
 }
 
 esp_err_t mb_server_net_start(void)
 {
-#if MB_GW_SPIKE
-    if (!app_config_get()->modbus.enable) return ESP_OK;
-    return mb_tcp_server_start(MB_TCP_PORT);
-#else
+    const app_config_t *cfg = app_config_get();
+    if (!cfg->modbus.enable || !cfg->modbus.tcp_server) return ESP_OK;
+
+    uint8_t uid = cfg->modbus.tcp_uid;
+    if (uid < 1 || uid > 247) uid = MB_TCP_UID_DEFAULT;   /* stored before the field existed */
+
+    esp_err_t ret = mb_tcp_server_start(MB_TCP_PORT, uid);
+    if (ret != ESP_OK) return ret;
+
+    if (cfg->modbus.rs485_role == MB_ROLE_MASTER)
+        ESP_LOGI(TAG, "Modbus TCP: own I/Os at unit ID %u, every other unit ID "
+                      "forwarded to RS-485 at %"PRIu32" baud",
+                 uid, cfg->modbus.baudrate);
+    else
+        ESP_LOGI(TAG, "Modbus TCP: own I/Os at unit ID %u; no gateway, the "
+                      "RS-485 side is a slave", uid);
     return ESP_OK;
-#endif
 }
