@@ -6,7 +6,13 @@ checker are exercised against this rather than against themselves, so a shared
 misunderstanding of the protocol has somewhere to show up. It is also what the
 board can be pointed at on the bench to try the TCP master for real.
 
-  python3 modbus_tcp_server.py [port]      # default 15020
+  python3 modbus_tcp_server.py [port] [bind]
+
+Binds to 127.0.0.1 by default, which is all the host test needs. To point the
+board at it, bind to the bench interface explicitly -- it speaks to anyone who
+connects and has no authentication:
+
+  python3 modbus_tcp_server.py 15020 0.0.0.0
 """
 import socket, socketserver, struct, sys, threading
 
@@ -76,6 +82,7 @@ class Server(socketserver.ThreadingTCPServer):
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 15020
-    with Server(("127.0.0.1", port), Handler) as s:
-        print("listening on 127.0.0.1:%d" % port, flush=True)
+    bind = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1"
+    with Server((bind, port), Handler) as s:
+        print("listening on %s:%d" % (bind, port), flush=True)
         s.serve_forever()

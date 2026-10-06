@@ -57,6 +57,10 @@
 #define MB_TCP_MAX_CONN       NET_SOCK_MB_CONN
 #define MB_TCP_JOB_DEPTH      MB_TCP_WORKERS
 
+/* Room for a burst of connections to wait while the poller is busy elsewhere;
+   they cost a PCB each, not a slot. */
+#define MB_TCP_BACKLOG        (2 * MB_TCP_MAX_CONN)
+
 #define MBAP_HDR              (MB_MBAP_LEN - 1)   /* the part before uid */
 #define FRAME_MAX             (MB_MBAP_LEN + MB_PDU_MAX)
 
@@ -325,12 +329,21 @@ static uint16_t build_busy(const uint8_t *frame, uint8_t *out)
     return MB_MBAP_LEN + 2;
 }
 
-static void accept_one(void)
+/* Takes one waiting connection and says whether there may be another, so
+   the caller can drain the queue in one visit.
+
+   One per poll pass was not enough. Measured on the bench at 83 connections
+   a second from a single client: the queue filled and the stack reset
+   connections the application had already accepted and answered -- on the
+   wire a reset, then a repeated SYN-ACK, then the answer, and the client saw
+   only the reset. 0.2 % of connections, with nothing else running. The
+   receive path already reads until EAGAIN for the same reason. */
+static bool accept_one(void)
 {
     struct sockaddr_in peer;
     socklen_t plen = sizeof(peer);
     int fd = accept(s_listen_fd, (struct sockaddr *)&peer, &plen);
-    if (fd < 0) return;
+    if (fd < 0) return false;
 
     /* A slot a worker gave up on in this same iteration is free in all but
        name; reclaim it before turning anyone away. */
@@ -345,7 +358,7 @@ static void accept_one(void)
         s_stats.refused++;
         ESP_LOGW(TAG, "no free slot, dropped a connection (%d in use)", MB_TCP_MAX_CONN);
         close(fd);
-        return;
+        return true;              /* the queue may still hold others */
     }
 
     /* Modbus frames are small and answered one at a time, so Nagle would only
@@ -363,6 +376,7 @@ static void accept_one(void)
     s_conn[slot].state = SLOT_IDLE;
     s_stats.accepted++;
     ESP_LOGD(TAG, "connection on slot %d", slot);
+    return true;
 }
 
 /* Takes whatever has arrived on one connection and, when that completes a
@@ -538,7 +552,7 @@ static void poller_task(void *arg)
             uint64_t v;
             (void)read(s_wake_fd, &v, sizeof(v));    /* clears the counter */
         }
-        if (FD_ISSET(s_listen_fd, &rd)) accept_one();
+        if (FD_ISSET(s_listen_fd, &rd)) while (accept_one()) { }
 
         /* Outgoing first: a connection waiting to be written to is holding a
            buffer and a deadline, and finishing it frees both. */
@@ -626,7 +640,13 @@ esp_err_t mb_tcp_server_start(uint16_t port, uint8_t local_uid)
         start_unwind(fd, NULL, 0);
         return ESP_FAIL;
     }
-    if (listen(fd, MB_TCP_MAX_CONN) < 0) {
+    /* The backlog is not the slot count: it is how many completed connections
+       may wait to be accepted, and the two answer different questions. Sized
+       to the slots, a burst arriving between two poll passes overflowed it and
+       the stack reset clients mid-handshake -- which the application never
+       sees, because it happens below accept(). Refusing past the slot count is
+       still the application's job, and it does that with a clean close. */
+    if (listen(fd, MB_TCP_BACKLOG) < 0) {
         ESP_LOGE(TAG, "listen: errno %d", errno);
         start_unwind(fd, NULL, 0);
         return ESP_FAIL;
