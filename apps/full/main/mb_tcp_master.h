@@ -13,6 +13,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "app_config.h"
 #include "esp_err.h"
 
 /* Starts the polling task if any entry is enabled. Needs a working IP stack,
@@ -26,7 +27,7 @@ esp_err_t mb_tcp_master_reload(void);
 
 /* What happened to one entry last time, for the status API. */
 typedef struct {
-    char     name[21];     /* as the polling task has it, not as stored     */
+    char     name[APP_CFG_MBM_NAME_LEN + 1];  /* as the polling task has it   */
     bool     enabled;
     bool     valid;        /* a value has been read at least once; age_ms says
                               how long ago -- nothing here calls it stale     */

@@ -72,7 +72,7 @@ uint8_t mb_parse_pdu(const uint8_t *pdu, uint16_t len, mb_request_t *req)
         uint8_t  byte_cnt = pdu[5];
         bool     bits     = (req->fc == MB_FC_WRITE_COILS);
         uint16_t max      = bits ? MAX_WRITE_BITS : MAX_WRITE_REGS;
-        uint16_t want     = bits ? (uint16_t)((req->count + 7u) / 8u)
+        uint16_t want     = bits ? (uint16_t)MB_BIT_BYTES(req->count)
                                  : (uint16_t)(req->count * 2u);
         if (req->count < 1 || req->count > max) return MB_EXC_ILLEGAL_VALUE;
         if (byte_cnt != want || len != 6u + byte_cnt) return MB_EXC_ILLEGAL_VALUE;

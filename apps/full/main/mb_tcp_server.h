@@ -8,6 +8,11 @@
    or refused if nothing is driving it. */
 esp_err_t mb_tcp_server_start(uint16_t port, uint8_t local_uid);
 
+/* How many forwarded requests can be in flight at once. Public because the
+   gateway has to know how many of them may be queued ahead of any one
+   request before it gives up waiting for the segment. */
+#define MB_TCP_WORKERS  4
+
 /* Counters, for the status API and for telling a busy segment from a broken
    one without a packet capture. */
 typedef struct {

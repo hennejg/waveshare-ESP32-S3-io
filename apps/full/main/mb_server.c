@@ -1,4 +1,5 @@
 #include "mb_server.h"
+#include "mb_pdu.h"
 
 #include <string.h>
 #include "app_config.h"
@@ -126,13 +127,8 @@ static void apply_rgb252(uint16_t reg)
 /* Called with the mutex held. */
 static uint8_t enqueue(const mb_cmd_t *cmd, const char *what)
 {
-    /* The queue is created before anything can deliver a request, but an
-       out-of-memory failure at start-up leaves it absent while the TCP server
-       still comes up. Sending to a null queue is an abort, not a refusal. */
-    if (!s_cmd_q) {
-        ESP_LOGE(TAG, "no command queue, refused %s", what);
-        return MB_EXC_DEVICE_FAILURE;
-    }
+    /* Only ever reached through an accessor that has already refused unless
+       s_local_ready, which is set once the queue and the mutex both exist. */
     if (xQueueSend(s_cmd_q, cmd, 0) == pdTRUE) return MB_EXC_NONE;
 
     /* "Slave device busy" is the canonical "I could not take this, try
@@ -148,7 +144,7 @@ static uint8_t local_read_coils(uint16_t addr, uint16_t count, uint8_t *out)
     if (!s_local_ready) return MB_EXC_DEVICE_FAILURE;
     if ((uint32_t)addr + count > MB_NUM_COILS) return MB_EXC_ILLEGAL_ADDR;
 
-    memset(out, 0, (size_t)((count + 7u) / 8u));
+    memset(out, 0, (size_t)MB_BIT_BYTES(count));
     uint8_t live = dout_get_all();
 
     CMD_LOCK();
@@ -167,7 +163,7 @@ static uint8_t local_read_discrete(uint16_t addr, uint16_t count, uint8_t *out)
     if (!s_local_ready) return MB_EXC_DEVICE_FAILURE;
     if ((uint32_t)addr + count > MB_NUM_DISCRETE) return MB_EXC_ILLEGAL_ADDR;
 
-    memset(out, 0, (size_t)((count + 7u) / 8u));
+    memset(out, 0, (size_t)MB_BIT_BYTES(count));
     for (uint16_t i = 0; i < count; i++)
         if (di_get((uint8_t)(addr + i))) out[i >> 3] |= (uint8_t)(1u << (i & 7));
     return MB_EXC_NONE;
@@ -221,7 +217,7 @@ static uint8_t local_write_holding(uint16_t addr, uint16_t count, const uint8_t 
 
     mb_cmd_t cmd = { .area = MB_PARAM_HOLDING, .offset = addr, .count = count };
     for (uint16_t i = 0; i < count; i++)
-        cmd.regs[i] = (uint16_t)((regs_be[i * 2] << 8) | regs_be[i * 2 + 1]);
+        cmd.regs[i] = mb_be16(&regs_be[i * 2]);
 
     CMD_LOCK();
     uint8_t exc = enqueue(&cmd, "holding register write");
@@ -243,36 +239,36 @@ uint8_t mb_server_handle(const mb_request_t *req, uint8_t *resp, uint16_t *resp_
     /* The length is set only once the read succeeded. An exception response
        carries no data, and a caller that framed resp anyway would put
        whatever was on its stack onto the wire. */
-    case MB_FUNC_READ_COILS:
+    case MB_FC_READ_COILS:
         exc = local_read_coils(req->addr, req->count, resp);
-        if (!exc) *resp_len = (uint16_t)((req->count + 7u) / 8u);
+        if (!exc) *resp_len = (uint16_t)MB_BIT_BYTES(req->count);
         return exc;
 
-    case MB_FUNC_READ_DISCRETE_INPUTS:
+    case MB_FC_READ_DISCRETE:
         exc = local_read_discrete(req->addr, req->count, resp);
-        if (!exc) *resp_len = (uint16_t)((req->count + 7u) / 8u);
+        if (!exc) *resp_len = (uint16_t)MB_BIT_BYTES(req->count);
         return exc;
 
-    case MB_FUNC_READ_HOLDING_REGISTER:
+    case MB_FC_READ_HOLDING:
         exc = local_read_holding(req->addr, req->count, resp);
         if (!exc) *resp_len = (uint16_t)(req->count * 2u);
         return exc;
 
-    case MB_FUNC_READ_INPUT_REGISTER:
+    case MB_FC_READ_INPUT:
         return MB_EXC_ILLEGAL_ADDR;     /* no input registers on this device */
 
-    case MB_FUNC_WRITE_SINGLE_COIL: {
+    case MB_FC_WRITE_COIL: {
         /* The value arrives as the two bytes of the request: 0xFF00 on,
            0x0000 off, and nothing else is a valid single-coil write. */
         uint8_t bit = (req->data[0] == 0xFF) ? 1u : 0u;
         return local_write_coils(req->addr, 1, &bit);
     }
 
-    case MB_FUNC_WRITE_MULTIPLE_COILS:
+    case MB_FC_WRITE_COILS:
         return local_write_coils(req->addr, req->count, req->data);
 
-    case MB_FUNC_WRITE_REGISTER:
-    case MB_FUNC_WRITE_MULTIPLE_REGISTERS:
+    case MB_FC_WRITE_REGISTER:
+    case MB_FC_WRITE_REGISTERS:
         return local_write_holding(req->addr, req->count, req->data);
 
     default:
@@ -416,7 +412,7 @@ static void command_task(void *arg)
 
 static esp_err_t start_command_task(void)
 {
-    if (s_cmd_q) return ESP_OK;
+    if (s_local_ready) return ESP_OK;
 
     s_cmd_mux = xSemaphoreCreateMutex();
     ESP_RETURN_ON_FALSE(s_cmd_mux, ESP_ERR_NO_MEM, TAG, "command mutex");
@@ -426,11 +422,8 @@ static esp_err_t start_command_task(void)
     ESP_RETURN_ON_FALSE(s_cmd_q, ESP_ERR_NO_MEM, TAG, "command queue");
 
     if (xTaskCreate(command_task, "mb_cmd", 4096, NULL, 5, NULL) != pdPASS) {
-        /* The queue and the mutex go with it. Left behind, the guard at the
-           top would report success on the next call and every write would be
-           accepted into a queue nobody empties -- answered positively, read
-           back from the shadow registers as if it had happened, and never
-           carried out. */
+        /* The queue and the mutex go with it: s_local_ready stays false, so
+           nothing would ever empty them again. */
         vQueueDelete(s_cmd_q);
         s_cmd_q = NULL;
         vSemaphoreDelete(s_cmd_mux);

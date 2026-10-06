@@ -2,10 +2,13 @@
 """Builds a host test for the TCP server's receive path out of the real source.
 
 The receive path cannot be compiled on a development machine as it stands --
-it reaches FreeRTOS, lwIP and the logging layer. So the three functions that
-matter are cut out of mb_tcp_server.c verbatim and given stubs for the rest.
-Cutting rather than copying is the point: the test cannot drift away from the
-code it is meant to guard.
+it reaches FreeRTOS, lwIP and the logging layer. So the functions that matter
+are cut out of mb_tcp_server.c verbatim and given stubs for the rest. Cutting
+rather than copying is the point: the test cannot drift away from the code it
+is meant to guard. The same argument applies to the #defines and to the types
+the cut functions work on, so those are cut as well -- a field added to conn_t
+or a number changed in net_budget.h arrives here without anyone editing this
+file.
 
 Checks two things the previous design got wrong, both demonstrated against it
 by an outside review:
@@ -14,39 +17,17 @@ by an outside review:
   - a frame has one deadline covering all of it, not one per read, so a client
     cannot extend it by arriving in pieces
 
+and the three ways a request leaves pump_slot(): answered on the poller,
+handed to a worker, or refused with "slave device busy" when the pool is full.
+
 Run through the Makefile: make -C test/host poller
 """
-import pathlib, re, sys
+import pathlib
+from cutter import Source
 
-SRC = pathlib.Path(__file__).resolve().parents[2] / "apps/full/main/mb_tcp_server.c"
-text = SRC.read_text()
-
-
-def cut_defines(*names):
-    """The #define lines themselves, taken from the source.
-
-    Re-typing them in the harness was the flaw an outside review pointed at:
-    raising FRAME_WAIT_MS in the firmware would have left the test asserting
-    the old number and still passing.
-    """
-    out = []
-    for n in names:
-        m = re.search(r"^#define\s+%s\b.*$" % re.escape(n), text, re.M)
-        if not m:
-            raise SystemExit("gen_poller_test.py: #define %s not found" % n)
-        out.append(m.group(0))
-    return "\n".join(out) + "\n"
-
-
-def cut(signature):
-    """The function whose definition starts with signature, braces balanced."""
-    a = text.index(signature)
-    b = text.index("{", a) + 1
-    depth = 1
-    while depth:
-        depth += (text[b] == "{") - (text[b] == "}")
-        b += 1
-    return text[a:b] + "\n"
+ROOT   = pathlib.Path(__file__).resolve().parents[2]
+src    = Source(ROOT / "apps/full/main/mb_tcp_server.c")
+budget = Source(ROOT / "apps/full/main/net_budget.h")
 
 
 HARNESS = r'''
@@ -64,26 +45,17 @@ HARNESS = r'''
 __DEFINES__
 #define ESP_LOGW(...)    ((void)0)
 
-enum { SLOT_FREE = 0, SLOT_IDLE, SLOT_BUSY, SLOT_DEAD };
-
-typedef struct {
-    int              fd;
-    volatile uint8_t state;
-    uint16_t         got;
-    uint16_t         want;
-    int64_t          deadline_us;
-    uint8_t          frame[FRAME_MAX];
-    uint8_t          out[MBAP_LEN + MB_PDU_MAX];
-    uint16_t         out_len;
-    uint16_t         out_sent;
-    int64_t          out_deadline_us;
-} conn_t;
-
-typedef struct { int slot; uint16_t len; uint8_t frame[FRAME_MAX]; } job_t;
+/* --- cut from mb_tcp_server.c: the types the functions below work on ----- */
+__TYPES__
+/* ------------------------------------------------------------------------ */
 
 static conn_t s_conn[MB_TCP_MAX_CONN];
 static struct { unsigned malformed, overloaded; } s_stats;
+/* NULL stands for "no gateway running, so no worker pool" -- the firmware's
+   shipping default, and a live branch in pump_slot(). The forwarding tests
+   point it at a dummy. */
 static void *s_jobs;
+static uint8_t s_local_uid = 247;
 
 /* --- the world the cut-out functions see ------------------------------- */
 
@@ -125,25 +97,46 @@ static int recv(int fd, void *buf, size_t n, int flags)
 }
 
 static int  close(int fd)                                   { (void)fd; closes++; return 0; }
-static bool is_local(uint8_t uid)                           { return uid == 247; }
 static uint16_t process(const uint8_t *f, uint16_t n, uint8_t *o)
 { (void)f; assert(n == sizeof FRAME); answers++; memset(o, 0xA5, 9); return 9; }
-/* Per fd: how many bytes its receive window will still take. A send is
-   non-blocking by contract and never advances the clock, so a test that ends
-   with time on it means the code under test waited. */
+/* Per fd: how many bytes its receive window will still take, and what went
+   out of it. A send is non-blocking by contract and never advances the clock,
+   so a test that ends with time on it means the code under test waited. The
+   bytes are kept because what build_busy() puts on the wire is a Modbus
+   exception response, and only the bytes say whether it is the right one. */
 static int      window[MB_TCP_MAX_CONN];
 static unsigned sent_bytes[MB_TCP_MAX_CONN];
+static uint8_t  sent_buf[MB_TCP_MAX_CONN][FRAME_MAX];
 
 static int send(int fd, const void *buf, size_t n, int flags)
 {
-    (void)buf; (void)flags;
+    (void)flags;
     if (window[fd] <= 0) { errno = EAGAIN; return -1; }
     if ((int)n > window[fd]) n = (size_t)window[fd];
+    if (sent_bytes[fd] + n <= sizeof sent_buf[fd])
+        memcpy(sent_buf[fd] + sent_bytes[fd], buf, n);
     window[fd] -= (int)n;
     sent_bytes[fd] += (unsigned)n;
     return (int)n;
 }
-static int  xQueueSend(void *q, const void *j, int t)       { (void)q; (void)j; (void)t; return 0; }
+
+/* The pool, as far as pump_slot() can tell. queue_ok says whether a worker
+   was free; queued_slot/queued_len are what it was asked to do. */
+static bool     queue_ok;
+static int      queued_slot;
+static uint16_t queued_len;
+static unsigned queued;
+
+static int xQueueSend(void *q, const void *j, int t)
+{
+    (void)q; (void)t;
+    if (!queue_ok) return 0;
+    const job_t *job = (const job_t *)j;
+    queued_slot = job->slot;
+    queued_len  = job->len;
+    queued++;
+    return pdTRUE;
+}
 
 /* --- cut from mb_tcp_server.c ------------------------------------------ */
 __CUT__
@@ -153,6 +146,8 @@ static int failures;
 #define CHECK(c, ...) do { if (!(c)) { failures++; printf("  FEHLER: "); \
                                        printf(__VA_ARGS__); printf("\n"); } } while (0)
 
+static int dummy_queue;                 /* a non-NULL s_jobs to point at */
+
 static void reset(void)
 {
     memset(s_conn, 0, sizeof s_conn);
@@ -161,7 +156,11 @@ static void reset(void)
     memset(end_mode, 0, sizeof end_mode);
     memset(ready_at, 0, sizeof ready_at);
     memset(sent_bytes, 0, sizeof sent_bytes);
-    clock_us = 0; answers = 0; closes = 0; s_stats.malformed = 0;
+    memset(sent_buf, 0, sizeof sent_buf);
+    clock_us = 0; answers = 0; closes = 0;
+    s_stats.malformed = 0; s_stats.overloaded = 0;
+    s_jobs = NULL; queue_ok = false; queued = 0;
+    queued_slot = -1; queued_len = 0;
     for (int i = 0; i < MB_TCP_MAX_CONN; i++) {
         s_conn[i].fd = i; s_conn[i].state = SLOT_IDLE;
         window[i] = 1 << 20;                    /* takes everything by default */
@@ -170,7 +169,6 @@ static void reset(void)
 
 int main(void)
 {
-    job_t j;
     printf("Empfangspfad des TCP-Servers\n");
 
     /* 1. Seven clients send one byte and stop; the eighth sends a whole
@@ -179,7 +177,7 @@ int main(void)
     reset();
     for (int i = 0; i < 7; i++) give[i] = 1;
     give[7] = sizeof FRAME;
-    for (int i = 0; i < MB_TCP_MAX_CONN; i++) pump_slot(i, &j);
+    for (int i = 0; i < MB_TCP_MAX_CONN; i++) pump_slot(i);
     CHECK(answers == 1, "vollstaendige Anfrage nicht beantwortet (%u)", answers);
     CHECK(clock_us == 0, "der Poller hat gewartet: %lld ms", (long long)(clock_us / 1000));
     CHECK(closes == 0, "eine Verbindung wurde zu frueh geschlossen");
@@ -191,11 +189,11 @@ int main(void)
           deadline of 200 ms from the first byte must end it first. */
     reset();
     give[0] = 1; ready_at[0] = 0;
-    pump_slot(0, &j);                       /* first byte at t = 0 */
+    pump_slot(0);                           /* first byte at t = 0 */
     CHECK(s_conn[0].want == MBAP_HDR, "nach dem ersten Byte wird kein Kopf erwartet");
 
     clock_us = 180000; give[0] = MBAP_HDR;  /* rest of the header at 180 ms */
-    pump_slot(0, &j);
+    pump_slot(0);
     CHECK(answers == 0, "unvollstaendiger Rahmen beantwortet");
 
     clock_us = 210000;                      /* past the deadline */
@@ -208,9 +206,9 @@ int main(void)
     /* 3. A frame that arrives in pieces but inside the deadline is served. */
     reset();
     give[0] = 1;
-    pump_slot(0, &j);
+    pump_slot(0);
     clock_us = 100000; give[0] = sizeof FRAME;
-    pump_slot(0, &j);
+    pump_slot(0);
     CHECK(answers == 1, "rechtzeitiger zerstueckelter Rahmen nicht beantwortet");
     CHECK(s_conn[0].want == 0, "Empfangszustand nicht zurueckgesetzt");
     printf("  zerstueckelter Rahmen innerhalb der Frist beantwortet\n");
@@ -220,7 +218,7 @@ int main(void)
           belongs to a frame in progress, not to the connection. */
     reset();
     give[0] = sizeof FRAME;
-    pump_slot(0, &j);
+    pump_slot(0);
     CHECK(answers == 1, "Anfrage nicht beantwortet");
     clock_us = 3600LL * 1000000;            /* an hour later */
     sweep_deadlines();
@@ -233,7 +231,7 @@ int main(void)
     reset();
     give[0] = sizeof FRAME;
     FRAME[2] = 1;                           /* protocol id 1 instead of 0 */
-    pump_slot(0, &j);
+    pump_slot(0);
     FRAME[2] = 0;
     CHECK(answers == 0, "Rahmen mit falscher Protokoll-ID wurde beantwortet");
     CHECK(s_conn[0].state == SLOT_FREE, "Verbindung nicht geschlossen");
@@ -243,7 +241,7 @@ int main(void)
     reset();
     give[0] = sizeof FRAME;
     FRAME[5] = 1;                           /* length 1: less than the unit id */
-    pump_slot(0, &j);
+    pump_slot(0);
     FRAME[5] = 6;
     CHECK(s_conn[0].state == SLOT_FREE, "Rahmen mit unmoeglicher Laenge angenommen");
     CHECK(s_stats.malformed == 1, "nicht als fehlerhaft gezaehlt");
@@ -252,20 +250,20 @@ int main(void)
     /* 5b. The two ways a peer can go away, both of which must free the slot. */
     reset();
     end_mode[0] = END_EOF;                  /* clean close, nothing given */
-    pump_slot(0, &j);
+    pump_slot(0);
     CHECK(s_conn[0].state == SLOT_FREE, "sauberer Abbruch gibt den Platz nicht frei");
     CHECK(closes == 1, "Socket nicht geschlossen");
 
     reset();
     end_mode[0] = END_RESET;                /* reset */
-    pump_slot(0, &j);
+    pump_slot(0);
     CHECK(s_conn[0].state == SLOT_FREE, "Reset gibt den Platz nicht frei");
     CHECK(closes == 1, "Socket nicht geschlossen");
 
     /* A peer that closes mid-frame must not leave the frame half-held. */
     reset();
     give[0] = 3; end_mode[0] = END_EOF;
-    pump_slot(0, &j);
+    pump_slot(0);
     CHECK(s_conn[0].state == SLOT_FREE, "Abbruch mitten im Rahmen nicht behandelt");
     printf("  Abbruch und Reset geben den Platz frei, auch mitten im Rahmen\n");
 
@@ -277,20 +275,20 @@ int main(void)
     reset();
     window[0] = 0;                        /* slot 0 takes nothing at all */
     give[0] = sizeof FRAME;
-    pump_slot(0, &j);                     /* answers, cannot send it */
+    pump_slot(0);                         /* answers, cannot send it */
     CHECK(clock_us == 0, "der Poller hat auf den Sendepuffer gewartet: %lld ms",
           (long long)(clock_us / 1000));
     CHECK(s_conn[0].out_len != 0, "die unversandte Antwort wurde nicht gepuffert");
     CHECK(s_conn[0].state == SLOT_IDLE, "Verbindung zu frueh geschlossen");
 
     give[1] = 1;                          /* slot 1 begins a frame at t = 0 */
-    pump_slot(1, &j);
+    pump_slot(1);
     CHECK(s_conn[1].got == 1, "erstes Byte von Slot 1 nicht angenommen");
 
     clock_us = 360000;                    /* later than slot 1's deadline */
     give[1] = sizeof FRAME;               /* the rest arrives too late */
     unsigned before = answers;
-    pump_slot(1, &j);
+    pump_slot(1);
     CHECK(answers == before, "verspaeteter Rahmen wurde doch ausgefuehrt");
     CHECK(s_conn[1].state == SLOT_FREE, "verspaetete Verbindung nicht geschlossen");
     printf("  blockierter Sender haelt niemanden auf, verspaeteter Rahmen abgewiesen\n");
@@ -307,7 +305,7 @@ int main(void)
     reset();
     window[0] = 4;                        /* takes four of the nine bytes */
     give[0] = sizeof FRAME;
-    pump_slot(0, &j);
+    pump_slot(0);
     CHECK(s_conn[0].out_len && s_conn[0].out_sent == 4, "Teilversand nicht vermerkt");
     window[0] = 1 << 20;
     CHECK(flush_out(0), "Rest konnte nicht gesendet werden");
@@ -315,21 +313,91 @@ int main(void)
     CHECK(sent_bytes[0] == 9, "nicht alle Bytes gesendet (%u)", sent_bytes[0]);
     printf("  Teilversand wird fortgesetzt, sobald das Fenster aufgeht\n");
 
+    /* 9. No gateway, so no worker pool: s_jobs is NULL. A request for a
+          foreign unit id has nowhere to be forwarded to and must still be
+          answered on the poller rather than left waiting. This is what the
+          board ships as, so it is the ordinary case, not a corner. */
+    reset();
+    FRAME[6] = 5;                         /* not 247, not 0, not 255 */
+    give[0] = sizeof FRAME;
+    pump_slot(0);
+    FRAME[6] = 247;
+    CHECK(s_jobs == NULL, "die Vorbedingung stimmt nicht: s_jobs ist belegt");
+    CHECK(answers == 1, "fremde Unit-ID ohne Gateway nicht beantwortet (%u)", answers);
+    CHECK(queued == 0, "ohne Arbeiterpool wurde eingereiht");
+    CHECK(s_conn[0].state == SLOT_IDLE, "Platz nicht wieder freigegeben");
+    CHECK(sent_bytes[0] == 9, "Antwort nicht gesendet (%u)", sent_bytes[0]);
+    printf("  ohne Gateway wird auch eine fremde Unit-ID am Poller beantwortet\n");
+
+    /* 10. With a pool and a free worker the frame is handed over: the slot
+           stays busy, the poller sends nothing, and what was queued names
+           this slot and the whole frame. */
+    reset();
+    s_jobs = &dummy_queue; queue_ok = true;
+    FRAME[6] = 5;
+    give[0] = sizeof FRAME;
+    pump_slot(0);
+    FRAME[6] = 247;
+    CHECK(queued == 1, "fremde Unit-ID nicht an den Pool uebergeben (%u)", queued);
+    CHECK(queued_slot == 0 && queued_len == (uint16_t)sizeof FRAME,
+          "falscher Auftrag eingereiht: Platz %d, Laenge %u",
+          queued_slot, (unsigned)queued_len);
+    CHECK(s_conn[0].state == SLOT_BUSY, "Platz nicht als belegt vermerkt");
+    CHECK(answers == 0, "der Poller hat selbst geantwortet");
+    CHECK(sent_bytes[0] == 0, "der Poller hat gesendet (%u Bytes)", sent_bytes[0]);
+    CHECK(s_conn[0].out_len == 0, "der Poller hat eine Antwort gepuffert");
+    printf("  fremde Unit-ID geht an den Pool, der Platz bleibt belegt\n");
+
+    /* 11. Pool full: the client is told to retry instead of waiting for a
+           slot. The bytes have to be a Modbus exception response -- function
+           code with the high bit set, exception 0x06 -- or the client sees
+           nine bytes of nonsense and gives up. */
+    reset();
+    s_jobs = &dummy_queue; queue_ok = false;
+    FRAME[6] = 5;
+    give[0] = sizeof FRAME;
+    pump_slot(0);
+    FRAME[6] = 247;
+    CHECK(s_stats.overloaded == 1, "Ueberlast nicht gezaehlt (%u)", s_stats.overloaded);
+    CHECK(s_conn[0].state == SLOT_IDLE, "Platz nach abgewiesenem Auftrag nicht frei");
+    CHECK(answers == 0, "die Anfrage wurde doch ausgefuehrt");
+    CHECK(sent_bytes[0] == MB_MBAP_LEN + 2, "falsche Antwortlaenge (%u)", sent_bytes[0]);
+    CHECK(sent_buf[0][0] == 0 && sent_buf[0][1] == 1, "Transaktions-ID nicht gespiegelt");
+    CHECK(sent_buf[0][2] == 0 && sent_buf[0][3] == 0, "Protokoll-ID nicht 0");
+    CHECK(sent_buf[0][4] == 0 && sent_buf[0][5] == 3, "Laengenfeld nicht 3");
+    CHECK(sent_buf[0][6] == 5, "Unit-ID nicht gespiegelt (%u)", (unsigned)sent_buf[0][6]);
+    CHECK(sent_buf[0][7] == 0x81, "kein Ausnahme-Funktionscode (0x%02X)",
+          (unsigned)sent_buf[0][7]);
+    CHECK(sent_buf[0][8] == MB_EXC_DEVICE_BUSY, "nicht Ausnahme 0x06 (0x%02X)",
+          (unsigned)sent_buf[0][8]);
+    printf("  voller Pool antwortet mit Ausnahme 0x%02X statt zu warten\n",
+           (unsigned)sent_buf[0][8]);
+
     printf("%s\n", failures ? "FEHLER" : "alles in Ordnung");
     return failures ? 1 : 0;
 }
 '''
 
-cuts = "".join(cut(sig) for sig in (
-    "static void close_slot(int i)",
-    "static void queue_out(int i, const uint8_t *buf, uint16_t len)",
-    "static bool flush_out(int i)",
-    "static void sweep_deadlines(void)",
-    "static uint16_t build_busy(const uint8_t *frame, uint8_t *out)",
-    "static void pump_slot(int i, job_t *job)",
+types = "".join(src.type(e) for e in (
+    "SLOT_DEAD };",
+    "} conn_t;",
+    "} job_t;",
 ))
-defines = cut_defines("MBAP_HDR", "MBAP_LEN", "FRAME_MAX", "MB_TCP_MAX_CONN",
-                      "FRAME_WAIT_MS", "SEND_WAIT_MS")
+cuts = "".join(src.func(sig) for sig in (          # C declaration order
+    "static void arm_out(int i, uint16_t len)",
+    "static bool is_local(uint8_t uid)",
+    "static bool flush_out(int i)",
+    "static void close_slot(int i)",
+    "static bool frame_expired(int i, int64_t now)",
+    "static uint16_t build_busy(const uint8_t *frame, uint8_t *out)",
+    "static void pump_slot(int i)",
+    "static void sweep_deadlines(void)",
+))
+defines = (budget.defines("NET_SOCK_MB_CONN") +
+           src.defines("MBAP_HDR", "FRAME_MAX", "MB_TCP_MAX_CONN",
+                       "FRAME_WAIT_MS", "SEND_WAIT_MS"))
 out = pathlib.Path(__file__).with_name("test_mb_poller.c")
-out.write_text(HARNESS.replace("__DEFINES__", defines).replace("__CUT__", cuts))
+out.write_text(HARNESS.replace("__DEFINES__", defines)
+                      .replace("__TYPES__", types)
+                      .replace("__CUT__", cuts))
 print("erzeugt:", out.name)

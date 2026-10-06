@@ -449,6 +449,31 @@ rule('my-rule')
   <p id="fw-version" style="font-size:.75rem;color:#bbb;margin-top:1.5rem;text-align:right"></p>
 
   <script>
+    /* ---- Modbus master status poll ----
+       Declared here because switchTab() below drives it from page setup on. */
+    let mbmPollTimer  = null;
+    let mbmPollActive = false;
+
+    function startMbmPoll() {
+      if (mbmPollActive) return;
+      mbmPollActive = true;
+      refreshMbmStatus();          // so the table is not left on its dashes
+      scheduleMbmPoll();
+    }
+
+    function scheduleMbmPoll() {
+      mbmPollTimer = setTimeout(async () => {
+        if (!mbmPollActive) return;
+        await refreshMbmStatus();
+        if (mbmPollActive) scheduleMbmPoll();
+      }, 5000);
+    }
+
+    function stopMbmPoll() {
+      mbmPollActive = false;
+      if (mbmPollTimer) { clearTimeout(mbmPollTimer); mbmPollTimer = null; }
+    }
+
     /* ---- Tab switching ---- */
     function switchTab(name) {
       document.querySelectorAll('.tab-btn').forEach(b =>
@@ -457,6 +482,7 @@ rule('my-rule')
         p.classList.toggle('active', p.id === 'tab-' + name));
       try { localStorage.setItem('active_tab', name); } catch (_) {}
       if (name === 'rules') loadRules();
+      if (name === 'modbus') startMbmPoll(); else stopMbmPoll();
     }
 
     (function initTabs() {
@@ -494,6 +520,7 @@ rule('my-rule')
 
     function showOverlay(screen) {
       stopIoPoll();
+      stopMbmPoll();
       document.getElementById('auth-overlay').style.display = 'flex';
       showScreen(screen);
     }
@@ -725,8 +752,9 @@ rule('my-rule')
         // role to master and back would then turn Modbus TCP off behind the
         // user, from a value they never chose.
         renderMbm(cfg.mbm);
-        refreshMbmStatus();
-        if (!window._mbmTimer) window._mbmTimer = setInterval(refreshMbmStatus, 5000);
+        /* Only worth an HTTP round trip while the Modbus tab is on screen. */
+        if (document.getElementById('tab-modbus').classList.contains('active'))
+          startMbmPoll();
         if (cfg.sntp) {
           document.getElementById('sntp_enable').checked = !!cfg.sntp.enable;
           document.getElementById('sntp_server').value   = cfg.sntp.server ?? '';
@@ -954,7 +982,7 @@ rule('my-rule')
     // Shows what each row last actually read, which is the only way to tell a
     // wrong register from a device that is not answering.
     function refreshMbmStatus() {
-      apiFetch('/api/modbus/status').then(function (r) {
+      return apiFetch('/api/modbus/status').then(function (r) {
         return r.ok ? r.json() : null;
       }).then(function (d) {
         if (!d || !d.tcp_master) return;

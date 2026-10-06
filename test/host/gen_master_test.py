@@ -13,39 +13,12 @@ while the HTTP task replaced it with an unsynchronised memcpy.
 
   make -C test/host master
 """
-import pathlib, re
+import pathlib
+from cutter import Source
 
-SRC = pathlib.Path(__file__).resolve().parents[2] / "apps/full/main/mb_tcp_master.c"
-text = SRC.read_text()
-
-
-def cut_defines(*names):
-    """The #define lines themselves, so the test cannot assert a number the
-    firmware no longer uses."""
-    out = []
-    for n in names:
-        m = re.search(r"^#define\s+%s\b.*$" % re.escape(n), text, re.M)
-        if not m:
-            raise SystemExit("gen_master_test.py: #define %s not found" % n)
-        out.append(m.group(0))
-    return "\n".join(out) + "\n"
-
-
-def cut_typedef(name):
-    m = re.search(r"^typedef enum \{[^}]*\} %s;$" % re.escape(name), text, re.M)
-    if not m:
-        raise SystemExit("gen_master_test.py: typedef %s not found" % name)
-    return m.group(0) + "\n"
-
-
-def cut(signature):
-    a = text.index(signature)
-    b = text.index("{", a) + 1
-    depth = 1
-    while depth:
-        depth += (text[b] == "{") - (text[b] == "}")
-        b += 1
-    return text[a:b] + "\n"
+ROOT   = pathlib.Path(__file__).resolve().parents[2]
+src    = Source(ROOT / "apps/full/main/mb_tcp_master.c")
+budget = Source(ROOT / "apps/full/main/net_budget.h")
 
 
 HARNESS = r'''
@@ -66,14 +39,6 @@ __DEFINES__
 
 /* cut from the source: what one attempt returned */
 __TYPES__
-
-typedef struct {
-    int64_t  due_ms, value_ms;
-    double   value;
-    bool     valid;
-    uint32_t reads, errors, backoff_ms;
-    char     last_error[48];
-} entry_state_t;
 
 typedef struct { int fd; } conn_t;
 static conn_t   s_conns[CONN_CACHE];
@@ -192,12 +157,19 @@ int main(void)
     apply_staged_config();
     CHECK(!strcmp(s_active[0].name, "new_meter"), "neue Tabelle nicht uebernommen");
     CHECK(!strcmp(s_active[0].host, "192.0.2.2"), "neuer Host nicht uebernommen");
-    CHECK(!s_state[0].valid && s_state[0].value == 0 && s_state[0].reads == 0,
+    CHECK(!s_state[0].value_ms && s_state[0].value == 0 && s_state[0].reads == 0,
           "alter Status nicht geloescht");
     CHECK(s_state[0].due_ms == 5000, "Termin nicht auf jetzt gesetzt (%lld)",
           (long long)s_state[0].due_ms);
+    /* Faechern, nicht alle auf denselben Augenblick: eine Tabelle voller
+       abgeschalteter Hosts wuerde sonst eine Verbindungsfrist nach der
+       anderen zahlen, bevor ein gesunder Eintrag ueberhaupt drankommt. */
+    for (int i = 1; i < APP_CFG_MBM_COUNT; i++)
+        CHECK(s_state[i].due_ms > s_state[i - 1].due_ms,
+              "Termin %d nicht gegen %d versetzt (%lld vs %lld)", i, i - 1,
+              (long long)s_state[i].due_ms, (long long)s_state[i - 1].due_ms);
     CHECK(conn_closes == CONN_CACHE, "Verbindungen nicht verworfen");
-    printf("  Uebernahme danach: Status geleert, Termin jetzt, Verbindungen verworfen\n");
+    printf("  Uebernahme danach: Status geleert, Termine gefaechert, Verbindungen verworfen\n");
 
     /* 3. The new entry is polled with the new scale, under the new name. */
     pub_count = 0;
@@ -221,7 +193,7 @@ int main(void)
     poll_entry(&s_active[0], &s_state[0]);
     CHECK(s_state[0].errors == 1, "Fehler nicht gezaehlt");
     CHECK(s_state[0].backoff_ms == BACKOFF_FIRST_MS, "Backoff nicht gesetzt");
-    CHECK(s_state[0].valid, "ein frueherer gueltiger Wert wurde verworfen");
+    CHECK(s_state[0].value_ms != 0, "ein frueherer gueltiger Wert wurde verworfen");
     CHECK(read_calls == 1, "nicht wiederholbarer Fehler wurde wiederholt (%u)", read_calls);
     read_script[0] = RD_OK;
     printf("  fehlgeschlagener Poll: Backoff gesetzt, letzter Wert bleibt, kein zweiter Versuch\n");
@@ -262,7 +234,7 @@ int main(void)
 }
 '''
 
-cuts = "".join(cut(sig) for sig in (
+cuts = "".join(src.func(sig) for sig in (
     "static bool read_value(const mbm_poll_t *e, double *value, char *err, size_t err_len)",
     "static void publish(const mbm_poll_t *e, double value)",
     "static void poll_entry(const mbm_poll_t *e, entry_state_t *st)",
@@ -271,12 +243,13 @@ cuts = "".join(cut(sig) for sig in (
 ))
 # s_active / s_staged / s_reload_pending are declared next to the comment that
 # explains them; take them with their explanation.
-decl = text[text.index("static mbm_poll_t    s_active"):
-            text.index("static volatile bool s_reload_pending;") + len("static volatile bool s_reload_pending;")]
+decl = src.span("static mbm_poll_t    s_active", "static volatile bool s_reload_pending;")
 
 out = pathlib.Path(__file__).with_name("test_mb_master.c")
-defines = cut_defines("CONN_CACHE", "BACKOFF_FIRST_MS", "BACKOFF_MAX_MS")
+defines = (budget.defines("NET_SOCK_MB_MASTER") +
+           src.defines("CONN_CACHE", "BACKOFF_FIRST_MS", "BACKOFF_MAX_MS"))
 out.write_text(HARNESS.replace("__DEFINES__", defines)
-                      .replace("__TYPES__", cut_typedef("rd_result_t"))
+                      .replace("__TYPES__", src.typedef_enum("rd_result_t") +
+                                       src.type("} entry_state_t;"))
                       .replace("__CUT__", decl + "\n\n" + cuts))
 print("erzeugt:", out.name)

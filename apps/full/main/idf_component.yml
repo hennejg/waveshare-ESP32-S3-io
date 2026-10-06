@@ -5,6 +5,9 @@ dependencies:
   # Fork of espressif/esp-modbus 2.1.4. The upstream master API reports a slave
   # exception as ESP_FAIL without the code, so a gateway cannot pass the
   # original on to its client; the fork adds mbc_master_get_last_exception().
+  # It also carries MB_ERR_EXCEPTION(), which let a slave callback return a
+  # verbatim exception code -- left over from the design where the component's
+  # own slave served TCP, and used by nothing here since.
   espressif/esp-modbus:
     git: https://github.com/sauttefk/esp-modbus.git
     version: 77ea17d

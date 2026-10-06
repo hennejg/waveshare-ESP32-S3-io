@@ -55,6 +55,12 @@ typedef uint8_t (*mb_handler_fn)(const mb_request_t *req,
 #define MB_FC_WRITE_COILS       0x0F
 #define MB_FC_WRITE_REGISTERS   0x10
 
+/* Coils travel packed, eight to a byte, with the last byte padded. Both the
+   request count and the response length are derived from this, in enough
+   places that writing it out each time invites one of them to be written out
+   differently. */
+#define MB_BIT_BYTES(n)         (((n) + 7u) / 8u)
+
 /* How a register pair is to be read. Meters disagree about this more than
    about anything else in the protocol, so it is per value, not per device.
    A 32-bit quantity occupies two registers; "word swapped" is the CDAB order

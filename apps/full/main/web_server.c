@@ -1,4 +1,5 @@
 #include "web_server.h"
+#include "net_budget.h"
 #include "app_config.h"
 #include "app_time.h"
 #include "auth.h"
@@ -328,24 +329,28 @@ static esp_err_t api_auth_set_password(httpd_req_t *req)
 /* The value types and the two readable function codes travel as names rather
    than numbers: a configuration is read by people, and "f32" says what 4 does
    not. */
+/* One table rather than two chains: they are exact inverses, and a type added
+   to one of them alone would read back as something it is not. u16 is the
+   default on both sides and so needs no row. */
+static const struct { const char *name; uint8_t type; } k_mbm_types[] = {
+    { "s16", MBM_VAL_S16 },
+    { "u32", MBM_VAL_U32 },
+    { "s32", MBM_VAL_S32 },
+    { "f32", MBM_VAL_F32 },
+};
+
 static const char *mbm_type_name(uint8_t t)
 {
-    switch (t) {
-    case MBM_VAL_S16: return "s16";
-    case MBM_VAL_U32: return "u32";
-    case MBM_VAL_S32: return "s32";
-    case MBM_VAL_F32: return "f32";
-    default:          return "u16";
-    }
+    for (size_t i = 0; i < sizeof(k_mbm_types) / sizeof(k_mbm_types[0]); i++)
+        if (k_mbm_types[i].type == t) return k_mbm_types[i].name;
+    return "u16";
 }
 
 static void mbm_type_value(const char *s, uint8_t *out)
 {
-    if      (!strcmp(s, "s16")) *out = MBM_VAL_S16;
-    else if (!strcmp(s, "u32")) *out = MBM_VAL_U32;
-    else if (!strcmp(s, "s32")) *out = MBM_VAL_S32;
-    else if (!strcmp(s, "f32")) *out = MBM_VAL_F32;
-    else                        *out = MBM_VAL_U16;
+    for (size_t i = 0; i < sizeof(k_mbm_types) / sizeof(k_mbm_types[0]); i++)
+        if (!strcmp(s, k_mbm_types[i].name)) { *out = k_mbm_types[i].type; return; }
+    *out = MBM_VAL_U16;
 }
 
 static esp_err_t api_config_get(httpd_req_t *req)
@@ -676,8 +681,9 @@ static esp_err_t api_config_post(httpd_req_t *req)
                 else if (e->scale == 0.0f)        why = "a Modbus master scale must be a non-zero finite number";
                 else {
                     /* Two entries of the same name would publish to one topic
-                       and feed one rule key, last poll winning at random. The
-                       di and dout names are checked the same way. */
+                       and feed one rule key, last poll winning at random.
+                       validate_names() does the same for di and dout, but only
+                       against '/': those names are not MQTT topics of their own. */
                     for (int j = 0; j < i; j++)
                         if (cfg.mbm[j].enable && !strcmp(cfg.mbm[j].name, e->name)) {
                             why = "two Modbus master entries have the same name";
@@ -1456,6 +1462,7 @@ esp_err_t web_server_start(void)
     if (s_server) return ESP_OK;
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.max_open_sockets = NET_SOCK_HTTPD_CLIENTS;   /* the share net_budget.h allots */
     cfg.uri_match_fn     = httpd_uri_match_wildcard;
     /* Derive from the table so adding a handler never overflows the cap and
      * silently drops the last registration (the wildcard file-serving fallback). */

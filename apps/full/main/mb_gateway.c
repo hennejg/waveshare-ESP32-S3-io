@@ -1,4 +1,6 @@
 #include "mb_gateway.h"
+#include "mb_tcp_server.h"
+#include "mb_pdu.h"
 
 #include <string.h>
 #include "esp_check.h"
@@ -22,12 +24,17 @@
 
 /* How long a request waits for its turn on the segment before being turned
    away, derived from the timeout actually configured rather than from the
-   ceiling the configuration allows. It has to clear the worst case of the
-   three other connection workers ahead of it each timing out first, plus the
-   stack's cooldown; beyond that the client is told to retry rather than left
-   hanging for longer than any Modbus client waits. Against the compile-time
-   ceiling this came to 40 s, which no client would still be listening for. */
-#define GW_QUEUE_AHEAD 3
+   ceiling the configuration allows. It has to clear the worst case of every
+   other connection worker ahead of it timing out first, plus the stack's
+   cooldown; beyond that the client is told to retry rather than left hanging
+   for longer than any Modbus client waits. Against the compile-time ceiling
+   this came to 40 s, which no client would still be listening for.
+
+   Derived rather than written out: the workers are the only thing that can
+   queue here, so raising MB_TCP_WORKERS without this following would make the
+   wait too short and hand out "busy" for requests that would have been
+   served, with nothing to say so. */
+#define GW_QUEUE_AHEAD (MB_TCP_WORKERS - 1)
 static uint32_t s_bus_wait_ms = 4000;
 
 static void             *s_master = NULL;
@@ -188,7 +195,7 @@ static void regs_to_wire(uint8_t *wire, const uint16_t *regs, uint16_t count)
 static void wire_to_regs(uint16_t *regs, const uint8_t *wire, uint16_t count)
 {
     for (uint16_t i = 0; i < count; i++)
-        regs[i] = (uint16_t)((wire[i * 2] << 8) | wire[i * 2 + 1]);
+        regs[i] = mb_be16(&wire[i * 2]);
 }
 
 uint8_t mb_gateway_handle(uint8_t uid, const mb_request_t *req,
@@ -198,9 +205,9 @@ uint8_t mb_gateway_handle(uint8_t uid, const mb_request_t *req,
 
     switch (req->fc) {
 
-    case MB_FUNC_READ_COILS:
-    case MB_FUNC_READ_DISCRETE_INPUTS: {
-        size_t bytes = (size_t)((req->count + 7u) / 8u);
+    case MB_FC_READ_COILS:
+    case MB_FC_READ_DISCRETE: {
+        size_t bytes = (size_t)MB_BIT_BYTES(req->count);
         if (bytes > MB_DATA_MAX) return MB_EXC_ILLEGAL_VALUE;
         /* The master copies into a buffer of its own, so the response slice
            cannot be handed to it directly. Both sides use the same packed
@@ -212,8 +219,8 @@ uint8_t mb_gateway_handle(uint8_t uid, const mb_request_t *req,
         return exc;
     }
 
-    case MB_FUNC_READ_HOLDING_REGISTER:
-    case MB_FUNC_READ_INPUT_REGISTER: {
+    case MB_FC_READ_HOLDING:
+    case MB_FC_READ_INPUT: {
         if ((size_t)req->count * 2u > MB_DATA_MAX) return MB_EXC_ILLEGAL_VALUE;
         uint16_t tmp[GW_BUF_BYTES / 2];
         uint8_t exc = transact(uid, req->fc, req->addr, req->count, tmp);
@@ -224,27 +231,27 @@ uint8_t mb_gateway_handle(uint8_t uid, const mb_request_t *req,
         return exc;
     }
 
-    case MB_FUNC_WRITE_SINGLE_COIL: {
+    case MB_FC_WRITE_COIL: {
         /* The stack takes the value as a uint16 and puts it on the wire as
            0xFF00 or 0x0000; the request already carries exactly those bytes. */
-        uint16_t v = (uint16_t)((req->data[0] << 8) | req->data[1]);
+        uint16_t v = mb_be16(req->data);
         return transact(uid, req->fc, req->addr, 1, &v);
     }
 
-    case MB_FUNC_WRITE_REGISTER: {
-        uint16_t v = (uint16_t)((req->data[0] << 8) | req->data[1]);
+    case MB_FC_WRITE_REGISTER: {
+        uint16_t v = mb_be16(req->data);
         return transact(uid, req->fc, req->addr, 1, &v);
     }
 
-    case MB_FUNC_WRITE_MULTIPLE_COILS: {
-        size_t bytes = (size_t)((req->count + 7u) / 8u);
+    case MB_FC_WRITE_COILS: {
+        size_t bytes = (size_t)MB_BIT_BYTES(req->count);
         if (bytes > MB_DATA_MAX) return MB_EXC_ILLEGAL_VALUE;
         uint8_t tmp[GW_BUF_BYTES];
         memcpy(tmp, req->data, bytes);
         return transact(uid, req->fc, req->addr, req->count, tmp);
     }
 
-    case MB_FUNC_WRITE_MULTIPLE_REGISTERS: {
+    case MB_FC_WRITE_REGISTERS: {
         if ((size_t)req->count * 2u > MB_DATA_MAX) return MB_EXC_ILLEGAL_VALUE;
         uint16_t tmp[GW_BUF_BYTES / 2];
         wire_to_regs(tmp, req->data, req->count);

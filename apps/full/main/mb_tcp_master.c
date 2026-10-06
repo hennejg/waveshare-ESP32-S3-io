@@ -21,9 +21,26 @@
 #include "app_config.h"
 #include "app_mqtt.h"
 #include "mb_pdu.h"
+#include "net_budget.h"
 #include "scripting.h"
 
 #define TAG "mb_master"
+
+/* Why this is not the component's own TCP master.
+ *
+ * mbc_master_create_tcp() is given its whole node list at once, in
+ * tcp_opts.ip_addr_table, and its parameter descriptors once more through
+ * mbc_master_set_descriptor(). The public API has no way to change either
+ * afterwards -- only create, start, stop, delete. These eight entries are
+ * rows in a web form: correcting the address of one of them would mean
+ * tearing down the master and rebuilding it, taking the other seven off the
+ * air for as long as that takes, on every save.
+ *
+ * Reading registers over TCP is also the one part of Modbus that is nearly
+ * all framing, and the framing is already here: mb_pdu.c builds the request
+ * and checks the answer, with no dependency on the component or on the
+ * board, which is why it can be and is tested on a development machine. What
+ * is left below that is a socket and a clock. */
 
 /* app_config.h cannot include mb_request.h -- it belongs to the board and
    must not depend on the application -- so the value types are written out
@@ -48,9 +65,10 @@ _Static_assert(MBM_VAL_U16 == MB_VAL_U16 && MBM_VAL_S16 == MB_VAL_S16 &&
 #define BACKOFF_MAX_MS   60000
 
 /* Connections are kept open between polls -- a meter polled every second
-   should not see a new connection every second. Three covers the usual case
-   of one or two devices without holding sockets the web server needs. */
-#define CONN_CACHE       3
+   should not see a new connection every second. The share is what the board
+   can spare, not what the table could use: eight entries on eight distinct
+   hosts will redial, which costs a connect per poll and nothing else. */
+#define CONN_CACHE       NET_SOCK_MB_MASTER
 #define CONN_IDLE_MS    60000
 
 typedef struct {
@@ -64,7 +82,6 @@ typedef struct {
     int64_t  due_ms;
     int64_t  value_ms;     /* when the last good value arrived, 0 = never */
     double   value;
-    bool     valid;
     uint32_t reads;
     uint32_t errors;
     uint32_t backoff_ms;
@@ -83,24 +100,22 @@ static SemaphoreHandle_t s_state_mux;
 #define ST_LOCK()   do { if (s_state_mux) xSemaphoreTake(s_state_mux, portMAX_DELAY); } while (0)
 #define ST_UNLOCK() do { if (s_state_mux) xSemaphoreGive(s_state_mux); } while (0)
 
-/* Set by a configuration change, acted on by the polling task: the cached
-   sockets belong to that task and must not be closed from under it. */
 /* The table this task works from, and nobody else touches.
  *
- * Reading the shared configuration directly cannot be made safe by ordering
- * or by a generation counter, because the writer replaces the whole struct
- * with an unsynchronised memcpy and only afterwards says so. A poll that read
- * it mid-copy could take the new name with the old host and publish one
- * device's reading under another's name, and no later signal could take that
- * back.
- *
- * So the configuration is handed over instead of shared: the HTTP task leaves
- * a complete copy in s_staged, and this task picks it up between polls, where
- * nothing of its own is in flight. Everything that follows -- which entry is
- * polled, what its answer is committed to, what name it is published under --
- * then belongs to one task from start to finish. */
+ * A poll has to be committed against the configuration it was started from:
+ * which entry is polled, what its answer is committed to, what name it is
+ * published under all belong to one generation from start to finish, and the
+ * counters, due times and cached sockets have to change over together at one
+ * defined point between polls. Reading the shared configuration directly
+ * offers no such point, whatever it is guarded with. So the configuration is
+ * handed over instead: the HTTP task leaves a complete copy in s_staged, and
+ * this task picks it up between polls, where nothing of its own is in flight.
+ * That it also sidesteps the unsynchronised memcpy in app_config_update() is
+ * a property of that function, not of this file. */
 static mbm_poll_t    s_active[APP_CFG_MBM_COUNT];   /* this task only       */
 static mbm_poll_t    s_staged[APP_CFG_MBM_COUNT];   /* under s_state_mux    */
+/* Set by a configuration change, acted on by the polling task: the cached
+   sockets belong to that task and must not be closed from under it. */
 static volatile bool s_reload_pending;
 
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
@@ -393,9 +408,6 @@ static void publish(const mbm_poll_t *e, double value)
 
 /* ------------------------------------------------------------------ task */
 
-/* e is a copy, not a pointer into the live configuration: the HTTP task
-   overwrites that table in place, and a read in progress would otherwise
-   finish against an entry that describes a different device. */
 /* e points into s_active, which only this task writes and only between
    polls, so it cannot change under this function. The status commit still
    takes the lock -- the HTTP task reads the status -- but there is nothing
@@ -411,7 +423,6 @@ static void poll_entry(const mbm_poll_t *e, entry_state_t *st)
     if (ok) {
         st->value      = value;
         st->value_ms   = now_ms();
-        st->valid      = true;
         st->reads++;
         st->backoff_ms = 0;
         st->last_error[0] = '\0';
@@ -447,8 +458,13 @@ static void apply_staged_config(void)
        backoff earned by a host that has been corrected, counters belonging to
        another device. */
     memset(s_state, 0, sizeof(s_state));
+    /* Spread out rather than all due at the same instant. The one polling task
+       works them in order, and an entry whose host is switched off costs a
+       full connect timeout before the next one is even tried; a tableful of
+       those, paid back to back, is most of a minute in which every healthy
+       entry misses its interval. */
     int64_t now = now_ms();
-    for (int i = 0; i < APP_CFG_MBM_COUNT; i++) s_state[i].due_ms = now;
+    for (int i = 0; i < APP_CFG_MBM_COUNT; i++) s_state[i].due_ms = now + i * 200;
     ST_UNLOCK();
 
     /* A cached socket may lead to a device nobody asks about any more. */
@@ -562,7 +578,7 @@ uint8_t mb_tcp_master_get_status(mbm_status_t *out, uint8_t count)
            apart. */
         out[n] = (mbm_status_t){
             .enabled = s_active[i].enable != 0,
-            .valid   = st->valid,
+            .valid   = st->value_ms != 0,
             .value   = st->value,
             .age_ms  = st->value_ms ? (now_ms() - st->value_ms) : -1,
             .reads   = st->reads,

@@ -52,16 +52,30 @@ CONFIG_APP_MATTER_ENABLE=n
 
 # Sockets. The default of ten is shared by the web server, MQTT and SNTP;
 # Modbus TCP serving several clients at once needs its own share on top.
+# apps/full/main/net_budget.h divides this up and checks the sum at compile
+# time -- change the figure there as well, not only here.
 CONFIG_LWIP_MAX_SOCKETS=24
 
 # cJSON parses by recursion and guards only the nesting depth, not the stack.
 # At the default of 1000 a body of nothing but '[' overflows the HTTP task's
-# stack -- and /api/auth/set-password parses before it checks the token, so
-# that is reachable without credentials. The deepest JSON this firmware reads
-# is three levels (object, array, object).
+# stack. The deepest JSON this firmware reads is three levels (object, array,
+# object), so sixteen costs nothing and bounds every parser in the build.
+#
+# Defence in depth, not the fix: /api/auth/set-password still parses before it
+# checks the token, so an unauthenticated caller still reaches the parser. The
+# fix for that is to consume the token first, and until it is done this line
+# is load-bearing for more than it looks -- raising it again re-exposes that
+# path, and a future API needing deeper nesting fails looking like a
+# malformed body.
 CONFIG_CJSON_NESTING_LIMIT=16
 
 # The Modbus master's response timeout is a setting, up to 10 s. The stack
 # silently replaces any value at or above this threshold with its own default,
 # so the threshold has to be above the range the configuration offers.
+#
+# It is not only that threshold: the same symbol is MB_MAX_RESP_DELAY_MS, the
+# semaphore timeout on every master API call. Raising it widens the worst case
+# for which a gateway worker can sit inside one call holding the segment, so
+# GW_QUEUE_AHEAD in mb_gateway.c is what keeps a waiting client's own timeout
+# ahead of it.
 CONFIG_FMB_MASTER_MAX_API_BLOCKING_TIME_MS=12000
