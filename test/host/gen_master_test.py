@@ -13,10 +13,29 @@ while the HTTP task replaced it with an unsynchronised memcpy.
 
   make -C test/host master
 """
-import pathlib
+import pathlib, re
 
 SRC = pathlib.Path(__file__).resolve().parents[2] / "apps/full/main/mb_tcp_master.c"
 text = SRC.read_text()
+
+
+def cut_defines(*names):
+    """The #define lines themselves, so the test cannot assert a number the
+    firmware no longer uses."""
+    out = []
+    for n in names:
+        m = re.search(r"^#define\s+%s\b.*$" % re.escape(n), text, re.M)
+        if not m:
+            raise SystemExit("gen_master_test.py: #define %s not found" % n)
+        out.append(m.group(0))
+    return "\n".join(out) + "\n"
+
+
+def cut_typedef(name):
+    m = re.search(r"^typedef enum \{[^}]*\} %s;$" % re.escape(name), text, re.M)
+    if not m:
+        raise SystemExit("gen_master_test.py: typedef %s not found" % name)
+    return m.group(0) + "\n"
 
 
 def cut(signature):
@@ -43,9 +62,10 @@ HARNESS = r'''
 #define ESP_LOGW(...)   ((void)0)
 #define ESP_LOGI(...)   ((void)0)
 #define ESP_LOGE(...)   ((void)0)
-#define CONN_CACHE       3
-#define BACKOFF_FIRST_MS 2000
-#define BACKOFF_MAX_MS  60000
+__DEFINES__
+
+/* cut from the source: what one attempt returned */
+__TYPES__
 
 typedef struct {
     int64_t  due_ms, value_ms;
@@ -74,23 +94,33 @@ static int lock_depth, lock_max;
 static app_config_t fake_cfg;
 const app_config_t *app_config_get(void) { return &fake_cfg; }
 
-/* What poll_entry gets back, and what it was asked for when it was called. */
-static bool   read_ok = true;
-static double read_value_out = 123.0;
-static char   read_host_seen[APP_CFG_MBM_HOST_LEN + 1];
-static char   read_name_seen[APP_CFG_MBM_NAME_LEN + 1];
-static void (*during_read)(void);
+/* read_value() is cut from the source and tested; what it calls is stubbed.
+   The retry decision lives in read_value, and it is the thing an outside
+   review found wrong -- a host that cannot be reached at all was dialled
+   twice per poll. Counting the calls is how that is pinned down. */
+static rd_result_t read_script[4] = { RD_OK, RD_OK, RD_OK, RD_OK };
+static unsigned    read_calls;
+static double      read_value_out = 123.0;
+static char        read_host_seen[APP_CFG_MBM_HOST_LEN + 1];
+static char        read_name_seen[APP_CFG_MBM_NAME_LEN + 1];
+static void      (*during_read)(void);
 
-static bool read_value(const mbm_poll_t *e, double *value, char *err, size_t err_len)
+static uint16_t mb_value_regs(uint8_t type) { return type <= MBM_VAL_S16 ? 1 : 2; }
+
+static rd_result_t read_once(const mbm_poll_t *e, uint16_t regs, double *value,
+                             char *err, size_t err_len)
 {
+    (void)regs;
     strlcpy(read_host_seen, e->host, sizeof(read_host_seen));
     strlcpy(read_name_seen, e->name, sizeof(read_name_seen));
     if (during_read) { void (*f)(void) = during_read; during_read = NULL; f(); }
-    if (!read_ok) { snprintf(err, err_len, "no answer"); return false; }
-    /* The real one scales before it returns; keeping that here means the
-       test exercises what poll_entry() actually publishes. */
+
+    rd_result_t r = read_script[read_calls < 4 ? read_calls : 3];
+    read_calls++;
+    if (r != RD_OK) { snprintf(err, err_len, "no answer"); return r; }
+    /* The real one scales before it returns. */
     *value = read_value_out * (double)e->scale;
-    return true;
+    return RD_OK;
 }
 
 /* Where a published value ends up. */
@@ -186,13 +216,43 @@ int main(void)
     printf("  Uebernahme ohne Anforderung aendert nichts\n");
 
     /* 5. A failed read leaves no value and arms the backoff. */
-    read_ok = false;
+    read_script[0] = RD_FAILED;
+    read_calls = 0;
     poll_entry(&s_active[0], &s_state[0]);
     CHECK(s_state[0].errors == 1, "Fehler nicht gezaehlt");
     CHECK(s_state[0].backoff_ms == BACKOFF_FIRST_MS, "Backoff nicht gesetzt");
     CHECK(s_state[0].valid, "ein frueherer gueltiger Wert wurde verworfen");
-    read_ok = true;
-    printf("  fehlgeschlagener Poll: Backoff gesetzt, letzter Wert bleibt\n");
+    CHECK(read_calls == 1, "nicht wiederholbarer Fehler wurde wiederholt (%u)", read_calls);
+    read_script[0] = RD_OK;
+    printf("  fehlgeschlagener Poll: Backoff gesetzt, letzter Wert bleibt, kein zweiter Versuch\n");
+
+    /* 6. The retry decision. Only a connection kept from an earlier poll is
+          worth a second attempt; a host that cannot be reached at all, or a
+          device that answered, must not be asked twice -- that cost two full
+          connect timeouts per poll on the one polling task. */
+    char err[48]; double v = 0;
+
+    read_calls = 0; read_script[0] = RD_OK;
+    CHECK(read_value(&s_active[0], &v, err, sizeof err) && read_calls == 1,
+          "Erfolg brauchte %u Versuche", read_calls);
+
+    read_calls = 0; read_script[0] = RD_FAILED;
+    CHECK(!read_value(&s_active[0], &v, err, sizeof err) && read_calls == 1,
+          "endgueltiger Fehler wurde wiederholt (%u Versuche)", read_calls);
+
+    read_calls = 0; read_script[0] = RD_STALE_CONN; read_script[1] = RD_OK;
+    CHECK(read_value(&s_active[0], &v, err, sizeof err) && read_calls == 2,
+          "veraltete Verbindung: %u Versuche, erwartet 2", read_calls);
+
+    read_calls = 0; read_script[0] = RD_STALE_CONN; read_script[1] = RD_FAILED;
+    CHECK(!read_value(&s_active[0], &v, err, sizeof err) && read_calls == 2,
+          "veraltete Verbindung mit zweitem Fehlschlag: %u Versuche", read_calls);
+
+    read_calls = 0; read_script[0] = RD_STALE_CONN; read_script[1] = RD_STALE_CONN;
+    CHECK(!read_value(&s_active[0], &v, err, sizeof err) && read_calls == 2,
+          "mehr als ein zweiter Versuch (%u)", read_calls);
+    read_script[1] = RD_OK;
+    printf("  Wiederholung nur bei veralteter Verbindung, und nur einmal\n");
 
     CHECK(lock_depth == 0, "Sperre nicht ausgeglichen (%d)", lock_depth);
     CHECK(lock_max == 1, "Sperre wurde verschachtelt genommen (%d)", lock_max);
@@ -203,6 +263,7 @@ int main(void)
 '''
 
 cuts = "".join(cut(sig) for sig in (
+    "static bool read_value(const mbm_poll_t *e, double *value, char *err, size_t err_len)",
     "static void publish(const mbm_poll_t *e, double value)",
     "static void poll_entry(const mbm_poll_t *e, entry_state_t *st)",
     "static void apply_staged_config(void)",
@@ -214,5 +275,8 @@ decl = text[text.index("static mbm_poll_t    s_active"):
             text.index("static volatile bool s_reload_pending;") + len("static volatile bool s_reload_pending;")]
 
 out = pathlib.Path(__file__).with_name("test_mb_master.c")
-out.write_text(HARNESS.replace("__CUT__", decl + "\n\n" + cuts))
+defines = cut_defines("CONN_CACHE", "BACKOFF_FIRST_MS", "BACKOFF_MAX_MS")
+out.write_text(HARNESS.replace("__DEFINES__", defines)
+                      .replace("__TYPES__", cut_typedef("rd_result_t"))
+                      .replace("__CUT__", decl + "\n\n" + cuts))
 print("erzeugt:", out.name)

@@ -601,7 +601,8 @@ static esp_err_t api_config_post(httpd_req_t *req)
     }
 
     cJSON *mbm_j = cJSON_GetObjectItem(root, "mbm");
-    if (cJSON_IsArray(mbm_j)) {
+    bool mbm_present = cJSON_IsArray(mbm_j);
+    if (mbm_present) {
         /* The array replaces the table wholesale rather than being merged into
            it: a partial update would leave an entry the user deleted in the
            UI still being polled. Entries past the end are cleared. */
@@ -720,11 +721,16 @@ static esp_err_t api_config_post(httpd_req_t *req)
 
     app_config_update(&cfg);
 
-    /* The Modbus master re-reads the table on its own, but the task only
-       exists once something is enabled -- and what it knew about the old
-       entries no longer describes the new ones. Everything else on this page
-       needs a reboot, which is what the form says; this one does not have to. */
-    mb_tcp_master_reload();
+    /* Only when this request actually carried the table. Reloading clears the
+       master's counters and drops its connections to every meter, so doing it
+       for a request that merely renamed an input or changed the NTP server
+       would throw away readings nobody asked to lose.
+
+       The master re-reads the table on its own, but the task only exists once
+       something is enabled, and what it knew about the old entries no longer
+       describes the new ones. Everything else on this page needs a reboot,
+       which is what the form says; this one does not have to. */
+    if (mbm_present) mb_tcp_master_reload();
     sntp_sync_apply();    /* apply any SNTP server / enable change immediately */
     app_time_apply_tz();  /* apply any timezone change to localtime + cron */
     di_publish_all();

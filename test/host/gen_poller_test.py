@@ -16,10 +16,26 @@ by an outside review:
 
 Run through the Makefile: make -C test/host poller
 """
-import pathlib, sys
+import pathlib, re, sys
 
 SRC = pathlib.Path(__file__).resolve().parents[2] / "apps/full/main/mb_tcp_server.c"
 text = SRC.read_text()
+
+
+def cut_defines(*names):
+    """The #define lines themselves, taken from the source.
+
+    Re-typing them in the harness was the flaw an outside review pointed at:
+    raising FRAME_WAIT_MS in the firmware would have left the test asserting
+    the old number and still passing.
+    """
+    out = []
+    for n in names:
+        m = re.search(r"^#define\s+%s\b.*$" % re.escape(n), text, re.M)
+        if not m:
+            raise SystemExit("gen_poller_test.py: #define %s not found" % n)
+        out.append(m.group(0))
+    return "\n".join(out) + "\n"
 
 
 def cut(signature):
@@ -43,14 +59,9 @@ HARNESS = r'''
 #include <string.h>
 #include "mb_pdu.h"
 
-#define FRAME_WAIT_MS     200
-#define MBAP_HDR            6
-#define MBAP_LEN            7
-#define FRAME_MAX        (MBAP_LEN + MB_PDU_MAX)
-#define MB_TCP_MAX_CONN     8
 #define pdTRUE              1
 #define MSG_DONTWAIT     0x08
-#define SEND_WAIT_MS      500
+__DEFINES__
 #define ESP_LOGW(...)    ((void)0)
 
 enum { SLOT_FREE = 0, SLOT_IDLE, SLOT_BUSY, SLOT_DEAD };
@@ -84,7 +95,14 @@ static unsigned pos[MB_TCP_MAX_CONN];
 static int64_t  ready_at[MB_TCP_MAX_CONN];
 static unsigned give[MB_TCP_MAX_CONN];     /* bytes this fd will ever give */
 
-static const uint8_t FRAME[] = { 0,1, 0,0, 0,6, 247, 1, 0,0, 0,1 };  /* FC01, local */
+static uint8_t FRAME[] = { 0,1, 0,0, 0,6, 247, 1, 0,0, 0,1 };  /* FC01, local */
+
+/* How a connection behaves once it has given everything it is going to:
+   nothing more for now, a clean close, or a reset. The last two are the two
+   branches of pump_slot() that close a slot, and without them a regression
+   that leaked a slot on a half-close would pass unnoticed. */
+enum { END_SILENT = 0, END_EOF, END_RESET };
+static int end_mode[MB_TCP_MAX_CONN];
 
 static int64_t esp_timer_get_time(void) { return clock_us; }
 
@@ -93,7 +111,12 @@ static int64_t esp_timer_get_time(void) { return clock_us; }
 static int recv(int fd, void *buf, size_t n, int flags)
 {
     (void)flags;
-    if (pos[fd] >= give[fd] || clock_us < ready_at[fd]) { errno = EAGAIN; return -1; }
+    if (clock_us < ready_at[fd]) { errno = EAGAIN; return -1; }
+    if (pos[fd] >= give[fd]) {
+        if (end_mode[fd] == END_EOF)   return 0;
+        if (end_mode[fd] == END_RESET) { errno = ECONNRESET; return -1; }
+        errno = EAGAIN; return -1;
+    }
     size_t avail = give[fd] - pos[fd];
     if (n > avail) n = avail;
     memcpy(buf, FRAME + pos[fd], n);
@@ -135,6 +158,7 @@ static void reset(void)
     memset(s_conn, 0, sizeof s_conn);
     memset(pos, 0, sizeof pos);
     memset(give, 0, sizeof give);
+    memset(end_mode, 0, sizeof end_mode);
     memset(ready_at, 0, sizeof ready_at);
     memset(sent_bytes, 0, sizeof sent_bytes);
     clock_us = 0; answers = 0; closes = 0; s_stats.malformed = 0;
@@ -179,8 +203,6 @@ int main(void)
     CHECK(s_conn[0].state == SLOT_FREE, "Verbindung nach Fristablauf nicht geschlossen");
     CHECK(s_stats.malformed == 1, "Fristablauf nicht gezaehlt");
 
-    clock_us = 360000; give[0] = sizeof FRAME;   /* the body, too late */
-    CHECK(answers == 0, "verspaeteter Rahmen doch noch beantwortet");
     printf("  zerstueckelter Rahmen bei 200 ms beendet, nicht bei 360\n");
 
     /* 3. A frame that arrives in pieces but inside the deadline is served. */
@@ -206,15 +228,46 @@ int main(void)
     CHECK(closes == 0, "ruhende Verbindung wurde geschlossen");
     printf("  ruhende Verbindung nach einer Stunde noch offen\n");
 
-    /* 5. A header that is not Modbus ends the connection at once. */
+    /* 5. A header that is not Modbus ends the connection at once -- this is
+          what stops a non-Modbus client from holding a slot. */
     reset();
     give[0] = sizeof FRAME;
-    s_conn[0].frame[0] = 0;                 /* overwritten by the read anyway */
-    clock_us = 0;
-    /* protocol id 1 instead of 0 */
+    FRAME[2] = 1;                           /* protocol id 1 instead of 0 */
     pump_slot(0, &j);
-    CHECK(answers == 1, "gueltiger Rahmen nicht beantwortet");
-    printf("  gueltiger Rahmen weiterhin beantwortet\n");
+    FRAME[2] = 0;
+    CHECK(answers == 0, "Rahmen mit falscher Protokoll-ID wurde beantwortet");
+    CHECK(s_conn[0].state == SLOT_FREE, "Verbindung nicht geschlossen");
+    CHECK(s_stats.malformed == 1, "nicht als fehlerhaft gezaehlt");
+
+    /* And a length field outside what a PDU can be. */
+    reset();
+    give[0] = sizeof FRAME;
+    FRAME[5] = 1;                           /* length 1: less than the unit id */
+    pump_slot(0, &j);
+    FRAME[5] = 6;
+    CHECK(s_conn[0].state == SLOT_FREE, "Rahmen mit unmoeglicher Laenge angenommen");
+    CHECK(s_stats.malformed == 1, "nicht als fehlerhaft gezaehlt");
+    printf("  falsche Protokoll-ID und unmoegliche Laenge beenden die Verbindung\n");
+
+    /* 5b. The two ways a peer can go away, both of which must free the slot. */
+    reset();
+    end_mode[0] = END_EOF;                  /* clean close, nothing given */
+    pump_slot(0, &j);
+    CHECK(s_conn[0].state == SLOT_FREE, "sauberer Abbruch gibt den Platz nicht frei");
+    CHECK(closes == 1, "Socket nicht geschlossen");
+
+    reset();
+    end_mode[0] = END_RESET;                /* reset */
+    pump_slot(0, &j);
+    CHECK(s_conn[0].state == SLOT_FREE, "Reset gibt den Platz nicht frei");
+    CHECK(closes == 1, "Socket nicht geschlossen");
+
+    /* A peer that closes mid-frame must not leave the frame half-held. */
+    reset();
+    give[0] = 3; end_mode[0] = END_EOF;
+    pump_slot(0, &j);
+    CHECK(s_conn[0].state == SLOT_FREE, "Abbruch mitten im Rahmen nicht behandelt");
+    printf("  Abbruch und Reset geben den Platz frei, auch mitten im Rahmen\n");
 
     /* 6. A client that has stopped reading must not hold the poll loop, and
           must not let another connection's frame deadline slip past unseen.
@@ -275,6 +328,8 @@ cuts = "".join(cut(sig) for sig in (
     "static uint16_t build_busy(const uint8_t *frame, uint8_t *out)",
     "static void pump_slot(int i, job_t *job)",
 ))
+defines = cut_defines("MBAP_HDR", "MBAP_LEN", "FRAME_MAX", "MB_TCP_MAX_CONN",
+                      "FRAME_WAIT_MS", "SEND_WAIT_MS")
 out = pathlib.Path(__file__).with_name("test_mb_poller.c")
-out.write_text(HARNESS.replace("__CUT__", cuts))
+out.write_text(HARNESS.replace("__DEFINES__", defines).replace("__CUT__", cuts))
 print("erzeugt:", out.name)

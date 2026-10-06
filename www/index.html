@@ -705,6 +705,11 @@ rule('my-rule')
           document.getElementById('can_tx_interval').value  = cfg.can.tx_interval_ms ?? 1000;
           updateCanFields();
         }
+        // Before anything is painted, not after: updateModbusFields() runs
+        // inside the block below and would otherwise apply a snapshot taken
+        // before this load -- turning Modbus TCP off from a value the user
+        // never chose, on the next switch back to slave.
+        mbSavedTcp = null;
         if (cfg.modbus) {
           document.getElementById('mb_enable').checked  = !!cfg.modbus.enable;
           document.getElementById('mb_address').value   = cfg.modbus.address  ?? 1;
@@ -719,7 +724,6 @@ rule('my-rule')
         // reload it would restore a state two page loads old -- switching the
         // role to master and back would then turn Modbus TCP off behind the
         // user, from a value they never chose.
-        mbSavedTcp = null;
         renderMbm(cfg.mbm);
         refreshMbmStatus();
         if (!window._mbmTimer) window._mbmTimer = setInterval(refreshMbmStatus, 5000);

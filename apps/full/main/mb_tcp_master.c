@@ -263,14 +263,19 @@ static bool io_all(int fd, uint8_t *buf, size_t len, bool sending, bool *closed)
     return true;
 }
 
-/* One read, start to finish. *fresh tells the caller whether the connection
-   it used had just been opened. Returns true with *value set, or false with
-   the reason in err. */
-static bool read_once(const mbm_poll_t *e, uint16_t regs, double *value,
-                      bool *fresh, char *err, size_t err_len)
+/* What happened to one attempt, and whether trying again could change it. */
+typedef enum { RD_OK, RD_FAILED, RD_STALE_CONN } rd_result_t;
+
+/* One read, start to finish. Returns RD_STALE_CONN only for a failure that a
+   fresh connection might cure: the connection was one kept from an earlier
+   poll and the exchange on it went wrong. A connection that could not be
+   opened at all, or a device that answered, are not that. */
+static rd_result_t read_once(const mbm_poll_t *e, uint16_t regs, double *value,
+                             char *err, size_t err_len)
 {
-    conn_t *c = conn_get(e->host, e->port, fresh, err, err_len);
-    if (!c) return false;
+    bool fresh = false;
+    conn_t *c = conn_get(e->host, e->port, &fresh, err, err_len);
+    if (!c) return RD_FAILED;        /* no connection; dialling again is the same */
 
     uint8_t  req[MB_MBAP_LEN + 5];
     uint16_t tid = ++s_tid;
@@ -281,7 +286,7 @@ static bool read_once(const mbm_poll_t *e, uint16_t regs, double *value,
         snprintf(err, err_len, closed ? "connection lost while sending"
                                       : "could not send in %d ms", RESPONSE_MS);
         conn_close(c);
-        return false;
+        return fresh ? RD_FAILED : RD_STALE_CONN;
     }
 
     /* The header says how long the rest is, so it is read in two goes rather
@@ -291,18 +296,18 @@ static bool read_once(const mbm_poll_t *e, uint16_t regs, double *value,
         snprintf(err, err_len, closed ? "connection closed by the device"
                                       : "no answer in %d ms", RESPONSE_MS);
         conn_close(c);
-        return false;
+        return fresh ? RD_FAILED : RD_STALE_CONN;
     }
     uint16_t rest = mb_be16(&rsp[4]);
     if (rest < 2 || rest > sizeof(rsp) - 6) {
         snprintf(err, err_len, "bad length field %u", rest);
         conn_close(c);                       /* the stream is out of step now */
-        return false;
+        return RD_FAILED;
     }
     if (!io_all(c->fd, &rsp[6], rest, false, &closed)) {
         snprintf(err, err_len, "answer cut short");
         conn_close(c);
-        return false;
+        return fresh ? RD_FAILED : RD_STALE_CONN;
     }
 
     const uint8_t *data = NULL;
@@ -310,19 +315,20 @@ static bool read_once(const mbm_poll_t *e, uint16_t regs, double *value,
     mb_rsp_t r = mb_parse_read_response(rsp, (uint16_t)(6 + rest), tid, e->unit_id,
                                         e->fc, regs, &data, &exc);
     if (r == MB_RSP_EXCEPTION) {
+        /* The device answered. Asking again would only ask the same thing. */
         snprintf(err, err_len, "device says exception 0x%02X", exc);
-        return false;                        /* the connection is still good */
+        return RD_FAILED;
     }
     if (r != MB_RSP_OK) {
         snprintf(err, err_len, "answer does not match the request");
         conn_close(c);
-        return false;
+        return RD_FAILED;
     }
 
     double raw;
     if (!mb_value_decode(data, e->type, e->word_swap != 0, &raw)) {
         snprintf(err, err_len, "cannot decode type %u", e->type);
-        return false;
+        return RD_FAILED;
     }
     double scaled = raw * (double)e->scale;
     /* A meter that reports "no reading" as 0xFFFFFFFF decodes to NaN, and
@@ -330,10 +336,10 @@ static bool read_once(const mbm_poll_t *e, uint16_t regs, double *value,
        every comparison is false against, and MQTT the literal text "nan". */
     if (!isfinite(scaled)) {
         snprintf(err, err_len, "device returned a value that is not a number");
-        return false;
+        return RD_FAILED;
     }
     *value = scaled;
-    return true;
+    return RD_OK;
 }
 
 /* A connection kept from an earlier poll may have been closed at the other
@@ -341,17 +347,23 @@ static bool read_once(const mbm_poll_t *e, uint16_t regs, double *value,
    read comes back empty. Devices that drop idle connections after 10 to 30
    seconds are common, and this cache holds them for 60, so without a second
    attempt on a fresh connection such a device would fail every other poll for
-   ever. A connection that was already fresh is not retried -- that failure is
-   real. */
+   ever.
+
+   Only that case is retried. A host that cannot be reached at all would
+   otherwise cost two full connect timeouts per poll on the one polling task
+   -- with a tableful of dead entries, all made due at once by a save, a
+   single pass would block for most of a minute and every healthy entry would
+   miss its turn. And a device that answered with an exception has said what
+   it has to say. */
 static bool read_value(const mbm_poll_t *e, double *value, char *err, size_t err_len)
 {
     uint16_t regs = mb_value_regs(e->type);
     if (regs == 0) { snprintf(err, err_len, "unknown value type %u", e->type); return false; }
 
-    bool fresh = false;
-    if (read_once(e, regs, value, &fresh, err, err_len)) return true;
-    if (fresh) return false;
-    return read_once(e, regs, value, &fresh, err, err_len);
+    rd_result_t r = read_once(e, regs, value, err, err_len);
+    if (r == RD_OK)     return true;
+    if (r == RD_FAILED) return false;
+    return read_once(e, regs, value, err, err_len) == RD_OK;   /* once more, fresh */
 }
 
 /* ------------------------------------------------------------- publishing */
