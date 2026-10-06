@@ -132,6 +132,11 @@ static void on_network_ready(const char *iface)
     esp_err_t ws_ret = web_server_start();
     if (ws_ret != ESP_OK)
         ESP_LOGW(TAG, "Web server start failed: %s", esp_err_to_name(ws_ret));
+    /* Modbus TCP opens a listening socket, so it cannot be started from
+       app_main() with the rest of Modbus -- lwIP is not up at that point. */
+    esp_err_t mbn_ret = mb_server_net_start();
+    if (mbn_ret != ESP_OK)
+        ESP_LOGE(TAG, "Modbus TCP start failed: %s", esp_err_to_name(mbn_ret));
     app_mqtt_set_connected_callback(on_mqtt_connected);
     app_mqtt_set_disconnected_callback(on_mqtt_disconnected);
     app_mqtt_set_msg_callback(on_mqtt_message);

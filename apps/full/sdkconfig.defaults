@@ -50,3 +50,8 @@ CONFIG_APP_SCRIPTING_ENABLE=y
 
 # No Matter in the full firmware
 CONFIG_APP_MATTER_ENABLE=n
+
+# The MBAP unit identifier. Off by default, and then the slave reports every
+# request as coming from the pseudo address 255 -- a gateway cannot tell which
+# device a request is for and answers all of them itself.
+CONFIG_FMB_TCP_UID_ENABLED=y

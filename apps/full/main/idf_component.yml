@@ -2,4 +2,9 @@ dependencies:
   idf: ">=5.0"
   espressif/mqtt: "^1.0.0"
   espressif/cjson: "*"
-  espressif/esp-modbus: "^2.1.2"
+  # Fork of espressif/esp-modbus 2.1.4. The upstream master API reports a slave
+  # exception as ESP_FAIL without the code, so a gateway cannot pass the
+  # original on to its client; the fork adds mbc_master_get_last_exception().
+  espressif/esp-modbus:
+    git: https://github.com/sauttefk/esp-modbus.git
+    version: 77ea17d

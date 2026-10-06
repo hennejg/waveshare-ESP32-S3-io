@@ -7,6 +7,7 @@
 #include "led.h"
 #include "buzzer.h"
 #include "scripting.h"
+#include "mb_gateway.h"
 
 #include "mbcontroller.h"
 #include "driver/gpio.h"
@@ -30,6 +31,27 @@
    it can then neither answer nor hear anyone else. */
 #define MB_RTS_GPIO GPIO_NUM_21
 
+/* ------------------------------------------------------------------ routing
+
+   SPIKE. Hard-coded while the mechanism is being proved on hardware; the
+   configuration model that replaces these three constants is the next step.
+   With MB_GW_SPIKE set the board serves Modbus TCP on port 502 and drives the
+   RS-485 segment as a master, instead of sitting on it as a slave.
+
+   A TCP slave created with uid 0 accepts every unit ID the client sends --
+   that is the stack's wildcard, and without it the gateway would never see a
+   request meant for anyone else. Which device a request belongs to is then
+   decided per request, from the unit ID:
+
+     MB_LOCAL_UID, 0 or 255 -> this board's own I/Os
+     anything else          -> forwarded to that address on RS-485
+
+   0 and 255 count as local because a TCP client with nothing to address
+   sends one of them, and on TCP neither means broadcast. */
+#define MB_GW_SPIKE   1
+#define MB_LOCAL_UID  247
+#define MB_TCP_PORT   502
+
 /* ------------------------------------------------------------ register layout */
 
 #define MB_NUM_COILS     8     /* DO1-DO8, bit 0 = DO1            */
@@ -44,7 +66,21 @@ static struct { uint8_t  b[1]; } s_coils_unused;
 static struct { uint8_t  b[1]; } s_di_unused;
 static struct { uint16_t r[MB_NUM_HOLDING]; } s_hr_unused;
 
-static void *s_handle = NULL;
+static void *s_handle = NULL;        /* the slave instance serving requests */
+
+/* Which device the request being processed is addressed to. Returns true for
+   this board, and otherwise leaves the foreign unit ID in *uid.
+
+   This runs inside a register callback, so "the request being processed" is
+   well defined: the stack is single-threaded per slave instance and has not
+   touched the next frame yet. */
+static bool request_is_local(uint8_t *uid)
+{
+    *uid = MB_LOCAL_UID;
+    if (!mb_gateway_is_running()) return true;   /* nowhere to forward to */
+    if (mbc_slave_get_request_uid(s_handle, uid) != ESP_OK) return true;
+    return (*uid == MB_LOCAL_UID) || (*uid == 0) || (*uid == 255);
+}
 
 /* ---------------------------------------------------------------- commands */
 
@@ -120,6 +156,11 @@ mb_err_enum_t mbc_reg_coils_slave_cb(mb_base_t *inst, uint8_t *reg_buffer,
     (void)inst;
     if (!reg_buffer) return MB_EINVAL;
     address--;                                   /* the stack passes it +1 */
+
+    uint8_t uid;
+    if (!request_is_local(&uid))
+        return mb_gateway_coils(uid, reg_buffer, address, n_coils, mode);
+
     if ((uint32_t)address + n_coils > MB_NUM_COILS) return MB_ENOREG;
 
     if (mode == MB_REG_READ) {
@@ -146,6 +187,11 @@ mb_err_enum_t mbc_reg_discrete_slave_cb(mb_base_t *inst, uint8_t *reg_buffer,
     (void)inst;
     if (!reg_buffer) return MB_EINVAL;
     address--;
+
+    uint8_t uid;
+    if (!request_is_local(&uid))
+        return mb_gateway_discrete(uid, reg_buffer, address, n_discrete);
+
     if ((uint32_t)address + n_discrete > MB_NUM_DISCRETE) return MB_ENOREG;
 
     memset(reg_buffer, 0, (size_t)((n_discrete + 7u) / 8u));   /* see the coil path */
@@ -161,6 +207,11 @@ mb_err_enum_t mbc_reg_holding_slave_cb(mb_base_t *inst, uint8_t *reg_buffer,
     (void)inst;
     if (!reg_buffer) return MB_EINVAL;
     address--;
+
+    uint8_t uid;
+    if (!request_is_local(&uid))
+        return mb_gateway_holding(uid, reg_buffer, address, n_regs, mode);
+
     if ((uint32_t)address + n_regs > MB_NUM_HOLDING) return MB_ENOREG;
 
     if (mode == MB_REG_READ) {
@@ -185,7 +236,14 @@ mb_err_enum_t mbc_reg_holding_slave_cb(mb_base_t *inst, uint8_t *reg_buffer,
 mb_err_enum_t mbc_reg_input_slave_cb(mb_base_t *inst, uint8_t *reg_buffer,
                                      uint16_t address, uint16_t n_regs)
 {
-    (void)inst; (void)reg_buffer; (void)address; (void)n_regs;
+    (void)inst;
+    if (!reg_buffer) return MB_EINVAL;
+    address--;
+
+    uint8_t uid;
+    if (!request_is_local(&uid))
+        return mb_gateway_input(uid, reg_buffer, address, n_regs);
+
     return MB_ENOREG;          /* no input registers on this device */
 }
 
@@ -242,14 +300,61 @@ static void command_task(void *arg)
 
 /* ---------------------------------------------------------------- public */
 
+/* The stack still wants these even though the access callbacks are
+   overridden, and they have to be registered on each slave instance
+   separately. */
+static esp_err_t register_areas(void)
+{
+    mb_register_area_descriptor_t area = {0};
+
+    area.type = MB_PARAM_COIL;     area.start_offset = 0;
+    area.address = &s_coils_unused; area.size = sizeof(s_coils_unused);
+    area.access  = MB_ACCESS_RW;
+    ESP_RETURN_ON_ERROR(mbc_slave_set_descriptor(s_handle, area), TAG, "coil desc");
+
+    area.type = MB_PARAM_DISCRETE;  area.start_offset = 0;
+    area.address = &s_di_unused;    area.size = sizeof(s_di_unused);
+    area.access  = MB_ACCESS_RO;
+    ESP_RETURN_ON_ERROR(mbc_slave_set_descriptor(s_handle, area), TAG, "di desc");
+
+    area.type = MB_PARAM_HOLDING;  area.start_offset = 0;
+    area.address = &s_hr_unused;   area.size = sizeof(s_hr_unused);
+    area.access  = MB_ACCESS_RW;
+    ESP_RETURN_ON_ERROR(mbc_slave_set_descriptor(s_handle, area), TAG, "hr desc");
+    return ESP_OK;
+}
+
+static esp_err_t start_command_task(void)
+{
+    if (s_cmd_q) return ESP_OK;
+    s_cmd_q = xQueueCreate(MB_CMD_QUEUE_DEPTH, sizeof(mb_cmd_t));
+    ESP_RETURN_ON_FALSE(s_cmd_q, ESP_ERR_NO_MEM, TAG, "command queue");
+    ESP_RETURN_ON_FALSE(xTaskCreate(command_task, "mb_cmd", 4096, NULL, 5, NULL) == pdPASS,
+                        ESP_ERR_NO_MEM, TAG, "command task");
+    return ESP_OK;
+}
+
 esp_err_t mb_server_init(void)
 {
     const app_config_t *cfg = app_config_get();
     if (!cfg->modbus.enable) {
-        ESP_LOGI(TAG, "Modbus RTU disabled");
+        ESP_LOGI(TAG, "Modbus disabled");
         return ESP_OK;
     }
 
+    /* Ready to accept commands before any stack can deliver one. */
+    ESP_RETURN_ON_ERROR(start_command_task(), TAG, "command task");
+
+#if MB_GW_SPIKE
+    /* The RS-485 port belongs to the master now; the two cannot share it. The
+       TCP slave that feeds it cannot be created yet -- creating it opens a
+       listening socket, and lwIP is only brought up much later in app_main().
+       mb_server_net_start() finishes the job from the network-ready path. */
+    ESP_RETURN_ON_ERROR(mb_gateway_start(MB_UART, cfg->modbus.baudrate,
+                                         MB_TX_GPIO, MB_RX_GPIO, MB_RTS_GPIO),
+                        TAG, "gateway master");
+    return ESP_OK;
+#else
     mb_communication_info_t comm = {
         .ser_opts.mode      = MB_RTU,
         .ser_opts.port      = MB_UART,
@@ -274,33 +379,73 @@ esp_err_t mb_server_init(void)
         uart_set_mode(MB_UART, UART_MODE_RS485_HALF_DUPLEX),
         TAG, "uart_set_mode");
 
-    /* Register data areas */
-    mb_register_area_descriptor_t area = {0};
-
-    area.type = MB_PARAM_COIL;     area.start_offset = 0;
-    area.address = &s_coils_unused; area.size = sizeof(s_coils_unused);
-    area.access  = MB_ACCESS_RW;
-    ESP_RETURN_ON_ERROR(mbc_slave_set_descriptor(s_handle, area), TAG, "coil desc");
-
-    area.type = MB_PARAM_DISCRETE;  area.start_offset = 0;
-    area.address = &s_di_unused;    area.size = sizeof(s_di_unused);
-    area.access  = MB_ACCESS_RO;
-    ESP_RETURN_ON_ERROR(mbc_slave_set_descriptor(s_handle, area), TAG, "di desc");
-
-    area.type = MB_PARAM_HOLDING;  area.start_offset = 0;
-    area.address = &s_hr_unused;   area.size = sizeof(s_hr_unused);
-    area.access  = MB_ACCESS_RW;
-    ESP_RETURN_ON_ERROR(mbc_slave_set_descriptor(s_handle, area), TAG, "hr desc");
-
-    /* Ready to accept commands before the stack can deliver any. */
-    s_cmd_q = xQueueCreate(MB_CMD_QUEUE_DEPTH, sizeof(mb_cmd_t));
-    ESP_RETURN_ON_FALSE(s_cmd_q, ESP_ERR_NO_MEM, TAG, "command queue");
-    ESP_RETURN_ON_FALSE(xTaskCreate(command_task, "mb_cmd", 4096, NULL, 5, NULL) == pdPASS,
-                        ESP_ERR_NO_MEM, TAG, "command task");
-
+    ESP_RETURN_ON_ERROR(register_areas(), TAG, "areas");
     ESP_RETURN_ON_ERROR(mbc_slave_start(s_handle), TAG, "start");
 
     ESP_LOGI(TAG, "Modbus RTU slave started — addr=%u baud=%"PRIu32,
              cfg->modbus.address, cfg->modbus.baudrate);
     return ESP_OK;
+#endif
 }
+
+#if MB_GW_SPIKE
+
+/* Brings the TCP slave up. Everything here wants a working IP stack, which is
+   why it cannot run from mb_server_init(), and it is given a task of its own
+   rather than running on the caller's: the network-ready callback arrives on
+   the system event task, whose stack is sized for short handlers and which
+   creating a Modbus TCP slave overflows outright. */
+static void net_start_task(void *arg)
+{
+    (void)arg;
+    const app_config_t *cfg = app_config_get();
+
+    mb_communication_info_t comm = {
+        .tcp_opts.mode          = MB_TCP,
+        .tcp_opts.port          = MB_TCP_PORT,
+        .tcp_opts.uid           = 0,     /* wildcard: take every unit ID */
+        .tcp_opts.addr_type     = MB_IPV4,
+        .tcp_opts.ip_addr_table = NULL,
+        /* A slave only listens, so it needs no interface of its own: the netif
+           pointer is used for mDNS and for binding a master's outgoing socket,
+           neither of which applies here. */
+        .tcp_opts.ip_netif_ptr  = NULL,
+    };
+
+    esp_err_t err = mbc_slave_create_tcp(&comm, &s_handle);
+    if (err == ESP_OK) err = register_areas();
+    if (err == ESP_OK) err = mbc_slave_start(s_handle);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Modbus TCP start failed: %s", esp_err_to_name(err));
+        s_handle = NULL;            /* keep request routing out of a dead stack */
+    } else {
+        ESP_LOGI(TAG, "Modbus TCP on port %u — own I/Os at unit ID %u, "
+                      "every other unit ID forwarded to RS-485 at %"PRIu32" baud",
+                 MB_TCP_PORT, MB_LOCAL_UID, cfg->modbus.baudrate);
+    }
+    vTaskDelete(NULL);
+}
+
+esp_err_t mb_server_net_start(void)
+{
+    const app_config_t *cfg = app_config_get();
+    if (!cfg->modbus.enable) return ESP_OK;
+
+    /* Both interfaces report ready on the same task, so a plain flag is enough
+       to keep the second report from starting a second slave. */
+    static bool started = false;
+    if (started) return ESP_OK;
+    started = true;
+
+    ESP_RETURN_ON_FALSE(
+        xTaskCreate(net_start_task, "mb_tcp_up", 6144, NULL, 5, NULL) == pdPASS,
+        ESP_ERR_NO_MEM, TAG, "tcp start task");
+    return ESP_OK;
+}
+
+#else
+
+esp_err_t mb_server_net_start(void) { return ESP_OK; }
+
+#endif
