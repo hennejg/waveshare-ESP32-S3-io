@@ -88,6 +88,19 @@ static SemaphoreHandle_t s_cmd_mux;
 #define CMD_LOCK()   xSemaphoreTake(s_cmd_mux, portMAX_DELAY)
 #define CMD_UNLOCK() xSemaphoreGive(s_cmd_mux)
 
+/* True once the command task, its queue and the mutex exist.
+ *
+ * mb_server_init() runs at boot from the configuration as it was then;
+ * mb_server_net_start() runs later, from the network-ready callback, and
+ * reads the configuration as it is by then. Those are not the same thing: a
+ * board booted with Modbus off, then configured and saved, then reconnecting
+ * its WiFi, would have started the TCP listener on top of a local side that
+ * was never built -- and the first request would have taken a null mutex,
+ * which FreeRTOS answers with an abort. The listener now refuses instead, and
+ * the accessors below refuse too, so neither depends on the other being
+ * right. */
+static bool s_local_ready;
+
 /* ---------------------------------------------------------------- colour decode */
 
 /* RGB252: bits[15:14]=R(2), bits[13:9]=G(5), bits[8:7]=B(2), bits[6:0]=unused */
@@ -132,6 +145,7 @@ static uint8_t enqueue(const mb_cmd_t *cmd, const char *what)
 
 static uint8_t local_read_coils(uint16_t addr, uint16_t count, uint8_t *out)
 {
+    if (!s_local_ready) return MB_EXC_DEVICE_FAILURE;
     if ((uint32_t)addr + count > MB_NUM_COILS) return MB_EXC_ILLEGAL_ADDR;
 
     memset(out, 0, (size_t)((count + 7u) / 8u));
@@ -150,6 +164,7 @@ static uint8_t local_read_coils(uint16_t addr, uint16_t count, uint8_t *out)
 
 static uint8_t local_read_discrete(uint16_t addr, uint16_t count, uint8_t *out)
 {
+    if (!s_local_ready) return MB_EXC_DEVICE_FAILURE;
     if ((uint32_t)addr + count > MB_NUM_DISCRETE) return MB_EXC_ILLEGAL_ADDR;
 
     memset(out, 0, (size_t)((count + 7u) / 8u));
@@ -160,6 +175,7 @@ static uint8_t local_read_discrete(uint16_t addr, uint16_t count, uint8_t *out)
 
 static uint8_t local_read_holding(uint16_t addr, uint16_t count, uint8_t *out)
 {
+    if (!s_local_ready) return MB_EXC_DEVICE_FAILURE;
     if ((uint32_t)addr + count > MB_NUM_HOLDING) return MB_EXC_ILLEGAL_ADDR;
 
     CMD_LOCK();
@@ -176,6 +192,7 @@ static uint8_t local_read_holding(uint16_t addr, uint16_t count, uint8_t *out)
    payload and a single coil reduced to one byte arrive. */
 static uint8_t local_write_coils(uint16_t addr, uint16_t count, const uint8_t *bits)
 {
+    if (!s_local_ready) return MB_EXC_DEVICE_FAILURE;
     if ((uint32_t)addr + count > MB_NUM_COILS) return MB_EXC_ILLEGAL_ADDR;
 
     mb_cmd_t cmd = { .area = MB_PARAM_COIL, .offset = addr, .count = count };
@@ -199,6 +216,7 @@ static uint8_t local_write_coils(uint16_t addr, uint16_t count, const uint8_t *b
 
 static uint8_t local_write_holding(uint16_t addr, uint16_t count, const uint8_t *regs_be)
 {
+    if (!s_local_ready) return MB_EXC_DEVICE_FAILURE;
     if ((uint32_t)addr + count > MB_NUM_HOLDING) return MB_EXC_ILLEGAL_ADDR;
 
     mb_cmd_t cmd = { .area = MB_PARAM_HOLDING, .offset = addr, .count = count };
@@ -408,16 +426,20 @@ static esp_err_t start_command_task(void)
     ESP_RETURN_ON_FALSE(s_cmd_q, ESP_ERR_NO_MEM, TAG, "command queue");
 
     if (xTaskCreate(command_task, "mb_cmd", 4096, NULL, 5, NULL) != pdPASS) {
-        /* The queue has to go with it. Left behind, the guard above would
-           report success on the next call and every write would be accepted
-           into a queue nobody empties -- answered positively, read back from
-           the shadow registers as if it had happened, and never carried out. */
+        /* The queue and the mutex go with it. Left behind, the guard at the
+           top would report success on the next call and every write would be
+           accepted into a queue nobody empties -- answered positively, read
+           back from the shadow registers as if it had happened, and never
+           carried out. */
         vQueueDelete(s_cmd_q);
         s_cmd_q = NULL;
         vSemaphoreDelete(s_cmd_mux);
         s_cmd_mux = NULL;
-        ESP_RETURN_ON_FALSE(false, ESP_ERR_NO_MEM, TAG, "command task");
+        ESP_LOGE(TAG, "command task could not be created");
+        return ESP_ERR_NO_MEM;
     }
+
+    s_local_ready = true;
     return ESP_OK;
 }
 
@@ -510,6 +532,15 @@ esp_err_t mb_server_net_start(void)
 {
     const app_config_t *cfg = app_config_get();
     if (!cfg->modbus.enable || !cfg->modbus.tcp_server) return ESP_OK;
+
+    /* The saved configuration may have been changed since boot. Serving
+       requests needs the local side that mb_server_init() builds, and that
+       ran under the old configuration. */
+    if (!s_local_ready) {
+        ESP_LOGW(TAG, "Modbus TCP not started: Modbus was off when the board "
+                      "came up — reboot to apply");
+        return ESP_OK;
+    }
 
     uint8_t uid = cfg->modbus.tcp_uid;
     if (uid < 1 || uid > 247) uid = MB_TCP_UID_DEFAULT;   /* stored before the field existed */

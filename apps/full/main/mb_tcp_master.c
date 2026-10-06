@@ -87,6 +87,14 @@ static SemaphoreHandle_t s_state_mux;
    sockets belong to that task and must not be closed from under it. */
 static volatile bool s_drop_conns;
 
+/* Bumped by every configuration change. A poll already in flight when the
+   table was replaced carries the value from before, and its answer is thrown
+   away rather than written under whatever name now occupies that slot: two
+   meters often share unit id, function code and register, so such an answer
+   passes every protocol check and would be published as a perfectly plausible
+   reading of the wrong device. */
+static volatile uint32_t s_generation;
+
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
 /* ------------------------------------------------------------ connections */
@@ -346,7 +354,11 @@ static void publish(const mbm_poll_t *e, double value)
     snprintf(topic, sizeof(topic), "modbus/%s", e->name);
 
     char payload[32];
-    int len = snprintf(payload, sizeof(payload), "%.6g", value);
+    /* Six significant digits turn a 32-bit counter into 4.29497e+09, which
+       reads back as 4294970000 -- the status API and the published value then
+       disagree about the same reading. Ten covers u32 and s32 exactly without
+       printing noise from below a float32's precision. */
+    int len = snprintf(payload, sizeof(payload), "%.10g", value);
     if (len < 0) return;
     if (len >= (int)sizeof(payload)) len = (int)sizeof(payload) - 1;
 
@@ -361,12 +373,22 @@ static void publish(const mbm_poll_t *e, double value)
 
 /* ------------------------------------------------------------------ task */
 
-static void poll_entry(const mbm_poll_t *e, entry_state_t *st)
+/* e is a copy, not a pointer into the live configuration: the HTTP task
+   overwrites that table in place, and a read in progress would otherwise
+   finish against an entry that describes a different device. */
+static void poll_entry(const mbm_poll_t *e, entry_state_t *st, uint32_t gen)
 {
     double value = 0;
     char   err[sizeof(st->last_error)];
+    bool   ok = read_value(e, &value, err, sizeof(err));
 
-    if (read_value(e, &value, err, sizeof(err))) {
+    if (gen != s_generation) {
+        ESP_LOGD(TAG, "%s: answer arrived after a configuration change, dropped",
+                 e->name);
+        return;
+    }
+
+    if (ok) {
         ST_LOCK();
         st->value      = value;
         st->value_ms   = now_ms();
@@ -405,18 +427,21 @@ static void master_task(void *arg)
         int64_t next = now + 1000;
 
         for (int i = 0; i < APP_CFG_MBM_COUNT; i++) {
-            const mbm_poll_t *e = &cfg->mbm[i];
-            entry_state_t    *st = &s_state[i];
-            if (!e->enable || !e->name[0] || !e->host[0]) continue;
+            /* Copied before anything blocks, and used for the whole poll:
+               the HTTP task overwrites this table in place. */
+            mbm_poll_t     snap = cfg->mbm[i];
+            uint32_t       gen  = s_generation;
+            entry_state_t *st   = &s_state[i];
+            if (!snap.enable || !snap.name[0] || !snap.host[0]) continue;
 
             if (now >= st->due_ms) {
-                poll_entry(e, st);
+                poll_entry(&snap, st, gen);
                 now = now_ms();
                 /* The backoff widens the gap after a failure; it must never
                    narrow it. An entry polled once a day that fails once would
                    otherwise be retried every minute from then on -- more
                    traffic to a dead device than the working one ever caused. */
-                uint32_t wait = e->interval_ms;
+                uint32_t wait = snap.interval_ms;
                 if (st->backoff_ms > wait)      wait = st->backoff_ms;
                 if (wait < MBM_INTERVAL_MIN_MS) wait = MBM_INTERVAL_MIN_MS;
                 st->due_ms = now + wait;
@@ -453,6 +478,7 @@ esp_err_t mb_tcp_master_reload(void)
     int64_t now = now_ms();
     for (int i = 0; i < APP_CFG_MBM_COUNT; i++) s_state[i].due_ms = now;
     ST_UNLOCK();
+    s_generation++;        /* anything already in flight is now stale */
     s_drop_conns = true;
 
     /* And if this is the first entry anyone has enabled, there is no task

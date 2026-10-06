@@ -72,7 +72,7 @@ time, so forwarded requests queue behind each other.
 |---|---|
 | Connections served at once | 8; a ninth is closed immediately |
 | Requests forwarded at once | 4; beyond that the answer is `0x06`, retry |
-| Time to receive one frame  | 200 ms, then the connection is closed |
+| Time to receive one frame  | 200 ms from its first byte, then the connection is closed |
 | Time to send one response  | 500 ms, then the connection is closed |
 
 A connection is kept open for as long as the client wants it. One whose peer
@@ -100,6 +100,8 @@ read it.
 
 Reading only. Nothing is ever written to the other device.
 
+Unlike the settings above, this table takes effect on save — no reboot.
+
 ### Where the value goes
 
 Each successful read publishes on MQTT as `modbus/<name>` (under the configured
@@ -114,6 +116,9 @@ rule('shed load')
 ```
 
 ### When it goes wrong
+
+Published values carry ten significant digits, which is exactly what a 32-bit
+counter needs; the status API and the published value always agree.
 
 A device that does not answer is retried with a widening gap — 2 s, then 4, 8,
 up to a minute — rather than at its poll interval, so a switched-off device does

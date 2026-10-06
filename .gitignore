@@ -13,3 +13,5 @@ dependencies.lock
 /test/host/test_mb_pdu
 /test/host/test_mb_client
 /test/host/*.dSYM
+/test/host/test_mb_poller
+/test/host/test_mb_poller.c

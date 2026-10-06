@@ -9,8 +9,8 @@ CFLAGS := -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 PORT ?= 15020
 
-.PHONY: all clean client
-all: test_mb_pdu client
+.PHONY: all clean client poller
+all: test_mb_pdu client poller
 	./test_mb_pdu
 
 # The firmware's framing against a Modbus TCP server written independently of
@@ -24,6 +24,15 @@ client: test_mb_client modbus_tcp_server.py
 	 kill $$SRV 2>/dev/null; \
 	 exit $$RC
 
+# The TCP server's receive path, cut out of the real source by the generator
+# so the test cannot drift away from the code.
+poller: test_mb_poller
+	./test_mb_poller
+
+test_mb_poller: gen_poller_test.py $(MAIN)/mb_tcp_server.c $(MAIN)/mb_pdu.c $(MAIN)/mb_pdu.h
+	python3 gen_poller_test.py
+	$(CC) $(CFLAGS) test_mb_poller.c $(MAIN)/mb_pdu.c -o $@
+
 test_mb_client: test_mb_client.c $(MAIN)/mb_pdu.c $(MAIN)/mb_pdu.h $(MAIN)/mb_request.h
 	$(CC) $(CFLAGS) test_mb_client.c $(MAIN)/mb_pdu.c -o $@
 
@@ -31,4 +40,4 @@ test_mb_pdu: test_mb_pdu.c $(MAIN)/mb_pdu.c $(MAIN)/mb_pdu.h $(MAIN)/mb_request.
 	$(CC) $(CFLAGS) test_mb_pdu.c $(MAIN)/mb_pdu.c -o $@
 
 clean:
-	rm -rf test_mb_pdu test_mb_client *.dSYM
+	rm -rf test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c *.dSYM
