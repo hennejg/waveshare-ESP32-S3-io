@@ -19,10 +19,16 @@
    so call it once the network is up; calling it again is harmless. */
 esp_err_t mb_tcp_master_start(void);
 
+/* Apply a changed configuration. Starts the task if the first entry has just
+   been enabled, and forgets what it knew about entries that have been
+   repointed. Call after app_config_update(). */
+esp_err_t mb_tcp_master_reload(void);
+
 /* What happened to one entry last time, for the status API. */
 typedef struct {
     bool     enabled;
-    bool     valid;        /* a value has been read and is not stale         */
+    bool     valid;        /* a value has been read at least once; age_ms says
+                              how long ago -- nothing here calls it stale     */
     double   value;        /* already scaled                                 */
     int64_t  age_ms;       /* since that value, -1 if there has never been one */
     uint32_t reads;

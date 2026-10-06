@@ -24,6 +24,7 @@ extern const char DEMO_SCRIPT[];
 #define RULES_NVS_KEY "script"
 #define RULES_MAX_LEN 3900
 
+#include <math.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
@@ -57,7 +58,11 @@ extern const char DEMO_SCRIPT[];
 #define RULES_APPLY_TIMEOUT_MS 1000
 #define WWW_BASE   "/www"
 #define CHUNK_SIZE  4096
-#define BODY_MAX    2048  /* names add ~768 bytes to the di/dout arrays */
+/* The whole configuration travels in one body. The di and dout names add
+   about 768 bytes; the eight Modbus master rows add up to another 1850 at
+   their maximum name and host lengths, measured at 2868 bytes for a full
+   table. At 2048 a table of five rows could be displayed but never saved. */
+#define BODY_MAX    4096
 
 #define NVS_ETH_NS  "app_config"
 #define NVS_ETH_KEY "eth_only"
@@ -386,7 +391,10 @@ static esp_err_t api_config_get(httpd_req_t *req)
         cJSON_AddNumberToObject(o, "reg",         e->reg);
         cJSON_AddStringToObject(o, "type",        mbm_type_name(e->type));
         cJSON_AddBoolToObject  (o, "word_swap",   e->word_swap);
-        cJSON_AddNumberToObject(o, "scale",       e->scale != 0.0f ? e->scale : 1.0);
+        /* Reported as stored. Substituting 1 for 0 here would describe a
+           configuration other than the one in effect; 0 is refused on the way
+           in instead. */
+        cJSON_AddNumberToObject(o, "scale",       e->scale);
         cJSON_AddNumberToObject(o, "interval_ms", e->interval_ms ? e->interval_ms : 5000);
         cJSON_AddItemToArray(mbm, o);
     }
@@ -610,8 +618,12 @@ static esp_err_t api_config_post(httpd_req_t *req)
             e->port = 502; e->unit_id = 1; e->fc = 3;
             e->scale = 1.0f; e->interval_ms = 5000;
 
-            if ((v = cJSON_GetObjectItem(o, "enable")) && cJSON_IsBool(v))
-                e->enable = cJSON_IsTrue(v) ? 1 : 0;
+            /* A script writing "enable": 1 rather than true would otherwise
+               store a silently disabled entry and get 200 back. */
+            if ((v = cJSON_GetObjectItem(o, "enable"))) {
+                if (cJSON_IsBool(v))        e->enable = cJSON_IsTrue(v) ? 1 : 0;
+                else if (cJSON_IsNumber(v)) e->enable = v->valuedouble != 0 ? 1 : 0;
+            }
             if ((v = cJSON_GetObjectItem(o, "name")) && cJSON_IsString(v))
                 strlcpy(e->name, v->valuestring, sizeof(e->name));
             if ((v = cJSON_GetObjectItem(o, "host")) && cJSON_IsString(v))
@@ -634,8 +646,18 @@ static esp_err_t api_config_post(httpd_req_t *req)
                 mbm_type_value(v->valuestring, &e->type);
             if ((v = cJSON_GetObjectItem(o, "word_swap")) && cJSON_IsBool(v))
                 e->word_swap = cJSON_IsTrue(v) ? 1 : 0;
-            if ((v = cJSON_GetObjectItem(o, "scale")) && cJSON_IsNumber(v))
-                e->scale = (float)v->valuedouble;
+            if ((v = cJSON_GetObjectItem(o, "scale")) && cJSON_IsNumber(v)) {
+                /* The only field with no natural range, and the one that can
+                   carry an infinity straight through to MQTT: cJSON parses
+                   1e400 as inf, cJSON_IsNumber accepts it, and the published
+                   value becomes the literal "inf". Zero is refused too --
+                   it silently turns every reading into nothing. */
+                double sc = v->valuedouble;
+                if (isfinite(sc) && sc != 0.0 && sc > -1e9 && sc < 1e9)
+                    e->scale = (float)sc;
+                else
+                    e->scale = 0.0f;   /* flagged below */
+            }
             if ((v = cJSON_GetObjectItem(o, "interval_ms")) && cJSON_IsNumber(v)) {
                 uint32_t t = (uint32_t)v->valuedouble;
                 if (t >= MBM_INTERVAL_MIN_MS && t <= MBM_INTERVAL_MAX_MS)
@@ -650,6 +672,17 @@ static esp_err_t api_config_post(httpd_req_t *req)
                 if (!e->name[0])                  why = "a Modbus master entry needs a name";
                 else if (strpbrk(e->name, "#+/")) why = "a Modbus master name must not contain '#', '+' or '/'";
                 else if (!e->host[0])             why = "a Modbus master entry needs a host";
+                else if (e->scale == 0.0f)        why = "a Modbus master scale must be a non-zero finite number";
+                else {
+                    /* Two entries of the same name would publish to one topic
+                       and feed one rule key, last poll winning at random. The
+                       di and dout names are checked the same way. */
+                    for (int j = 0; j < i; j++)
+                        if (cfg.mbm[j].enable && !strcmp(cfg.mbm[j].name, e->name)) {
+                            why = "two Modbus master entries have the same name";
+                            break;
+                        }
+                }
                 if (why) {
                     cJSON_Delete(root);
                     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, why);
@@ -686,6 +719,12 @@ static esp_err_t api_config_post(httpd_req_t *req)
     }
 
     app_config_update(&cfg);
+
+    /* The Modbus master re-reads the table on its own, but the task only
+       exists once something is enabled -- and what it knew about the old
+       entries no longer describes the new ones. Everything else on this page
+       needs a reboot, which is what the form says; this one does not have to. */
+    mb_tcp_master_reload();
     sntp_sync_apply();    /* apply any SNTP server / enable change immediately */
     app_time_apply_tz();  /* apply any timezone change to localtime + cron */
     di_publish_all();
@@ -1425,6 +1464,12 @@ esp_err_t web_server_start(void)
      * and the DMA pool still has ~29 KB free at that point. */
     cfg.task_caps        = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
     cfg.send_wait_timeout = 10;   /* seconds; default 5 is too tight with Matter on WiFi */
+    /* HTTPD_DEFAULT_CONFIG gives 4096. A handler holds a whole app_config_t
+       (1.7 kB) or the Modbus status table (640 B) plus cJSON's own working
+       set, so the default leaves too little. sdkconfig carried a
+       CONFIG_HTTPD_STACK_SIZE line for years that does not exist as a Kconfig
+       symbol and therefore never did anything. */
+    cfg.stack_size        = 6144;
 
     esp_err_t ret = httpd_start(&s_server, &cfg);
     if (ret != ESP_OK) {

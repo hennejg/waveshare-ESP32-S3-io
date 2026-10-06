@@ -35,7 +35,6 @@ CONFIG_LWIP_TCP_WND_DEFAULT=16384
 # Stack sizes
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=8192
-CONFIG_HTTPD_STACK_SIZE=6144
 
 # PSRAM heap routing
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
@@ -54,3 +53,15 @@ CONFIG_APP_MATTER_ENABLE=n
 # Sockets. The default of ten is shared by the web server, MQTT and SNTP;
 # Modbus TCP serving several clients at once needs its own share on top.
 CONFIG_LWIP_MAX_SOCKETS=24
+
+# cJSON parses by recursion and guards only the nesting depth, not the stack.
+# At the default of 1000 a body of nothing but '[' overflows the HTTP task's
+# stack -- and /api/auth/set-password parses before it checks the token, so
+# that is reachable without credentials. The deepest JSON this firmware reads
+# is three levels (object, array, object).
+CONFIG_CJSON_NESTING_LIMIT=16
+
+# The Modbus master's response timeout is a setting, up to 10 s. The stack
+# silently replaces any value at or above this threshold with its own default,
+# so the threshold has to be above the range the configuration offers.
+CONFIG_FMB_MASTER_MAX_API_BLOCKING_TIME_MS=12000

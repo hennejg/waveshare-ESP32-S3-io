@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <netdb.h>
 #include <stdio.h>
 #include <string.h>
@@ -15,6 +16,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "app_config.h"
 #include "app_mqtt.h"
@@ -71,8 +73,19 @@ typedef struct {
 
 static conn_t        s_conns[CONN_CACHE];
 static entry_state_t s_state[APP_CFG_MBM_COUNT];
-static bool          s_running;
-static uint16_t      s_tid;
+static bool              s_running;
+static uint16_t          s_tid;
+/* s_state is written by the polling task and read by the HTTP task. The
+   64-bit fields are two stores on this core, so without this a status request
+   could show half of one value and half of the previous one. */
+static SemaphoreHandle_t s_state_mux;
+
+#define ST_LOCK()   do { if (s_state_mux) xSemaphoreTake(s_state_mux, portMAX_DELAY); } while (0)
+#define ST_UNLOCK() do { if (s_state_mux) xSemaphoreGive(s_state_mux); } while (0)
+
+/* Set by a configuration change, acted on by the polling task: the cached
+   sockets belong to that task and must not be closed from under it. */
+static volatile bool s_drop_conns;
 
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
@@ -107,8 +120,17 @@ static int dial(const char *host, uint16_t port, char *err, size_t err_len)
         return -1;
     }
 
+    /* The whole pacing of io_all() rests on these: a blocking socket with a
+       short timeout. If the flags could not be read, restoring them later
+       would leave the socket non-blocking and io_all() would spin hot for its
+       whole deadline instead of waiting. */
     int flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        snprintf(err, err_len, "cannot set socket mode: errno %d", errno);
+        close(fd);
+        freeaddrinfo(ai);
+        return -1;
+    }
 
     int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
     freeaddrinfo(ai);
@@ -131,7 +153,7 @@ static int dial(const char *host, uint16_t port, char *err, size_t err_len)
         }
         int soerr = 0;
         socklen_t l = sizeof(soerr);
-        getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &l);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &l) != 0) soerr = errno;
         if (soerr) {
             snprintf(err, err_len, "refused: errno %d", soerr);
             close(fd);
@@ -139,28 +161,36 @@ static int dial(const char *host, uint16_t port, char *err, size_t err_len)
         }
     }
 
-    fcntl(fd, F_SETFL, flags);          /* back to blocking, with timeouts */
     int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     struct timeval slice = { .tv_sec = 0, .tv_usec = IO_SLICE_MS * 1000 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &slice, sizeof(slice));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &slice, sizeof(slice));
+    if (fcntl(fd, F_SETFL, flags) < 0 ||          /* back to blocking */
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &slice, sizeof(slice)) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &slice, sizeof(slice)) != 0) {
+        snprintf(err, err_len, "cannot set socket timeouts: errno %d", errno);
+        close(fd);
+        return -1;
+    }
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));  /* a hint, not a must */
     return fd;
 }
 
-static conn_t *conn_get(const char *host, uint16_t port, char *err, size_t err_len)
+static conn_t *conn_get(const char *host, uint16_t port, bool *fresh,
+                        char *err, size_t err_len)
 {
     int64_t now = now_ms();
+    *fresh = false;
 
     for (int i = 0; i < CONN_CACHE; i++) {
         if (s_conns[i].fd >= 0 && s_conns[i].port == port &&
             strcmp(s_conns[i].host, host) == 0) {
             s_conns[i].used_ms = now;
-            return &s_conns[i];
+            return &s_conns[i];   /* kept from an earlier poll; may be stale */
         }
     }
 
-    /* Take a free slot, or the one unused the longest. */
+    /* Take a free slot, or the one unused the longest. The new connection is
+       dialled before the old one is dropped: giving up a working connection
+       for one that then fails to open would cost two entries instead of one. */
     conn_t *pick = NULL;
     for (int i = 0; i < CONN_CACHE; i++)
         if (s_conns[i].fd < 0) { pick = &s_conns[i]; break; }
@@ -168,16 +198,17 @@ static conn_t *conn_get(const char *host, uint16_t port, char *err, size_t err_l
         pick = &s_conns[0];
         for (int i = 1; i < CONN_CACHE; i++)
             if (s_conns[i].used_ms < pick->used_ms) pick = &s_conns[i];
-        conn_close(pick);
     }
 
     int fd = dial(host, port, err, err_len);
     if (fd < 0) return NULL;
+    if (pick->fd >= 0) conn_close(pick);
 
     strlcpy(pick->host, host, sizeof(pick->host));
     pick->port    = port;
     pick->fd      = fd;
     pick->used_ms = now;
+    *fresh = true;
     ESP_LOGI(TAG, "connected to %s:%u", host, port);
     return pick;
 }
@@ -194,39 +225,45 @@ static void conn_reap_idle(void)
 
 /* ------------------------------------------------------------------- i/o */
 
-static bool io_all(int fd, uint8_t *buf, size_t len, bool sending)
+/* *closed distinguishes "the peer hung up" from "it said nothing in time".
+   Both end the connection, but during commissioning they mean quite
+   different things and the reason is shown to the user. */
+static bool io_all(int fd, uint8_t *buf, size_t len, bool sending, bool *closed)
 {
     int64_t deadline = now_ms() + RESPONSE_MS;
     size_t  done = 0;
+    *closed = false;
 
     while (done < len) {
         if (now_ms() > deadline) return false;
         int n = sending ? send(fd, buf + done, len - done, 0)
                         : recv(fd, buf + done, len - done, 0);
         if (n > 0) { done += (size_t)n; continue; }
-        if (n == 0) return false;                        /* the peer closed */
+        if (n == 0) { *closed = true; return false; }
         if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+        *closed = true;
         return false;
     }
     return true;
 }
 
-/* One read, start to finish. Returns true with *value set, or false with the
-   reason in err. */
-static bool read_value(const mbm_poll_t *e, double *value, char *err, size_t err_len)
+/* One read, start to finish. *fresh tells the caller whether the connection
+   it used had just been opened. Returns true with *value set, or false with
+   the reason in err. */
+static bool read_once(const mbm_poll_t *e, uint16_t regs, double *value,
+                      bool *fresh, char *err, size_t err_len)
 {
-    uint16_t regs = mb_value_regs(e->type);
-    if (regs == 0) { snprintf(err, err_len, "unknown value type %u", e->type); return false; }
-
-    conn_t *c = conn_get(e->host, e->port, err, err_len);
+    conn_t *c = conn_get(e->host, e->port, fresh, err, err_len);
     if (!c) return false;
 
     uint8_t  req[MB_MBAP_LEN + 5];
     uint16_t tid = ++s_tid;
     uint16_t n = mb_build_read_request(req, tid, e->unit_id, e->fc, e->reg, regs);
 
-    if (!io_all(c->fd, req, n, true)) {
-        snprintf(err, err_len, "send failed");
+    bool closed = false;
+    if (!io_all(c->fd, req, n, true, &closed)) {
+        snprintf(err, err_len, closed ? "connection lost while sending"
+                                      : "could not send in %d ms", RESPONSE_MS);
         conn_close(c);
         return false;
     }
@@ -234,8 +271,9 @@ static bool read_value(const mbm_poll_t *e, double *value, char *err, size_t err
     /* The header says how long the rest is, so it is read in two goes rather
        than guessed at. */
     uint8_t rsp[MB_MBAP_LEN + 2 + 8];
-    if (!io_all(c->fd, rsp, 6, false)) {
-        snprintf(err, err_len, "no answer in %d ms", RESPONSE_MS);
+    if (!io_all(c->fd, rsp, 6, false, &closed)) {
+        snprintf(err, err_len, closed ? "connection closed by the device"
+                                      : "no answer in %d ms", RESPONSE_MS);
         conn_close(c);
         return false;
     }
@@ -245,7 +283,7 @@ static bool read_value(const mbm_poll_t *e, double *value, char *err, size_t err
         conn_close(c);                       /* the stream is out of step now */
         return false;
     }
-    if (!io_all(c->fd, &rsp[6], rest, false)) {
+    if (!io_all(c->fd, &rsp[6], rest, false, &closed)) {
         snprintf(err, err_len, "answer cut short");
         conn_close(c);
         return false;
@@ -270,8 +308,34 @@ static bool read_value(const mbm_poll_t *e, double *value, char *err, size_t err
         snprintf(err, err_len, "cannot decode type %u", e->type);
         return false;
     }
-    *value = raw * (double)e->scale;
+    double scaled = raw * (double)e->scale;
+    /* A meter that reports "no reading" as 0xFFFFFFFF decodes to NaN, and
+       0x7F800000 to infinity. Publishing either gives the rule engine a value
+       every comparison is false against, and MQTT the literal text "nan". */
+    if (!isfinite(scaled)) {
+        snprintf(err, err_len, "device returned a value that is not a number");
+        return false;
+    }
+    *value = scaled;
     return true;
+}
+
+/* A connection kept from an earlier poll may have been closed at the other
+   end without us hearing: the send succeeds into a half-closed socket and the
+   read comes back empty. Devices that drop idle connections after 10 to 30
+   seconds are common, and this cache holds them for 60, so without a second
+   attempt on a fresh connection such a device would fail every other poll for
+   ever. A connection that was already fresh is not retried -- that failure is
+   real. */
+static bool read_value(const mbm_poll_t *e, double *value, char *err, size_t err_len)
+{
+    uint16_t regs = mb_value_regs(e->type);
+    if (regs == 0) { snprintf(err, err_len, "unknown value type %u", e->type); return false; }
+
+    bool fresh = false;
+    if (read_once(e, regs, value, &fresh, err, err_len)) return true;
+    if (fresh) return false;
+    return read_once(e, regs, value, &fresh, err, err_len);
 }
 
 /* ------------------------------------------------------------- publishing */
@@ -303,24 +367,29 @@ static void poll_entry(const mbm_poll_t *e, entry_state_t *st)
     char   err[sizeof(st->last_error)];
 
     if (read_value(e, &value, err, sizeof(err))) {
+        ST_LOCK();
         st->value      = value;
         st->value_ms   = now_ms();
         st->valid      = true;
         st->reads++;
         st->backoff_ms = 0;
         st->last_error[0] = '\0';
+        ST_UNLOCK();
         publish(e, value);
         ESP_LOGD(TAG, "%s = %.6g", e->name, value);
     } else {
+        ST_LOCK();
         st->errors++;
-        if (strcmp(st->last_error, err) != 0) {
+        st->backoff_ms = st->backoff_ms ? (st->backoff_ms * 2) : BACKOFF_FIRST_MS;
+        if (st->backoff_ms > BACKOFF_MAX_MS) st->backoff_ms = BACKOFF_MAX_MS;
+        bool first = strcmp(st->last_error, err) != 0;
+        if (first) strlcpy(st->last_error, err, sizeof(st->last_error));
+        ST_UNLOCK();
+        if (first) {
             /* Only the first of a repeating failure is logged: a device that
                is switched off would otherwise fill the log at its poll rate. */
             ESP_LOGW(TAG, "%s: %s", e->name, err);
-            strlcpy(st->last_error, err, sizeof(st->last_error));
         }
-        st->backoff_ms = st->backoff_ms ? (st->backoff_ms * 2) : BACKOFF_FIRST_MS;
-        if (st->backoff_ms > BACKOFF_MAX_MS) st->backoff_ms = BACKOFF_MAX_MS;
     }
 }
 
@@ -343,13 +412,25 @@ static void master_task(void *arg)
             if (now >= st->due_ms) {
                 poll_entry(e, st);
                 now = now_ms();
-                uint32_t wait = st->backoff_ms ? st->backoff_ms : e->interval_ms;
+                /* The backoff widens the gap after a failure; it must never
+                   narrow it. An entry polled once a day that fails once would
+                   otherwise be retried every minute from then on -- more
+                   traffic to a dead device than the working one ever caused. */
+                uint32_t wait = e->interval_ms;
+                if (st->backoff_ms > wait)      wait = st->backoff_ms;
                 if (wait < MBM_INTERVAL_MIN_MS) wait = MBM_INTERVAL_MIN_MS;
                 st->due_ms = now + wait;
             }
             if (st->due_ms < next) next = st->due_ms;
         }
 
+        if (s_drop_conns) {
+            /* The table was replaced; a cached socket may lead to a device
+               nobody asked about any more. */
+            s_drop_conns = false;
+            for (int i = 0; i < CONN_CACHE; i++)
+                if (s_conns[i].fd >= 0) conn_close(&s_conns[i]);
+        }
         conn_reap_idle();
 
         int64_t sleep_ms = next - now_ms();
@@ -360,6 +441,25 @@ static void master_task(void *arg)
 }
 
 /* ---------------------------------------------------------------- public */
+
+esp_err_t mb_tcp_master_reload(void)
+{
+    /* The configuration POST replaces the whole table, so everything known
+       about the old entries describes something that is no longer there: a
+       value from a register that has been repointed, a backoff earned by a
+       host that has been corrected, counters belonging to another device. */
+    ST_LOCK();
+    memset(s_state, 0, sizeof(s_state));
+    int64_t now = now_ms();
+    for (int i = 0; i < APP_CFG_MBM_COUNT; i++) s_state[i].due_ms = now;
+    ST_UNLOCK();
+    s_drop_conns = true;
+
+    /* And if this is the first entry anyone has enabled, there is no task
+       yet. Without this the entry would sit there, reported as enabled,
+       until the next reboot. */
+    return mb_tcp_master_start();
+}
 
 esp_err_t mb_tcp_master_start(void)
 {
@@ -372,6 +472,11 @@ esp_err_t mb_tcp_master_start(void)
     if (!enabled) return ESP_OK;              /* nothing to do, no task */
 
     for (int i = 0; i < CONN_CACHE; i++) s_conns[i].fd = -1;
+
+    if (!s_state_mux) {
+        s_state_mux = xSemaphoreCreateMutex();
+        ESP_RETURN_ON_FALSE(s_state_mux, ESP_ERR_NO_MEM, TAG, "state mutex");
+    }
 
     ESP_RETURN_ON_FALSE(
         xTaskCreate(master_task, "mb_master", 5120, NULL, 4, NULL) == pdPASS,
@@ -388,6 +493,7 @@ uint8_t mb_tcp_master_get_status(mbm_status_t *out, uint8_t count)
     const app_config_t *cfg = app_config_get();
     uint8_t n = 0;
 
+    ST_LOCK();
     for (int i = 0; i < APP_CFG_MBM_COUNT && n < count; i++, n++) {
         const entry_state_t *st = &s_state[i];
         out[n] = (mbm_status_t){
@@ -400,5 +506,6 @@ uint8_t mb_tcp_master_get_status(mbm_status_t *out, uint8_t count)
         };
         strlcpy(out[n].last_error, st->last_error, sizeof(out[n].last_error));
     }
+    ST_UNLOCK();
     return n;
 }

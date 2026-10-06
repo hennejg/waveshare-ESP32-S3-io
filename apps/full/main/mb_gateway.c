@@ -21,12 +21,14 @@
 #define GW_BUF_BYTES 256
 
 /* How long a request waits for its turn on the segment before being turned
-   away. It has to clear the worst case of every other worker ahead of it
-   timing out first -- four workers, the longest timeout the configuration
-   allows plus the stack's cooldown -- or a queue of perfectly legitimate
-   requests would be refused. Beyond that the client is told to retry rather
-   than left hanging. */
-#define GW_BUS_WAIT_MS ((MB_RS485_TOUT_MAX_MS + 200) * 4)
+   away, derived from the timeout actually configured rather than from the
+   ceiling the configuration allows. It has to clear the worst case of the
+   three other connection workers ahead of it each timing out first, plus the
+   stack's cooldown; beyond that the client is told to retry rather than left
+   hanging for longer than any Modbus client waits. Against the compile-time
+   ceiling this came to 40 s, which no client would still be listening for. */
+#define GW_QUEUE_AHEAD 3
+static uint32_t s_bus_wait_ms = 4000;
 
 static void             *s_master = NULL;
 static SemaphoreHandle_t s_bus;
@@ -62,8 +64,12 @@ bool mb_gateway_is_running(void)
    UART pins were never applied, which leaves the board holding the bus. */
 static void gateway_unwind(void)
 {
-    s_master = NULL;
-    if (s_bus) { vSemaphoreDelete(s_bus); s_bus = NULL; }
+    /* The controller installs the UART driver at create time, so dropping the
+       pointer is not enough: the port would stay claimed and neither this
+       master nor the RTU slave could ever have it again this boot. Delete
+       before clearing, so nothing can find a half-freed object. */
+    if (s_master) { (void)mbc_master_delete(s_master); s_master = NULL; }
+    if (s_bus)    { vSemaphoreDelete(s_bus);           s_bus    = NULL; }
 }
 
 #define GW_START_CHECK(expr, what)                                   \
@@ -108,6 +114,8 @@ esp_err_t mb_gateway_start(uart_port_t uart, uint32_t baudrate,
     GW_START_CHECK(mbc_master_set_descriptor(s_master, s_unused_descr, 1), "descriptor");
     GW_START_CHECK(mbc_master_start(s_master), "start");
 
+    s_bus_wait_ms = ((uint32_t)response_tout_ms + 250u) * GW_QUEUE_AHEAD + 500u;
+
     ESP_LOGI(TAG, "RTU master on UART%d, %"PRIu32" baud, %u ms response timeout",
              (int)uart, baudrate, response_tout_ms);
     return ESP_OK;
@@ -134,9 +142,9 @@ static uint8_t transact(uint8_t uid, uint8_t fc, uint16_t addr,
 {
     if (!s_master) return MB_EXC_GW_PATH;
 
-    if (xSemaphoreTake(s_bus, pdMS_TO_TICKS(GW_BUS_WAIT_MS)) != pdTRUE) {
-        ESP_LOGW(TAG, "uid %u fc %u: segment busy for %d ms, turned away",
-                 uid, fc, GW_BUS_WAIT_MS);
+    if (xSemaphoreTake(s_bus, pdMS_TO_TICKS(s_bus_wait_ms)) != pdTRUE) {
+        ESP_LOGW(TAG, "uid %u fc %u: segment busy for %"PRIu32" ms, turned away",
+                 uid, fc, s_bus_wait_ms);
         return MB_EXC_DEVICE_BUSY;
     }
 

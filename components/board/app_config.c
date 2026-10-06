@@ -3,8 +3,12 @@
 #include <nvs_flash.h>
 #include <nvs.h>
 
-_Static_assert(sizeof(app_config_t) < 3000,
-               "app_config_t too large for NVS single-key storage");
+/* Not an NVS limit -- the configuration is thirteen blobs, the largest of
+   them the Modbus master table at 736 bytes. What this actually guards is the
+   stack: api_config_post puts a whole app_config_t on the HTTP task's, which
+   is 6 kB. Today the struct is about 1.7 kB. */
+_Static_assert(sizeof(app_config_t) < 2600,
+               "app_config_t too large for the HTTP task stack");
 
 #define NVS_NS "app_config"
 

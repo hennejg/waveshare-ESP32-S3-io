@@ -25,7 +25,11 @@ typedef struct {
    to put on the wire. On a read it fills resp with the data bytes alone --
    packed bits or big-endian registers -- and sets *resp_len to their count;
    the function code and byte count are the framing's business. A write
-   produces no data, and its echo is built from the request. */
+   produces no data, and its echo is built from the request.
+
+   On a non-zero return *resp_len is zero and resp has not been written: an
+   exception response carries no data, and framing one anyway would put
+   whatever was on the caller's stack onto the wire. */
 typedef uint8_t (*mb_handler_fn)(const mb_request_t *req,
                                  uint8_t *resp, uint16_t *resp_len);
 

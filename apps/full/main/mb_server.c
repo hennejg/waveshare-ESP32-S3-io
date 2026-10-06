@@ -18,6 +18,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 
 #define TAG         "mb_server"
 #define MB_UART     UART_NUM_1
@@ -64,10 +65,28 @@ typedef struct {
 #define MB_CMD_QUEUE_DEPTH 8
 static QueueHandle_t s_cmd_q;
 
-/* Last values accepted for the holding registers, so a read gives back what
-   was written. Several tasks may touch this now, so it is guarded. */
+/* What the most recent write asked for, so a read gives back what was
+   written even before the command task has carried it out.
+ *
+ * Holding registers need this because nothing else remembers them. Coils need
+ * it for a different reason: a read goes to the live hardware, so a client
+ * that writes a coil and reads it straight back would be shown the state its
+ * own write is about to change. s_do_pending counts, per coil, the writes
+ * still waiting; a read takes the shadow for those coils and the live state
+ * for the rest, so a change made over MQTT or by a rule is still seen at once.
+ *
+ * The mutex covers the shadows AND the enqueue, as one step. Two tasks can
+ * reach here -- the RTU slave's and the TCP server's -- and if they could
+ * interleave, the queue order and the shadow order could end up opposite, and
+ * the registers would report one value for ever while the relays held
+ * another. */
 static uint16_t          s_hr_shadow[MB_NUM_HOLDING];
-static portMUX_TYPE      s_hr_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t           s_do_shadow;
+static uint8_t           s_do_pending[MB_NUM_COILS];
+static SemaphoreHandle_t s_cmd_mux;
+
+#define CMD_LOCK()   xSemaphoreTake(s_cmd_mux, portMAX_DELAY)
+#define CMD_UNLOCK() xSemaphoreGive(s_cmd_mux)
 
 /* ---------------------------------------------------------------- colour decode */
 
@@ -91,8 +110,16 @@ static void apply_rgb252(uint16_t reg)
    that the command task carries out. That is what makes them safe to call
    from several connection workers at once. */
 
+/* Called with the mutex held. */
 static uint8_t enqueue(const mb_cmd_t *cmd, const char *what)
 {
+    /* The queue is created before anything can deliver a request, but an
+       out-of-memory failure at start-up leaves it absent while the TCP server
+       still comes up. Sending to a null queue is an abort, not a refusal. */
+    if (!s_cmd_q) {
+        ESP_LOGE(TAG, "no command queue, refused %s", what);
+        return MB_EXC_DEVICE_FAILURE;
+    }
     if (xQueueSend(s_cmd_q, cmd, 0) == pdTRUE) return MB_EXC_NONE;
 
     /* "Slave device busy" is the canonical "I could not take this, try
@@ -109,8 +136,15 @@ static uint8_t local_read_coils(uint16_t addr, uint16_t count, uint8_t *out)
 
     memset(out, 0, (size_t)((count + 7u) / 8u));
     uint8_t live = dout_get_all();
-    for (uint16_t i = 0; i < count; i++)
-        if (live & (1u << (addr + i))) out[i >> 3] |= (uint8_t)(1u << (i & 7));
+
+    CMD_LOCK();
+    for (uint16_t i = 0; i < count; i++) {
+        uint8_t ch = (uint8_t)(addr + i);
+        uint8_t v  = s_do_pending[ch] ? (s_do_shadow & (1u << ch))
+                                      : (live       & (1u << ch));
+        if (v) out[i >> 3] |= (uint8_t)(1u << (i & 7));
+    }
+    CMD_UNLOCK();
     return MB_EXC_NONE;
 }
 
@@ -128,13 +162,13 @@ static uint8_t local_read_holding(uint16_t addr, uint16_t count, uint8_t *out)
 {
     if ((uint32_t)addr + count > MB_NUM_HOLDING) return MB_EXC_ILLEGAL_ADDR;
 
-    portENTER_CRITICAL(&s_hr_lock);
+    CMD_LOCK();
     for (uint16_t i = 0; i < count; i++) {           /* big endian on the wire */
         uint16_t v = s_hr_shadow[addr + i];
         out[i * 2]     = (uint8_t)(v >> 8);
         out[i * 2 + 1] = (uint8_t)(v & 0xFF);
     }
-    portEXIT_CRITICAL(&s_hr_lock);
+    CMD_UNLOCK();
     return MB_EXC_NONE;
 }
 
@@ -148,7 +182,19 @@ static uint8_t local_write_coils(uint16_t addr, uint16_t count, const uint8_t *b
     for (uint16_t i = 0; i < count; i++)
         if (bits[i >> 3] & (1u << (i & 7)))
             cmd.bits |= (uint8_t)(1u << (addr + i));
-    return enqueue(&cmd, "coil write");
+
+    CMD_LOCK();
+    uint8_t exc = enqueue(&cmd, "coil write");
+    if (exc == MB_EXC_NONE) {
+        for (uint16_t i = 0; i < count; i++) {
+            uint8_t ch = (uint8_t)(addr + i);
+            if (cmd.bits & (1u << ch)) s_do_shadow |=  (uint8_t)(1u << ch);
+            else                       s_do_shadow &= (uint8_t)~(1u << ch);
+            s_do_pending[ch]++;
+        }
+    }
+    CMD_UNLOCK();
+    return exc;
 }
 
 static uint8_t local_write_holding(uint16_t addr, uint16_t count, const uint8_t *regs_be)
@@ -159,12 +205,11 @@ static uint8_t local_write_holding(uint16_t addr, uint16_t count, const uint8_t 
     for (uint16_t i = 0; i < count; i++)
         cmd.regs[i] = (uint16_t)((regs_be[i * 2] << 8) | regs_be[i * 2 + 1]);
 
+    CMD_LOCK();
     uint8_t exc = enqueue(&cmd, "holding register write");
-    if (exc == MB_EXC_NONE) {                     /* read-back follows the command */
-        portENTER_CRITICAL(&s_hr_lock);
+    if (exc == MB_EXC_NONE)                       /* read-back follows the command */
         for (uint16_t i = 0; i < count; i++) s_hr_shadow[addr + i] = cmd.regs[i];
-        portEXIT_CRITICAL(&s_hr_lock);
-    }
+    CMD_UNLOCK();
     return exc;
 }
 
@@ -174,18 +219,26 @@ uint8_t mb_server_handle(const mb_request_t *req, uint8_t *resp, uint16_t *resp_
 {
     *resp_len = 0;
 
+    uint8_t exc;
+
     switch (req->fc) {
+    /* The length is set only once the read succeeded. An exception response
+       carries no data, and a caller that framed resp anyway would put
+       whatever was on its stack onto the wire. */
     case MB_FUNC_READ_COILS:
-        *resp_len = (uint16_t)((req->count + 7u) / 8u);
-        return local_read_coils(req->addr, req->count, resp);
+        exc = local_read_coils(req->addr, req->count, resp);
+        if (!exc) *resp_len = (uint16_t)((req->count + 7u) / 8u);
+        return exc;
 
     case MB_FUNC_READ_DISCRETE_INPUTS:
-        *resp_len = (uint16_t)((req->count + 7u) / 8u);
-        return local_read_discrete(req->addr, req->count, resp);
+        exc = local_read_discrete(req->addr, req->count, resp);
+        if (!exc) *resp_len = (uint16_t)((req->count + 7u) / 8u);
+        return exc;
 
     case MB_FUNC_READ_HOLDING_REGISTER:
-        *resp_len = (uint16_t)(req->count * 2u);
-        return local_read_holding(req->addr, req->count, resp);
+        exc = local_read_holding(req->addr, req->count, resp);
+        if (!exc) *resp_len = (uint16_t)(req->count * 2u);
+        return exc;
 
     case MB_FUNC_READ_INPUT_REGISTER:
         return MB_EXC_ILLEGAL_ADDR;     /* no input registers on this device */
@@ -288,6 +341,21 @@ static void run_coil_cmd(const mb_cmd_t *cmd)
     if (ret != ESP_OK)
         ESP_LOGW(TAG, "coil write %u..%u failed: %s",
                  cmd->offset + 1u, cmd->offset + cmd->count, esp_err_to_name(ret));
+
+    CMD_LOCK();
+    uint8_t live = dout_get_all();
+    for (uint16_t i = 0; i < cmd->count; i++) {
+        uint8_t ch = (uint8_t)(cmd->offset + i);
+        if (s_do_pending[ch]) s_do_pending[ch]--;
+        /* A write the hardware refused must not leave the shadow claiming it
+           happened: once no write is outstanding for this coil, the shadow is
+           put back in step with the relay. */
+        if (!s_do_pending[ch]) {
+            if (live & (1u << ch)) s_do_shadow |=  (uint8_t)(1u << ch);
+            else                   s_do_shadow &= (uint8_t)~(1u << ch);
+        }
+    }
+    CMD_UNLOCK();
 }
 
 static void run_holding_cmd(const mb_cmd_t *cmd)
@@ -331,6 +399,11 @@ static void command_task(void *arg)
 static esp_err_t start_command_task(void)
 {
     if (s_cmd_q) return ESP_OK;
+
+    s_cmd_mux = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(s_cmd_mux, ESP_ERR_NO_MEM, TAG, "command mutex");
+    s_do_shadow = dout_get_all();       /* start in step with the relays */
+
     s_cmd_q = xQueueCreate(MB_CMD_QUEUE_DEPTH, sizeof(mb_cmd_t));
     ESP_RETURN_ON_FALSE(s_cmd_q, ESP_ERR_NO_MEM, TAG, "command queue");
 
@@ -341,6 +414,8 @@ static esp_err_t start_command_task(void)
            the shadow registers as if it had happened, and never carried out. */
         vQueueDelete(s_cmd_q);
         s_cmd_q = NULL;
+        vSemaphoreDelete(s_cmd_mux);
+        s_cmd_mux = NULL;
         ESP_RETURN_ON_FALSE(false, ESP_ERR_NO_MEM, TAG, "command task");
     }
     return ESP_OK;

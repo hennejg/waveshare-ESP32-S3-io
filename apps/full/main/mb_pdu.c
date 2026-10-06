@@ -201,8 +201,12 @@ mb_rsp_t mb_parse_read_response(const uint8_t *frame, uint16_t len,
     }
     if (rsp_fc != fc) return MB_RSP_MALFORMED;
 
+    /* In 32-bit arithmetic, and the count is checked first: at count 128 the
+       truncated (uint8_t)(count * 2) would be 0, and a frame carrying no data
+       at all would be accepted as the answer to a 256-byte read. */
+    if (count < 1 || count > 125) return MB_RSP_MALFORMED;
     uint8_t byte_cnt = frame[8];
-    if (byte_cnt != (uint8_t)(count * 2u)) return MB_RSP_MALFORMED;
+    if ((uint32_t)byte_cnt != (uint32_t)count * 2u) return MB_RSP_MALFORMED;
     if (len != MB_MBAP_LEN + 2 + byte_cnt) return MB_RSP_MALFORMED;
 
     *data = &frame[9];

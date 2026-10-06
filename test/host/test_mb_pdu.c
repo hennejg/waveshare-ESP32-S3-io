@@ -455,6 +455,18 @@ static void test_client_framing(void)
         CHECK(r == MB_RSP_MALFORMED, "%s wurde angenommen", bad[i].what);
     }
 
+    /* A byte count of count*2 truncated into a uint8: at 128 registers that
+       is 0, and a frame carrying no data at all would have been accepted as
+       the answer to a 256-byte read. The count is now checked first. */
+    const uint8_t empty[] = { 0xBE,0xEF, 0x00,0x00, 0x00,0x03, 11, 0x03, 0x00 };
+    memcpy(rsp, empty, sizeof(empty));
+    CHECK(mb_parse_read_response(rsp, sizeof(empty), 0xBEEF, 11, 0x03, 128, &data, &exc)
+          == MB_RSP_MALFORMED, "count 128 mit Bytezahl 0 angenommen");
+    CHECK(mb_parse_read_response(rsp, sizeof(empty), 0xBEEF, 11, 0x03, 0, &data, &exc)
+          == MB_RSP_MALFORMED, "count 0 angenommen");
+    CHECK(mb_parse_read_response(rsp, sizeof(empty), 0xBEEF, 11, 0x03, 126, &data, &exc)
+          == MB_RSP_MALFORMED, "count ueber 125 angenommen");
+
     /* Too short, at every length. */
     for (uint16_t l = 0; l < sizeof(good); l++) {
         memcpy(rsp, good, sizeof(good));

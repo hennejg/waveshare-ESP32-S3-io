@@ -714,6 +714,11 @@ rule('my-rule')
           document.getElementById('mb_tout').value      = cfg.modbus.rs485_tout_ms ?? 1000;
           updateModbusFields();
         }
+        // The snapshot belongs to one sequence of clicks. Carried across a
+        // reload it would restore a state two page loads old -- switching the
+        // role to master and back would then turn Modbus TCP off behind the
+        // user, from a value they never chose.
+        mbSavedTcp = null;
         renderMbm(cfg.mbm);
         refreshMbmStatus();
         if (!window._mbmTimer) window._mbmTimer = setInterval(refreshMbmStatus, 5000);
@@ -835,6 +840,13 @@ rule('my-rule')
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(cfg),
         });
+        if (!r.ok) {
+          // The device explains itself in a plain-text body; without this the
+          // JSON parse below throws and the explanation is thrown away, so a
+          // refused name or an oversized body reads as a script error.
+          const why = (await r.text()).replace(/<[^>]*>/g, ' ').trim();
+          throw new Error(why || ('HTTP ' + r.status));
+        }
         const res = await r.json();
         if (res.status === 'ok') {
           status.className = 'ok';
@@ -897,7 +909,7 @@ rule('my-rule')
                    '<input type="number" id="mbm_reg_' + i + '" style="width:5rem" min="0" max="65535" value="' + (e.reg || 0) + '">') +
           _mbmCell('<select id="mbm_type_' + i + '">' + opts + '</select>') +
           _mbmCell('<input type="checkbox" id="mbm_sw_' + i + '"' + (e.word_swap ? ' checked' : '') + '>') +
-          _mbmCell('<input type="number" id="mbm_scale_' + i + '" style="width:5rem" step="any" value="' + (e.scale != null ? e.scale : 1) + '">') +
+          _mbmCell('<input type="number" id="mbm_scale_' + i + '" style="width:5rem" step="any" title="Any non-zero number" value="' + (e.scale != null ? e.scale : 1) + '">') +
           _mbmCell('<input type="number" id="mbm_int_' + i + '" style="width:5.5rem" min="200" step="100" value="' + (e.interval_ms || 5000) + '">') +
           '<td style="padding:.15rem .3rem;white-space:nowrap" id="mbm_stat_' + i + '">—</td>';
         tb.appendChild(tr);
@@ -914,7 +926,9 @@ rule('my-rule')
         var name = document.getElementById('mbm_name_' + i).value.trim();
         var host = document.getElementById('mbm_host_' + i).value.trim();
         var on   = document.getElementById('mbm_en_' + i).checked;
-        if (!on && !name && !host) continue;          // an untouched row is not sent
+        // Every row is sent, empty ones included. The device stores the array
+        // by position, so skipping blanks would shift the rows below them up
+        // and the table would come back rearranged.
         out.push({
           enable:      on,
           name:        name,
@@ -935,7 +949,7 @@ rule('my-rule')
     // Shows what each row last actually read, which is the only way to tell a
     // wrong register from a device that is not answering.
     function refreshMbmStatus() {
-      fetch('/api/modbus/status').then(function (r) {
+      apiFetch('/api/modbus/status').then(function (r) {
         return r.ok ? r.json() : null;
       }).then(function (d) {
         if (!d || !d.tcp_master) return;

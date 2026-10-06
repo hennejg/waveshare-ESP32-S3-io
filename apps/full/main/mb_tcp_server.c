@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -116,6 +117,10 @@ typedef struct {
 static conn_t        s_conn[MB_TCP_MAX_CONN];
 static QueueHandle_t s_jobs;
 static int           s_listen_fd = -1;
+/* Separate from s_listen_fd on purpose. The poller reads s_listen_fd as its
+   first act, so the socket has to be published before the task exists; this
+   flag is what "already started" means, and it is set last. */
+static bool          s_started;
 
 /* A worker finishing cannot be seen by select(), so it writes here and the
    poller wakes. Polling for it instead cost every request on a busy
@@ -272,7 +277,7 @@ static void close_slot(int i)
 
 /* Answers without going near a worker. Used when the pool is saturated: the
    client is told to retry rather than left waiting for a slot. */
-static void answer_busy(int fd, const uint8_t *frame)
+static bool answer_busy(int fd, const uint8_t *frame)
 {
     uint8_t out[MBAP_LEN + 2];
     memcpy(out, frame, 4);
@@ -280,7 +285,7 @@ static void answer_busy(int fd, const uint8_t *frame)
     out[6] = frame[6];
     out[7] = (uint8_t)(frame[MBAP_LEN] | 0x80u);
     out[8] = MB_EXC_DEVICE_BUSY;
-    (void)send_all(fd, out, sizeof(out));
+    return send_all(fd, out, sizeof(out));
 }
 
 static void accept_one(void)
@@ -311,11 +316,18 @@ static void accept_one(void)
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
+    /* send_all() and recv_exact() only check their deadline between calls, so
+       the whole bound rests on these two. Without them a single peer that
+       stops reading blocks the polling task for good -- which is the failure
+       they were added to prevent. */
     struct timeval rtv = { .tv_sec = 0, .tv_usec = RECV_SLICE_MS * 1000 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
-
     struct timeval stv = { .tv_sec = 0, .tv_usec = SEND_SLICE_MS * 1000 };
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof(stv));
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv)) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof(stv)) != 0) {
+        ESP_LOGE(TAG, "cannot set socket timeouts: errno %d — dropping", errno);
+        close(fd);
+        return;
+    }
 
     int ka = 1, idle = KEEPALIVE_IDLE_S, intvl = KEEPALIVE_INTVL_S, cnt = KEEPALIVE_COUNT;
     setsockopt(fd, SOL_SOCKET,  SO_KEEPALIVE,  &ka,    sizeof(ka));
@@ -375,8 +387,11 @@ static void serve_slot(int i, job_t *job)
            bound, say so: "slave device busy" is the one answer a client knows
            to retry. */
         s_stats.overloaded++;
-        answer_busy(fd, job->frame);
-        s_conn[i].state = SLOT_IDLE;
+        /* The same rule as everywhere else: half a response on the wire
+           cannot be taken back, so the connection ends rather than being put
+           back into service with the client's framing four bytes adrift. */
+        if (answer_busy(fd, job->frame)) s_conn[i].state = SLOT_IDLE;
+        else                             close_slot(i);
     }
 }
 
@@ -410,7 +425,9 @@ static void poller_task(void *arg)
             /* With no timeout select() cannot return 0, so this is a real
                failure. Spinning on it at this priority would starve the
                workers in silence. */
-            ESP_LOGE(TAG, "select: errno %d", errno);
+            /* Once, not ten times a second for as long as it lasts. */
+            static bool said;
+            if (!said) { said = true; ESP_LOGE(TAG, "select: errno %d", errno); }
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
@@ -444,6 +461,7 @@ static void start_unwind(int fd, TaskHandle_t *tasks, int n_tasks)
 {
     for (int i = 0; i < n_tasks; i++)
         if (tasks[i]) vTaskDelete(tasks[i]);
+    s_listen_fd = -1;
     if (fd >= 0)          close(fd);
     if (s_wake_fd >= 0) { close(s_wake_fd); s_wake_fd = -1; }
     if (s_jobs)         { vQueueDelete(s_jobs); s_jobs = NULL; }
@@ -451,7 +469,7 @@ static void start_unwind(int fd, TaskHandle_t *tasks, int n_tasks)
 
 esp_err_t mb_tcp_server_start(uint16_t port, uint8_t local_uid)
 {
-    if (s_listen_fd >= 0) return ESP_OK;             /* a second interface came up */
+    if (s_started) return ESP_OK;                    /* a second interface came up */
 
     s_local_uid = local_uid;
 
@@ -507,6 +525,22 @@ esp_err_t mb_tcp_server_start(uint16_t port, uint8_t local_uid)
        published last. Half a server that reports success would be worse than
        none: the guard at the top would then make every later attempt return
        ESP_OK on something that answers nobody. */
+    /* Published before the tasks exist: the poller's first statement reads it
+       into its fd set, and on a dual-core board it can get there before this
+       function's next line. */
+    /* The one socket on this task with no timeout. accept() is only reached
+       when select() says there is something, but a connection aborted in
+       between would otherwise block the task that owns every connection and
+       every worker completion, with nothing to recover it. */
+    int lflags = fcntl(fd, F_GETFL, 0);
+    if (lflags < 0 || fcntl(fd, F_SETFL, lflags | O_NONBLOCK) < 0) {
+        ESP_LOGE(TAG, "listen socket mode: errno %d", errno);
+        start_unwind(fd, NULL, 0);
+        return ESP_FAIL;
+    }
+
+    s_listen_fd = fd;
+
     TaskHandle_t tasks[MB_TCP_WORKERS + 1] = {0};
     for (int i = 0; i < MB_TCP_WORKERS; i++) {
         char name[16];
@@ -523,7 +557,7 @@ esp_err_t mb_tcp_server_start(uint16_t port, uint8_t local_uid)
         start_unwind(fd, tasks, MB_TCP_WORKERS + 1);
         return ESP_ERR_NO_MEM;
     }
-    s_listen_fd = fd;
+    s_started = true;
 
     ESP_LOGI(TAG, "listening on port %u — %d connections, %d workers",
              port, MB_TCP_MAX_CONN, MB_TCP_WORKERS);
