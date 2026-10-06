@@ -26,6 +26,7 @@ esp_err_t mb_tcp_master_reload(void);
 
 /* What happened to one entry last time, for the status API. */
 typedef struct {
+    char     name[21];     /* as the polling task has it, not as stored     */
     bool     enabled;
     bool     valid;        /* a value has been read at least once; age_ms says
                               how long ago -- nothing here calls it stale     */

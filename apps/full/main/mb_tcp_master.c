@@ -85,15 +85,23 @@ static SemaphoreHandle_t s_state_mux;
 
 /* Set by a configuration change, acted on by the polling task: the cached
    sockets belong to that task and must not be closed from under it. */
-static volatile bool s_drop_conns;
-
-/* Bumped by every configuration change. A poll already in flight when the
-   table was replaced carries the value from before, and its answer is thrown
-   away rather than written under whatever name now occupies that slot: two
-   meters often share unit id, function code and register, so such an answer
-   passes every protocol check and would be published as a perfectly plausible
-   reading of the wrong device. */
-static volatile uint32_t s_generation;
+/* The table this task works from, and nobody else touches.
+ *
+ * Reading the shared configuration directly cannot be made safe by ordering
+ * or by a generation counter, because the writer replaces the whole struct
+ * with an unsynchronised memcpy and only afterwards says so. A poll that read
+ * it mid-copy could take the new name with the old host and publish one
+ * device's reading under another's name, and no later signal could take that
+ * back.
+ *
+ * So the configuration is handed over instead of shared: the HTTP task leaves
+ * a complete copy in s_staged, and this task picks it up between polls, where
+ * nothing of its own is in flight. Everything that follows -- which entry is
+ * polled, what its answer is committed to, what name it is published under --
+ * then belongs to one task from start to finish. */
+static mbm_poll_t    s_active[APP_CFG_MBM_COUNT];   /* this task only       */
+static mbm_poll_t    s_staged[APP_CFG_MBM_COUNT];   /* under s_state_mux    */
+static volatile bool s_reload_pending;
 
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
@@ -376,30 +384,18 @@ static void publish(const mbm_poll_t *e, double value)
 /* e is a copy, not a pointer into the live configuration: the HTTP task
    overwrites that table in place, and a read in progress would otherwise
    finish against an entry that describes a different device. */
-/* Returns false when the answer was thrown away because the configuration
-   changed while it was in flight. The caller must then leave the entry's
-   schedule alone: the reload has set it to "due now" deliberately, and
-   writing a new due date from the old snapshot's interval would undo that --
-   an entry repointed from a daily poll to a 200 ms one would wait a day.
-
-   The generation is compared under the same lock that the reload resets the
-   state and bumps it under. Comparing first and locking afterwards leaves a
-   gap in which the reload can complete, and the stale value then lands in the
-   slot it has just cleared. */
-static bool poll_entry(const mbm_poll_t *e, entry_state_t *st, uint32_t gen)
+/* e points into s_active, which only this task writes and only between
+   polls, so it cannot change under this function. The status commit still
+   takes the lock -- the HTTP task reads the status -- but there is nothing
+   left to compare against: a configuration change cannot be applied while
+   this is running. */
+static void poll_entry(const mbm_poll_t *e, entry_state_t *st)
 {
     double value = 0;
     char   err[sizeof(st->last_error)];
     bool   ok = read_value(e, &value, err, sizeof(err));
 
     ST_LOCK();
-    if (gen != s_generation) {
-        ST_UNLOCK();
-        ESP_LOGD(TAG, "%s: answer arrived after a configuration change, dropped",
-                 e->name);
-        return false;
-    }
-
     if (ok) {
         st->value      = value;
         st->value_ms   = now_ms();
@@ -423,64 +419,64 @@ static bool poll_entry(const mbm_poll_t *e, entry_state_t *st, uint32_t gen)
             ESP_LOGW(TAG, "%s: %s", e->name, err);
         }
     }
-    return true;
+}
+
+/* Picks up a configuration the HTTP task has left, at a point where this task
+   holds nothing of its own: between polls, never during one. */
+static void apply_staged_config(void)
+{
+    ST_LOCK();
+    if (!s_reload_pending) { ST_UNLOCK(); return; }
+    s_reload_pending = false;
+    memcpy(s_active, s_staged, sizeof(s_active));
+
+    /* Everything known about the old entries described something that is no
+       longer there: a value from a register that has been repointed, a
+       backoff earned by a host that has been corrected, counters belonging to
+       another device. */
+    memset(s_state, 0, sizeof(s_state));
+    int64_t now = now_ms();
+    for (int i = 0; i < APP_CFG_MBM_COUNT; i++) s_state[i].due_ms = now;
+    ST_UNLOCK();
+
+    /* A cached socket may lead to a device nobody asks about any more. */
+    for (int i = 0; i < CONN_CACHE; i++)
+        if (s_conns[i].fd >= 0) conn_close(&s_conns[i]);
 }
 
 static void master_task(void *arg)
 {
     (void)arg;
-    const app_config_t *cfg = app_config_get();
-
-    for (int i = 0; i < APP_CFG_MBM_COUNT; i++) s_state[i].due_ms = now_ms();
 
     for (;;) {
+        apply_staged_config();
         int64_t now  = now_ms();
         int64_t next = now + 1000;
 
         for (int i = 0; i < APP_CFG_MBM_COUNT; i++) {
-            /* The generation is read FIRST. Taken afterwards, a change
-               landing between the two lines would stamp an old snapshot --
-               or a half-copied one, since the writer memcpy's the whole
-               struct -- with the generation that is about to be current, and
-               the result would be kept instead of thrown away. This way any
-               change after this point makes the comparison fail. */
-            uint32_t       gen  = s_generation;
-            mbm_poll_t     snap = cfg->mbm[i];
-            entry_state_t *st   = &s_state[i];
-            if (!snap.enable || !snap.name[0] || !snap.host[0]) continue;
+            const mbm_poll_t *e  = &s_active[i];
+            entry_state_t    *st = &s_state[i];
+            if (!e->enable || !e->name[0] || !e->host[0]) continue;
 
             if (now >= st->due_ms) {
-                bool kept = poll_entry(&snap, st, gen);
+                poll_entry(e, st);
                 now = now_ms();
 
-                /* A discarded answer leaves the schedule as the reload set
-                   it: due now, under the new configuration. */
-                if (kept) {
-                    ST_LOCK();
-                    if (gen == s_generation) {
-                        /* The backoff widens the gap after a failure; it must
-                           never narrow it. An entry polled once a day that
-                           failed once would otherwise be retried every minute
-                           from then on -- more traffic to a dead device than
-                           the working one ever caused. */
-                        uint32_t wait = snap.interval_ms;
-                        if (st->backoff_ms > wait)      wait = st->backoff_ms;
-                        if (wait < MBM_INTERVAL_MIN_MS) wait = MBM_INTERVAL_MIN_MS;
-                        st->due_ms = now + wait;
-                    }
-                    ST_UNLOCK();
-                }
+                ST_LOCK();
+                /* The backoff widens the gap after a failure; it must never
+                   narrow it. An entry polled once a day that failed once
+                   would otherwise be retried every minute from then on --
+                   more traffic to a dead device than the working one ever
+                   caused. */
+                uint32_t wait = e->interval_ms;
+                if (st->backoff_ms > wait)      wait = st->backoff_ms;
+                if (wait < MBM_INTERVAL_MIN_MS) wait = MBM_INTERVAL_MIN_MS;
+                st->due_ms = now + wait;
+                ST_UNLOCK();
             }
             if (st->due_ms < next) next = st->due_ms;
         }
 
-        if (s_drop_conns) {
-            /* The table was replaced; a cached socket may lead to a device
-               nobody asked about any more. */
-            s_drop_conns = false;
-            for (int i = 0; i < CONN_CACHE; i++)
-                if (s_conns[i].fd >= 0) conn_close(&s_conns[i]);
-        }
         conn_reap_idle();
 
         int64_t sleep_ms = next - now_ms();
@@ -492,20 +488,22 @@ static void master_task(void *arg)
 
 /* ---------------------------------------------------------------- public */
 
+/* Leaves a complete copy of the table for the polling task to pick up. Called
+   on the HTTP task, directly after app_config_update() and therefore on the
+   only task that writes the configuration -- so what is copied here is whole,
+   which is exactly what the polling task cannot guarantee for itself. */
+static void stage_config(void)
+{
+    const app_config_t *cfg = app_config_get();
+    ST_LOCK();
+    memcpy(s_staged, cfg->mbm, sizeof(s_staged));
+    s_reload_pending = true;
+    ST_UNLOCK();
+}
+
 esp_err_t mb_tcp_master_reload(void)
 {
-    /* The configuration POST replaces the whole table, so everything known
-       about the old entries describes something that is no longer there: a
-       value from a register that has been repointed, a backoff earned by a
-       host that has been corrected, counters belonging to another device. */
-    ST_LOCK();
-    memset(s_state, 0, sizeof(s_state));
-    int64_t now = now_ms();
-    for (int i = 0; i < APP_CFG_MBM_COUNT; i++) s_state[i].due_ms = now;
-    s_generation++;        /* anything already in flight is now stale */
-    ST_UNLOCK();
-    s_drop_conns = true;
-
+    stage_config();
     /* And if this is the first entry anyone has enabled, there is no task
        yet. Without this the entry would sit there, reported as enabled,
        until the next reboot. */
@@ -516,18 +514,18 @@ esp_err_t mb_tcp_master_start(void)
 {
     if (s_running) return ESP_OK;
 
-    const app_config_t *cfg = app_config_get();
-    int enabled = 0;
-    for (int i = 0; i < APP_CFG_MBM_COUNT; i++)
-        if (cfg->mbm[i].enable && cfg->mbm[i].name[0] && cfg->mbm[i].host[0]) enabled++;
-    if (!enabled) return ESP_OK;              /* nothing to do, no task */
-
-    for (int i = 0; i < CONN_CACHE; i++) s_conns[i].fd = -1;
-
     if (!s_state_mux) {
         s_state_mux = xSemaphoreCreateMutex();
         ESP_RETURN_ON_FALSE(s_state_mux, ESP_ERR_NO_MEM, TAG, "state mutex");
     }
+    stage_config();           /* the task reads it on its first pass */
+
+    int enabled = 0;
+    for (int i = 0; i < APP_CFG_MBM_COUNT; i++)
+        if (s_staged[i].enable && s_staged[i].name[0] && s_staged[i].host[0]) enabled++;
+    if (!enabled) return ESP_OK;              /* nothing to do, no task */
+
+    for (int i = 0; i < CONN_CACHE; i++) s_conns[i].fd = -1;
 
     ESP_RETURN_ON_FALSE(
         xTaskCreate(master_task, "mb_master", 5120, NULL, 4, NULL) == pdPASS,
@@ -541,21 +539,25 @@ esp_err_t mb_tcp_master_start(void)
 
 uint8_t mb_tcp_master_get_status(mbm_status_t *out, uint8_t count)
 {
-    const app_config_t *cfg = app_config_get();
     uint8_t n = 0;
 
     ST_LOCK();
     for (int i = 0; i < APP_CFG_MBM_COUNT && n < count; i++, n++) {
         const entry_state_t *st = &s_state[i];
+        /* From the task's own table, not the stored one: right after a save
+           they differ for a moment, and reporting the new name beside the old
+           entry's last value would be the one thing this is meant to tell
+           apart. */
         out[n] = (mbm_status_t){
-            .enabled = cfg->mbm[i].enable != 0,
+            .enabled = s_active[i].enable != 0,
             .valid   = st->valid,
             .value   = st->value,
             .age_ms  = st->value_ms ? (now_ms() - st->value_ms) : -1,
             .reads   = st->reads,
             .errors  = st->errors,
         };
-        strlcpy(out[n].last_error, st->last_error, sizeof(out[n].last_error));
+        strlcpy(out[n].name,       s_active[i].name, sizeof(out[n].name));
+        strlcpy(out[n].last_error, st->last_error,   sizeof(out[n].last_error));
     }
     ST_UNLOCK();
     return n;

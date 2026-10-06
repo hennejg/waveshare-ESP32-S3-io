@@ -1393,11 +1393,10 @@ static esp_err_t api_modbus_status(httpd_req_t *req)
 
     mbm_status_t ms[APP_CFG_MBM_COUNT];
     uint8_t n = mb_tcp_master_get_status(ms, APP_CFG_MBM_COUNT);
-    const app_config_t *cfg = app_config_get();
     cJSON *arr = cJSON_AddArrayToObject(root, "tcp_master");
     for (uint8_t i = 0; i < n; i++) {
         cJSON *o = cJSON_CreateObject();
-        cJSON_AddStringToObject(o, "name",    cfg->mbm[i].name);
+        cJSON_AddStringToObject(o, "name",    ms[i].name);
         cJSON_AddBoolToObject  (o, "enabled", ms[i].enabled);
         if (ms[i].valid) {
             cJSON_AddNumberToObject(o, "value",  ms[i].value);
