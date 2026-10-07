@@ -16,23 +16,29 @@ config APP_SNTP_ENABLE
         accurate local time (e.g. Matter-only builds).
 
 config APP_AUX_DI_ENABLE
-    bool "Three extra NON-ISOLATED digital inputs (GPIO1, GPIO44, GPIO43)"
+    bool "Offer GPIO1, GPIO44 and GPIO43 as extra NON-ISOLATED digital inputs"
     depends on !APP_MATTER_ENABLE
-    default n
+    default y
     help
-        Adds three more inputs on GPIO1, GPIO44 and GPIO43 for boards that
-        need more than the eight on-board ones.  They are shown as AUX1, AUX2
-        and AUX3 in the web UI and occupy channels 8..10 of the DI array,
-        behind the eight isolated ones.
+        Lets each of the three header pins IO1, RXD and TXD (GPIO1, GPIO44,
+        GPIO43) be switched between its standard function and a digital input,
+        per pin, in the web UI (Inputs tab) or with "aux_in" in /api/config.
+        The change takes effect on saving; no reboot.  Every pin starts in its
+        standard function, so a board that never touches the setting behaves
+        as it did without this option.
+
+        Standard function: GPIO1 is left alone (this firmware does not use it);
+        GPIO44 and GPIO43 are UART0 RX and TX, which is where the console is.
+        As an input, the pin is taken off UART0 -- the console keeps running
+        on USB-Serial/JTAG, and on UART0 it simply no longer reaches the pin.
+
+        The channels are AUX1, AUX2 and AUX3, channels 8..10 of the DI array
+        behind the eight isolated ones.  A channel in its standard function
+        reads false and is not published.
 
         These three pins run straight to the ESP32-S3: no optocoupler, no
         series resistor, no reverse protection.  They need external protection
         and must never see more than 3.3 V or less than 0 V.
-
-        GPIO43/44 are UART0 TX/RX and carry the default console, so the console
-        has to be moved to USB-Serial/JTAG only (Component config -> ESP System
-        Settings -> Channel for console output -> USB Serial/JTAG Controller).
-        Building with the console still on UART0 fails with an #error.
 
         Moving the console is not enough for GPIO43 (AUX3).  It is U0TXD, and the
         ROM bootloader drives it as a push-pull output from every reset until

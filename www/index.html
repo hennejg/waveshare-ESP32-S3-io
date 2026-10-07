@@ -652,7 +652,12 @@ rule('my-rule')
     const AUX_GPIO = [1, 44, 43];
     /* Silkscreen names of the same three pads, in channel order. */
     const AUX_PAD  = ['IO1', 'RXD', 'TXD'];
+    /* What each pad does when it is not an input. */
+    const AUX_STD  = ['unused', 'UART0 RX', 'UART0 TX (console)'];
     const AUX_HEAD = 'Direct GPIO inputs — not isolated';
+    const AUX_TXD  = 'TXD (GPIO43) is driven as an output by the ROM bootloader at every reset and while flashing — ' +
+                     'wire it through a series resistor of at least 1 kΩ.';
+    let auxIn = null;   /* from /api/config; null = firmware without the switch */
     const AUX_WARN = 'No optocoupler, no protection: 0–3.3 V logic levels only. ' +
                      'A field voltage destroys the MCU — condition these signals externally.';
     let diCount    = 8;
@@ -686,12 +691,22 @@ rule('my-rule')
             `<div class="hint err">${AUX_WARN}</div></td></tr>`);
         }
         const pin = auxPin(i);
+        const a   = i - diIsolated;
+        /* The switch only where the firmware reports one for this pad. */
+        const sel = (a >= 0 && Array.isArray(auxIn) && a < auxIn.length)
+          ? `<br><select id="aux_${a}_mode" style="margin-top:.2rem">` +
+            `<option value="std">Standard: ${AUX_STD[a] ?? 'standard function'}</option>` +
+            `<option value="in">Digital input</option></select>` +
+            (AUX_PAD[a] === 'TXD' ? `<div class="hint err">${AUX_TXD}</div>` : '')
+          : '';
         const tr = document.createElement('tr');
         tr.innerHTML =
-          `<td>${diLabel(i)}${pin === undefined ? '' : ` <span class="hint">${pin}</span>`}</td>` +
+          `<td>${diLabel(i)}${pin === undefined ? '' : ` <span class="hint">${pin}</span>`}${sel}</td>` +
           `<td><input type="text" id="di_${i}_name" maxlength="20" style="width:9rem"></td>` +
           `<td style="text-align:center"><input type="checkbox" id="di_${i}_invert"></td>`;
         diTbl.appendChild(tr);
+        const s = document.getElementById(`aux_${a}_mode`);
+        if (s) s.value = auxIn[a] ? 'in' : 'std';
       }
     }
     buildDiRows();
@@ -703,6 +718,7 @@ rule('my-rule')
       diCount    = (cfg.di ?? []).length || 8;
       diIsolated = Number.isInteger(cfg.di_isolated)
                    ? Math.min(cfg.di_isolated, diCount) : 0;
+      auxIn      = Array.isArray(cfg.aux_in) ? cfg.aux_in.map(Boolean) : null;
       buildDiRows();
     }
 
@@ -873,6 +889,9 @@ rule('my-rule')
           di,
           dout,
         };
+        if (Array.isArray(auxIn))
+          cfg.aux_in = auxIn.map((_, a) =>
+            document.getElementById(`aux_${a}_mode`)?.value === 'in');
         const r = await apiFetch('/api/config', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1265,7 +1284,13 @@ rule('my-rule')
         const d = await r.json();
         (d.di   || []).forEach((v, i) => {
           const el = document.getElementById(`di-dot-${i}`);
-          if (el) el.className = 'io-dot' + (v ? ' on' : '');
+          /* A pad in its standard function is not an input: no level to show. */
+          const off = Array.isArray(d.di_active) && d.di_active[i] === false;
+          if (el) {
+            el.className = 'io-dot' + (v ? ' on' : '');
+            el.style.opacity = off ? '.25' : '';
+            if (off) el.title = 'standard function — not used as an input';
+          }
         });
         (d.dout || []).forEach((v, i) => {
           const el = document.getElementById(`do-btn-${i}`);

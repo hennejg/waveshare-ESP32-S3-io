@@ -10,7 +10,7 @@ endif()
 idf_component_register(
     SRCS ${SRCS}
     INCLUDE_DIRS "."
-    REQUIRES nvs_flash esp_driver_gpio esp_driver_i2c esp_driver_ledc
+    REQUIRES nvs_flash esp_driver_gpio esp_driver_i2c esp_driver_ledc esp_driver_uart
              esp_eth esp_driver_spi esp_netif esp32-wifi-bootstrap lwip
              esp_timer json mbedtls
 )

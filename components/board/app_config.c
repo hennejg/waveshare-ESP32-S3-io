@@ -26,6 +26,7 @@ _Static_assert(sizeof(app_config_t) < 2600,
 #define K_DOUT_CFG      "dout_cfg"
 #define K_MODBUS_CFG    "mb_cfg"
 #define K_LED_MODE      "led_mode"
+#define K_AUX_IN        "aux_in"
 #define K_CAN_CFG       "can_cfg"
 #define K_SNTP_CFG      "sntp_cfg"
 #define K_MBM_CFG       "mbm_cfg"
@@ -107,6 +108,9 @@ esp_err_t app_config_init(void)
     uint8_t led_mode_val = 0;
     nvs_get_u8(h, K_LED_MODE, &led_mode_val);
     s_cfg.led_mode = led_mode_val;
+    uint8_t aux_in_val = 0;
+    nvs_get_u8(h, K_AUX_IN, &aux_in_val);
+    s_cfg.aux_in = aux_in_val & 0x07u;
     sz = sizeof(s_cfg.can);
     nvs_get_blob(h, K_CAN_CFG, &s_cfg.can, &sz);
     sz = sizeof(s_cfg.sntp);
@@ -156,6 +160,7 @@ esp_err_t app_config_update(const app_config_t *cfg)
     PUT(nvs_set_blob(h, K_DOUT_CFG,   cfg->dout, sizeof(cfg->dout)));
     PUT(nvs_set_blob(h, K_MODBUS_CFG, &cfg->modbus, sizeof(cfg->modbus)));
     PUT(nvs_set_u8(h, K_LED_MODE,     cfg->led_mode));
+    PUT(nvs_set_u8(h, K_AUX_IN,       cfg->aux_in));
     PUT(nvs_set_blob(h, K_CAN_CFG,    &cfg->can, sizeof(cfg->can)));
     PUT(nvs_set_blob(h, K_SNTP_CFG,   &cfg->sntp, sizeof(cfg->sntp)));
     PUT(nvs_set_blob(h, K_MBM_CFG,    cfg->mbm, sizeof(cfg->mbm)));

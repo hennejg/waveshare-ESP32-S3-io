@@ -236,13 +236,25 @@ Status mode all LED commands from MQTT, Modbus, and CAN are ignored.
 
 ### Optional Extra Inputs (`APP_AUX_DI_ENABLE`)
 
-> Build-time option, **off by default** — the released binaries do not contain it.
+> Switched per pin in the web UI. Every pin starts in its **standard function**.
 
-`APP_AUX_DI_ENABLE` adds three further digital inputs on the **IO1, RXD and TXD** pads (GPIO1, GPIO44, GPIO43), behind the eight
-isolated ones.
-They show up as **AUX1–AUX3** in the web UI and occupy DI indices 8, 9 and 10. Enable it with
-`CONFIG_APP_AUX_DI_ENABLE=y` in `apps/full/sdkconfig.defaults`, or in `./idf.sh menuconfig` under
-*Board driver options → Three extra NON-ISOLATED digital inputs (GPIO1, GPIO44, GPIO43)*.
+The **IO1, RXD and TXD** pads (GPIO1, GPIO44, GPIO43) can each be used either in their standard function or as a
+further digital input. The choice is made per pin on the *Inputs* tab, or with `"aux_in": [true, false, false]` in
+`POST /api/config`, and takes effect on saving, without a reboot. As inputs they show up as **AUX1–AUX3** behind the
+eight isolated ones and occupy DI indices 8, 9 and 10.
+
+| Pad | GPIO | Standard function                         | As input |
+|-----|------|-------------------------------------------|----------|
+| IO1 | 1    | unused by this firmware                   | AUX1     |
+| RXD | 44   | UART0 RX                                  | AUX2     |
+| TXD | 43   | UART0 TX — the serial console             | AUX3     |
+
+A pad switched to input is taken off UART0. The console carries on over USB-Serial/JTAG; on UART0 it no longer
+reaches the pin until the pad is switched back. A channel in its standard function reads `false`, is not published,
+and `/api/io/state` marks it in `di_active`.
+
+The build option `CONFIG_APP_AUX_DI_ENABLE` (default on, not available in the Matter build) only decides whether the
+switch is offered at all.
 
 **These three pins are not isolated.** They run straight to the ESP32-S3 — no optocoupler, no series resistor, no
 reverse protection — and must never see more than 3.3 V or less than 0 V. Conditioning them is up to the external
@@ -255,11 +267,7 @@ driver on every boot and during every flash. It is deliberately the last channel
 extra inputs can leave it unwired. GPIO44 (AUX2, U0RXD) is an input and has no such problem; GPIO1 is otherwise
 unused by this firmware.
 
-**The console has to move.** GPIO43/44 are UART0 TX/RX, so the option also requires
-`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` (*Component config → ESP System Settings → Channel for console output →
-USB Serial/JTAG Controller*). Building with the console still on UART0 fails with an `#error`.
-
-**Turning the option back off loses the input names.** The per-input settings are stored as one NVS blob. Eleven
+**Turning the build option back off loses the input names.** The per-input settings are stored as one NVS blob. Eleven
 entries written by an option-on firmware do not fit the eight-entry buffer of an option-off one, so `nvs_get_blob()`
 returns `ESP_ERR_NVS_INVALID_LENGTH` and *every* input name and invert flag falls back to its default — the eight
 isolated ones included. Note them down before switching back.
@@ -268,9 +276,9 @@ Not every interface grows with the extra channels:
 
 | Interface        | AUX1–AUX3 | Detail                                                              |
 |------------------|-----------|---------------------------------------------------------------------|
-| Web UI           | yes       | Listed as AUX1–AUX3, marked as not isolated                         |
+| Web UI           | yes       | Listed as AUX1–AUX3, marked as not isolated, switch per pin         |
 | REST API         | yes       | `/api/config` and the status JSON carry 11 input entries            |
-| MQTT             | yes       | `input/9`, `input/10`, `input/11` — the topic index is DI index + 1 |
+| MQTT             | yes       | `input/9`, `input/10`, `input/11` — only for pads set to input      |
 | CAN bus          | **no**    | DI state is packed into a single byte — room for 8                  |
 | Modbus RTU       | **no**    | Discrete inputs 10001–10008 only                                    |
 | Matter           | **no**    | 8 Contact Sensor endpoints, unchanged                               |

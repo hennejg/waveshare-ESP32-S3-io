@@ -435,6 +435,12 @@ static esp_err_t api_config_get(httpd_req_t *req)
     }
     /* Inputs from this index on are not optocoupler-isolated. */
     cJSON_AddNumberToObject(root, "di_isolated", APP_CFG_DI_ISOLATED_COUNT);
+#if APP_CFG_DI_AUX_COUNT
+    /* Per auxiliary pin: true = digital input, false = standard function. */
+    cJSON *aux = cJSON_AddArrayToObject(root, "aux_in");
+    for (int a = 0; a < APP_CFG_DI_AUX_COUNT; a++)
+        cJSON_AddItemToArray(aux, cJSON_CreateBool((cfg->aux_in >> a) & 1u));
+#endif
 
     cJSON *dout = cJSON_AddArrayToObject(root, "dout");
     for (int i = 0; i < APP_CFG_DO_COUNT; i++) {
@@ -534,6 +540,20 @@ static esp_err_t api_config_post(httpd_req_t *req)
         strlcpy(cfg.mqtt_password, pass->valuestring, sizeof(cfg.mqtt_password));
 
     parse_invert_array(cJSON_GetObjectItem(root, "di"),   cfg.di,   APP_CFG_DI_COUNT);
+#if APP_CFG_DI_AUX_COUNT
+    /* Only what is sent changes: a request without aux_in, or with a shorter
+       array, leaves the other pins as they are. */
+    cJSON *aux_j = cJSON_GetObjectItem(root, "aux_in");
+    if (cJSON_IsArray(aux_j)) {
+        int n = cJSON_GetArraySize(aux_j);
+        for (int a = 0; a < n && a < APP_CFG_DI_AUX_COUNT; a++) {
+            cJSON *v = cJSON_GetArrayItem(aux_j, a);
+            if (!cJSON_IsBool(v)) continue;
+            if (cJSON_IsTrue(v)) cfg.aux_in |=  (uint8_t)(1u << a);
+            else                 cfg.aux_in &= (uint8_t)~(1u << a);
+        }
+    }
+#endif
     parse_invert_array(cJSON_GetObjectItem(root, "dout"), cfg.dout, APP_CFG_DO_COUNT);
 
     cJSON *led_mode_v = cJSON_GetObjectItem(root, "led_mode");
@@ -762,6 +782,7 @@ static esp_err_t api_config_post(httpd_req_t *req)
        describes the new ones. Everything else on this page needs a reboot,
        which is what the form says; this one does not have to. */
     if (mbm_present) mb_tcp_master_reload();
+    di_set_aux(app_config_get()->aux_in);   /* before di_publish_all() below */
     app_time_apply_tz();  /* timezone first, so a sync that follows computes in it */
     sntp_sync_apply();    /* apply any SNTP server / enable change immediately */
     di_publish_all();
@@ -1126,6 +1147,13 @@ static esp_err_t api_io_state(httpd_req_t *req)
     for (int i = 0; i < APP_CFG_DI_COUNT; i++) {
         cJSON_AddItemToArray(di,   cJSON_CreateBool(di_get((uint8_t)i)));
     }
+#if APP_CFG_DI_AUX_COUNT
+    /* Which channels are inputs right now; an auxiliary one in its standard
+       function reads false above without meaning "low". */
+    cJSON *act = cJSON_AddArrayToObject(root, "di_active");
+    for (int i = 0; i < APP_CFG_DI_COUNT; i++)
+        cJSON_AddItemToArray(act, cJSON_CreateBool(di_is_active((uint8_t)i)));
+#endif
     for (int i = 0; i < APP_CFG_DO_COUNT; i++) {
         cJSON_AddItemToArray(dout, cJSON_CreateBool(dout_get((uint8_t)i)));
     }

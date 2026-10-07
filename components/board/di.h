@@ -3,15 +3,9 @@
 #include <stdint.h>
 #include "esp_err.h"
 
-/* GPIO43/44 are UART0 TX/RX.  CONFIG_ESP_CONSOLE_UART is set for both UART
-   console choices — "Default: UART0" and "Custom", whose TX/RX default to
-   exactly GPIO43/44 on the ESP32-S3. */
-#if CONFIG_APP_AUX_DI_ENABLE && CONFIG_ESP_CONSOLE_UART
-#error "APP_AUX_DI_ENABLE uses GPIO43/44, which a UART console drives as TX/RX. Select USB Serial/JTAG Controller as the console channel (CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG) or turn APP_AUX_DI_ENABLE off."
-#endif
-
-/* Initialise the digital inputs: the 8 isolated ones on GPIO4-11, plus the
-   3 auxiliary ones on GPIO1/43/44 when APP_AUX_DI_ENABLE is set.
+/* Initialise the digital inputs: the 8 isolated ones on GPIO4-11, plus
+   whichever of the 3 auxiliary ones on GPIO1/44/43 the configuration's aux_in
+   selects (APP_AUX_DI_ENABLE).
    Safe to call before WiFi/MQTT are up — monitoring starts immediately,
    publishing begins once the MQTT broker connects. */
 esp_err_t di_init(void);
@@ -28,6 +22,15 @@ bool di_get(uint8_t n);
    ones, which sit directly on a 3.3 V GPIO with no optocoupler and no series
    protection.  The web UI uses this to warn about them. */
 bool di_is_isolated(uint8_t n);
+
+/* False for an auxiliary channel left in its standard function; such a
+   channel reads false and is not published.  Always true for 0-7. */
+bool di_is_active(uint8_t n);
+
+/* Switches the auxiliary pins: bit i set = AUX(i+1) is an input, clear = its
+   standard function (GPIO1 untouched, GPIO44/43 back on UART0 RX/TX).  Takes
+   effect at once; a channel that becomes an input is read and published. */
+void di_set_aux(uint8_t mask);
 
 /* Publish the current state of all inputs immediately. */
 void di_publish_all(void);

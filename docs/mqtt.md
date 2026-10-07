@@ -39,7 +39,7 @@ The client reconnects automatically with exponential backoff if the broker becom
 
 The board has 8 optocoupler-isolated digital inputs on GPIO4–GPIO11 (DI1–DI8).
 
-Firmware built with `APP_AUX_DI_ENABLE` has three more, non-isolated, on GPIO1/GPIO44/GPIO43. They are called AUX1–AUX3
+Three more, non-isolated, on GPIO1/GPIO44/GPIO43 are published once switched to input in the web UI (`APP_AUX_DI_ENABLE`); a pad left in its standard function is not published. They are called AUX1–AUX3
 in the web UI and are published like any other input — the topic index continues after DI8:
 
 | Web UI | Pad | GPIO   | DI index | Default topic       |

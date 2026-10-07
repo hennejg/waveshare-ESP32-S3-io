@@ -18,13 +18,12 @@ jobs:
           - config: default
             label: ''
             sdkconfig: ''
-          # APP_AUX_DI_ENABLE compiles code the default build never sees: the
-          # UART-console #error, the 11-entry DI arrays, the AUX rows in the UI.
-          - config: aux-di
-            label: ', APP_AUX_DI_ENABLE'
+          # APP_AUX_DI_ENABLE is on by default; this compiles the eight-input
+          # build the default never sees: 8-entry DI arrays, no aux_in switch.
+          - config: no-aux-di
+            label: ', without APP_AUX_DI_ENABLE'
             sdkconfig: |
-              CONFIG_APP_AUX_DI_ENABLE=y
-              CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+              CONFIG_APP_AUX_DI_ENABLE=n
 
     steps:
       - name: Checkout

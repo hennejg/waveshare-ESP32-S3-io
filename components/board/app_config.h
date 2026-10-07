@@ -119,7 +119,9 @@ typedef struct {
     di_config_t  dout[APP_CFG_DO_COUNT];
 
     uint8_t led_mode;    /* LED_MODE_IO or LED_MODE_STATUS */
-    uint8_t _led_pad[3];
+    uint8_t aux_in;      /* bit i: AUX(i+1) is an input, else its standard
+                            function (APP_AUX_DI_ENABLE); 0 by default */
+    uint8_t _led_pad[2];
 
     /* CAN bus */
     struct {
