@@ -260,12 +260,17 @@ void dout_on_mqtt_message(const char *topic, size_t tlen,
                            const char *data,  size_t dlen)
 {
 #ifdef CONFIG_APP_MQTT_ENABLE
-    /* Match suffix "output/set" — bulk set all outputs at once.
+    /* The topic arrives relative, without the prefix (app_mqtt strips it),
+       and is compared whole: a suffix match used to let "rules/output/set"
+       -- delivered through the rule engine's "rules/#" subscription -- pass
+       for the bulk command and switch every output.
+
+       "output/set" — bulk set all outputs at once.
        Single value: apply same state/toggle to every output.
        JSON array:   apply each element to the corresponding output (1-indexed). */
-    static const char BULK_SUFFIX[] = "output/set";
-    const size_t bs = sizeof(BULK_SUFFIX) - 1;
-    if (tlen >= bs && memcmp(topic + tlen - bs, BULK_SUFFIX, bs) == 0) {
+    static const char BULK_TOPIC[] = "output/set";
+    const size_t bs = sizeof(BULK_TOPIC) - 1;
+    if (tlen == bs && memcmp(topic, BULK_TOPIC, bs) == 0) {
         char buf[256];
         if (dlen == 0 || dlen >= sizeof(buf)) return;
         memcpy(buf, data, dlen);
@@ -300,10 +305,9 @@ void dout_on_mqtt_message(const char *topic, size_t tlen,
         return;   /* dout_modify() publishes the channels that moved */
     }
 
-    /* Match suffix "output/read" */
-    static const char READ_SUFFIX[] = "output/read";
-    const size_t rs = sizeof(READ_SUFFIX) - 1;
-    if (tlen >= rs && memcmp(topic + tlen - rs, READ_SUFFIX, rs) == 0) {
+    static const char READ_TOPIC[] = "output/read";
+    const size_t rs = sizeof(READ_TOPIC) - 1;
+    if (tlen == rs && memcmp(topic, READ_TOPIC, rs) == 0) {
         dout_publish_all();
         return;
     }
@@ -317,7 +321,7 @@ void dout_on_mqtt_message(const char *topic, size_t tlen,
             if (name[0]) snprintf(cmd, sizeof(cmd), "output/%.20s/set",   name);
             else         snprintf(cmd, sizeof(cmd), "output/%u/set",    i + 1);
             size_t clen = strlen(cmd);
-            if (tlen >= clen && memcmp(topic + tlen - clen, cmd, clen) == 0) {
+            if (tlen == clen && memcmp(topic, cmd, clen) == 0) {
                 bool state;
                 if (parse_toggle(data, dlen))              dout_set(i, !dout_get(i));
                 else if (parse_payload(data, dlen, &state)) dout_set(i, state);

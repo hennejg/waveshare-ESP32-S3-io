@@ -165,9 +165,10 @@ void buzzer_on_mqtt_message(const char *topic, size_t tlen,
                              const char *data,  size_t dlen)
 {
 #ifdef CONFIG_APP_MQTT_ENABLE
-    static const char SUFFIX[] = "buzzer/beep";
-    const size_t sl = sizeof(SUFFIX) - 1;
-    if (tlen < sl || memcmp(topic + tlen - sl, SUFFIX, sl) != 0) return;
+    /* Relative topic, compared whole -- see dout_on_mqtt_message(). */
+    static const char TOPIC[] = "buzzer/beep";
+    const size_t sl = sizeof(TOPIC) - 1;
+    if (tlen != sl || memcmp(topic, TOPIC, sl) != 0) return;
 
     char buf[1024];
     if (dlen == 0 || dlen >= sizeof(buf)) return;

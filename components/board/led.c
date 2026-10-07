@@ -308,9 +308,10 @@ void led_on_mqtt_message(const char *topic, size_t tlen,
 {
 #ifdef CONFIG_APP_MQTT_ENABLE
     if (s_status_mode) return;   /* status mode ignores MQTT LED commands */
-    static const char SUFFIX[] = "led/set";
-    const size_t sl = sizeof(SUFFIX) - 1;
-    if (tlen < sl || memcmp(topic + tlen - sl, SUFFIX, sl) != 0) return;
+    /* Relative topic, compared whole -- see dout_on_mqtt_message(). */
+    static const char TOPIC[] = "led/set";
+    const size_t sl = sizeof(TOPIC) - 1;
+    if (tlen != sl || memcmp(topic, TOPIC, sl) != 0) return;
 
     char buf[1024];
     if (dlen == 0 || dlen >= sizeof(buf)) return;

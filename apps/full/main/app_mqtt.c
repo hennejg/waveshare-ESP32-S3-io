@@ -109,8 +109,27 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
             break;
         }
         if (s_on_msg) {
-            s_on_msg(event->topic, (size_t)event->topic_len,
-                     event->data,  (size_t)event->data_len);
+            /* Hand the handlers the topic the way they subscribed to it:
+               relative, without the configured prefix. Each handler used to
+               match its own suffix against the full topic instead, and the
+               suffix match could not tell "<prefix>/output/set" from
+               "<prefix>/rules/output/set" -- which arrives through the rule
+               engine's "rules/#" subscription and switched every output.
+               Stripping once here lets every handler compare the whole
+               topic, and lets a rule's mqtt('rules/x') match with a prefix
+               set, which it never did. A topic that does not start with the
+               prefix (an absolute one, or a stray retained message) is
+               passed through unchanged. */
+            const char *topic = event->topic;
+            size_t      tlen  = (size_t)event->topic_len;
+            const char *prefix = app_config_get()->mqtt_topic_prefix;
+            size_t      plen   = strlen(prefix);
+            if (plen && tlen > plen + 1 &&
+                memcmp(topic, prefix, plen) == 0 && topic[plen] == '/') {
+                topic += plen + 1;
+                tlen  -= plen + 1;
+            }
+            s_on_msg(topic, tlen, event->data, (size_t)event->data_len);
         }
         break;
 

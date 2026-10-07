@@ -173,10 +173,10 @@ void di_on_mqtt_message(const char *topic, size_t tlen,
                          const char *data,  size_t dlen)
 {
 #ifdef CONFIG_APP_MQTT_ENABLE
-    /* Match any topic ending in "input/read" regardless of prefix. */
-    static const char SUFFIX[] = "input/read";
-    const size_t slen = sizeof(SUFFIX) - 1;
-    if (tlen >= slen && memcmp(topic + tlen - slen, SUFFIX, slen) == 0) {
+    /* The topic arrives relative, without the prefix, and is compared whole. */
+    static const char TOPIC[] = "input/read";
+    const size_t slen = sizeof(TOPIC) - 1;
+    if (tlen == slen && memcmp(topic, TOPIC, slen) == 0) {
         di_publish_all();
     }
 #else
