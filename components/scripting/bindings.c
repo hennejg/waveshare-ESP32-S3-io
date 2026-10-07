@@ -129,15 +129,30 @@ static JSValue js_mqtt_publish(JSContext *ctx, JSValue this_val, int argc, JSVal
     return JS_NewInt32(ctx, msg_id);
 }
 
-/* _aux_pwm_set(pad, duty%, freq) -- pad 1..3; freq undefined or 0 keeps it. */
+/* A pad number 1..3, checked as the number it is: JS_ToInt32 wraps modulo
+   2^32, so pwm(4294967297) would otherwise reach pad 1. */
+static int pad_arg(JSContext *ctx, JSValue v, int32_t *pad)
+{
+    double d;
+    if (JS_ToFloat64(ctx, &d, v) < 0) return -1;
+    if (!(d >= 1 && d <= 3) || d != (double)(int32_t)d) {
+        JS_ThrowRangeError(ctx, "pad must be 1, 2 or 3");
+        return -1;
+    }
+    *pad = (int32_t)d;
+    return 0;
+}
+
+/* _aux_pwm_set(pad, duty%, freq) -- pad 1..3; freq undefined or 0 keeps it.
+   The ranges are aux_io.h's AUX_PWM_*; this component cannot include it. */
 static JSValue js_aux_pwm_set(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
 {
     if (!g_scripting_io->aux_pwm_set) return JS_ThrowInternalError(ctx, "no PWM pads on this board");
     int32_t pad;
     double duty, freq = 0;
-    if (JS_ToInt32(ctx, &pad, argv[0]) < 0 || JS_ToFloat64(ctx, &duty, argv[1]) < 0) return JS_EXCEPTION;
+    if (pad_arg(ctx, argv[0], &pad) < 0) return JS_EXCEPTION;
+    if (JS_ToFloat64(ctx, &duty, argv[1]) < 0) return JS_EXCEPTION;
     if (argc > 2 && !JS_IsUndefined(argv[2]) && JS_ToFloat64(ctx, &freq, argv[2]) < 0) return JS_EXCEPTION;
-    if (pad < 1 || pad > 3) return JS_ThrowRangeError(ctx, "pwm pad must be 1-3");
     if (!(duty >= 0.0 && duty <= 100.0)) return JS_ThrowRangeError(ctx, "pwm duty must be 0-100 (%%)");
     if (freq != 0 && (!(freq >= 5 && freq <= 1000000) || freq != (double)(uint32_t)freq))
         return JS_ThrowRangeError(ctx, "pwm freq must be a whole number of Hz from 5 to 1000000");
@@ -152,7 +167,7 @@ static JSValue js_aux_pwm_set(JSContext *ctx, JSValue this_val, int argc, JSValu
 static JSValue js_aux_pwm_get(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
 {
     int32_t pad;
-    if (JS_ToInt32(ctx, &pad, argv[0]) < 0) return JS_EXCEPTION;
+    if (pad_arg(ctx, argv[0], &pad) < 0) return JS_EXCEPTION;
     uint32_t f; uint16_t d;
     if (!g_scripting_io->aux_pwm_get || !g_scripting_io->aux_pwm_get((uint8_t)pad, &f, &d)) return JS_NULL;
     JSValue o = JS_NewObject(ctx);
@@ -165,7 +180,7 @@ static JSValue js_aux_pwm_get(JSContext *ctx, JSValue this_val, int argc, JSValu
 static JSValue js_aux_analog_get(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
 {
     int32_t pad;
-    if (JS_ToInt32(ctx, &pad, argv[0]) < 0) return JS_EXCEPTION;
+    if (pad_arg(ctx, argv[0], &pad) < 0) return JS_EXCEPTION;
     int mv;
     if (!g_scripting_io->aux_analog_get || g_scripting_io->aux_analog_get((uint8_t)pad, &mv) != ESP_OK)
         return JS_NULL;

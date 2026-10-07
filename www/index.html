@@ -202,6 +202,10 @@
       <div id="aux-dev" style="display:none">
         <h2>Header pads IO1 / RXD / TXD</h2>
         <p class="hint err">Not isolated: 0–3.3 V logic levels only, no protection. Condition every signal externally.</p>
+        <p class="hint err">A PWM output is only under control while the firmware runs. Switching a PWM pad to another
+          mode does not switch its load off — the input pull-up, or on RXD/TXD the UART's idle level, pulls it high:
+          set the duty cycle to 0 instead. TXD carries the boot log at every reset and while flashing, so a load on it
+          is driven then too; prefer IO1 or RXD for PWM, and give the driver input a pull-down.</p>
         <table>
           <thead><tr><th>Pad</th><th>Mode</th></tr></thead>
           <tbody id="aux-table"></tbody>
@@ -674,9 +678,11 @@ rule('my-rule')
     /* What each pad does in its standard function, and how a mode reads. */
     const AUX_STD  = ['unused', 'UART0 RX', 'UART0 TX (console)'];
     const AUX_MODE_LABEL = { input: 'Digital input', pwm: 'PWM output', analog: 'Analog input (0–3.1 V)' };
+    const AUX_NOTE = { standard: 'standard function', pwm: 'PWM output', analog: 'analog input' };
     const AUX_HEAD = 'Direct GPIO inputs — not isolated';
-    const AUX_TXD  = 'TXD (GPIO43) is driven as an output by the ROM bootloader at every reset and while flashing — ' +
-                     'wire it through a series resistor of at least 1 kΩ.';
+    const AUX_TXD  = 'TXD (GPIO43) is UART0 TX: from every reset until the firmware has started, and all the time ' +
+                     'while flashing, it is driven with the boot log. As an input, wire it through a series resistor ' +
+                     'of at least 1 kΩ; as a PWM output, expect the load to see that traffic.';
     let aux = null;     /* cfg.aux from /api/config; null = firmware without the switch */
     const AUX_WARN = 'No optocoupler, no protection: 0–3.3 V logic levels only. ' +
                      'A field voltage destroys the MCU — condition these signals externally.';
@@ -755,6 +761,24 @@ rule('my-rule')
       auxModeChanged();
     }
 
+    /* The first PWM field that would be refused, or null. */
+    function auxCheck() {
+      if (!Array.isArray(aux)) return null;
+      for (let a = 0; a < aux.length; a++) {
+        if (document.getElementById(`aux_${a}_mode`)?.value !== 'pwm') continue;
+        const pad = AUX_PAD[a] ?? a + 1;
+        const f = document.getElementById(`aux_${a}_freq`);
+        const fv = Number(f.value);
+        if (f.value === '' || !Number.isInteger(fv) || fv < 5 || fv > 1000000)
+          return { el: f, msg: `${pad}: the PWM frequency must be a whole number of Hz from 5 to 1000000.` };
+        const d = document.getElementById(`aux_${a}_duty`);
+        const dv = Number(d.value);
+        if (d.value === '' || !(dv >= 0 && dv <= 100))
+          return { el: d, msg: `${pad}: the duty cycle must be a percentage from 0 to 100.` };
+      }
+      return null;
+    }
+
     /* Follows the mode selects before they are saved: the PWM rows on the
        Outputs tab and the notes on the Inputs tab show what the form says. */
     function auxModeChanged() {
@@ -767,7 +791,7 @@ rule('my-rule')
         if (m === 'pwm') anyPwm = true;
         const note = document.getElementById(`aux_${a}_note`);
         if (note) note.textContent = m === 'input' ? ''
-          : `currently ${m === 'standard' ? 'standard function' : (AUX_MODE_LABEL[m] ?? m).toLowerCase()} — set on the Device tab`;
+          : `currently ${AUX_NOTE[m] ?? m} — set on the Device tab`;
       });
       document.getElementById('aux-pwm-box').style.display = anyPwm ? '' : 'none';
     }
@@ -902,6 +926,17 @@ rule('my-rule')
         status.textContent = 'Device name is required.';
         return;
       }
+      /* PWM values are checked here, where the field can be pointed at: the
+         form is novalidate, and an emptied or unparsable number field reads
+         as '' -- which Number() would have turned into 0 % or 0 Hz. */
+      const auxBad = auxCheck();
+      if (auxBad) {
+        switchTab('outputs');
+        auxBad.el.focus();
+        status.className = 'err';
+        status.textContent = auxBad.msg;
+        return;
+      }
       btn.disabled = true;
       status.textContent = '';
       try {
@@ -951,12 +986,17 @@ rule('my-rule')
           di,
           dout,
         };
+        /* PWM values only for a pad set to PWM: a hidden row's leftover value
+           must not get the whole save refused. */
         if (Array.isArray(aux))
-          cfg.aux = aux.map((_, a) => ({
-            mode:     document.getElementById(`aux_${a}_mode`).value,
-            pwm_freq: Number(document.getElementById(`aux_${a}_freq`).value),
-            pwm_duty: Number(document.getElementById(`aux_${a}_duty`).value),
-          }));
+          cfg.aux = aux.map((_, a) => {
+            const mode = document.getElementById(`aux_${a}_mode`).value;
+            return mode !== 'pwm' ? { mode } : {
+              mode,
+              pwm_freq: Number(document.getElementById(`aux_${a}_freq`).value),
+              pwm_duty: Number(document.getElementById(`aux_${a}_duty`).value),
+            };
+          });
         const r = await apiFetch('/api/config', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1312,7 +1352,7 @@ rule('my-rule')
                 : pin === undefined ? `${n} — not isolated`
                                     : `${n} — ${pin}, not isolated`;
         diG.insertAdjacentHTML('beforeend',
-          `<div class="io-cell"><span id="di-dot-${i}" class="io-dot" title="${t}"></span>` +
+          `<div class="io-cell"><span id="di-dot-${i}" class="io-dot" title="${t}" data-t="${t}"></span>` +
           `<span class="io-lbl" title="${t}">${n}<span id="aux-val-${i}" class="hint"></span></span></div>`);
       }
       for (let i = 0; i < 8; i++) {
@@ -1355,20 +1395,24 @@ rule('my-rule')
           if (el) {
             el.className = 'io-dot' + (v ? ' on' : '');
             el.style.opacity = off ? '.25' : '';
-            if (off) el.title = p?.mode === 'pwm' ? 'PWM output' : p?.mode === 'analog'
-                              ? 'analog input' : 'standard function — not used as an input';
+            el.title = off ? `${el.dataset.t} — ${AUX_NOTE[p?.mode] ?? 'not used as an input'}` : el.dataset.t;
           }
-          const live = document.getElementById('aux-pwm-live');
-          if (live && i === diCount - 1 && Array.isArray(d.aux))
-            live.textContent = d.aux.map((q, k) => q.mode === 'pwm'
-              ? `${AUX_PAD[k] ?? k + 1}: ${q.pwm_duty} % @ ${q.pwm_freq} Hz (${q.pwm_bits} bit)` : null)
-              .filter(Boolean).join(' · ').replace(/^(.)/, 'Running now — $1');
           const val = document.getElementById(`aux-val-${i}`);
           if (val) val.textContent =
-              p?.mode === 'pwm'    ? ` PWM ${p.pwm_duty} % @ ${p.pwm_freq} Hz`
-            : p?.mode === 'analog' ? ` ${p.mv} mV`
+              p?.mode === 'pwm'                         ? ` PWM ${p.pwm_duty} % @ ${p.pwm_freq} Hz`
+            : p?.mode === 'analog' && p.mv !== undefined ? ` ${p.mv} mV`
             : '';
         });
+        /* What the PWM pads run now, on the Outputs tab: Modbus, MQTT and
+           rules may have changed it since the form was loaded. */
+        const live = document.getElementById('aux-pwm-live');
+        if (live && Array.isArray(d.aux)) {
+          const runs = d.aux.map((q, k) => q.mode !== 'pwm' ? null
+            : `${AUX_PAD[k] ?? k + 1}: ${q.pwm_duty} % at ${q.pwm_freq} Hz` +
+              (q.pwm_freq_actual && q.pwm_freq_actual !== q.pwm_freq ? ` (timer ${q.pwm_freq_actual} Hz)` : '') +
+              `, ${q.pwm_bits} bit`).filter(Boolean);
+          live.textContent = runs.length ? 'Running now — ' + runs.join(' · ') : '';
+        }
         (d.dout || []).forEach((v, i) => {
           const el = document.getElementById(`do-btn-${i}`);
           if (el) el.className = 'io-toggle' + (v ? ' on' : '');

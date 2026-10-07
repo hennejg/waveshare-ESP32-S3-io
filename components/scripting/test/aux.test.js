@@ -71,9 +71,47 @@ test('analog band with heldFor fires once after the hold', () => {
   assert.strictEqual(e.T.n, 1);
 });
 
-test('an analog pad that is not analog never matches a band', () => {
+test('a pad that leaves analog mode no longer matches a band', () => {
   const e = createEngine();
-  e.load(`rule('x').when(analog(2).above(-1)).then(function(){ T.n = 1; });`);
-  e.input(0, true);
-  assert.strictEqual(e.T.n, undefined);
+  e.analog(1, 2500);
+  e.load(`rule('x').when(analog(1).above(2000), input(0).isOn()).then(function(){ T.n = (T.n||0)+1; });`);
+  e.input(0, true);  assert.strictEqual(e.T.n, 1);
+  e.input(0, false);
+  e.analogGone(1);
+  e.input(0, true);  assert.strictEqual(e.T.n, 1);   // the old 2500 is forgotten
+  assert.strictEqual(e.evalIn('analog(1).value'), null);
+});
+
+test('a band fired through another fact does not fire again on the next reading inside', () => {
+  const e = createEngine();
+  e.analog(1, 2100);
+  e.load(`rule('x').when(analog(1).above(2000), input(0).isOn()).then(function(){ T.n = (T.n||0)+1; });`);
+  e.input(0, true);   assert.strictEqual(e.T.n, 1);
+  e.analog(1, 2130);  assert.strictEqual(e.T.n, 1);   // still inside: no new edge
+  e.analog(1, 1500);  e.analog(1, 2200);
+  assert.strictEqual(e.T.n, 2);                       // left and entered again
+});
+
+test('a predicate rule is edge-triggered on analog readings', () => {
+  const e = createEngine();
+  e.load(`rule('p').when(function(){ return input(0).value; }).then(function(){ T.n = (T.n||0)+1; });`);
+  e.input(0, true);   assert.strictEqual(e.T.n, 1);
+  e.analog(1, 100); e.analog(1, 200); e.analog(1, 300);
+  assert.strictEqual(e.T.n, 1);                       // readings do not re-run it
+});
+
+test('pad numbers outside 1..3 are refused, whatever their size', () => {
+  const e = createEngine();
+  assert.throws(() => e.load(`pwm(0)`),          /pad must be 1, 2 or 3/);
+  assert.throws(() => e.load(`analog(4)`),       /pad must be 1, 2 or 3/);
+  assert.throws(() => e.load(`pwm(4294967297)`), /pad must be 1, 2 or 3/);
+});
+
+test('pwm frequency is checked as on the device', () => {
+  const e = createEngine();
+  e.setPwmPad(2, true, 1000);
+  for (const bad of ['2', '50.5', '2e6', '-100'])
+    assert.throws(() => e.load(`pwm(2).set(50, ${bad})`), /whole number of Hz/);
+  assert.throws(() => e.load(`pwm(2).set(100.5)`), /0-100/);
+  assert.deepStrictEqual(e.pwmState(2), { duty: 0, freq: 1000 });
 });

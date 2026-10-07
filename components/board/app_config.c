@@ -27,7 +27,6 @@ _Static_assert(sizeof(app_config_t) < 2600,
 #define K_DOUT_CFG      "dout_cfg"
 #define K_MODBUS_CFG    "mb_cfg"
 #define K_LED_MODE      "led_mode"
-#define K_AUX_IN        "aux_in"     /* older bitmask, read once to migrate */
 #define K_AUX_MODE      "aux_mode"
 #define K_AUX_PWM       "aux_pwm"
 #define K_CAN_CFG       "can_cfg"
@@ -64,9 +63,6 @@ static app_config_t s_cfg = {
 #define NVS_GET_STR(h, key, dst) \
     do { size_t _l = sizeof(dst); nvs_get_str((h), (key), (dst), &_l); } while (0)
 
-/* A blob written before a field existed reads it as zero, and a blob written
-   by a hand-edited request can hold a value outside its range. Settled here,
-   once, after loading: every reader then takes the structure as it is. */
 /* Pad modes and PWM settings outside their range -- an older firmware's
    blob, a hand-made request -- fall back to the safe value. */
 static void aux_normalize(app_config_t *c)
@@ -80,6 +76,9 @@ static void aux_normalize(app_config_t *c)
     }
 }
 
+/* A blob written before a field existed reads it as zero, and a blob written
+   by a hand-edited request can hold a value outside its range. Settled here,
+   once, after loading: every reader then takes the structure as it is. */
 static void modbus_normalize(app_config_t *c)
 {
     if (c->modbus.tcp_uid < MB_UID_MIN || c->modbus.tcp_uid > MB_UID_MAX)
@@ -127,10 +126,13 @@ esp_err_t app_config_init(void)
     s_cfg.led_mode = led_mode_val;
     sz = sizeof(s_cfg.aux_mode);
     if (nvs_get_blob(h, K_AUX_MODE, s_cfg.aux_mode, &sz) != ESP_OK) {
-        /* The first version of the pad switch stored inputs as a bitmask. */
-        uint8_t aux_in_val = 0;
-        nvs_get_u8(h, K_AUX_IN, &aux_in_val);
-        for (int a = 0; a < 3; a++) s_cfg.aux_mode[a] = (aux_in_val >> a) & 1u;   /* 1 = input */
+        /* No pad modes stored. A firmware built with APP_AUX_DI_ENABLE before
+           the pads became switchable had all three as inputs, always, and
+           wrote an 11-entry input table; such a board keeps its inputs. */
+        size_t di_len = 0;
+        if (nvs_get_blob(h, K_DI_CFG, NULL, &di_len) == ESP_OK &&
+            di_len == 11 * sizeof(di_config_t))
+            for (int a = 0; a < 3; a++) s_cfg.aux_mode[a] = AUX_MODE_INPUT;
     }
     sz = sizeof(s_cfg.aux_pwm);
     nvs_get_blob(h, K_AUX_PWM, s_cfg.aux_pwm, &sz);

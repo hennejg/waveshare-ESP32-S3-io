@@ -48,7 +48,8 @@ in the web UI and are published like any other input — the topic index continu
 | AUX2   | RXD | GPIO44 | 9        | `<prefix>/input/10` |
 | AUX3   | TXD | GPIO43 | 10       | `<prefix>/input/11` |
 
-The option is off by default, so a stock firmware has 8 inputs. See the README for the wiring caveats.
+The three pads start in their standard function, so a board that has not been configured publishes 8 inputs. See the
+README for the wiring caveats.
 
 - `true` = input active
 - `false` = input inactive
@@ -147,12 +148,13 @@ RXD, 3 for TXD:
 | Topic | Direction | Payload |
 |-------|-----------|---------|
 | `<prefix>/aux/<n>/mode` | published, retained | `standard`, `input`, `pwm` or `analog` |
-| `<prefix>/aux/<n>/pwm` | published, retained | `{"duty":25.0,"freq":1000}` — the PWM as it runs |
-| `<prefix>/aux/<n>/pwm/set` | subscribed | `25` (duty in %) or `{"duty":25,"freq":1000}`; either field may be left out |
+| `<prefix>/aux/<n>/pwm` | published, retained | `{"duty":25.0,"freq":1000}` — the PWM as set; an empty retained payload once the pad is no longer a PWM output |
+| `<prefix>/aux/<n>/pwm/set` | subscribed | `25` (duty in %) or `{"duty":25,"freq":1000}`; either field may be left out, but a field that is present must be a number |
 | `<prefix>/aux/1/analog` | published | IO1 analog input in millivolts, whenever it moves by 20 mV or more |
 | `<prefix>/aux/read` | subscribed | anything — publishes all of the above |
 
-A `pwm/set` takes effect at once and is not stored: after a reboot the pad starts with the configured values. A
+A `pwm/set` takes effect at once and is not stored: after a reboot the pad starts with the configured values. Only a
+change is republished. A
 command for a pad that is not a PWM output, or with a value out of range (duty 0–100, frequency 5–1000000 Hz), is
 ignored and logged.
 

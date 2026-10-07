@@ -32,7 +32,7 @@ board hardware abstraction layer (`components/board/`):
 | **MCU**             | ESP32-S3-WROOM-1U-N16R8 (dual-core Xtensa LX7, 240 MHz, 16 MB Flash, 8 MB PSRAM)                        |
 | **Ethernet**        | W5500 SPI (10/100 Mbit)                                                                                 |
 | **Digital inputs**  | 8 × optocoupler-isolated (DI1–DI8, GPIO4–GPIO11)                                                        |
-| **Extra inputs**    | 3 × **non-isolated** 3.3 V GPIO (AUX1–AUX3, GPIO1/43/44) — [optional, off by default](#optional-extra-inputs-app_aux_di_enable) |
+| **Header pads**     | 3 × **non-isolated** 3.3 V GPIO (IO1/RXD/TXD = GPIO1/44/43): input, PWM output, IO1 also analog — [switched in the web UI](#optional-extra-inputs-app_aux_di_enable) |
 | **Digital outputs** | (ESP32-S3-POE-ETH-8DI-8DO only) 8 × optocoupler-isolated Darlington (DO1–DO8, via TCA9554 I²C expander) |
 | **Relay outputs**   | (ESP32-S3-POE-ETH-8DI-8RO only) 8 × 1NO 1NC; ≤10A 250V AC or ≤10A 30V DC                                |
 | **CAN bus**         | ESP32-S3 TWAI peripheral (GPIO2 TX, GPIO3 RX)                                                           |
@@ -201,8 +201,12 @@ RS-485, configurable baud rate and slave address. Register map:
 |-------------|-----------------------|---------------------------------------|
 | 1–8         | Coil (RW)             | DO1–DO8                               |
 | 10001–10008 | Discrete input (RO)   | DI1–DI8                               |
+| 10009–10011 | Discrete input (RO)   | AUX1–AUX3 (header pads set to input)  |
+| 30001–30080 | Input register (RO)   | Device identification                 |
+| 30101–30104 | Input register (RO)   | IO1 analog mV, pad modes              |
 | 40001       | Holding register (RW) | LED colour (RGB252, 16-bit)           |
 | 40002       | Holding register (RW) | Buzzer: write frequency → 200 ms beep |
+| 40003–40011 | Holding register (RW) | PWM duty and frequency of the pads    |
 
 ### LED Modes
 
@@ -239,7 +243,7 @@ Status mode all LED commands from MQTT, Modbus, and CAN are ignored.
 > Switched per pin in the web UI. Every pin starts in its **standard function**.
 
 The **IO1, RXD and TXD** pads (GPIO1, GPIO44, GPIO43) can each be put in their standard function, used as a digital
-input, or driven as a PWM output; IO1 can also be an analog input. The choice is made per pin on the *Inputs* tab, or
+input, or driven as a PWM output; IO1 can also be an analog input. The choice is made per pin on the *Device* tab, or
 with `"aux"` in `POST /api/config`, and takes effect on saving, without a reboot. As inputs they show up as
 **AUX1–AUX3** behind the eight isolated ones and occupy DI indices 8, 9 and 10.
 
@@ -259,9 +263,9 @@ with `"aux"` in `POST /api/config`, and takes effect on saving, without a reboot
 
 - **PWM**: 5 Hz to 1 MHz, duty 0–100 % in steps of 0.1 %. Each pad has its own timer, so the three frequencies are
   independent. The duty resolution follows from the frequency: 14 bits up to about 4.9 kHz, fewer above — 6 bits
-  at 1 MHz. `/api/io/state` reports the frequency the timer really produces and the resolution in bits. The output
-  is a 3.3 V logic signal straight from the MCU, a few milliamperes at most: drive a MOSFET, an LED driver or a
-  0–10 V converter from it, never a load.
+  at 1 MHz. `/api/io/state` reports the frequency as set, the frequency the timer really produces and the
+  resolution in bits. The output is a 3.3 V logic signal straight from the MCU, a few milliamperes at most: drive a
+  MOSFET, an LED driver or a 0–10 V converter from it, never a load.
 - **Analog** (IO1 only, ADC1 channel 0): 0 to about 3.1 V, calibrated from eFuse, averaged over 16 conversions,
   reported in millivolts in `/api/io/state`. Divide larger voltages down externally.
 - The mode is chosen on the *Device* tab, PWM frequency and duty cycle on the *Outputs* tab, input names on the
@@ -272,8 +276,18 @@ with `"aux"` in `POST /api/config`, and takes effect on saving, without a reboot
   [docs/mqtt.md](docs/mqtt.md) and [RULES.md](components/scripting/RULES.md).
 
 A pad in any mode other than its standard function is taken off UART0. The console carries on over USB-Serial/JTAG; on UART0 it no longer
-reaches the pin until the pad is switched back. A channel in its standard function reads `false`, is not published,
+reaches the pin until the pad is switched back. A channel that is not set to input reads `false`, is not published,
 and `/api/io/state` marks it in `di_active`.
+
+**A PWM output is under control only while the firmware runs.** Plan the load's driver for the rest of the time:
+
+- **Switching a PWM pad to another mode does not switch its load off.** As an input the pad has its pull-up on, and
+  RXD/TXD in their standard function idle high as UART lines. Set the duty cycle to 0 to switch off.
+- **TXD is driven at every reset.** It is UART0 TX: the ROM bootloader, the second-stage bootloader and the early
+  application log drive it from every reset until the pads are set up, and indefinitely while the chip sits in
+  download mode (esptool, BOOT button). A load on TXD sees that traffic. Prefer IO1 or RXD for PWM.
+- **Give the driver input a pull-down.** Until the firmware sets a pad up after reset, IO1 and RXD are undriven
+  inputs (RXD with its reset pull-up), so a MOSFET gate on them is only held low by an external pull-down.
 
 The build option `CONFIG_APP_AUX_DI_ENABLE` (default on, not available in the Matter build) only decides whether the
 switch is offered at all.
@@ -282,17 +296,21 @@ switch is offered at all.
 reverse protection — and must never see more than 3.3 V or less than 0 V. Conditioning them is up to the external
 circuit.
 
-**Important — GPIO43 needs a series resistor of at least 1 kΩ.** GPIO43 is U0TXD, and the ROM bootloader drives it as
-a push-pull output from every reset until the second-stage bootloader releases it — and indefinitely while the chip
-sits in UART download mode (esptool, BOOT button). A contact wired straight from GPIO43 to ground therefore shorts that
-driver on every boot and during every flash. It is deliberately the last channel, so a board that needs only two
-extra inputs can leave it unwired. GPIO44 (AUX2, U0RXD) is an input and has no such problem; GPIO1 is otherwise
-unused by this firmware.
+**Important — GPIO43 needs a series resistor of at least 1 kΩ as an input.** GPIO43 is U0TXD: the console stays on
+UART0, so the ROM bootloader, the second-stage bootloader and the early application log all drive it as a push-pull
+output, from every reset until the pads are set up — and indefinitely while the chip sits in UART download mode
+(esptool, BOOT button). A contact wired straight from GPIO43 to ground shorts that driver for the whole boot log and
+during every flash. It is deliberately the last channel, so a board that needs only two extra inputs can leave it
+unwired. GPIO44 (AUX2, U0RXD) is an input and has no such problem; GPIO1 is otherwise unused by this firmware.
 
-**Turning the build option back off loses the input names.** The per-input settings are stored as one NVS blob. Eleven
-entries written by an option-on firmware do not fit the eight-entry buffer of an option-off one, so `nvs_get_blob()`
-returns `ESP_ERR_NVS_INVALID_LENGTH` and *every* input name and invert flag falls back to its default — the eight
-isolated ones included. Note them down before switching back.
+**Going back to an older firmware loses the input names.** This firmware stores eleven input entries in one NVS blob
+the first time any setting is saved. An eight-input firmware — every release up to v1.1.13, a build without
+`APP_AUX_DI_ENABLE`, or the Matter firmware — cannot read that blob: `nvs_get_blob()` returns
+`ESP_ERR_NVS_INVALID_LENGTH`, and *every* input name and invert flag falls back to its default, the eight isolated ones
+included. Note them down before going back.
+
+A board that ran a firmware built with `APP_AUX_DI_ENABLE` before the pads became switchable keeps its three inputs:
+with no pad modes stored and an eleven-entry input table, all three pads start as inputs.
 
 Not every interface grows with the extra channels:
 

@@ -3,6 +3,7 @@
 #include "di.h"
 
 #include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,8 +21,10 @@ bool app_mqtt_is_connected(void);
 #endif
 #ifdef CONFIG_APP_SCRIPTING_ENABLE
 /* Declared rather than included: components/board does not depend on the
-   scripting component. pad is 1..3. */
-void scripting_on_analog(uint8_t pad, int mv);
+   scripting component. pad is 1..3; mv INT_MIN = the pad is no longer an
+   analog input. False if the engine could not take it (not running yet,
+   queue full) -- the caller tries again with its next sample. */
+bool scripting_on_analog(uint8_t pad, int mv);
 #endif
 
 #if CONFIG_APP_AUX_DI_ENABLE
@@ -36,6 +39,10 @@ void scripting_on_analog(uint8_t pad, int mv);
 #endif
 
 #define TAG "aux"
+
+_Static_assert(sizeof(((app_config_t *)0)->aux_mode) == AUX_PAD_COUNT, "aux_mode[] is not one per pad");
+_Static_assert(sizeof(((app_config_t *)0)->aux_pwm) / sizeof(((app_config_t *)0)->aux_pwm[0]) == AUX_PAD_COUNT,
+               "aux_pwm[] is not one per pad");
 
 static const char *const s_names[AUX_MODE_COUNT] = { "standard", "input", "pwm", "analog" };
 
@@ -59,12 +66,25 @@ bool aux_mode_allowed(uint8_t a, aux_mode_t m)
     return true;
 }
 
+bool aux_pwm_duty_from_pct(double pct, uint16_t *duty_pm)
+{
+    if (!(pct >= 0.0 && pct <= 100.0)) return false;          /* also NaN */
+    *duty_pm = (uint16_t)lround(pct * 10.0);
+    return true;
+}
+
+bool aux_pwm_freq_ok(double hz)
+{
+    return hz >= AUX_PWM_FREQ_MIN && hz <= AUX_PWM_FREQ_MAX && hz == floor(hz);
+}
+
 #if !CONFIG_APP_AUX_DI_ENABLE
 
 esp_err_t  aux_io_init(void)  { return ESP_OK; }
 esp_err_t  aux_io_apply(void) { return ESP_OK; }
 aux_mode_t aux_io_mode(uint8_t a) { (void)a; return AUX_MODE_STANDARD; }
 bool aux_io_pwm_info(uint8_t a, uint32_t *f, uint16_t *d, uint8_t *b) { (void)a; (void)f; (void)d; (void)b; return false; }
+uint32_t aux_io_pwm_actual_hz(uint8_t a) { (void)a; return 0; }
 esp_err_t aux_io_pwm_set(uint8_t a, uint32_t f, uint16_t d) { (void)a; (void)f; (void)d; return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t aux_io_analog_mv(uint8_t a, int *mv) { (void)a; (void)mv; return ESP_ERR_NOT_SUPPORTED; }
 void aux_io_on_mqtt_connected(void) {}
@@ -72,7 +92,7 @@ void aux_io_on_mqtt_message(const char *t, size_t tl, const char *d, size_t dl) 
 
 #else
 
-static const gpio_num_t s_gpio[AUX_PAD_COUNT] = { GPIO_NUM_1, GPIO_NUM_44, GPIO_NUM_43 };
+static const gpio_num_t s_gpio[AUX_PAD_COUNT] = { AUX_PAD_GPIOS };
 
 /* LEDC: the buzzer has timer 0 and channel 0. Each pad gets a timer of its
    own, so the three frequencies are independent. The clock is fixed to APB:
@@ -84,10 +104,13 @@ static const gpio_num_t s_gpio[AUX_PAD_COUNT] = { GPIO_NUM_1, GPIO_NUM_44, GPIO_
 #define PWM_SRC_HZ      80000000u
 #define PWM_BITS_MAX    14u
 
+/* Everything below is under s_mux, and nothing under s_mux publishes, takes
+   another driver's lock that does, or waits on the network: the MQTT task
+   calls in here while it holds its client's API lock. */
 static SemaphoreHandle_t s_mux;
 static aux_mode_t        s_mode[AUX_PAD_COUNT];
-static uint32_t          s_freq[AUX_PAD_COUNT];
-static uint16_t          s_duty[AUX_PAD_COUNT];
+static uint32_t          s_freq[AUX_PAD_COUNT];   /* as given, Hz              */
+static uint16_t          s_duty[AUX_PAD_COUNT];   /* as given, 0.1 %           */
 static uint8_t           s_bits[AUX_PAD_COUNT];
 
 /* The configuration's PWM values as last applied. A save that does not touch
@@ -97,11 +120,14 @@ static uint16_t          s_cfg_duty[AUX_PAD_COUNT];
 
 static adc_oneshot_unit_handle_t s_adc;
 static adc_cali_handle_t         s_cali;
+static int                       s_an_mv;         /* last sample, mV          */
+static bool                      s_an_valid;      /* s_an_mv is current       */
 
 /* Publishing is left to the pad task, so that nothing that changes a pad --
    a Modbus request, a rule, an HTTP save -- waits on the MQTT client. */
 static TaskHandle_t      s_task;
 static volatile uint8_t  s_dirty;          /* bit a: publish pad a's state */
+
 static void mark_dirty(uint8_t a)
 {
     __atomic_fetch_or(&s_dirty, (uint8_t)(1u << a), __ATOMIC_RELAXED);
@@ -110,10 +136,10 @@ static void mark_dirty(uint8_t a)
 
 /* ------------------------------------------------------------ pad function */
 
-/* Off UART0. gpio_config() in the next mode selects the plain GPIO function,
-   which takes U0TXD off GPIO43; U0RXD is fed a constant high instead of
-   GPIO44, so the UART sees an idle line rather than whatever is on the pad.
-   The console reserved both pins at boot. */
+/* Off UART0. The next mode's gpio_config()/ledc_channel_config() selects the
+   plain GPIO function, which takes U0TXD off GPIO43; U0RXD is fed a constant
+   high instead of GPIO44, so the UART sees an idle line rather than whatever
+   is on the pad. The console reserved both pins at boot. */
 static void detach_uart(gpio_num_t g)
 {
     if (g == GPIO_NUM_43 || g == GPIO_NUM_44) esp_gpio_revoke(BIT64(g));
@@ -123,28 +149,42 @@ static void detach_uart(gpio_num_t g)
 
 /* Back to the standard function. The reset first: it clears an output enable
    a PWM channel left behind, which the IO MUX path of uart_set_pin() would
-   not. GPIO1 stays as gpio_reset_pin() leaves it, an input with pull-up;
-   GPIO44/43 go back to UART0, which needs no UART driver installed. */
+   not, and gives back a GPIO reservation. GPIO1 is then left floating with
+   its input off -- no pull-up to switch on a load that was driven by PWM;
+   GPIO44/43 go back to UART0 through the IO MUX, which needs no UART driver. */
 static void restore_standard(gpio_num_t g)
 {
     gpio_reset_pin(g);
     if (g == GPIO_NUM_43)
         uart_set_pin(UART_NUM_0, GPIO_NUM_43, UART_PIN_NO_CHANGE,
                      UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    else if (g == GPIO_NUM_44) {
+    else if (g == GPIO_NUM_44)
         uart_set_pin(UART_NUM_0, UART_PIN_NO_CHANGE, GPIO_NUM_44,
                      UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-        esp_rom_gpio_connect_in_signal(GPIO_NUM_44, U0RXD_IN_IDX, false);
-    }
+    else
+        gpio_set_pull_mode(g, GPIO_FLOATING);
 }
 
 /* ------------------------------------------------------------------- PWM */
 
 static uint32_t duty_ticks(uint16_t duty_pm, uint8_t bits)
 {
-    uint32_t full = 1u << bits;
-    /* 100 % has to be the full count, which LEDC takes as "always high". */
-    return (uint32_t)(((uint64_t)duty_pm * full + AUX_PWM_DUTY_MAX / 2) / AUX_PWM_DUTY_MAX);
+    return (uint32_t)(((uint64_t)duty_pm * (1u << bits) + AUX_PWM_DUTY_MAX / 2) / AUX_PWM_DUTY_MAX);
+}
+
+/* The duty cycle onto a configured channel. 100 % is the channel stopped
+   with its idle level high, never a duty of 2^bits: at the S3's maximum
+   resolution of 14 bits that overflows the hardware duty counter (ESP-IDF
+   LEDC documentation), which is every frequency up to 4.88 kHz here.
+   ledc_update_duty() starts a stopped channel again. */
+static void pwm_put_duty(uint8_t a, uint16_t duty, uint8_t bits)
+{
+    if (duty >= AUX_PWM_DUTY_MAX) {
+        ledc_stop(PWM_MODE, PWM_CHAN(a), 1);
+    } else {
+        ledc_set_duty(PWM_MODE, PWM_CHAN(a), duty_ticks(duty, bits));
+        ledc_update_duty(PWM_MODE, PWM_CHAN(a));
+    }
 }
 
 static esp_err_t pwm_set(uint8_t a, uint32_t freq, uint16_t duty, bool fresh)
@@ -153,7 +193,11 @@ static esp_err_t pwm_set(uint8_t a, uint32_t freq, uint16_t duty, bool fresh)
     if (bits > PWM_BITS_MAX) bits = PWM_BITS_MAX;
     if (bits < 1) return ESP_ERR_INVALID_ARG;
 
-    if (fresh || freq != s_freq[a] || bits != s_bits[a]) {
+    if (fresh || freq != s_freq[a]) {
+        /* A new resolution takes effect with the timer reset, a new duty
+           only at the next period: in between the old tick count would run
+           against the new counter. Held low for that moment instead. */
+        if (!fresh && bits != s_bits[a]) ledc_stop(PWM_MODE, PWM_CHAN(a), 0);
         ledc_timer_config_t t = {
             .speed_mode      = PWM_MODE,
             .timer_num       = PWM_TIMER(a),
@@ -170,23 +214,23 @@ static esp_err_t pwm_set(uint8_t a, uint32_t freq, uint16_t duty, bool fresh)
             .speed_mode = PWM_MODE,
             .channel    = PWM_CHAN(a),
             .timer_sel  = PWM_TIMER(a),
-            .duty       = duty_ticks(duty, (uint8_t)bits),
+            .duty       = 0,
             .hpoint     = 0,
         };
         esp_err_t r = ledc_channel_config(&c);
         if (r != ESP_OK) return r;
-    } else {
-        ledc_set_duty(PWM_MODE, PWM_CHAN(a), duty_ticks(duty, (uint8_t)bits));
-        ledc_update_duty(PWM_MODE, PWM_CHAN(a));
     }
+    pwm_put_duty(a, duty, (uint8_t)bits);
     s_freq[a] = freq; s_duty[a] = duty; s_bits[a] = (uint8_t)bits;
     return ESP_OK;
 }
 
+/* Output low, and the pin given back: ledc_channel_config() reserved it, and
+   the next ledc_channel_config() on it would otherwise warn of a conflict. */
 static void pwm_stop(uint8_t a)
 {
     ledc_stop(PWM_MODE, PWM_CHAN(a), 0);
-    s_freq[a] = 0; s_bits[a] = 0;
+    esp_gpio_revoke(BIT64(s_gpio[a]));
 }
 
 /* ---------------------------------------------------------------- analog */
@@ -198,11 +242,10 @@ static esp_err_t analog_start(void)
         esp_err_t r = adc_oneshot_new_unit(&u, &s_adc);
         if (r != ESP_OK) return r;
     }
+    /* Also puts the pad in analog mode: input off, no pulls. */
     adc_oneshot_chan_cfg_t c = { .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT };
     esp_err_t r = adc_oneshot_config_channel(s_adc, ADC_CHANNEL_0, &c);
     if (r != ESP_OK) return r;
-    /* Floating: the pull-up would add its own current to the reading. */
-    gpio_set_pull_mode(GPIO_NUM_1, GPIO_FLOATING);
 
     if (!s_cali) {
         adc_cali_curve_fitting_config_t k = {
@@ -214,7 +257,22 @@ static esp_err_t analog_start(void)
             ESP_LOGW(TAG, "no ADC calibration in eFuse -- readings are uncalibrated");
         }
     }
+    s_an_valid = false;
     return ESP_OK;
+}
+
+/* One averaged reading; under s_mux. A single conversion moves by tens of
+   millivolts. */
+static bool analog_sample(int *mv)
+{
+    int sum = 0, raw = 0, n = 0;
+    for (int i = 0; i < 16; i++)
+        if (adc_oneshot_read(s_adc, ADC_CHANNEL_0, &raw) == ESP_OK) { sum += raw; n++; }
+    if (!n) return false;
+    raw = (sum + n / 2) / n;
+    if (s_cali) return adc_cali_raw_to_voltage(s_cali, raw, mv) == ESP_OK;
+    *mv = (int)((int64_t)raw * 3100 / 4095);
+    return true;
 }
 
 esp_err_t aux_io_analog_mv(uint8_t a, int *mv)
@@ -222,17 +280,7 @@ esp_err_t aux_io_analog_mv(uint8_t a, int *mv)
     if (a >= AUX_PAD_COUNT || !s_mux) return ESP_ERR_INVALID_ARG;
     xSemaphoreTake(s_mux, portMAX_DELAY);
     esp_err_t r = ESP_ERR_INVALID_STATE;
-    if (s_mode[a] == AUX_MODE_ANALOG && s_adc) {
-        /* Averaged: one conversion moves by tens of millivolts. */
-        int sum = 0, raw = 0, n = 0;
-        for (int i = 0; i < 16; i++)
-            if (adc_oneshot_read(s_adc, ADC_CHANNEL_0, &raw) == ESP_OK) { sum += raw; n++; }
-        if (n) {
-            raw = (sum + n / 2) / n;
-            if (s_cali) r = adc_cali_raw_to_voltage(s_cali, raw, mv);
-            else { *mv = (int)((int64_t)raw * 3100 / 4095); r = ESP_OK; }
-        } else r = ESP_FAIL;
-    }
+    if (s_mode[a] == AUX_MODE_ANALOG && s_an_valid) { *mv = s_an_mv; r = ESP_OK; }
     xSemaphoreGive(s_mux);
     return r;
 }
@@ -244,6 +292,7 @@ static void leave(uint8_t a)
     switch (s_mode[a]) {
     case AUX_MODE_INPUT:  di_aux_input(a, false); break;
     case AUX_MODE_PWM:    pwm_stop(a);            break;
+    case AUX_MODE_ANALOG: s_an_valid = false;     break;
     default:                                      break;
     }
 }
@@ -273,6 +322,7 @@ static esp_err_t enter(uint8_t a, aux_mode_t m, uint32_t freq, uint16_t duty)
     if (r != ESP_OK) {
         ESP_LOGE(TAG, "AUX%u (GPIO%d): %s failed (%s), back to standard function",
                  a + 1, g, aux_mode_name(m), esp_err_to_name(r));
+        if (m == AUX_MODE_PWM) pwm_stop(a);
         restore_standard(g);
         s_mode[a] = AUX_MODE_STANDARD;
         return r;
@@ -299,8 +349,6 @@ esp_err_t aux_io_apply(void)
         uint32_t f = cfg->aux_pwm[a].freq_hz;
         uint16_t d = cfg->aux_pwm[a].duty_pm;
         bool cfg_changed = f != s_cfg_freq[a] || d != s_cfg_duty[a];
-        s_cfg_freq[a] = f;
-        s_cfg_duty[a] = d;
 
         esp_err_t r = ESP_OK;
         if (m == s_mode[a]) {
@@ -308,13 +356,19 @@ esp_err_t aux_io_apply(void)
                something else leaves a run-time duty cycle where it is. */
             if (m == AUX_MODE_PWM && cfg_changed) {
                 r = pwm_set(a, f, d, false);
+                if (r != ESP_OK)
+                    ESP_LOGE(TAG, "AUX%u: PWM %lu Hz failed (%s)", a + 1,
+                             (unsigned long)f, esp_err_to_name(r));
                 mark_dirty(a);
             }
         } else {
             r = enter(a, m, f, d);
             mark_dirty(a);
         }
-        if (r != ESP_OK && first == ESP_OK) first = r;
+        /* Remembered only once applied, so that saving the same values again
+           tries again. */
+        if (r == ESP_OK) { s_cfg_freq[a] = f; s_cfg_duty[a] = d; }
+        else if (first == ESP_OK) first = r;
     }
     xSemaphoreGive(s_mux);
     return first;
@@ -333,88 +387,142 @@ esp_err_t aux_io_pwm_set(uint8_t a, uint32_t freq_hz, uint16_t duty_pm)
     if (s_mode[a] == AUX_MODE_PWM) {
         uint32_t f = freq_hz ? freq_hz : s_freq[a];
         uint16_t d = (duty_pm == AUX_PWM_DUTY_KEEP) ? s_duty[a] : duty_pm;
-        r = (f == s_freq[a] && d == s_duty[a]) ? ESP_OK : pwm_set(a, f, d, false);
-        if (r == ESP_OK) mark_dirty(a);
+        if (f == s_freq[a] && d == s_duty[a]) {
+            r = ESP_OK;                      /* nothing moves, nothing to tell */
+        } else {
+            r = pwm_set(a, f, d, false);
+            if (r == ESP_OK) mark_dirty(a);
+        }
     }
     xSemaphoreGive(s_mux);
     return r;
+}
+
+aux_mode_t aux_io_mode(uint8_t a)
+{
+    return (a < AUX_PAD_COUNT) ? s_mode[a] : AUX_MODE_STANDARD;
+}
+
+bool aux_io_pwm_info(uint8_t a, uint32_t *freq_hz, uint16_t *duty_pm, uint8_t *bits)
+{
+    if (a >= AUX_PAD_COUNT || !s_mux) return false;
+    xSemaphoreTake(s_mux, portMAX_DELAY);           /* the three values together */
+    bool on = s_mode[a] == AUX_MODE_PWM;
+    if (on) {
+        if (freq_hz) *freq_hz = s_freq[a];
+        if (duty_pm) *duty_pm = s_duty[a];
+        if (bits)    *bits    = s_bits[a];
+    }
+    xSemaphoreGive(s_mux);
+    return on;
+}
+
+uint32_t aux_io_pwm_actual_hz(uint8_t a)
+{
+    if (a >= AUX_PAD_COUNT || s_mode[a] != AUX_MODE_PWM) return 0;
+    return ledc_get_freq(PWM_MODE, PWM_TIMER(a));
 }
 
 /* ------------------------------------------------------------- pad task */
 
 #define SAMPLE_MS 200
 
-static int s_an_reported = INT_MIN;   /* last analog value passed on, mV */
+/* What the rule engine and MQTT were last told about the analog input. Kept
+   apart: a reading the engine could not take is offered again, while MQTT
+   republishes on reconnect anyway. Pad task only. */
+static bool s_an_rules_has;
+static int  s_an_rules_mv;
+static bool s_an_mqtt_has;
+static int  s_an_mqtt_mv;
 
 #ifdef CONFIG_APP_MQTT_ENABLE
+static void publish_analog(int mv)
+{
+    char payload[16];
+    snprintf(payload, sizeof(payload), "%d", mv);
+    app_mqtt_publish("aux/1/analog", payload, -1, 0, false);
+    s_an_mqtt_has = true;
+    s_an_mqtt_mv  = mv;
+}
+
 static void publish_pad(uint8_t a)
 {
     if (!app_mqtt_is_connected()) return;
     char topic[24], payload[48];
     snprintf(topic, sizeof(topic), "aux/%u/mode", a + 1);
-    app_mqtt_publish(topic, aux_mode_name(s_mode[a]), -1, 0, true);
-    uint32_t f; uint16_t d; uint8_t b;
-    if (aux_io_pwm_info(a, &f, &d, &b)) {
-        snprintf(topic, sizeof(topic), "aux/%u/pwm", a + 1);
+    app_mqtt_publish(topic, aux_mode_name(aux_io_mode(a)), -1, 0, true);
+    uint32_t f; uint16_t d;
+    snprintf(topic, sizeof(topic), "aux/%u/pwm", a + 1);
+    if (aux_io_pwm_info(a, &f, &d, NULL)) {
         snprintf(payload, sizeof(payload), "{\"duty\":%u.%u,\"freq\":%lu}",
                  d / 10, d % 10, (unsigned long)f);
         app_mqtt_publish(topic, payload, -1, 0, true);
+    } else {
+        /* Not a PWM output (any more): an empty retained payload removes the
+           old state, so a new subscriber is not told it still runs. */
+        app_mqtt_publish(topic, "", 0, 0, true);
     }
+    int mv;
+    if (a == 0 && aux_io_analog_mv(0, &mv) == ESP_OK) publish_analog(mv);
 }
 #endif
-
-static void report_analog(int mv)
-{
-#ifdef CONFIG_APP_MQTT_ENABLE
-    if (app_mqtt_is_connected()) {
-        char payload[16];
-        snprintf(payload, sizeof(payload), "%d", mv);
-        app_mqtt_publish("aux/1/analog", payload, -1, 0, false);
-    }
-#endif
-#ifdef CONFIG_APP_SCRIPTING_ENABLE
-    scripting_on_analog(1, mv);
-#endif
-    (void)mv;
-}
 
 static void aux_task(void *arg)
 {
     (void)arg;
     TickType_t next_sample = xTaskGetTickCount();
     for (;;) {
-        /* Woken early to publish, the analog input is still sampled on its own
-           clock: a rule that sets a PWM output from the reading wakes this
-           task, and sampling again on that wake fed the rule a new reading,
-           which set the PWM again -- 30 readings a second instead of 5. */
-        TickType_t now  = xTaskGetTickCount();
-        TickType_t wait = (TickType_t)(next_sample - now);
-        if ((int32_t)wait < 0) wait = 0;
+        /* Sampled on its own clock, and only while IO1 is analog: woken early
+           to publish, sampling again on that wake fed a rule that sets a PWM
+           output from the reading a new reading, which set the PWM again. */
+        TickType_t wait = portMAX_DELAY;
+        if (s_mode[0] == AUX_MODE_ANALOG || s_an_rules_has) {
+            TickType_t now = xTaskGetTickCount();
+            wait = ((int32_t)(next_sample - now) > 0) ? (TickType_t)(next_sample - now) : 0;
+        }
         ulTaskNotifyTake(pdTRUE, wait);
 
         uint8_t dirty = __atomic_exchange_n(&s_dirty, 0, __ATOMIC_RELAXED);
-        for (uint8_t a = 0; a < AUX_PAD_COUNT; a++) {
-            if (!(dirty & (1u << a))) continue;
 #ifdef CONFIG_APP_MQTT_ENABLE
-            publish_pad(a);
+        for (uint8_t a = 0; a < AUX_PAD_COUNT; a++)
+            if (dirty & (1u << a)) publish_pad(a);
+#else
+        (void)dirty;
 #endif
-            /* A pad that has just become an analog input reports at once. */
-            if (a == 0) s_an_reported = INT_MIN;
-        }
 
-        now = xTaskGetTickCount();
-        if ((int32_t)(now - next_sample) < 0) continue;      /* not time to sample yet */
+        TickType_t now = xTaskGetTickCount();
+        if ((int32_t)(now - next_sample) < 0) continue;      /* not time yet */
         next_sample = now + pdMS_TO_TICKS(SAMPLE_MS);
 
-        int mv;
-        if (aux_io_analog_mv(0, &mv) == ESP_OK) {
-            if (s_an_reported == INT_MIN || abs(mv - s_an_reported) >= AUX_ANALOG_STEP_MV) {
-                s_an_reported = mv;
-                report_analog(mv);
-            }
-        } else {
-            s_an_reported = INT_MIN;
+        int  mv = 0;
+        bool have = false;
+        xSemaphoreTake(s_mux, portMAX_DELAY);
+        if (s_mode[0] == AUX_MODE_ANALOG && s_adc) {
+            have = analog_sample(&mv);
+            s_an_mv = mv;
+            s_an_valid = have;
         }
+        xSemaphoreGive(s_mux);
+
+        /* Outside the lock from here on: both of these may wait. */
+#ifdef CONFIG_APP_SCRIPTING_ENABLE
+        if (have) {
+            if ((!s_an_rules_has || abs(mv - s_an_rules_mv) >= AUX_ANALOG_STEP_MV) &&
+                scripting_on_analog(1, mv)) {
+                s_an_rules_has = true;
+                s_an_rules_mv  = mv;
+            }
+        } else if (s_an_rules_has && s_mode[0] != AUX_MODE_ANALOG) {
+            /* IO1 has left analog mode: the engine forgets its last reading. */
+            if (scripting_on_analog(1, INT_MIN)) s_an_rules_has = false;
+        }
+#endif
+#ifdef CONFIG_APP_MQTT_ENABLE
+        if (have && app_mqtt_is_connected() &&
+            (!s_an_mqtt_has || abs(mv - s_an_mqtt_mv) >= AUX_ANALOG_STEP_MV))
+            publish_analog(mv);
+        if (!have) s_an_mqtt_has = false;
+#endif
     }
 }
 
@@ -458,52 +566,39 @@ void aux_io_on_mqtt_message(const char *topic, size_t tlen, const char *data, si
     memcpy(buf, data, dlen);
     buf[dlen] = '\0';
 
-    double duty = -1, freq = 0;
-    cJSON *j = cJSON_Parse(buf);
+    /* A bare number is a duty cycle; an object may carry duty, freq or both.
+       Whatever is present has to be a number in range -- a field that is
+       there but wrong is refused, never read as "keep". */
+    bool    has_duty = false, has_freq = false, bad = false;
+    double  duty = 0, freq = 0;
+    cJSON  *j = cJSON_Parse(buf);
     if (cJSON_IsNumber(j)) {
-        duty = j->valuedouble;
+        has_duty = true; duty = j->valuedouble;
     } else if (cJSON_IsObject(j)) {
         cJSON *v;
-        if ((v = cJSON_GetObjectItem(j, "duty")) && cJSON_IsNumber(v)) duty = v->valuedouble;
-        else duty = -2;                                         /* keep */
-        if ((v = cJSON_GetObjectItem(j, "freq")) && cJSON_IsNumber(v)) freq = v->valuedouble;
+        if ((v = cJSON_GetObjectItem(j, "duty"))) { has_duty = true; bad |= !cJSON_IsNumber(v); duty = v->valuedouble; }
+        if ((v = cJSON_GetObjectItem(j, "freq"))) { has_freq = true; bad |= !cJSON_IsNumber(v); freq = v->valuedouble; }
+        bad |= !has_duty && !has_freq;
     } else {
-        cJSON_Delete(j);
-        ESP_LOGW(TAG, "aux/%u/pwm/set: expected a number or {\"duty\":..,\"freq\":..}", a + 1);
-        return;
+        bad = true;
     }
     cJSON_Delete(j);
 
-    uint16_t d;
-    if (duty == -2) d = AUX_PWM_DUTY_KEEP;
-    else if (duty >= 0.0 && duty <= 100.0) d = (uint16_t)(duty * 10.0 + 0.5);
-    else { ESP_LOGW(TAG, "aux/%u/pwm/set: duty must be 0..100", a + 1); return; }
-    if (freq != 0 && (freq != (double)(uint32_t)freq || freq < AUX_PWM_FREQ_MIN || freq > AUX_PWM_FREQ_MAX)) {
-        ESP_LOGW(TAG, "aux/%u/pwm/set: freq must be a whole number of Hz from %u to %u",
-                 a + 1, AUX_PWM_FREQ_MIN, AUX_PWM_FREQ_MAX);
+    uint16_t d = AUX_PWM_DUTY_KEEP;
+    if (!bad && has_duty && !aux_pwm_duty_from_pct(duty, &d)) bad = true;
+    if (!bad && has_freq && !aux_pwm_freq_ok(freq)) bad = true;
+    if (bad) {
+        ESP_LOGW(TAG, "aux/%u/pwm/set: expected a duty cycle 0..100 or "
+                      "{\"duty\":0..100,\"freq\":%u..%u}", a + 1, AUX_PWM_FREQ_MIN, AUX_PWM_FREQ_MAX);
         return;
     }
-    esp_err_t r = aux_io_pwm_set(a, (uint32_t)freq, d);
+    esp_err_t r = aux_io_pwm_set(a, has_freq ? (uint32_t)freq : 0, d);
     if (r != ESP_OK)
         ESP_LOGW(TAG, "aux/%u/pwm/set: %s", a + 1,
                  r == ESP_ERR_INVALID_STATE ? "pad is not a PWM output" : esp_err_to_name(r));
 #else
     (void)topic; (void)tlen; (void)data; (void)dlen;
 #endif
-}
-
-aux_mode_t aux_io_mode(uint8_t a)
-{
-    return (a < AUX_PAD_COUNT) ? s_mode[a] : AUX_MODE_STANDARD;
-}
-
-bool aux_io_pwm_info(uint8_t a, uint32_t *freq_hz, uint16_t *duty_pm, uint8_t *bits)
-{
-    if (a >= AUX_PAD_COUNT || s_mode[a] != AUX_MODE_PWM) return false;
-    *freq_hz = ledc_get_freq(PWM_MODE, PWM_TIMER(a));
-    *duty_pm = s_duty[a];
-    *bits    = s_bits[a];
-    return true;
 }
 
 #endif /* CONFIG_APP_AUX_DI_ENABLE */

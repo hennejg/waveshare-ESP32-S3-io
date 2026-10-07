@@ -195,20 +195,24 @@ static uint8_t local_read_holding(uint16_t addr, uint16_t count, uint8_t *out)
     if (!s_local_ready) return MB_EXC_DEVICE_FAILURE;
     if ((uint32_t)addr + count > MB_NUM_HOLDING) return MB_EXC_ILLEGAL_ADDR;
 
+    /* The PWM as it runs, one snapshot per pad: read register by register,
+       the two frequency words could come from two different settings. A pad
+       that is not a PWM output reads 0. */
+    uint32_t f[AUX_PAD_COUNT] = {0};
+    uint16_t d[AUX_PAD_COUNT] = {0};
+    for (uint8_t a = 0; a < AUX_PAD_COUNT; a++)
+        if (!aux_io_pwm_info(a, &f[a], &d[a], NULL)) { f[a] = 0; d[a] = 0; }
+
     CMD_LOCK();
     for (uint16_t i = 0; i < count; i++) {           /* big endian on the wire */
         uint16_t reg = (uint16_t)(addr + i);
-        uint16_t v   = 0;
+        uint16_t v;
         if (reg < MB_HR_BASE) {
             v = s_hr_shadow[reg];
         } else {
-            /* The PWM as it runs -- changed by Modbus, MQTT or a rule alike.
-               A pad that is not a PWM output reads 0. */
-            uint8_t  a   = (uint8_t)((reg - MB_HR_BASE) / MB_HR_PER_PAD);
-            uint8_t  k   = (uint8_t)((reg - MB_HR_BASE) % MB_HR_PER_PAD);
-            uint32_t f = 0; uint16_t d = 0; uint8_t bits;
-            if (aux_io_pwm_info(a, &f, &d, &bits))
-                v = (k == 0) ? d : (k == 1) ? (uint16_t)(f >> 16) : (uint16_t)f;
+            uint8_t a = (uint8_t)((reg - MB_HR_BASE) / MB_HR_PER_PAD);
+            uint8_t k = (uint8_t)((reg - MB_HR_BASE) % MB_HR_PER_PAD);
+            v = (k == 0) ? d[a] : (k == 1) ? (uint16_t)(f[a] >> 16) : (uint16_t)f[a];
         }
         mb_put16(&out[i * 2], v);
     }
@@ -243,38 +247,41 @@ static uint8_t local_write_coils(uint16_t addr, uint16_t count, const uint8_t *b
 }
 
 /* The PWM part of a holding write, checked as a whole before anything moves:
-   every pad it touches must be a PWM output, and the duty cycle and the
-   frequency it ends up with -- written registers over the running values --
-   must be in range. A write of only one frequency word combines with the
-   other as it runs; FC 16 over both words changes the frequency in one step. */
-typedef struct { bool touched; uint32_t freq; uint16_t duty; } pwm_req_t;
+   every pad it touches must be a PWM output, and the values it writes must be
+   in range. Only what is written changes: an unwritten duty cycle stays as it
+   runs (AUX_PWM_DUTY_KEEP), an unwritten frequency too (0). A write of only
+   one frequency word combines with the other word of the frequency as it was
+   set; FC 16 over both words changes the frequency in one step. */
+typedef struct { bool touched, has_duty, has_hi, has_lo; uint16_t duty, hi, lo; uint32_t freq; } pwm_req_t;
 
 static uint8_t plan_pwm(uint16_t addr, uint16_t count, const uint8_t *regs_be,
-                        pwm_req_t req[APP_CFG_DI_AUX_COUNT ? APP_CFG_DI_AUX_COUNT : 1])
+                        pwm_req_t req[AUX_PAD_COUNT])
 {
     for (uint16_t i = 0; i < count; i++) {
         uint16_t reg = (uint16_t)(addr + i);
         if (reg < MB_HR_BASE) continue;
-        uint8_t a = (uint8_t)((reg - MB_HR_BASE) / MB_HR_PER_PAD);
-        uint8_t k = (uint8_t)((reg - MB_HR_BASE) % MB_HR_PER_PAD);
-        if (!req[a].touched) {
-            uint8_t bits;
-            if (!aux_io_pwm_info(a, &req[a].freq, &req[a].duty, &bits))
-                return MB_EXC_ILLEGAL_VALUE;          /* not a PWM output */
-            req[a].touched = true;
-        }
+        uint8_t  a = (uint8_t)((reg - MB_HR_BASE) / MB_HR_PER_PAD);
+        uint8_t  k = (uint8_t)((reg - MB_HR_BASE) % MB_HR_PER_PAD);
         uint16_t v = mb_be16(&regs_be[i * 2]);
-        if      (k == 0) req[a].duty = v;
-        else if (k == 1) req[a].freq = ((uint32_t)v << 16) | (req[a].freq & 0xFFFFu);
-        else             req[a].freq = (req[a].freq & 0xFFFF0000u) | v;
+        req[a].touched = true;
+        if      (k == 0) { req[a].has_duty = true; req[a].duty = v; }
+        else if (k == 1) { req[a].has_hi   = true; req[a].hi   = v; }
+        else             { req[a].has_lo   = true; req[a].lo   = v; }
     }
-#if APP_CFG_DI_AUX_COUNT
-    for (uint8_t a = 0; a < APP_CFG_DI_AUX_COUNT; a++)
-        if (req[a].touched &&
-            (req[a].duty > AUX_PWM_DUTY_MAX ||
-             req[a].freq < AUX_PWM_FREQ_MIN || req[a].freq > AUX_PWM_FREQ_MAX))
-            return MB_EXC_ILLEGAL_VALUE;
-#endif
+    for (uint8_t a = 0; a < AUX_PAD_COUNT; a++) {
+        if (!req[a].touched) continue;
+        uint32_t set_f;
+        if (!aux_io_pwm_info(a, &set_f, NULL, NULL)) return MB_EXC_ILLEGAL_VALUE;   /* not PWM */
+        if (req[a].has_duty && req[a].duty > AUX_PWM_DUTY_MAX) return MB_EXC_ILLEGAL_VALUE;
+        req[a].freq = 0;                                               /* keep */
+        if (req[a].has_hi || req[a].has_lo) {
+            uint32_t hi = req[a].has_hi ? req[a].hi : (uint16_t)(set_f >> 16);
+            uint32_t lo = req[a].has_lo ? req[a].lo : (uint16_t)set_f;
+            req[a].freq = (hi << 16) | lo;
+            if (req[a].freq < AUX_PWM_FREQ_MIN || req[a].freq > AUX_PWM_FREQ_MAX)
+                return MB_EXC_ILLEGAL_VALUE;
+        }
+    }
     return MB_EXC_NONE;
 }
 
@@ -283,9 +290,24 @@ static uint8_t local_write_holding(uint16_t addr, uint16_t count, const uint8_t 
     if (!s_local_ready) return MB_EXC_DEVICE_FAILURE;
     if ((uint32_t)addr + count > MB_NUM_HOLDING) return MB_EXC_ILLEGAL_ADDR;
 
-    pwm_req_t pwm[APP_CFG_DI_AUX_COUNT ? APP_CFG_DI_AUX_COUNT : 1] = {0};
+    pwm_req_t pwm[AUX_PAD_COUNT] = {0};
     uint8_t exc = plan_pwm(addr, count, regs_be, pwm);
     if (exc != MB_EXC_NONE) return exc;
+
+    /* PWM first and at once, not queued: a few register writes under a
+       mutex, publishing left to the pad task, and a read straight after the
+       write shows the new values. First, so that a refusal here -- the pad
+       changed mode since the plan -- has not already queued the LED. */
+    bool any = false;
+    for (uint8_t a = 0; a < AUX_PAD_COUNT; a++) {
+        if (!pwm[a].touched) continue;
+        esp_err_t r = aux_io_pwm_set(a, pwm[a].freq,
+                                     pwm[a].has_duty ? pwm[a].duty : AUX_PWM_DUTY_KEEP);
+        if (r == ESP_ERR_INVALID_STATE || r == ESP_ERR_INVALID_ARG) return MB_EXC_ILLEGAL_VALUE;
+        if (r != ESP_OK) return MB_EXC_DEVICE_FAILURE;
+        any = true;
+    }
+    if (any) scripting_on_modbus_activity();
 
     /* LED and buzzer go through the command task as before. */
     uint16_t base_n = (addr < MB_HR_BASE) ? (uint16_t)(MB_HR_BASE - addr) : 0;
@@ -300,22 +322,8 @@ static uint8_t local_write_holding(uint16_t addr, uint16_t count, const uint8_t 
         if (exc == MB_EXC_NONE)                   /* read-back follows the command */
             for (uint16_t i = 0; i < base_n; i++) s_hr_shadow[addr + i] = cmd.regs[i];
         CMD_UNLOCK();
-        if (exc != MB_EXC_NONE) return exc;
     }
-
-    /* PWM at once, not queued: it is a few register writes under a mutex,
-       publishing is left to the pad task, and a read straight after the
-       write then shows the new values without a shadow. */
-#if APP_CFG_DI_AUX_COUNT
-    bool any = false;
-    for (uint8_t a = 0; a < APP_CFG_DI_AUX_COUNT; a++) {
-        if (!pwm[a].touched) continue;
-        if (aux_io_pwm_set(a, pwm[a].freq, pwm[a].duty) != ESP_OK) return MB_EXC_DEVICE_FAILURE;
-        any = true;
-    }
-    if (any) scripting_on_modbus_activity();
-#endif
-    return MB_EXC_NONE;
+    return exc;
 }
 
 /* Input registers: the identification block, then the pads. */
@@ -403,14 +411,18 @@ uint8_t mb_server_handle(const mb_request_t *req, uint8_t *resp, uint16_t *resp_
    parameter FIFO. With them replaced, nothing queues parameter records at
    all, so that queue can no longer fill up and stall responses. */
 
-/* The stack maps a callback's error onto an exception itself, and reaches
-   only three codes. The local handlers produce only those three. */
+/* The stack maps a callback's error onto an exception itself and reaches
+   only 0x02, 0x04 and 0x06; 0x03, which the PWM registers return, goes
+   through the fork's MB_ERR_EXCEPTION. */
 static mb_err_enum_t exc_to_err(uint8_t exc)
 {
     switch (exc) {
     case MB_EXC_NONE:         return MB_ENOERR;
     case MB_EXC_ILLEGAL_ADDR: return MB_ENOREG;
     case MB_EXC_DEVICE_BUSY:  return MB_ETIMEDOUT;
+    /* The stack's own mapping knows only 0x02, 0x04 and 0x06; the fork lets
+       a callback put any code on the wire (mb_types.h). */
+    case MB_EXC_ILLEGAL_VALUE: return MB_ERR_EXCEPTION(MB_EXC_ILLEGAL_VALUE);
     default:                  return MB_EIO;
     }
 }

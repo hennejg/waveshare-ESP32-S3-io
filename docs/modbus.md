@@ -224,8 +224,10 @@ Three registers per pad, for a pad set to *PWM output* on the Device tab:
 - **Write:** takes effect at once and is **not stored**: after a reboot the pad starts with the values from the
   configuration. A controller may therefore write the duty cycle as often as it likes without wearing the flash.
 - A write to a pad that is not a PWM output, or that leaves a value out of range, is refused with exception `0x03`
-  and changes nothing. Write both frequency words in one FC 16 request; a single word combines with the other as
-  it runs.
+  — over TCP and RTU alike — and changes nothing. Only the registers written change: a duty write leaves the
+  frequency as it was set. Write both frequency words in one FC 16 request; a single word combines with the other
+  word of the frequency as set.
+- Read-back is the frequency as set; `/api/io/state` also shows the frequency the timer actually produces.
 
 ### Input Registers (function code 04) — Device Identification
 
@@ -254,7 +256,7 @@ RS-485.
 | 56–63 | 8 | Serial number as text: the MAC as twelve hex digits, no separators |
 | 64–79 | 16 | Firmware version as text, as git describes it (`v1.1.13-3-gabc1234`) |
 
-A read that reaches past address 79 is answered with exception `0x02`.
+A read that reaches past address 79 into the gap before 100 is answered with exception `0x02`.
 
 #### Input registers 30101–30104 — header pads
 

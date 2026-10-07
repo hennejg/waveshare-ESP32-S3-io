@@ -47,9 +47,17 @@ function createEngine(opts) {
     _dout_set(ch, v)   { dout[ch] = !!v; },
     _dout_get(ch)      { return !!dout[ch]; },
     _dout_toggle(ch)   { dout[ch] = !dout[ch]; },
+    // Mirrors js_aux_pwm_set in bindings.c, checks and all, so that a rule the
+    // device would refuse fails here too.
     _aux_pwm_set(pad, duty, freq) {
-      if (!(pad in pwmPads)) throw new RangeError('pwm pad must be 1-3');
+      if (!(pad >= 1 && pad <= 3) || pad !== Math.trunc(pad)) throw new RangeError('pad must be 1, 2 or 3');
+      duty = Number(duty);
       if (!(duty >= 0 && duty <= 100)) throw new RangeError('pwm duty must be 0-100 (%)');
+      if (freq !== undefined) {
+        freq = Number(freq);
+        if (freq !== 0 && (!(freq >= 5 && freq <= 1000000) || freq !== Math.trunc(freq)))
+          throw new RangeError('pwm freq must be a whole number of Hz from 5 to 1000000');
+      }
       if (!pwmPads[pad]) throw new Error('pad ' + pad + ' is not set to PWM output');
       pwmPads[pad] = { duty: Math.round(duty * 10) / 10, freq: freq ? freq : pwmPads[pad].freq };
     },
@@ -106,6 +114,7 @@ function createEngine(opts) {
     setInput(ch, v) { di[ch] = !!v; },                              // set DI without firing
     publish(t, p)   { sandbox._on_mqtt(t, p); },                    // fire _on_mqtt
     analog(pad, mv) { analogMv[pad] = mv; sandbox._on_analog(pad, mv); },   // new reading + fire
+    analogGone(pad) { analogMv[pad] = null; sandbox._on_analog(pad, null); }, // pad leaves analog mode
     setPwmPad(pad, on, freq) { pwmPads[pad] = on ? { duty: 0, freq: freq || 1000 } : null; },
     pwmState(pad)   { return pwmPads[pad]; },
     reload(script)  { sandbox._reset_rules(); if (script) this.load(script); },

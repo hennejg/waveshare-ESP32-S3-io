@@ -53,8 +53,10 @@ void scripting_on_mqtt_message(const char *topic, size_t topic_len,
 void scripting_on_input_change(uint8_t channel, bool state);
 
 // A new analog reading of pad 1..3 in millivolts (only when it moved by the
-// driver's step). Safe to call from any task.
-void scripting_on_analog(uint8_t pad, int mv);
+// driver's step); INT_MIN when the pad has stopped being an analog input.
+// Safe to call from any task. False if the engine could not take it (not
+// started yet, queue full): the caller offers it again with its next sample.
+bool scripting_on_analog(uint8_t pad, int mv);
 
 // Replace the running script with new_script and restart rule evaluation.
 // The script is evaluated into a fresh context and only takes over if that

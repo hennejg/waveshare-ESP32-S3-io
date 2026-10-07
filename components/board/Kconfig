@@ -21,15 +21,17 @@ config APP_AUX_DI_ENABLE
     default y
     help
         Lets each of the three header pins IO1, RXD and TXD (GPIO1, GPIO44,
-        GPIO43) be switched, per pin, in the web UI (Inputs tab) or with "aux"
+        GPIO43) be switched, per pin, in the web UI (Device tab) or with "aux"
         in /api/config: standard function, digital input, or PWM output with
         its own frequency (5 Hz .. 1 MHz) and duty cycle; GPIO1 also as analog
         input (ADC1 channel 0, 0..3.1 V).  The change takes effect on saving;
-        no reboot.  Every pin starts in its standard function, so a board that
-        never touches the setting behaves as it did without this option.
+        no reboot.  Every pin starts in its standard function.  One thing does
+        change with the option on: the input table in NVS has eleven entries,
+        which an eight-input firmware (older releases, Matter) cannot read
+        back -- going back loses the input names (README).
 
-        Standard function: GPIO1 is left alone (this firmware does not use it);
-        GPIO44 and GPIO43 are UART0 RX and TX, which is where the console is.
+        Standard function: GPIO1 is high-impedance (this firmware does not use
+        it); GPIO44 and GPIO43 are UART0 RX and TX, which is where the console is.
         In any other mode the pin is taken off UART0 -- the console keeps
         running on USB-Serial/JTAG, and on UART0 it simply no longer reaches
         the pin.
@@ -42,16 +44,20 @@ config APP_AUX_DI_ENABLE
         series resistor, no reverse protection.  They need external protection
         and must never see more than 3.3 V or less than 0 V.
 
-        Moving the console is not enough for GPIO43 (AUX3).  It is U0TXD, and the
-        ROM bootloader drives it as a push-pull output from every reset until
-        the second-stage bootloader releases it — and indefinitely while the
-        chip sits in UART download mode (esptool, BOOT button).  A contact
-        wired straight from GPIO43 to ground therefore shorts that driver on
-        every boot and during every flash.  Put a series resistor of at least
-        1 kOhm in that line.  GPIO43 is deliberately the LAST channel, so a
-        board that needs only two extra inputs can leave it unwired.
-        GPIO44 (AUX2) is U0RXD, an input, and has no such
-        problem; GPIO1 is unaffected and otherwise unused by this firmware.
+        GPIO43 (TXD) is U0TXD.  The console stays on UART0, so the ROM
+        bootloader, the second-stage bootloader and the early application log
+        drive it as a push-pull output from every reset until the pads are set
+        up -- and indefinitely in UART download mode (esptool, BOOT button).
+        As an input it needs a series resistor of at least 1 kOhm; as a PWM
+        output its load sees that traffic at every reset.  GPIO43 is
+        deliberately the LAST channel, so a board that needs only two extra
+        inputs can leave it unwired.  GPIO44 (RXD) is an input at reset;
+        GPIO1 is unused by this firmware.
+
+        A PWM output is under control only while the firmware runs: switching
+        a PWM pad to another mode pulls it high (input pull-up, UART idle
+        level), so a load is switched off with duty 0, and a driver input
+        wants an external pull-down for the time before the pads are set up.
 
         Inputs, PWM and the analog reading are available over the web UI, the
         REST API, MQTT (aux/...), Modbus (discrete inputs 10009-10011, holding

@@ -516,7 +516,8 @@ static void scripting_task(void *arg)
                 JSValue fn = JS_GetPropertyStr(ctx, global, "_on_analog");
                 JS_FreeValue(ctx, global);
                 if (JS_IsFunction(ctx, fn))
-                    call2(ctx, fn, JS_NewInt32(ctx, ev.analog.pad), JS_NewInt32(ctx, ev.analog.mv));
+                    call2(ctx, fn, JS_NewInt32(ctx, ev.analog.pad),
+                          ev.analog.mv == INT32_MIN ? JS_NULL : JS_NewInt32(ctx, ev.analog.mv));
                 JS_FreeValue(ctx, fn);
                 break;
             }
@@ -776,14 +777,13 @@ static void post_activity(uint8_t source)
 void scripting_on_modbus_activity(void) { post_activity(ACT_MODBUS); }
 void scripting_on_can_activity(void)    { post_activity(ACT_CAN); }
 
-void scripting_on_analog(uint8_t pad, int mv)
+bool scripting_on_analog(uint8_t pad, int mv)
 {
-    if (!s_queue) return;
+    if (!s_queue) return false;
     scripting_evt_t ev = { .type = EVT_ANALOG, .analog = { .pad = pad, .mv = mv } };
-    /* Dropped when the queue is full: the next reading that moves by the
-       driver's step is delivered, and .value always reads live. */
-    if (xQueueSend(s_queue, &ev, 0) != pdTRUE)
-        ESP_LOGW(TAG, "Event queue full — analog reading dropped");
+    /* Not lost when the queue is full: the driver offers the reading again
+       with its next sample. */
+    return xQueueSend(s_queue, &ev, 0) == pdTRUE;
 }
 
 void scripting_on_input_change(uint8_t channel, bool state)

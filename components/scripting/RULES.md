@@ -167,7 +167,8 @@ an **actuator**: call `.publish()` in `then()` to send a message to the broker.
 
 ### `input(ch)` — digital input
 
-`ch` is the channel number (0–7).
+`ch` is the channel number: 0–7 for DI1–DI8, and 8–10 for the header pads IO1, RXD and TXD when the firmware offers
+them. A pad that is not set to *digital input* reads `false`.
 
 | Form | Meaning |
 |------|---------|
@@ -262,8 +263,13 @@ these act only on a pad in that mode. A pad set to *digital input* is `input(8)`
 | `analog(1).above(mV)` / `.below(mV)` / `.between(lo, hi)` | a band, bounds exclusive |
 | `analog(1).value` / `.get()` | live reading in mV, `null` when the pad is not analog |
 
-A rule gated on an analog **band** fires when the reading *enters* the band, not on every reading inside it, and
-again only after the reading has left it. A bare `analog(1)` fires on every reading.
+A rule gated on an analog **band** fires when its conditions start to hold — the reading enters the band, or another
+condition of the rule becomes true while the reading is inside — and not again on readings inside the band until the
+conditions have stopped holding. A bare `analog(1)` fires on every reading. When the pad leaves analog mode, its last
+reading is forgotten: bands no longer match and `.value` is `null`.
+
+A pad switched to another mode does not switch a load off — set the duty cycle to 0. See the README for what a PWM
+pad does while the firmware is not running.
 
 ```js
 // fan speed follows the temperature sensor on IO1 (0–3.3 V)
@@ -556,6 +562,8 @@ happens, the engine only re-evaluates the rules that reference the *changed* fac
 - An **MQTT message** on `topic` re-evaluates only rules referencing `mqtt(topic)`.
 - Writing **DO0** to a new level re-evaluates only rules referencing `output(0)`.
 - An **`every`/`cron` tick** re-evaluates only the rules using that specific trigger.
+- An **analog reading** of pad `n` (one per 20 mV of change) re-evaluates the rules referencing
+  `analog(n)`. A rule with a band (`above`/`below`/`between`) fires only on entering it.
 
 This is why toggling one input never accidentally fires a rule about another input.
 
@@ -568,7 +576,9 @@ bounds the chain so a feedback loop can't run away — see
 **Wildcard rules.** If a rule has an *opaque* condition — a predicate function or a bare
 value — the engine cannot tell which facts it depends on, so the rule is treated as
 **wildcard** and re-evaluated on *every* event. Prefer `input()` / `output()` / `mqtt()`
-conditions when you want the targeted behavior.
+conditions when you want the targeted behavior. Analog readings are the exception: they
+arrive several times a second, so a wildcard rule fires on one only when its predicate has
+just become true, not on every reading while it holds.
 
 ---
 

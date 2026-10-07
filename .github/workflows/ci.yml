@@ -19,7 +19,7 @@ jobs:
             label: ''
             sdkconfig: ''
           # APP_AUX_DI_ENABLE is on by default; this compiles the eight-input
-          # build the default never sees: 8-entry DI arrays, no aux_in switch.
+          # build the default never sees: 8-entry DI arrays, no header pads.
           - config: no-aux-di
             label: ', without APP_AUX_DI_ENABLE'
             sdkconfig: |
@@ -59,7 +59,7 @@ jobs:
           idf.py -C apps/full set-target esp32s3
           idf.py -C apps/full build
 
-      # Only the default configuration ships; the option-on leg is a compile check.
+      # Only the default configuration ships; the no-aux-di leg is a compile check.
       - name: Upload build artifacts
         if: matrix.config == 'default'
         uses: actions/upload-artifact@v7

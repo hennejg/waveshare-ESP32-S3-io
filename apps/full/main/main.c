@@ -51,6 +51,7 @@ const char DEMO_SCRIPT[] =
     "    output(0).set(true);\n"
     "  });\n";
 
+#if CONFIG_APP_AUX_DI_ENABLE
 /* The rule engine numbers the pads 1..3, like AUX1..AUX3; aux_io 0..2. */
 static esp_err_t rules_pwm_set(uint8_t pad, uint32_t freq_hz, uint16_t duty_pm)
 {
@@ -59,20 +60,22 @@ static esp_err_t rules_pwm_set(uint8_t pad, uint32_t freq_hz, uint16_t duty_pm)
 }
 static bool rules_pwm_get(uint8_t pad, uint32_t *freq_hz, uint16_t *duty_pm)
 {
-    uint8_t bits;
-    return pad >= 1 && pad <= 3 && aux_io_pwm_info((uint8_t)(pad - 1), freq_hz, duty_pm, &bits);
+    return pad >= 1 && pad <= 3 && aux_io_pwm_info((uint8_t)(pad - 1), freq_hz, duty_pm, NULL);
 }
 static esp_err_t rules_analog_get(uint8_t pad, int *mv)
 {
     return (pad >= 1 && pad <= 3) ? aux_io_analog_mv((uint8_t)(pad - 1), mv) : ESP_ERR_INVALID_ARG;
 }
+#endif
 
 static const scripting_io_t s_scripting_io = {
     .di_get         = di_get,
     .di_count       = APP_CFG_DI_COUNT,
+#if CONFIG_APP_AUX_DI_ENABLE
     .aux_pwm_set    = rules_pwm_set,
     .aux_pwm_get    = rules_pwm_get,
     .aux_analog_get = rules_analog_get,
+#endif
     .dout_set       = dout_set,
     .dout_get       = dout_get,
     .dout_toggle    = dout_toggle,

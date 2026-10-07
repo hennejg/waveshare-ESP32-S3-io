@@ -1,5 +1,6 @@
 #include "di.h"
 #include "app_config.h"
+#include "aux_io.h"
 #ifdef CONFIG_APP_MQTT_ENABLE
 #include <stdbool.h>
 int  app_mqtt_publish(const char *topic, const char *payload, int len, int qos, bool retain);
@@ -32,15 +33,24 @@ static const gpio_num_t s_gpios[NUM_DI] = {
     GPIO_NUM_8, GPIO_NUM_9, GPIO_NUM_10, GPIO_NUM_11,
 #if CONFIG_APP_AUX_DI_ENABLE
     /* Auxiliary inputs — direct 3.3 V GPIOs, no optocoupler. */
-    GPIO_NUM_1, GPIO_NUM_44, GPIO_NUM_43,
+    AUX_PAD_GPIOS,
 #endif
 };
 
 static bool         s_state[NUM_DI];
 static TaskHandle_t s_task;
 /* Which auxiliary pins are inputs, bit i = channel 8+i.  Written under s_mux
-   by di_aux_input(), read by the input task under the same lock. */
+   by di_aux_input(), read by the input task under the same lock.
+
+   Nothing is published under s_mux: publishing waits on the MQTT client's
+   lock, and the MQTT task calls into the drivers while holding it. Changes
+   are collected under the lock and reported after it. s_report: auxiliary
+   pins that have just become inputs and whose level is still to be reported;
+   s_gone: ones that have stopped being inputs, which the rule engine is told
+   read false. */
 static uint8_t           s_aux;
+static uint8_t           s_report;
+static uint8_t           s_gone;
 static SemaphoreHandle_t s_mux;
 static bool              s_isr_ready;
 
@@ -83,11 +93,19 @@ static void notify_one(uint8_t n, bool state)
 
 void di_publish_all(void)
 {
+    /* Refreshed from the pins under the lock, so that a pad changing hands
+       cannot be read as an input after it stopped being one; published
+       after it. */
+    bool active[NUM_DI], val[NUM_DI];
+    if (s_mux) xSemaphoreTake(s_mux, portMAX_DELAY);
     for (uint8_t i = 0; i < NUM_DI; i++) {
-        if (!di_is_active(i)) continue;
-        s_state[i] = read_pin(i);   /* refresh from hardware before publishing */
-        notify_one(i, s_state[i]);
+        active[i] = di_is_active(i);
+        if (active[i]) s_state[i] = read_pin(i);
+        val[i] = s_state[i];
     }
+    if (s_mux) xSemaphoreGive(s_mux);
+    for (uint8_t i = 0; i < NUM_DI; i++)
+        if (active[i]) notify_one(i, val[i]);
 }
 
 bool di_is_active(uint8_t n)
@@ -123,16 +141,29 @@ static void di_task(void *arg)
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS));
 
+        bool    changed[NUM_DI] = {0}, val[NUM_DI];
+        uint8_t report, gone;
         xSemaphoreTake(s_mux, portMAX_DELAY);
         for (uint8_t i = 0; i < NUM_DI; i++) {
+            val[i] = s_state[i];
             if (!di_is_active(i)) continue;
             bool cur = read_pin(i);
-            if (cur != s_state[i]) {
-                s_state[i] = cur;
-                notify_one(i, cur);
-            }
+            if (cur != s_state[i]) { s_state[i] = val[i] = cur; changed[i] = true; }
         }
+        report = s_report; s_report = 0;
+        gone   = s_gone;   s_gone   = 0;
         xSemaphoreGive(s_mux);
+
+        for (uint8_t i = 0; i < NUM_DI; i++) {
+            uint8_t a   = (uint8_t)(i - APP_CFG_DI_ISOLATED_COUNT);
+            bool    aux = i >= APP_CFG_DI_ISOLATED_COUNT;
+            if (changed[i] || (aux && (report >> a) & 1u)) notify_one(i, val[i]);
+#ifdef CONFIG_APP_SCRIPTING_ENABLE
+            /* A pad that is no longer an input reads false; the rule engine
+               holds the last level it was given and has to be told. */
+            if (aux && (gone >> a) & 1u) scripting_on_input_change(i, false);
+#endif
+        }
     }
 }
 
@@ -169,7 +200,8 @@ void di_aux_input(uint8_t a, bool on)
             gpio_isr_handler_add(g, gpio_isr, NULL);
             gpio_set_intr_type(g, GPIO_INTR_ANYEDGE);
         }
-        notify_one(n, s_state[n]);
+        s_report |= (uint8_t)(1u << a);       /* reported by di_task */
+        s_gone   &= (uint8_t)~(1u << a);
     } else if (!on && was) {
         /* Off the input path first, so nothing reads the pin while it
            changes hands. */
@@ -179,8 +211,11 @@ void di_aux_input(uint8_t a, bool on)
             gpio_isr_handler_remove(g);
         }
         s_state[n] = false;
+        s_gone   |= (uint8_t)(1u << a);
+        s_report &= (uint8_t)~(1u << a);
     }
     xSemaphoreGive(s_mux);
+    if (on != was && s_task) xTaskNotifyGive(s_task);
 #else
     (void)a; (void)on;
 #endif

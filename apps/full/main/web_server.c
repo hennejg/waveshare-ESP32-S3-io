@@ -7,6 +7,7 @@
 #include "di.h"
 #include "dout.h"
 #include "aux_io.h"
+#include "esp_system.h"
 #include "led.h"
 #ifdef CONFIG_APP_MATTER_ENABLE
 #include "matter.h"
@@ -574,26 +575,23 @@ static esp_err_t api_config_post(httpd_req_t *req)
                     cfg.aux_mode[a] = (uint8_t)m;
             }
             if (!aux_err && (v = cJSON_GetObjectItem(o, "pwm_freq"))) {
-                double f = cJSON_IsNumber(v) ? v->valuedouble : -1;
-                if (!(f >= AUX_PWM_FREQ_MIN && f <= AUX_PWM_FREQ_MAX) || f != (double)(uint32_t)f)
+                if (!cJSON_IsNumber(v) || !aux_pwm_freq_ok(v->valuedouble))
                     aux_err = "pwm_freq must be a whole number of Hz from 5 to 1000000";
                 else
-                    cfg.aux_pwm[a].freq_hz = (uint32_t)f;
+                    cfg.aux_pwm[a].freq_hz = (uint32_t)v->valuedouble;
             }
             if (!aux_err && (v = cJSON_GetObjectItem(o, "pwm_duty"))) {
-                double d = cJSON_IsNumber(v) ? v->valuedouble : -1;
-                if (!(d >= 0.0 && d <= 100.0))
+                if (!cJSON_IsNumber(v) || !aux_pwm_duty_from_pct(v->valuedouble, &cfg.aux_pwm[a].duty_pm))
                     aux_err = "pwm_duty must be a percentage from 0 to 100";
-                else
-                    cfg.aux_pwm[a].duty_pm = (uint16_t)(d * 10.0 + 0.5);
             }
         }
     }
     if (aux_err) {
+        /* Plain text, like every other refusal of this handler: the page
+           shows the body as it is. */
         cJSON_Delete(root);
-        char msg[96];
-        snprintf(msg, sizeof(msg), "{\"error\":\"%s\"}", aux_err);
-        return send_json(req, "400 Bad Request", msg);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, aux_err);
+        return ESP_OK;
     }
 #endif
     parse_invert_array(cJSON_GetObjectItem(root, "dout"), cfg.dout, APP_CFG_DO_COUNT);
@@ -824,13 +822,22 @@ static esp_err_t api_config_post(httpd_req_t *req)
        describes the new ones. Everything else on this page needs a reboot,
        which is what the form says; this one does not have to. */
     if (mbm_present) mb_tcp_master_reload();
-    aux_io_apply();       /* before di_publish_all() below */
+    /* Before di_publish_all() below. A pad that cannot take its mode is left
+       in its standard function; the save itself has happened. */
+    esp_err_t aux_ret = aux_io_apply();
     app_time_apply_tz();  /* timezone first, so a sync that follows computes in it */
     sntp_sync_apply();    /* apply any SNTP server / enable change immediately */
     di_publish_all();
     /* Re-subscribe with potentially new names, then publish all DO states. */
     dout_on_mqtt_connected();
 
+    if (aux_ret != ESP_OK) {
+        /* Stored, but not in effect: say so, rather than "ok" next to a mode
+           the Device tab shows and the pad does not have. */
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+            "Saved, but a header pad could not be switched and is in its standard function (see the device log)");
+        return ESP_OK;
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
     return ESP_OK;
@@ -1205,8 +1212,11 @@ static esp_err_t api_io_state(httpd_req_t *req)
         uint32_t f; uint16_t d; uint8_t bits; int mv;
         if (m == AUX_MODE_PWM && aux_io_pwm_info((uint8_t)a, &f, &d, &bits)) {
             /* As it runs, which Modbus, MQTT or a rule may have changed since
-               the configuration was saved. */
+               the configuration was saved: the values as set -- what Modbus
+               and MQTT report too -- and the frequency the timer actually
+               produces from them. */
             cJSON_AddNumberToObject(o, "pwm_freq", f);
+            cJSON_AddNumberToObject(o, "pwm_freq_actual", aux_io_pwm_actual_hz((uint8_t)a));
             cJSON_AddNumberToObject(o, "pwm_duty", d / 10.0);
             cJSON_AddNumberToObject(o, "pwm_bits", bits);
         } else if (m == AUX_MODE_ANALOG && aux_io_analog_mv((uint8_t)a, &mv) == ESP_OK) {
@@ -1493,10 +1503,21 @@ static esp_err_t api_rules_post(httpd_req_t *req)
 static esp_err_t api_version(httpd_req_t *req)
 {
     const esp_app_desc_t *d = esp_app_get_description();
-    char json[160];
+    /* Why the board last started: a watchdog or a panic otherwise leaves no
+       trace unless something happened to be reading the console. */
+    static const char *const reasons[] = {
+        [ESP_RST_UNKNOWN] = "unknown",   [ESP_RST_POWERON] = "poweron",  [ESP_RST_EXT] = "ext",
+        [ESP_RST_SW] = "sw",             [ESP_RST_PANIC] = "panic",      [ESP_RST_INT_WDT] = "int_wdt",
+        [ESP_RST_TASK_WDT] = "task_wdt", [ESP_RST_WDT] = "wdt",          [ESP_RST_DEEPSLEEP] = "deepsleep",
+        [ESP_RST_BROWNOUT] = "brownout", [ESP_RST_SDIO] = "sdio",        [ESP_RST_USB] = "usb",
+        [ESP_RST_JTAG] = "jtag",
+    };
+    esp_reset_reason_t rr = esp_reset_reason();
+    const char *rs = ((size_t)rr < sizeof(reasons) / sizeof(reasons[0]) && reasons[rr]) ? reasons[rr] : "other";
+    char json[200];
     snprintf(json, sizeof(json),
-             "{\"version\":\"%s\",\"idf\":\"%s\",\"date\":\"%s\",\"time\":\"%s\"}",
-             d->version, d->idf_ver, d->date, d->time);
+             "{\"version\":\"%s\",\"idf\":\"%s\",\"date\":\"%s\",\"time\":\"%s\",\"reset_reason\":\"%s\"}",
+             d->version, d->idf_ver, d->date, d->time, rs);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, json);
     return ESP_OK;
