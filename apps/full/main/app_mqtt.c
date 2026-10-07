@@ -8,6 +8,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "mqtt_client.h"
 
 #define TAG                  "app_mqtt"
@@ -60,11 +61,18 @@ static void publish_health(void)
    held up rule timers, the auth timeout and every other timer with it. */
 static TaskHandle_t s_health_task;
 
+/* Held by health_task around its publish and by app_mqtt_stop() around the
+   destroy, so the task can never run esp_mqtt_client_publish() on a client
+   that stop() has freed between the NULL check and the call. */
+static SemaphoreHandle_t s_client_lock;
+
 static void health_task(void *arg)
 {
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        xSemaphoreTake(s_client_lock, portMAX_DELAY);
         publish_health();
+        xSemaphoreGive(s_client_lock);
     }
 }
 
@@ -197,19 +205,38 @@ esp_err_t app_mqtt_start(void)
         mqtt_cfg.session.last_will.retain  = 1;
     }
 
+    /* The lock and the task outlive the client: stop() leaves them, start()
+       reuses them. The timer is created once too and deleted by stop(). */
+    if (!s_client_lock) s_client_lock = xSemaphoreCreateMutex();
+    if (!s_client_lock) {
+        ESP_LOGE(TAG, "Failed to create client lock");
+        return ESP_ERR_NO_MEM;
+    }
+    /* The publish runs the transport write on this stack; with an mqtts://
+       or wss:// URL that is an mbedtls record write. */
+    if (!s_health_task &&
+        xTaskCreate(health_task, "mqtt_health", 4096, NULL, 3,
+                    &s_health_task) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create health task");
+        return ESP_ERR_NO_MEM;
+    }
+    if (!s_health_timer) {
+        esp_timer_create_args_t timer_args = {
+            .callback = health_timer_cb,
+            .name     = "mqtt_health",
+        };
+        esp_err_t ret = esp_timer_create(&timer_args, &s_health_timer);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to create health timer: %s", esp_err_to_name(ret));
+            return ret;
+        }
+    }
+
     s_client = esp_mqtt_client_init(&mqtt_cfg);
     if (!s_client) {
         ESP_LOGE(TAG, "Failed to create MQTT client");
         return ESP_FAIL;
     }
-
-    esp_timer_create_args_t timer_args = {
-        .callback = health_timer_cb,
-        .name     = "mqtt_health",
-    };
-    esp_timer_create(&timer_args, &s_health_timer);
-    if (!s_health_task)
-        xTaskCreate(health_task, "mqtt_health", 3072, NULL, 3, &s_health_task);
 
     esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID,
                                    mqtt_event_handler, NULL);
@@ -233,10 +260,15 @@ void app_mqtt_stop(void)
         esp_timer_delete(s_health_timer);
         s_health_timer = NULL;
     }
+    /* Stop first, outside the lock: the mqtt task may be inside the inline
+       publish_health() of MQTT_EVENT_CONNECTED, and stop() waits for it to
+       exit. Once it has, only health_task can still reach s_client. */
     esp_mqtt_client_stop(s_client);
+    xSemaphoreTake(s_client_lock, portMAX_DELAY);
     esp_mqtt_client_destroy(s_client);
     s_client    = NULL;
     s_connected = false;
+    xSemaphoreGive(s_client_lock);
 }
 
 bool app_mqtt_is_connected(void)
