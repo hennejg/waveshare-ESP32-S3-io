@@ -243,7 +243,13 @@
     async function apiFetch(url, opts = {}) {
       opts.headers = { ...(opts.headers || {}), ...authHeaders() };
       const r = await fetch(url, opts);
-      if (r.status === 401) { showLogin(); throw new Error('unauthorized'); }
+      if (r.status === 401) {
+        // Before the first password is set the device answers setup_required;
+        // show the setup screen then, not a login that cannot succeed.
+        const e = await r.json().catch(() => ({}));
+        if (e.error === 'setup_required') initAuth(); else showLogin();
+        throw new Error('unauthorized');
+      }
       return r;
     }
 

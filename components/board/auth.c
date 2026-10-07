@@ -67,7 +67,7 @@ bool auth_is_password_set(void) { return s_pw_set; }
 
 bool auth_check_password(const char *pw)
 {
-    if (!s_pw_set) return true;
+    if (!s_pw_set) return false;      /* nothing to match against -- see auth.h */
     uint8_t test[32];
     compute_hash(s_pw_salt, pw, test);
     return (memcmp(test, s_pw_hash, 32) == 0);

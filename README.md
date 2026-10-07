@@ -92,7 +92,9 @@ The UI also provides **Save**, **Reboot**, and **Factory Reset** buttons.
 
 #### REST API (full firmware)
 
-All endpoints except the auth flow require an `Authorization: Basic base64(:<password>)` header when a password is set.
+All endpoints except the auth flow require an `Authorization: Basic base64(:<password>)` header.
+Until a password has been set they answer `401 {"error":"setup_required"}`: a device that has not been
+set up yet is closed, not open, and the only way in is the button-confirmed password flow.
 
 | Endpoint                 | Method | Auth required | Description                                      |
 |--------------------------|--------|---------------|--------------------------------------------------|
