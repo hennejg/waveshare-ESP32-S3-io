@@ -75,16 +75,27 @@ bool auth_check_password(const char *pw)
 
 esp_err_t auth_set_password(const char *pw)
 {
-    esp_fill_random(s_pw_salt, sizeof(s_pw_salt));
-    compute_hash(s_pw_salt, pw, s_pw_hash);
+    /* Into locals first, and into the live state only once the flash has
+       taken it: a write that fails must leave memory and flash agreeing on
+       the old password, or the device answers to one password until the
+       next reboot and to another after it, while the caller was told ok. */
+    uint8_t salt[sizeof(s_pw_salt)], hash[sizeof(s_pw_hash)];
+    esp_fill_random(salt, sizeof(salt));
+    compute_hash(salt, pw, hash);
 
     nvs_handle_t h;
     esp_err_t r = nvs_open(NVS_NS, NVS_READWRITE, &h);
     if (r != ESP_OK) return r;
-    nvs_set_blob(h, K_SALT, s_pw_salt, sizeof(s_pw_salt));
-    nvs_set_blob(h, K_HASH, s_pw_hash, sizeof(s_pw_hash));
-    nvs_commit(h);
+    r = nvs_set_blob(h, K_SALT, salt, sizeof(salt));
+    if (r == ESP_OK) r = nvs_set_blob(h, K_HASH, hash, sizeof(hash));
+    if (r == ESP_OK) r = nvs_commit(h);
     nvs_close(h);
+    if (r != ESP_OK) {
+        ESP_LOGE(TAG, "storing the password failed: %s", esp_err_to_name(r));
+        return r;
+    }
+    memcpy(s_pw_salt, salt, sizeof(s_pw_salt));
+    memcpy(s_pw_hash, hash, sizeof(s_pw_hash));
     s_pw_set = true;
     ESP_LOGI(TAG, "Password updated");
     return ESP_OK;

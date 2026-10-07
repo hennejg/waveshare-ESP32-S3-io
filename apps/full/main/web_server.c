@@ -328,8 +328,16 @@ static esp_err_t api_auth_set_password(httpd_req_t *req)
         return ESP_OK;
     }
 
-    auth_set_password(pw_j->valuestring);
+    esp_err_t set_ret = auth_set_password(pw_j->valuestring);
     cJSON_Delete(root);
+    if (set_ret != ESP_OK) {
+        /* The token is spent either way; say what happened rather than
+           reporting a protection the flash does not have. */
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"password could not be stored\"}");
+        return ESP_OK;
+    }
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
@@ -737,7 +745,15 @@ static esp_err_t api_config_post(httpd_req_t *req)
         return ESP_OK;
     }
 
-    app_config_update(&cfg);
+    esp_err_t upd = app_config_update(&cfg);
+    if (upd != ESP_OK) {
+        /* Nothing below is applied: the live configuration is still the old
+           one, and that is what the device keeps running. */
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"configuration could not be stored\"}");
+        return ESP_OK;
+    }
 
     /* Only when this request actually carried the table. Reloading clears the
        master's counters and drops its connections to every meter, so doing it

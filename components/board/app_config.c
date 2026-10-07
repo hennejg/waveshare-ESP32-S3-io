@@ -2,6 +2,9 @@
 #include <string.h>
 #include <nvs_flash.h>
 #include <nvs.h>
+#include "esp_log.h"
+
+#define TAG "app_config"
 
 /* Not an NVS limit -- the configuration is thirteen blobs, the largest of
    them the Modbus master table at 736 bytes. What this actually guards is the
@@ -98,27 +101,37 @@ const app_config_t *app_config_get(void)
 
 esp_err_t app_config_update(const app_config_t *cfg)
 {
-    memcpy(&s_cfg, cfg, sizeof(s_cfg));
-
+    /* Flash first, live state second: a write that fails leaves the device
+       running the configuration it still has in flash, and the caller is
+       told so, instead of running the new one until the next reboot while
+       having answered ok. Every step is chained, because a single
+       nvs_set_*() that fails -- a full partition, say -- was swallowed. */
     nvs_handle_t h;
     esp_err_t ret = nvs_open(NVS_NS, NVS_READWRITE, &h);
     if (ret != ESP_OK) return ret;
 
-    nvs_set_str(h, K_DEVICE_NAME, s_cfg.device_name);
-    nvs_set_str(h, K_MQTT_URL,    s_cfg.mqtt_url);
-    nvs_set_str(h, K_MQTT_USER,   s_cfg.mqtt_user);
-    nvs_set_str(h, K_MQTT_PASS,   s_cfg.mqtt_password);
-    nvs_set_str(h, K_MQTT_TOPIC,  s_cfg.mqtt_topic_prefix);
-    nvs_set_str(h, K_TZ,          s_cfg.tz);
-    nvs_set_blob(h, K_DI_CFG,    s_cfg.di,   sizeof(s_cfg.di));
-    nvs_set_blob(h, K_DOUT_CFG,  s_cfg.dout, sizeof(s_cfg.dout));
-    nvs_set_blob(h, K_MODBUS_CFG, &s_cfg.modbus, sizeof(s_cfg.modbus));
-    nvs_set_u8(h, K_LED_MODE, s_cfg.led_mode);
-    nvs_set_blob(h, K_CAN_CFG, &s_cfg.can, sizeof(s_cfg.can));
-    nvs_set_blob(h, K_SNTP_CFG, &s_cfg.sntp, sizeof(s_cfg.sntp));
-    nvs_set_blob(h, K_MBM_CFG, s_cfg.mbm, sizeof(s_cfg.mbm));
-
-    nvs_commit(h);
+#define PUT(call) do { if (ret == ESP_OK) ret = (call); } while (0)
+    PUT(nvs_set_str(h, K_DEVICE_NAME, cfg->device_name));
+    PUT(nvs_set_str(h, K_MQTT_URL,    cfg->mqtt_url));
+    PUT(nvs_set_str(h, K_MQTT_USER,   cfg->mqtt_user));
+    PUT(nvs_set_str(h, K_MQTT_PASS,   cfg->mqtt_password));
+    PUT(nvs_set_str(h, K_MQTT_TOPIC,  cfg->mqtt_topic_prefix));
+    PUT(nvs_set_str(h, K_TZ,          cfg->tz));
+    PUT(nvs_set_blob(h, K_DI_CFG,     cfg->di,   sizeof(cfg->di)));
+    PUT(nvs_set_blob(h, K_DOUT_CFG,   cfg->dout, sizeof(cfg->dout)));
+    PUT(nvs_set_blob(h, K_MODBUS_CFG, &cfg->modbus, sizeof(cfg->modbus)));
+    PUT(nvs_set_u8(h, K_LED_MODE,     cfg->led_mode));
+    PUT(nvs_set_blob(h, K_CAN_CFG,    &cfg->can, sizeof(cfg->can)));
+    PUT(nvs_set_blob(h, K_SNTP_CFG,   &cfg->sntp, sizeof(cfg->sntp)));
+    PUT(nvs_set_blob(h, K_MBM_CFG,    cfg->mbm, sizeof(cfg->mbm)));
+    PUT(nvs_commit(h));
+#undef PUT
     nvs_close(h);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "storing the configuration failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    memcpy(&s_cfg, cfg, sizeof(s_cfg));
     return ESP_OK;
 }
