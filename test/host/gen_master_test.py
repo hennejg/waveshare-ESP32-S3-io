@@ -72,10 +72,10 @@ static void      (*during_read)(void);
 
 static uint16_t mb_value_regs(uint8_t type) { return type <= MBM_VAL_S16 ? 1 : 2; }
 
-static rd_result_t read_once(const mbm_poll_t *e, uint16_t regs, double *value,
-                             char *err, size_t err_len)
+static rd_result_t read_once(const mbm_poll_t *e, entry_state_t *st, uint16_t regs,
+                             double *value, char *err, size_t err_len)
 {
-    (void)regs;
+    (void)st; (void)regs;
     strlcpy(read_host_seen, e->host, sizeof(read_host_seen));
     strlcpy(read_name_seen, e->name, sizeof(read_name_seen));
     if (during_read) { void (*f)(void) = during_read; during_read = NULL; f(); }
@@ -205,23 +205,23 @@ int main(void)
     char err[48]; double v = 0;
 
     read_calls = 0; read_script[0] = RD_OK;
-    CHECK(read_value(&s_active[0], &v, err, sizeof err) && read_calls == 1,
+    CHECK(read_value(&s_active[0], &s_state[0], &v, err, sizeof err) && read_calls == 1,
           "Erfolg brauchte %u Versuche", read_calls);
 
     read_calls = 0; read_script[0] = RD_FAILED;
-    CHECK(!read_value(&s_active[0], &v, err, sizeof err) && read_calls == 1,
+    CHECK(!read_value(&s_active[0], &s_state[0], &v, err, sizeof err) && read_calls == 1,
           "endgueltiger Fehler wurde wiederholt (%u Versuche)", read_calls);
 
     read_calls = 0; read_script[0] = RD_STALE_CONN; read_script[1] = RD_OK;
-    CHECK(read_value(&s_active[0], &v, err, sizeof err) && read_calls == 2,
+    CHECK(read_value(&s_active[0], &s_state[0], &v, err, sizeof err) && read_calls == 2,
           "veraltete Verbindung: %u Versuche, erwartet 2", read_calls);
 
     read_calls = 0; read_script[0] = RD_STALE_CONN; read_script[1] = RD_FAILED;
-    CHECK(!read_value(&s_active[0], &v, err, sizeof err) && read_calls == 2,
+    CHECK(!read_value(&s_active[0], &s_state[0], &v, err, sizeof err) && read_calls == 2,
           "veraltete Verbindung mit zweitem Fehlschlag: %u Versuche", read_calls);
 
     read_calls = 0; read_script[0] = RD_STALE_CONN; read_script[1] = RD_STALE_CONN;
-    CHECK(!read_value(&s_active[0], &v, err, sizeof err) && read_calls == 2,
+    CHECK(!read_value(&s_active[0], &s_state[0], &v, err, sizeof err) && read_calls == 2,
           "mehr als ein zweiter Versuch (%u)", read_calls);
     read_script[1] = RD_OK;
     printf("  Wiederholung nur bei veralteter Verbindung, und nur einmal\n");
@@ -235,7 +235,7 @@ int main(void)
 '''
 
 cuts = "".join(src.func(sig) for sig in (
-    "static bool read_value(const mbm_poll_t *e, double *value, char *err, size_t err_len)",
+    "static bool read_value(const mbm_poll_t *e, entry_state_t *st, double *value,",
     "static void publish(const mbm_poll_t *e, double value)",
     "static void poll_entry(const mbm_poll_t *e, entry_state_t *st)",
     "static void apply_staged_config(void)",

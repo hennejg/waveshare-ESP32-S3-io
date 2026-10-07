@@ -26,9 +26,14 @@
 
 #define NET_SOCK_MB_LISTEN       1   /* the Modbus TCP listening socket      */
 #define NET_SOCK_MB_CONN         8   /* Modbus TCP clients served at once    */
+/* A client arriving with every slot taken is accepted and closed at once, so
+   that it sees a clean close rather than a connection that never answers. For
+   that instant it holds a socket of its own, over and above the slots. */
+#define NET_SOCK_MB_REFUSE       1
 #define NET_SOCK_MB_MASTER       3   /* kept open to the devices this board polls */
 
 _Static_assert(NET_SOCK_HTTPD + NET_SOCK_MQTT + NET_SOCK_SNTP +
-               NET_SOCK_MB_LISTEN + NET_SOCK_MB_CONN + NET_SOCK_MB_MASTER
+               NET_SOCK_MB_LISTEN + NET_SOCK_MB_CONN + NET_SOCK_MB_REFUSE +
+               NET_SOCK_MB_MASTER
                <= CONFIG_LWIP_MAX_SOCKETS,
                "net_budget.h hands out more sockets than CONFIG_LWIP_MAX_SOCKETS has");

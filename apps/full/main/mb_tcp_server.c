@@ -53,7 +53,8 @@
 /* A budget, not a capacity -- net_budget.h says what the board can spare. A
    client arriving when all slots are taken has its connection closed at once,
    which it sees as a reset: the only honest answer, since there is no request
-   yet to reply to. */
+   yet to reply to. The socket it holds for that instant is in the budget too,
+   as NET_SOCK_MB_REFUSE. */
 #define MB_TCP_MAX_CONN       NET_SOCK_MB_CONN
 
 /* Room for a burst of connections to wait while the poller is busy elsewhere;

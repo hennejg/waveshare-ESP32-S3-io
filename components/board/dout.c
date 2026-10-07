@@ -29,6 +29,14 @@ bool app_mqtt_is_connected(void);
 static i2c_master_bus_handle_t s_bus = NULL;
 static i2c_master_dev_handle_t s_dev = NULL;
 static bool                    s_state[NUM_DO];  /* logical state */
+/* The same state as one byte, bit n = output n, stored only once the expander
+   has taken it (or refused it, in which case it is what it was). Readers take
+   this without the lock: dout_modify() holds the lock across the I2C write,
+   with its 10 ms timeout and a bus-recovery retry, and the Modbus TCP poller
+   reads the coils on the task that owns every connection -- it must not wait
+   on a stuck bus. A byte store is atomic here, and a reader sees either the
+   state before a change or the state after it, never the hope in between. */
+static volatile uint8_t        s_port;
 
 /* Guards s_state[] together with the TCA9554 write it feeds. Setting one
    output is a read-modify-write of the whole port byte, and it is driven from
@@ -178,16 +186,12 @@ esp_err_t dout_init(void)
 
 bool dout_get(uint8_t n)
 {
-    return (n < NUM_DO) ? s_state[n] : false;
+    return (n < NUM_DO) ? ((s_port >> n) & 1u) != 0 : false;
 }
 
 uint8_t dout_get_all(void)
 {
-    uint8_t v = 0;
-    dout_lock();
-    for (uint8_t i = 0; i < NUM_DO; i++) if (s_state[i]) v |= (uint8_t)(1u << i);
-    dout_unlock();
-    return v;
+    return s_port;          /* lock-free, see s_port */
 }
 
 esp_err_t dout_modify(uint8_t set, uint8_t clear, uint8_t toggle)
@@ -211,6 +215,7 @@ esp_err_t dout_modify(uint8_t set, uint8_t clear, uint8_t toggle)
         ESP_LOGW(TAG, "outputs: write failed (%s), nothing changed",
                  esp_err_to_name(ret));
     }
+    s_port = after;         /* what the relays are now doing, in one store */
     dout_unlock();
 
     /* Only publish channels that actually moved — avoids an echo loop from our

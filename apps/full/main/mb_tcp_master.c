@@ -85,6 +85,7 @@ typedef struct {
     uint32_t reads;
     uint32_t errors;
     uint32_t backoff_ms;
+    uint32_t addr_be;      /* the host's address, network order; 0 = not resolved */
     char     last_error[48];
 } entry_state_t;
 
@@ -96,6 +97,11 @@ static uint16_t          s_tid;
    64-bit fields are two stores on this core, so without this a status request
    could show half of one value and half of the previous one. */
 static SemaphoreHandle_t s_state_mux;
+/* Serialises start() and reload(), which are reached from different tasks:
+   the network event task on an interface coming up, the HTTP task on a save.
+   Both used to check s_running unlocked, so a save landing as a second
+   interface came up could start two polling tasks on one connection cache. */
+static SemaphoreHandle_t s_start_mux;
 
 #define ST_LOCK()   do { if (s_state_mux) xSemaphoreTake(s_state_mux, portMAX_DELAY); } while (0)
 #define ST_UNLOCK() do { if (s_state_mux) xSemaphoreGive(s_state_mux); } while (0)
@@ -129,25 +135,51 @@ static void conn_close(conn_t *c)
     c->host[0] = '\0';
 }
 
-/* Non-blocking connect with a deadline. A blocking one would sit on lwIP's
-   own retransmission schedule -- tens of seconds -- for a device that is
-   simply not there, and the whole polling task with it. */
-static int dial(const char *host, uint16_t port, char *err, size_t err_len)
+/* Resolves the host once and keeps the answer in *addr_be. A literal address
+   never reaches the resolver; a name costs a DNS round trip, and lwIP's
+   resolver blocks the calling task for its whole retry sequence when nobody
+   answers -- several seconds, on the one polling task, which connect() below
+   is carefully kept from doing. So a name is looked up on the first poll and
+   then not again until a connect to the answer fails (the address may have
+   moved) or the table is reloaded; an unresolvable name is retried under the
+   entry's backoff, not at its poll interval. */
+static bool resolve(const char *host, uint32_t *addr_be, char *err, size_t err_len)
 {
-    char portstr[8];
-    snprintf(portstr, sizeof(portstr), "%u", port);
+    if (*addr_be) return true;
 
     struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
     struct addrinfo *ai = NULL;
-    if (getaddrinfo(host, portstr, &hints, &ai) != 0 || !ai) {
+    if (getaddrinfo(host, NULL, &hints, &ai) != 0 || !ai) {
         snprintf(err, err_len, "name not resolved");
-        return -1;
+        return false;
     }
+    *addr_be = ((struct sockaddr_in *)ai->ai_addr)->sin_addr.s_addr;
+    freeaddrinfo(ai);
+    if (!*addr_be) {
+        snprintf(err, err_len, "name resolved to 0.0.0.0");
+        return false;
+    }
+    return true;
+}
 
-    int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+/* Non-blocking connect with a deadline. A blocking one would sit on lwIP's
+   own retransmission schedule -- tens of seconds -- for a device that is
+   simply not there, and the whole polling task with it. A connect that fails
+   forgets the resolved address, so the next attempt asks DNS again. */
+static int dial(const char *host, uint16_t port, uint32_t *addr_be,
+                char *err, size_t err_len)
+{
+    if (!resolve(host, addr_be, err, err_len)) return -1;
+
+    struct sockaddr_in sa = {
+        .sin_family      = AF_INET,
+        .sin_port        = htons(port),
+        .sin_addr.s_addr = *addr_be,
+    };
+
+    int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (fd < 0) {
         snprintf(err, err_len, "no socket: errno %d", errno);
-        freeaddrinfo(ai);
         return -1;
     }
 
@@ -159,17 +191,16 @@ static int dial(const char *host, uint16_t port, char *err, size_t err_len)
     if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
         snprintf(err, err_len, "cannot set socket mode: errno %d", errno);
         close(fd);
-        freeaddrinfo(ai);
         return -1;
     }
 
-    int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
-    freeaddrinfo(ai);
+    int rc = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
 
     if (rc != 0) {
         if (errno != EINPROGRESS) {
             snprintf(err, err_len, "connect: errno %d", errno);
             close(fd);
+            *addr_be = 0;
             return -1;
         }
         fd_set wr;
@@ -180,6 +211,7 @@ static int dial(const char *host, uint16_t port, char *err, size_t err_len)
         if (select(fd + 1, NULL, &wr, NULL, &tv) <= 0) {
             snprintf(err, err_len, "no answer in %d ms", CONNECT_MS);
             close(fd);
+            *addr_be = 0;
             return -1;
         }
         int soerr = 0;
@@ -188,6 +220,7 @@ static int dial(const char *host, uint16_t port, char *err, size_t err_len)
         if (soerr) {
             snprintf(err, err_len, "refused: errno %d", soerr);
             close(fd);
+            *addr_be = 0;
             return -1;
         }
     }
@@ -205,8 +238,8 @@ static int dial(const char *host, uint16_t port, char *err, size_t err_len)
     return fd;
 }
 
-static conn_t *conn_get(const char *host, uint16_t port, bool *fresh,
-                        char *err, size_t err_len)
+static conn_t *conn_get(const char *host, uint16_t port, uint32_t *addr_be,
+                        bool *fresh, char *err, size_t err_len)
 {
     int64_t now = now_ms();
     *fresh = false;
@@ -219,9 +252,13 @@ static conn_t *conn_get(const char *host, uint16_t port, bool *fresh,
         }
     }
 
-    /* Take a free slot, or the one unused the longest. The new connection is
-       dialled before the old one is dropped: giving up a working connection
-       for one that then fails to open would cost two entries instead of one. */
+    /* Take a free slot, or the one unused the longest. The old connection is
+       closed before the new one is dialled, not after: for that moment the
+       two would hold a socket each, and net_budget.h hands this task exactly
+       CONN_CACHE of them. Losing a working connection to a dial that then
+       fails costs that entry a reconnect on its next poll; running past the
+       budget costs some other subsystem its socket, and that one does not
+       get it back. */
     conn_t *pick = NULL;
     for (int i = 0; i < CONN_CACHE; i++)
         if (s_conns[i].fd < 0) { pick = &s_conns[i]; break; }
@@ -231,9 +268,9 @@ static conn_t *conn_get(const char *host, uint16_t port, bool *fresh,
             if (s_conns[i].used_ms < pick->used_ms) pick = &s_conns[i];
     }
 
-    int fd = dial(host, port, err, err_len);
-    if (fd < 0) return NULL;
     if (pick->fd >= 0) conn_close(pick);
+    int fd = dial(host, port, addr_be, err, err_len);
+    if (fd < 0) return NULL;
 
     strlcpy(pick->host, host, sizeof(pick->host));
     pick->port    = port;
@@ -285,11 +322,11 @@ typedef enum { RD_OK, RD_FAILED, RD_STALE_CONN } rd_result_t;
    fresh connection might cure: the connection was one kept from an earlier
    poll and the exchange on it went wrong. A connection that could not be
    opened at all, or a device that answered, are not that. */
-static rd_result_t read_once(const mbm_poll_t *e, uint16_t regs, double *value,
-                             char *err, size_t err_len)
+static rd_result_t read_once(const mbm_poll_t *e, entry_state_t *st, uint16_t regs,
+                             double *value, char *err, size_t err_len)
 {
     bool fresh = false;
-    conn_t *c = conn_get(e->host, e->port, &fresh, err, err_len);
+    conn_t *c = conn_get(e->host, e->port, &st->addr_be, &fresh, err, err_len);
     if (!c) return RD_FAILED;        /* no connection; dialling again is the same */
 
     uint8_t  req[MB_MBAP_LEN + 5];
@@ -374,15 +411,16 @@ static rd_result_t read_once(const mbm_poll_t *e, uint16_t regs, double *value,
    single pass would block for most of a minute and every healthy entry would
    miss its turn. And a device that answered with an exception has said what
    it has to say. */
-static bool read_value(const mbm_poll_t *e, double *value, char *err, size_t err_len)
+static bool read_value(const mbm_poll_t *e, entry_state_t *st, double *value,
+                       char *err, size_t err_len)
 {
     uint16_t regs = mb_value_regs(e->type);
     if (regs == 0) { snprintf(err, err_len, "unknown value type %u", e->type); return false; }
 
-    rd_result_t r = read_once(e, regs, value, err, err_len);
+    rd_result_t r = read_once(e, st, regs, value, err, err_len);
     if (r == RD_OK)     return true;
     if (r == RD_FAILED) return false;
-    return read_once(e, regs, value, err, err_len) == RD_OK;   /* once more, fresh */
+    return read_once(e, st, regs, value, err, err_len) == RD_OK;   /* once more, fresh */
 }
 
 /* ------------------------------------------------------------- publishing */
@@ -421,7 +459,7 @@ static void poll_entry(const mbm_poll_t *e, entry_state_t *st)
 {
     double value = 0;
     char   err[sizeof(st->last_error)];
-    bool   ok = read_value(e, &value, err, sizeof(err));
+    bool   ok = read_value(e, st, &value, err, sizeof(err));
 
     ST_LOCK();
     if (ok) {
@@ -533,23 +571,19 @@ static void stage_config(void)
     ST_UNLOCK();
 }
 
-esp_err_t mb_tcp_master_reload(void)
+esp_err_t mb_tcp_master_init(void)
 {
-    /* With no task yet -- the first entry anyone has enabled -- starting is
-       the reload: start() stages the table itself. */
-    if (!s_running) return mb_tcp_master_start();
-    stage_config();
+    if (!s_state_mux) s_state_mux = xSemaphoreCreateMutex();
+    if (!s_start_mux) s_start_mux = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(s_state_mux && s_start_mux, ESP_ERR_NO_MEM, TAG, "mutexes");
     return ESP_OK;
 }
 
-esp_err_t mb_tcp_master_start(void)
+/* Under s_start_mux. */
+static esp_err_t start_locked(void)
 {
     if (s_running) return ESP_OK;
 
-    if (!s_state_mux) {
-        s_state_mux = xSemaphoreCreateMutex();
-        ESP_RETURN_ON_FALSE(s_state_mux, ESP_ERR_NO_MEM, TAG, "state mutex");
-    }
     stage_config();           /* the task reads it on its first pass */
 
     int enabled = 0;
@@ -567,6 +601,28 @@ esp_err_t mb_tcp_master_start(void)
     ESP_LOGI(TAG, "reading %d value%s from other Modbus TCP devices",
              enabled, enabled == 1 ? "" : "s");
     return ESP_OK;
+}
+
+esp_err_t mb_tcp_master_start(void)
+{
+    ESP_RETURN_ON_FALSE(s_start_mux, ESP_ERR_INVALID_STATE, TAG, "not initialised");
+    xSemaphoreTake(s_start_mux, portMAX_DELAY);
+    esp_err_t ret = start_locked();
+    xSemaphoreGive(s_start_mux);
+    return ret;
+}
+
+esp_err_t mb_tcp_master_reload(void)
+{
+    ESP_RETURN_ON_FALSE(s_start_mux, ESP_ERR_INVALID_STATE, TAG, "not initialised");
+    xSemaphoreTake(s_start_mux, portMAX_DELAY);
+    /* With no task yet -- the first entry anyone has enabled -- starting is
+       the reload: start_locked() stages the table itself. */
+    esp_err_t ret = ESP_OK;
+    if (s_running) stage_config();
+    else           ret = start_locked();
+    xSemaphoreGive(s_start_mux);
+    return ret;
 }
 
 uint8_t mb_tcp_master_get_status(mbm_status_t *out, uint8_t count)

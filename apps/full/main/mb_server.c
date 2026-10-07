@@ -121,8 +121,9 @@ static void apply_rgb252(uint16_t reg)
    the RTU slave's register callbacks and the TCP server's request handler --
    go through these, so the two can never drift apart.
 
-   None of them touches I2C or publishes anything: dout_get_all() and di_get()
-   are cached reads behind a short mutex, and a write becomes a queued command
+   None of them touches I2C or publishes anything: dout_get_all() is a
+   lock-free snapshot, di_get() a cached read behind a short mutex, and a
+   write becomes a queued command
    that the command task carries out. That is what makes them safe to call
    from several connection workers at once. */
 

@@ -16,8 +16,13 @@
 #include "app_config.h"
 #include "esp_err.h"
 
+/* Creates what start() and reload() share. Call once from app_main(), before
+   the network can come up. */
+esp_err_t mb_tcp_master_init(void);
+
 /* Starts the polling task if any entry is enabled. Needs a working IP stack,
-   so call it once the network is up; calling it again is harmless. */
+   so call it once the network is up; calling it again is harmless, from any
+   task. */
 esp_err_t mb_tcp_master_start(void);
 
 /* Apply a changed configuration. Starts the task if the first entry has just

@@ -295,6 +295,10 @@ void app_main(void)
     if (mb_ret != ESP_OK)
         ESP_LOGE(TAG, "Modbus server init failed: %s — continuing without Modbus",
                  esp_err_to_name(mb_ret));
+    esp_err_t mbm_init_ret = mb_tcp_master_init();
+    if (mbm_init_ret != ESP_OK)
+        ESP_LOGE(TAG, "Modbus TCP master init failed: %s — continuing without it",
+                 esp_err_to_name(mbm_init_ret));
     esp_err_t can_ret = can_server_init();
     if (can_ret != ESP_OK)
         ESP_LOGE(TAG, "CAN server init failed: %s — continuing without CAN",

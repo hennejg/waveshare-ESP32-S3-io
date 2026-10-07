@@ -1,5 +1,6 @@
 #include "app_config.h"
 #include <string.h>
+#include <math.h>
 #include <nvs_flash.h>
 #include <nvs.h>
 #include "esp_log.h"
@@ -74,6 +75,10 @@ static void modbus_normalize(app_config_t *c)
         if (e->unit_id < MB_UID_MIN || e->unit_id > MB_UID_MAX) e->unit_id = MBM_UNIT_ID_DEFAULT;
         if (e->fc != 3 && e->fc != 4)                      e->fc          = MBM_FC_DEFAULT;
         if (!e->interval_ms)                               e->interval_ms = MBM_INTERVAL_DEFAULT_MS;
+        /* The one value the web API refuses on the way in: an untouched row
+           handed out with scale 0 came straight back as a 400 the moment a
+           client enabled it without changing anything else. */
+        if (!isfinite(e->scale) || e->scale == 0.0f)       e->scale       = 1.0f;
     }
 }
 

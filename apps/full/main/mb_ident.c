@@ -54,6 +54,26 @@ void mb_ident_init(void)
 
 /* ------------------------------------------------------------ registers */
 
+/* The interface a client most likely reached us through: the first of
+   Ethernet and WiFi that is up and has an address, else whichever exists.
+   Only ETH_DEF used to be asked, so a board on WiFi told its clients it was
+   reachable at 0.0.0.0. */
+static esp_netif_t *reachable_netif(void)
+{
+    static const char *const keys[] = { "ETH_DEF", "WIFI_STA_DEF" };
+    esp_netif_t *fallback = NULL;
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        esp_netif_t *n = esp_netif_get_handle_from_ifkey(keys[i]);
+        if (!n) continue;
+        esp_netif_ip_info_t ip;
+        if (esp_netif_is_netif_up(n) && esp_netif_get_ip_info(n, &ip) == ESP_OK &&
+            ip.ip.addr != 0)
+            return n;
+        if (!fallback) fallback = n;
+    }
+    return fallback;
+}
+
 /* Builds the whole block, 160 bytes, on the stack of whichever task asks;
    a read then copies the slice it wants. Simpler than filling only the
    requested slice, and a client reads this perhaps once a day. */
@@ -72,15 +92,15 @@ static void build(uint8_t *regs)
           ((uint32_t)s_mac[4] << 8)  |  (uint32_t)s_mac[5]);
     mb_put32(&regs[2 * MB_IDENT_REG_UPTIME], (uint32_t)(esp_timer_get_time() / 1000000LL));
 
-    esp_netif_t *eth = esp_netif_get_handle_from_ifkey("ETH_DEF");
+    esp_netif_t *netif = reachable_netif();
     esp_netif_ip_info_t ip = {0};
-    if (eth && esp_netif_get_ip_info(eth, &ip) == ESP_OK) {
+    if (netif && esp_netif_get_ip_info(netif, &ip) == ESP_OK) {
         mb_put32(&regs[2 * MB_IDENT_REG_IP],      ntohl(ip.ip.addr));
         mb_put32(&regs[2 * MB_IDENT_REG_NETMASK], ntohl(ip.netmask.addr));
         mb_put32(&regs[2 * MB_IDENT_REG_GATEWAY], ntohl(ip.gw.addr));
     }
     esp_netif_dhcp_status_t dhcp = ESP_NETIF_DHCP_INIT;
-    if (eth && esp_netif_dhcpc_get_status(eth, &dhcp) == ESP_OK)
+    if (netif && esp_netif_dhcpc_get_status(netif, &dhcp) == ESP_OK)
         mb_put16(&regs[2 * MB_IDENT_REG_DHCP], dhcp == ESP_NETIF_DHCP_STARTED ? 1 : 0);
 
     mb_ascii_to_regs(PRODUCT_NAME,     20, &regs[MB_IDENT_REG_MODEL * 2]);

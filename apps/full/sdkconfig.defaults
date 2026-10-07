@@ -54,7 +54,7 @@ CONFIG_APP_MATTER_ENABLE=n
 # Modbus TCP serving several clients at once needs its own share on top.
 # apps/full/main/net_budget.h divides this up and checks the sum at compile
 # time -- change the figure there as well, not only here.
-CONFIG_LWIP_MAX_SOCKETS=24
+CONFIG_LWIP_MAX_SOCKETS=25
 
 # cJSON parses by recursion and guards only the nesting depth, not the stack.
 # At the default of 1000 a body of nothing but '[' overflows the HTTP task's

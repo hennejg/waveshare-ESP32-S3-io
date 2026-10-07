@@ -201,6 +201,10 @@ uint8_t mb_gateway_handle(uint8_t uid, const mb_request_t *req,
            layout though -- bit 0 is the first coil of the request -- so the
            copy back is a straight memcpy. */
         uint8_t tmp[MB_DATA_MAX];       /* the largest data part a PDU can carry */
+        /* The master sets each bit on its own, read-modify-write, and leaves
+           the rest of the last byte as it found it: without this the padding
+           bits carried whatever the previous job left on this stack. */
+        memset(tmp, 0, bytes);
         uint8_t exc = transact(uid, req->fc, req->addr, req->count, tmp);
         if (exc == MB_EXC_NONE) { memcpy(resp, tmp, bytes); *resp_len = bytes; }
         return exc;
