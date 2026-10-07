@@ -1305,27 +1305,15 @@ static esp_err_t api_rules_post(httpd_req_t *req)
     }
 
     const char *script = script_j->valuestring;
-    nvs_handle_t h;
-    /* Reported rather than discarded: a failed write left the rule running
-       until the next reboot, when the previous script silently came back,
-       while the handler had answered ok. */
-    esp_err_t nvs_ret = nvs_open(RULES_NVS_NS, NVS_READWRITE, &h);
-    if (nvs_ret == ESP_OK) {
-        nvs_ret = (script[0] == '\0') ? nvs_erase_key(h, RULES_NVS_KEY)
-                                      : nvs_set_str(h, RULES_NVS_KEY, script);
-        if (nvs_ret == ESP_ERR_NVS_NOT_FOUND) nvs_ret = ESP_OK;   /* erasing what was not there */
-        if (nvs_ret == ESP_OK) nvs_ret = nvs_commit(h);
-        nvs_close(h);
-    }
-    if (nvs_ret != ESP_OK) {
-        ESP_LOGE(TAG, "storing rules failed: %s", esp_err_to_name(nvs_ret));
-        cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                            "rules could not be stored");
-        return ESP_OK;
-    }
 
-    /* Wait for the engine's verdict instead of acknowledging a request we
+    /* The engine first, the flash second. Stored before the verdict, a
+       script the engine refused -- a syntax error, say -- was what the
+       device booted into next time, with no fallback: the rules that were
+       running stayed in effect only until the reboot, then nothing ran at
+       all. The last script the engine accepted is the only one worth
+       keeping, so it is written once the engine has accepted this one.
+
+       Wait for the engine's verdict instead of acknowledging a request we
        cannot see through. A reload can be refused -- a syntax error, a global
        const clashing with the previous script, no free timers -- and the rules
        already running then stay in place, which the caller has to be told.
@@ -1338,7 +1326,6 @@ static esp_err_t api_rules_post(httpd_req_t *req)
     scripting_reload_status(&before);
 
     scripting_reload(script[0] ? script : DEMO_SCRIPT);
-    cJSON_Delete(root);
 
     scripting_reload_status_t now = before;
     for (int waited = 0; waited < RULES_APPLY_TIMEOUT_MS; waited += 10) {
@@ -1348,15 +1335,19 @@ static esp_err_t api_rules_post(httpd_req_t *req)
     }
 
     if (now.generation == before.generation) {
+        /* No verdict yet, so nothing is stored: the flash keeps the script
+           that was last known good. The caller is told the outcome is open. */
+        cJSON_Delete(root);
         httpd_resp_set_status(req, "202 Accepted");
         httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, "{\"status\":\"accepted\"}");
+        httpd_resp_sendstr(req, "{\"status\":\"accepted\",\"detail\":\"not stored until accepted\"}");
         return ESP_OK;
     }
 
     if (!now.ok) {
-        /* Stored but not running: say so plainly, including that the previous
-           rules are the ones still in effect. */
+        /* Refused and not stored: say so plainly, including that the previous
+           rules are the ones still in effect, in memory and in flash. */
+        cJSON_Delete(root);
         cJSON *resp = cJSON_CreateObject();
         cJSON_AddStringToObject(resp, "status", "rejected");
         cJSON_AddStringToObject(resp, "error", now.message);
@@ -1367,6 +1358,29 @@ static esp_err_t api_rules_post(httpd_req_t *req)
         httpd_resp_set_type(req, "application/json");
         httpd_resp_sendstr(req, body_out ? body_out : "{\"status\":\"rejected\"}");
         free(body_out);
+        return ESP_OK;
+    }
+
+    /* Accepted and running; now make it the script the next boot loads.
+       Reported rather than discarded: a failed write leaves the rules
+       running until the next reboot, when the previous script comes back,
+       and the caller has to know that. */
+    nvs_handle_t h;
+    esp_err_t nvs_ret = nvs_open(RULES_NVS_NS, NVS_READWRITE, &h);
+    if (nvs_ret == ESP_OK) {
+        nvs_ret = (script[0] == '\0') ? nvs_erase_key(h, RULES_NVS_KEY)
+                                      : nvs_set_str(h, RULES_NVS_KEY, script);
+        if (nvs_ret == ESP_ERR_NVS_NOT_FOUND) nvs_ret = ESP_OK;   /* erasing what was not there */
+        if (nvs_ret == ESP_OK) nvs_ret = nvs_commit(h);
+        nvs_close(h);
+    }
+    cJSON_Delete(root);
+    if (nvs_ret != ESP_OK) {
+        ESP_LOGE(TAG, "storing rules failed: %s", esp_err_to_name(nvs_ret));
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"error\":\"rules running but not stored\","
+                                "\"detail\":\"the previous script returns at the next reboot\"}");
         return ESP_OK;
     }
 
