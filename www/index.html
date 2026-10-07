@@ -199,6 +199,16 @@
         <button type="button" onclick="testBuzzer()">Beep</button>
       </div>
 
+      <div id="aux-dev" style="display:none">
+        <h2>Header pads IO1 / RXD / TXD</h2>
+        <p class="hint err">Not isolated: 0–3.3 V logic levels only, no protection. Condition every signal externally.</p>
+        <table>
+          <thead><tr><th>Pad</th><th>Mode</th></tr></thead>
+          <tbody id="aux-table"></tbody>
+        </table>
+        <p class="hint">Digital input: name and invert on the Inputs tab. PWM output: frequency and duty cycle on the Outputs tab. Applies on Save, no reboot.</p>
+      </div>
+
       <div id="network-mode" style="display:none;margin-top:1.5rem;border-top:1px solid #ccc;padding-top:1rem;font-size:.9rem;color:#555">
         <h2 style="margin:0 0 .5rem">Network Mode</h2>
         <p id="network-mode-msg"></p>
@@ -243,6 +253,15 @@
       </table>
       <p class="hint">Name: used as MQTT topic fragment. Invert: checked = physical bit flipped relative to logical state.</p>
       <div id="do-grid" class="io-grid" style="margin-top:.6rem"></div>
+      <div id="aux-pwm-box" style="display:none">
+        <h2>PWM outputs — header pads, not isolated</h2>
+        <table>
+          <thead><tr><th>Pad</th><th>Frequency (Hz)</th><th>Duty cycle (%)</th></tr></thead>
+          <tbody id="aux-pwm-table"></tbody>
+        </table>
+        <p class="hint">5 Hz – 1 MHz, duty cycle in 0.1 % steps. These are the values the pad starts with; Modbus, MQTT and rules can change them while it runs. A 3.3 V logic signal of a few mA — drive a MOSFET or a driver from it, never a load.</p>
+        <div id="aux-pwm-live" class="hint"></div>
+      </div>
     </div>
 
     <!-- ── CAN Bus / NMEA2000 ── -->
@@ -693,40 +712,64 @@ rule('my-rule')
         }
         const pin = auxPin(i);
         const a   = i - diIsolated;
-        /* The switch only where the firmware reports one for this pad, with
-           the modes it reports for it. */
-        const p   = (a >= 0 && Array.isArray(aux)) ? aux[a] : undefined;
-        const sel = p
-          ? `<br><select id="aux_${a}_mode" style="margin-top:.2rem" onchange="auxModeChanged(${a})">` +
-            (p.modes || ['standard']).map(m =>
-              `<option value="${esc(m)}">${m === 'standard'
-                 ? `Standard: ${AUX_STD[a] ?? 'standard function'}` : (AUX_MODE_LABEL[m] ?? esc(m))}</option>`).join('') +
-            `</select>` +
-            `<div id="aux_${a}_pwm" style="margin-top:.2rem">` +
-            `<input type="number" id="aux_${a}_freq" min="5" max="1000000" step="1" style="width:6.5rem"> Hz ` +
-            `<input type="number" id="aux_${a}_duty" min="0" max="100" step="0.1" style="width:4.5rem"> %</div>` +
-            (AUX_PAD[a] === 'TXD' ? `<div class="hint err">${AUX_TXD}</div>` : '')
-          : '';
+        /* Name and invert apply while the pad is an input; what it is now is
+           chosen on the Device tab and shown here. */
+        const note = (a >= 0 && Array.isArray(aux) && aux[a])
+          ? `<br><span class="hint" id="aux_${a}_note"></span>` : '';
         const tr = document.createElement('tr');
         tr.innerHTML =
-          `<td>${diLabel(i)}${pin === undefined ? '' : ` <span class="hint">${pin}</span>`}${sel}</td>` +
+          `<td>${diLabel(i)}${pin === undefined ? '' : ` <span class="hint">${pin}</span>`}${note}</td>` +
           `<td><input type="text" id="di_${i}_name" maxlength="20" style="width:9rem"></td>` +
           `<td style="text-align:center"><input type="checkbox" id="di_${i}_invert"></td>`;
         diTbl.appendChild(tr);
-        if (p) {
-          document.getElementById(`aux_${a}_mode`).value = p.mode ?? 'standard';
-          document.getElementById(`aux_${a}_freq`).value = p.pwm_freq ?? 1000;
-          document.getElementById(`aux_${a}_duty`).value = p.pwm_duty ?? 0;
-          auxModeChanged(a);
-        }
       }
+      buildAuxRows();
     }
 
-    /* Frequency and duty only next to a pad set to PWM. */
-    function auxModeChanged(a) {
-      const box = document.getElementById(`aux_${a}_pwm`);
-      if (box) box.style.display =
-        document.getElementById(`aux_${a}_mode`)?.value === 'pwm' ? '' : 'none';
+    /* The pads' roles on the Device tab, their PWM settings on the Outputs
+       tab. Both built from cfg.aux, which also says which modes a pad has. */
+    function buildAuxRows() {
+      const dev = document.getElementById('aux-dev');
+      const box = document.getElementById('aux-pwm-box');
+      const tb  = document.getElementById('aux-table');
+      const pt  = document.getElementById('aux-pwm-table');
+      if (!Array.isArray(aux) || !aux.length) { dev.style.display = 'none'; box.style.display = 'none'; return; }
+      dev.style.display = '';
+      tb.innerHTML = ''; pt.innerHTML = '';
+      aux.forEach((p, a) => {
+        const opts = (p.modes || ['standard']).map(m =>
+          `<option value="${esc(m)}">${m === 'standard'
+             ? `Standard: ${AUX_STD[a] ?? 'standard function'}` : (AUX_MODE_LABEL[m] ?? esc(m))}</option>`).join('');
+        tb.insertAdjacentHTML('beforeend',
+          `<tr><td>${AUX_PAD[a] ?? a + 1} <span class="hint">GPIO${AUX_GPIO[a] ?? '?'}</span></td>` +
+          `<td><select id="aux_${a}_mode" onchange="auxModeChanged()">${opts}</select>` +
+          (AUX_PAD[a] === 'TXD' ? `<div class="hint err">${AUX_TXD}</div>` : '') + `</td></tr>`);
+        pt.insertAdjacentHTML('beforeend',
+          `<tr id="aux_${a}_pwmrow"><td>${AUX_PAD[a] ?? a + 1} <span class="hint">GPIO${AUX_GPIO[a] ?? '?'}</span></td>` +
+          `<td><input type="number" id="aux_${a}_freq" min="5" max="1000000" step="1" style="width:7rem"></td>` +
+          `<td><input type="number" id="aux_${a}_duty" min="0" max="100" step="0.1" style="width:5rem"></td></tr>`);
+        document.getElementById(`aux_${a}_mode`).value = p.mode ?? 'standard';
+        document.getElementById(`aux_${a}_freq`).value = p.pwm_freq ?? 1000;
+        document.getElementById(`aux_${a}_duty`).value = p.pwm_duty ?? 0;
+      });
+      auxModeChanged();
+    }
+
+    /* Follows the mode selects before they are saved: the PWM rows on the
+       Outputs tab and the notes on the Inputs tab show what the form says. */
+    function auxModeChanged() {
+      if (!Array.isArray(aux)) return;
+      let anyPwm = false;
+      aux.forEach((_, a) => {
+        const m = document.getElementById(`aux_${a}_mode`)?.value ?? 'standard';
+        const row = document.getElementById(`aux_${a}_pwmrow`);
+        if (row) row.style.display = (m === 'pwm') ? '' : 'none';
+        if (m === 'pwm') anyPwm = true;
+        const note = document.getElementById(`aux_${a}_note`);
+        if (note) note.textContent = m === 'input' ? ''
+          : `currently ${m === 'standard' ? 'standard function' : (AUX_MODE_LABEL[m] ?? m).toLowerCase()} — set on the Device tab`;
+      });
+      document.getElementById('aux-pwm-box').style.display = anyPwm ? '' : 'none';
     }
     buildDiRows();
 
@@ -1315,6 +1358,11 @@ rule('my-rule')
             if (off) el.title = p?.mode === 'pwm' ? 'PWM output' : p?.mode === 'analog'
                               ? 'analog input' : 'standard function — not used as an input';
           }
+          const live = document.getElementById('aux-pwm-live');
+          if (live && i === diCount - 1 && Array.isArray(d.aux))
+            live.textContent = d.aux.map((q, k) => q.mode === 'pwm'
+              ? `${AUX_PAD[k] ?? k + 1}: ${q.pwm_duty} % @ ${q.pwm_freq} Hz (${q.pwm_bits} bit)` : null)
+              .filter(Boolean).join(' · ').replace(/^(.)/, 'Running now — $1');
           const val = document.getElementById(`aux-val-${i}`);
           if (val) val.textContent =
               p?.mode === 'pwm'    ? ` PWM ${p.pwm_duty} % @ ${p.pwm_freq} Hz`

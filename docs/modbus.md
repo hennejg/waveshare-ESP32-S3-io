@@ -161,8 +161,13 @@ Connections are held open between polls and dropped after a minute idle.
 | 2  | 1                 | 10002           | DI2     |
 | …  |                   |                 |         |
 | 8  | 7                 | 10008           | DI8     |
+| 9  | 8                 | 10009           | AUX1 (pad IO1)  |
+| 10 | 9                 | 10010           | AUX2 (pad RXD)  |
+| 11 | 10                | 10011           | AUX3 (pad TXD)  |
 
 - **Read (FC 02):** returns current logical input state (invert flag applied)
+- **AUX1–AUX3** exist when the firmware offers the header pads (`APP_AUX_DI_ENABLE`, on by default). A pad that is
+  not set to *digital input* on the Device tab reads 0.
 - Refreshed from hardware every 10 ms
 
 ---
@@ -201,6 +206,27 @@ Writing sets the LED colour immediately. No sequence support via Modbus.
 
 Writing a non-zero value triggers a single 200 ms beep. No sequence support via Modbus.
 
+#### HR 40003–40011 — PWM of the header pads
+
+Three registers per pad, for a pad set to *PWM output* on the Device tab:
+
+| Address | Modbus notation | Pad | Content |
+|---------|-----------------|-----|---------|
+| 2       | 40003           | IO1 | Duty cycle in 0.1 % (0–1000) |
+| 3–4     | 40004–40005     | IO1 | Frequency in Hz, 32 bit, high word first (5–1000000) |
+| 5       | 40006           | RXD | Duty cycle in 0.1 % |
+| 6–7     | 40007–40008     | RXD | Frequency in Hz |
+| 8       | 40009           | TXD | Duty cycle in 0.1 % |
+| 9–10    | 40010–40011     | TXD | Frequency in Hz |
+
+- **Read:** the PWM as it runs, whoever set it — Modbus, MQTT, a rule or the configuration. A pad that is not a PWM
+  output reads 0.
+- **Write:** takes effect at once and is **not stored**: after a reboot the pad starts with the values from the
+  configuration. A controller may therefore write the duty cycle as often as it likes without wearing the flash.
+- A write to a pad that is not a PWM output, or that leaves a value out of range, is refused with exception `0x03`
+  and changes nothing. Write both frequency words in one FC 16 request; a single word combines with the other as
+  it runs.
+
 ### Input Registers (function code 04) — Device Identification
 
 Read-only. What the device is, which one of several it is, which firmware
@@ -229,6 +255,17 @@ RS-485.
 | 64–79 | 16 | Firmware version as text, as git describes it (`v1.1.13-3-gabc1234`) |
 
 A read that reaches past address 79 is answered with exception `0x02`.
+
+#### Input registers 30101–30104 — header pads
+
+| Address | Modbus notation | Content |
+|---------|-----------------|---------|
+| 100     | 30101           | IO1 analog input in millivolts; 0 when the pad is not an analog input |
+| 101     | 30102           | Mode of pad IO1: 0 standard, 1 digital input, 2 PWM output, 3 analog input |
+| 102     | 30103           | Mode of pad RXD |
+| 103     | 30104           | Mode of pad TXD |
+
+Registers 80–99 do not exist; a read touching them is answered with exception `0x02`.
 
 The serial number is the MAC because the ESP32-S3 has no serial number of
 its own: the MAC is unique per chip, burned at the factory, and survives

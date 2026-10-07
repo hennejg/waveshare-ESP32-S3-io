@@ -247,6 +247,36 @@ rule('DO1 follows DO0')
 > wedge the engine (or trip the device watchdog). Writing an output to the value it
 > already holds is a no-op and emits no event.
 
+### `pwm(pad)` and `analog(pad)` — header pads IO1 / RXD / TXD
+
+The three header pads are numbered **1 to 3** (IO1, RXD, TXD). What each one does is set on the web UI's Device tab;
+these act only on a pad in that mode. A pad set to *digital input* is `input(8)`, `input(9)` or `input(10)`.
+
+| Expression | Meaning |
+|---|---|
+| `pwm(pad).set(duty)` | duty cycle in % (0–100, 0.1 steps); throws if the pad is not a PWM output |
+| `pwm(pad).set(duty, freq)` | also the frequency, 5–1000000 Hz |
+| `pwm(pad).off()` | duty 0 |
+| `pwm(pad).duty` / `.freq` / `.get()` | as it runs; `null` / `{duty, freq}` or `null` when not PWM |
+| `analog(1)` | **bare pattern** — matches every new reading (one per 20 mV of change) |
+| `analog(1).above(mV)` / `.below(mV)` / `.between(lo, hi)` | a band, bounds exclusive |
+| `analog(1).value` / `.get()` | live reading in mV, `null` when the pad is not analog |
+
+A rule gated on an analog **band** fires when the reading *enters* the band, not on every reading inside it, and
+again only after the reading has left it. A bare `analog(1)` fires on every reading.
+
+```js
+// fan speed follows the temperature sensor on IO1 (0–3.3 V)
+rule('fan').when(analog(1)).then(function () {
+  pwm(2).set(Math.min(100, analog(1).value / 33));
+});
+
+// alarm when the level sensor passes 2.5 V, once per crossing
+rule('high level').when(analog(1).above(2500)).then(function () { output(7).on(); });
+```
+
+A duty cycle set from a rule is not stored: after a reboot the pad starts with the configured values.
+
 ### `led()` and `buzzer()` — LED and buzzer actuators
 
 Two more actuators for `then()` bodies. They are **write-only** (not conditions) and

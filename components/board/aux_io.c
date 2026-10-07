@@ -2,11 +2,27 @@
 #include "app_config.h"
 #include "di.h"
 
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <driver/gpio.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <freertos/task.h>
 #include <esp_log.h>
+
+#ifdef CONFIG_APP_MQTT_ENABLE
+#include "cJSON.h"
+int  app_mqtt_publish(const char *topic, const char *payload, int len, int qos, bool retain);
+int  app_mqtt_subscribe(const char *topic, int qos);
+bool app_mqtt_is_connected(void);
+#endif
+#ifdef CONFIG_APP_SCRIPTING_ENABLE
+/* Declared rather than included: components/board does not depend on the
+   scripting component. pad is 1..3. */
+void scripting_on_analog(uint8_t pad, int mv);
+#endif
 
 #if CONFIG_APP_AUX_DI_ENABLE
 #include <driver/uart.h>
@@ -48,8 +64,11 @@ bool aux_mode_allowed(uint8_t a, aux_mode_t m)
 esp_err_t  aux_io_init(void)  { return ESP_OK; }
 esp_err_t  aux_io_apply(void) { return ESP_OK; }
 aux_mode_t aux_io_mode(uint8_t a) { (void)a; return AUX_MODE_STANDARD; }
-bool aux_io_pwm_info(uint8_t a, uint32_t *f, uint8_t *b) { (void)a; (void)f; (void)b; return false; }
+bool aux_io_pwm_info(uint8_t a, uint32_t *f, uint16_t *d, uint8_t *b) { (void)a; (void)f; (void)d; (void)b; return false; }
+esp_err_t aux_io_pwm_set(uint8_t a, uint32_t f, uint16_t d) { (void)a; (void)f; (void)d; return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t aux_io_analog_mv(uint8_t a, int *mv) { (void)a; (void)mv; return ESP_ERR_NOT_SUPPORTED; }
+void aux_io_on_mqtt_connected(void) {}
+void aux_io_on_mqtt_message(const char *t, size_t tl, const char *d, size_t dl) { (void)t; (void)tl; (void)d; (void)dl; }
 
 #else
 
@@ -71,8 +90,23 @@ static uint32_t          s_freq[AUX_PAD_COUNT];
 static uint16_t          s_duty[AUX_PAD_COUNT];
 static uint8_t           s_bits[AUX_PAD_COUNT];
 
+/* The configuration's PWM values as last applied. A save that does not touch
+   them must not overwrite a duty cycle set at run time. */
+static uint32_t          s_cfg_freq[AUX_PAD_COUNT];
+static uint16_t          s_cfg_duty[AUX_PAD_COUNT];
+
 static adc_oneshot_unit_handle_t s_adc;
 static adc_cali_handle_t         s_cali;
+
+/* Publishing is left to the pad task, so that nothing that changes a pad --
+   a Modbus request, a rule, an HTTP save -- waits on the MQTT client. */
+static TaskHandle_t      s_task;
+static volatile uint8_t  s_dirty;          /* bit a: publish pad a's state */
+static void mark_dirty(uint8_t a)
+{
+    __atomic_fetch_or(&s_dirty, (uint8_t)(1u << a), __ATOMIC_RELAXED);
+    if (s_task) xTaskNotifyGive(s_task);
+}
 
 /* ------------------------------------------------------------ pad function */
 
@@ -221,12 +255,6 @@ static esp_err_t enter(uint8_t a, aux_mode_t m, uint32_t freq, uint16_t duty)
     gpio_num_t g = s_gpio[a];
     esp_err_t  r = ESP_OK;
 
-    if (m == s_mode[a]) {
-        if (m == AUX_MODE_PWM && (freq != s_freq[a] || duty != s_duty[a]))
-            r = pwm_set(a, freq, duty, false);
-        return r;
-    }
-
     leave(a);
     if (m == AUX_MODE_STANDARD) {
         restore_standard(g);
@@ -268,18 +296,200 @@ esp_err_t aux_io_apply(void)
     for (uint8_t a = 0; a < AUX_PAD_COUNT; a++) {
         aux_mode_t m = (aux_mode_t)cfg->aux_mode[a];
         if (!aux_mode_allowed(a, m)) m = AUX_MODE_STANDARD;
-        esp_err_t r = enter(a, m, cfg->aux_pwm[a].freq_hz, cfg->aux_pwm[a].duty_pm);
+        uint32_t f = cfg->aux_pwm[a].freq_hz;
+        uint16_t d = cfg->aux_pwm[a].duty_pm;
+        bool cfg_changed = f != s_cfg_freq[a] || d != s_cfg_duty[a];
+        s_cfg_freq[a] = f;
+        s_cfg_duty[a] = d;
+
+        esp_err_t r = ESP_OK;
+        if (m == s_mode[a]) {
+            /* Same mode: only new configured PWM values are applied. A save of
+               something else leaves a run-time duty cycle where it is. */
+            if (m == AUX_MODE_PWM && cfg_changed) {
+                r = pwm_set(a, f, d, false);
+                mark_dirty(a);
+            }
+        } else {
+            r = enter(a, m, f, d);
+            mark_dirty(a);
+        }
         if (r != ESP_OK && first == ESP_OK) first = r;
     }
     xSemaphoreGive(s_mux);
     return first;
 }
 
+esp_err_t aux_io_pwm_set(uint8_t a, uint32_t freq_hz, uint16_t duty_pm)
+{
+    if (a >= AUX_PAD_COUNT || !s_mux) return ESP_ERR_INVALID_ARG;
+    if (freq_hz && (freq_hz < AUX_PWM_FREQ_MIN || freq_hz > AUX_PWM_FREQ_MAX))
+        return ESP_ERR_INVALID_ARG;
+    if (duty_pm != AUX_PWM_DUTY_KEEP && duty_pm > AUX_PWM_DUTY_MAX)
+        return ESP_ERR_INVALID_ARG;
+
+    xSemaphoreTake(s_mux, portMAX_DELAY);
+    esp_err_t r = ESP_ERR_INVALID_STATE;
+    if (s_mode[a] == AUX_MODE_PWM) {
+        uint32_t f = freq_hz ? freq_hz : s_freq[a];
+        uint16_t d = (duty_pm == AUX_PWM_DUTY_KEEP) ? s_duty[a] : duty_pm;
+        r = (f == s_freq[a] && d == s_duty[a]) ? ESP_OK : pwm_set(a, f, d, false);
+        if (r == ESP_OK) mark_dirty(a);
+    }
+    xSemaphoreGive(s_mux);
+    return r;
+}
+
+/* ------------------------------------------------------------- pad task */
+
+#define SAMPLE_MS 200
+
+static int s_an_reported = INT_MIN;   /* last analog value passed on, mV */
+
+#ifdef CONFIG_APP_MQTT_ENABLE
+static void publish_pad(uint8_t a)
+{
+    if (!app_mqtt_is_connected()) return;
+    char topic[24], payload[48];
+    snprintf(topic, sizeof(topic), "aux/%u/mode", a + 1);
+    app_mqtt_publish(topic, aux_mode_name(s_mode[a]), -1, 0, true);
+    uint32_t f; uint16_t d; uint8_t b;
+    if (aux_io_pwm_info(a, &f, &d, &b)) {
+        snprintf(topic, sizeof(topic), "aux/%u/pwm", a + 1);
+        snprintf(payload, sizeof(payload), "{\"duty\":%u.%u,\"freq\":%lu}",
+                 d / 10, d % 10, (unsigned long)f);
+        app_mqtt_publish(topic, payload, -1, 0, true);
+    }
+}
+#endif
+
+static void report_analog(int mv)
+{
+#ifdef CONFIG_APP_MQTT_ENABLE
+    if (app_mqtt_is_connected()) {
+        char payload[16];
+        snprintf(payload, sizeof(payload), "%d", mv);
+        app_mqtt_publish("aux/1/analog", payload, -1, 0, false);
+    }
+#endif
+#ifdef CONFIG_APP_SCRIPTING_ENABLE
+    scripting_on_analog(1, mv);
+#endif
+    (void)mv;
+}
+
+static void aux_task(void *arg)
+{
+    (void)arg;
+    TickType_t next_sample = xTaskGetTickCount();
+    for (;;) {
+        /* Woken early to publish, the analog input is still sampled on its own
+           clock: a rule that sets a PWM output from the reading wakes this
+           task, and sampling again on that wake fed the rule a new reading,
+           which set the PWM again -- 30 readings a second instead of 5. */
+        TickType_t now  = xTaskGetTickCount();
+        TickType_t wait = (TickType_t)(next_sample - now);
+        if ((int32_t)wait < 0) wait = 0;
+        ulTaskNotifyTake(pdTRUE, wait);
+
+        uint8_t dirty = __atomic_exchange_n(&s_dirty, 0, __ATOMIC_RELAXED);
+        for (uint8_t a = 0; a < AUX_PAD_COUNT; a++) {
+            if (!(dirty & (1u << a))) continue;
+#ifdef CONFIG_APP_MQTT_ENABLE
+            publish_pad(a);
+#endif
+            /* A pad that has just become an analog input reports at once. */
+            if (a == 0) s_an_reported = INT_MIN;
+        }
+
+        now = xTaskGetTickCount();
+        if ((int32_t)(now - next_sample) < 0) continue;      /* not time to sample yet */
+        next_sample = now + pdMS_TO_TICKS(SAMPLE_MS);
+
+        int mv;
+        if (aux_io_analog_mv(0, &mv) == ESP_OK) {
+            if (s_an_reported == INT_MIN || abs(mv - s_an_reported) >= AUX_ANALOG_STEP_MV) {
+                s_an_reported = mv;
+                report_analog(mv);
+            }
+        } else {
+            s_an_reported = INT_MIN;
+        }
+    }
+}
+
 esp_err_t aux_io_init(void)
 {
     s_mux = xSemaphoreCreateMutex();
     if (!s_mux) return ESP_ERR_NO_MEM;
+    if (xTaskCreate(aux_task, "aux", 3584, NULL, 4, &s_task) != pdPASS) return ESP_ERR_NO_MEM;
     return aux_io_apply();
+}
+
+/* ------------------------------------------------------------------ MQTT */
+
+void aux_io_on_mqtt_connected(void)
+{
+#ifdef CONFIG_APP_MQTT_ENABLE
+    app_mqtt_subscribe("aux/+/pwm/set", 0);
+    app_mqtt_subscribe("aux/read", 0);
+    for (uint8_t a = 0; a < AUX_PAD_COUNT; a++) mark_dirty(a);
+#endif
+}
+
+void aux_io_on_mqtt_message(const char *topic, size_t tlen, const char *data, size_t dlen)
+{
+#ifdef CONFIG_APP_MQTT_ENABLE
+    static const char READ[] = "aux/read";
+    if (tlen == sizeof(READ) - 1 && memcmp(topic, READ, tlen) == 0) {
+        for (uint8_t a = 0; a < AUX_PAD_COUNT; a++) mark_dirty(a);
+        return;
+    }
+    /* aux/<n>/pwm/set, compared whole. */
+    static const char TAIL[] = "/pwm/set";
+    const size_t tail = sizeof(TAIL) - 1;
+    if (tlen != 4 + 1 + tail || memcmp(topic, "aux/", 4) != 0 ||
+        memcmp(topic + 5, TAIL, tail) != 0 || topic[4] < '1' || topic[4] > '3')
+        return;
+    uint8_t a = (uint8_t)(topic[4] - '1');
+
+    char buf[96];
+    if (dlen >= sizeof(buf)) { ESP_LOGW(TAG, "aux/%u/pwm/set: payload too long", a + 1); return; }
+    memcpy(buf, data, dlen);
+    buf[dlen] = '\0';
+
+    double duty = -1, freq = 0;
+    cJSON *j = cJSON_Parse(buf);
+    if (cJSON_IsNumber(j)) {
+        duty = j->valuedouble;
+    } else if (cJSON_IsObject(j)) {
+        cJSON *v;
+        if ((v = cJSON_GetObjectItem(j, "duty")) && cJSON_IsNumber(v)) duty = v->valuedouble;
+        else duty = -2;                                         /* keep */
+        if ((v = cJSON_GetObjectItem(j, "freq")) && cJSON_IsNumber(v)) freq = v->valuedouble;
+    } else {
+        cJSON_Delete(j);
+        ESP_LOGW(TAG, "aux/%u/pwm/set: expected a number or {\"duty\":..,\"freq\":..}", a + 1);
+        return;
+    }
+    cJSON_Delete(j);
+
+    uint16_t d;
+    if (duty == -2) d = AUX_PWM_DUTY_KEEP;
+    else if (duty >= 0.0 && duty <= 100.0) d = (uint16_t)(duty * 10.0 + 0.5);
+    else { ESP_LOGW(TAG, "aux/%u/pwm/set: duty must be 0..100", a + 1); return; }
+    if (freq != 0 && (freq != (double)(uint32_t)freq || freq < AUX_PWM_FREQ_MIN || freq > AUX_PWM_FREQ_MAX)) {
+        ESP_LOGW(TAG, "aux/%u/pwm/set: freq must be a whole number of Hz from %u to %u",
+                 a + 1, AUX_PWM_FREQ_MIN, AUX_PWM_FREQ_MAX);
+        return;
+    }
+    esp_err_t r = aux_io_pwm_set(a, (uint32_t)freq, d);
+    if (r != ESP_OK)
+        ESP_LOGW(TAG, "aux/%u/pwm/set: %s", a + 1,
+                 r == ESP_ERR_INVALID_STATE ? "pad is not a PWM output" : esp_err_to_name(r));
+#else
+    (void)topic; (void)tlen; (void)data; (void)dlen;
+#endif
 }
 
 aux_mode_t aux_io_mode(uint8_t a)
@@ -287,10 +497,11 @@ aux_mode_t aux_io_mode(uint8_t a)
     return (a < AUX_PAD_COUNT) ? s_mode[a] : AUX_MODE_STANDARD;
 }
 
-bool aux_io_pwm_info(uint8_t a, uint32_t *freq_hz, uint8_t *bits)
+bool aux_io_pwm_info(uint8_t a, uint32_t *freq_hz, uint16_t *duty_pm, uint8_t *bits)
 {
     if (a >= AUX_PAD_COUNT || s_mode[a] != AUX_MODE_PWM) return false;
     *freq_hz = ledc_get_freq(PWM_MODE, PWM_TIMER(a));
+    *duty_pm = s_duty[a];
     *bits    = s_bits[a];
     return true;
 }

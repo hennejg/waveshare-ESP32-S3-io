@@ -236,6 +236,59 @@ Object.defineProperty(InputCondition.prototype, 'value', {
 });
 InputCondition.prototype.get = function() { return _di_get(this.channel); };
 
+// ── pwm(pad) / analog(pad) — the IO1/RXD/TXD header pads, numbered 1..3 ──────
+// Which pad does what is set in the web UI; these only act on a pad in that mode.
+// pwm(pad).set(duty%, freq?) changes a running PWM output (not stored: a reboot
+// starts from the configured values); .duty / .freq / .get() read it back.
+function PwmChannel(pad) { this.pad = _channel(pad, 'pwm'); }
+PwmChannel.prototype.set = function(duty, freq) {
+    _aux_pwm_set(this.pad, Number(duty), freq === undefined ? undefined : Number(freq));
+    return this.get();
+};
+PwmChannel.prototype.off = function() { return this.set(0); };
+PwmChannel.prototype.get = function() { return _aux_pwm_get(this.pad); };   // {duty, freq} or null
+Object.defineProperty(PwmChannel.prototype, 'duty', {
+    get: function() { var p = _aux_pwm_get(this.pad); return p ? p.duty : null; }
+});
+Object.defineProperty(PwmChannel.prototype, 'freq', {
+    get: function() { var p = _aux_pwm_get(this.pad); return p ? p.freq : null; }
+});
+function pwm(pad) { return new PwmChannel(pad); }
+
+// analog(pad) is a fact like input(): bare, it matches any new reading; narrowed
+// with .above(mV) / .below(mV) / .between(lo, hi) it matches a band. A rule
+// gated on an analog band fires when the reading ENTERS the band, not on every
+// reading inside it -- a reading moves a little all the time, and a level
+// trigger would re-run the action on each one. .value / .get() read live (mV).
+var _an_seen = {};   // pad -> last reading delivered by _on_analog()
+function AnalogCondition(pad) {
+    this.pad = _channel(pad, 'analog');
+    this._factKey = 'analog:' + this.pad;
+    this._lo = undefined;    // strictly above
+    this._hi = undefined;    // strictly below
+}
+AnalogCondition.prototype._narrow = function(lo, hi) {
+    var c = new AnalogCondition(this.pad);
+    c._lo = (lo === undefined) ? this._lo : Number(lo);
+    c._hi = (hi === undefined) ? this._hi : Number(hi);
+    return c;
+};
+AnalogCondition.prototype.above   = function(mv)     { return this._narrow(mv, undefined); };
+AnalogCondition.prototype.below   = function(mv)     { return this._narrow(undefined, mv); };
+AnalogCondition.prototype.between = function(lo, hi) { return this._narrow(lo, hi); };
+AnalogCondition.prototype._check = function() {
+    var v = (this.pad in _an_seen) ? _an_seen[this.pad] : _aux_analog_get(this.pad);
+    if (v === null || v === undefined) return false;
+    if (this._lo !== undefined && !(v > this._lo)) return false;
+    if (this._hi !== undefined && !(v < this._hi)) return false;
+    return true;
+};
+Object.defineProperty(AnalogCondition.prototype, 'value', {
+    get: function() { return _aux_analog_get(this.pad); }
+});
+AnalogCondition.prototype.get = function() { return _aux_analog_get(this.pad); };
+function analog(pad) { return new AnalogCondition(pad); }
+
 // ── OutputCondition ──────────────────────────────────────────────────────────
 // output(ch) is dual-purpose: an actuator (set/on/off/toggle/get/value, used in
 // then()) AND a fact (is/isOn/isOff/_check, used in when()). Writing it through
@@ -783,12 +836,10 @@ function _run_action(r) {
 // Only rules that reference that fact — or wildcard rules — are evaluated; a rule
 // gated solely on a different fact keeps its state untouched. factKey null/omitted
 // evaluates every rule.
-function _fire_matching(factKey, _isCascade) {
-    if (!_isCascade) _resetCascade();   // a root event/timer starts a fresh cascade budget
-    for (var i = 0; i < _rules.length; i++) {
-        var r = _rules[i];
-        if (factKey != null && !r._wildcard && !r._facts[factKey]) continue;
-        if (_rule_matches(r)) {
+// Fire, arm or disarm one rule for a match result -- shared by _fire_matching()
+// and the edge-triggered analog path.
+function _apply_match(r, matched) {
+        if (matched) {
             if (r.heldFor > 0) {
                 // sustained gate: arm a timer once; fire only if still matching at
                 // elapse; latch so it fires once per held period, not every event
@@ -808,5 +859,38 @@ function _fire_matching(factKey, _isCascade) {
             if (r._timer != null) { _unschedule(r._timer); r._timer = null; }
             r._fired = false;
         }
+}
+
+function _fire_matching(factKey, _isCascade) {
+    if (!_isCascade) _resetCascade();   // a root event/timer starts a fresh cascade budget
+    for (var i = 0; i < _rules.length; i++) {
+        var r = _rules[i];
+        if (factKey != null && !r._wildcard && !r._facts[factKey]) continue;
+        _apply_match(r, _rule_matches(r));
+    }
+}
+
+// A new analog reading. Edge-triggered per rule: a rule fires when its
+// conditions start to hold on an analog reading, and not again until they have
+// stopped holding on one -- see AnalogCondition.
+function _on_analog(pad, mv) {
+    _an_seen[pad] = mv;
+    _resetCascade();
+    var key = 'analog:' + pad;
+    for (var i = 0; i < _rules.length; i++) {
+        var r = _rules[i];
+        if (!r._wildcard && !r._facts[key]) continue;
+        var m = _rule_matches(r);
+        // Edge only for a band (above/below/between) on this pad; a bare
+        // analog(pad) matches every new reading, as a bare input() does.
+        var band = false;
+        for (var j = 0; j < r.conditions.length; j++) {
+            var c = r.conditions[j];
+            if (c instanceof AnalogCondition && c.pad === pad &&
+                (c._lo !== undefined || c._hi !== undefined)) { band = true; break; }
+        }
+        if (band && m && r._analogIn && !(r.heldFor > 0)) continue;   // still inside: edge taken
+        r._analogIn = m;
+        _apply_match(r, m);
     }
 }

@@ -264,7 +264,12 @@ with `"aux"` in `POST /api/config`, and takes effect on saving, without a reboot
   0–10 V converter from it, never a load.
 - **Analog** (IO1 only, ADC1 channel 0): 0 to about 3.1 V, calibrated from eFuse, averaged over 16 conversions,
   reported in millivolts in `/api/io/state`. Divide larger voltages down externally.
-- Not on MQTT yet: PWM and analog are set and read through the web UI and REST API only.
+- The mode is chosen on the *Device* tab, PWM frequency and duty cycle on the *Outputs* tab, input names on the
+  *Inputs* tab.
+- At run time the PWM can also be changed over Modbus (holding registers 40003–40011), MQTT (`aux/<n>/pwm/set`)
+  and from rules (`pwm(pad).set()`); such changes are not stored. The analog reading is available over Modbus
+  (input register 30101), MQTT (`aux/1/analog`) and to rules (`analog(1)`). See [docs/modbus.md](docs/modbus.md),
+  [docs/mqtt.md](docs/mqtt.md) and [RULES.md](components/scripting/RULES.md).
 
 A pad in any mode other than its standard function is taken off UART0. The console carries on over USB-Serial/JTAG; on UART0 it no longer
 reaches the pin until the pad is switched back. A channel in its standard function reads `false`, is not published,
@@ -297,9 +302,9 @@ Not every interface grows with the extra channels:
 | REST API         | yes       | `/api/config` and the status JSON carry 11 input entries            |
 | MQTT             | yes       | `input/9`, `input/10`, `input/11` — only for pads set to input      |
 | CAN bus          | **no**    | DI state is packed into a single byte — room for 8                  |
-| Modbus RTU       | **no**    | Discrete inputs 10001–10008 only                                    |
+| Modbus RTU / TCP | yes       | Discrete inputs 10009–10011                                         |
 | Matter           | **no**    | 8 Contact Sensor endpoints, unchanged                               |
-| Automation rules | **no**    | `input` / `output` channels are limited to 0–7 (`RangeError` above) |
+| Automation rules | yes       | `input(8)`–`input(10)`                                              |
 
 ---
 

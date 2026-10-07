@@ -11,6 +11,7 @@
 #include "mb_gateway.h"
 #include "mb_tcp_server.h"
 #include "mb_ident.h"
+#include "aux_io.h"
 
 #include "mbcontroller.h"
 #include "driver/gpio.h"
@@ -37,17 +38,28 @@
 /* ------------------------------------------------------------ register layout */
 
 #define MB_NUM_COILS     8     /* DO1-DO8, bit 0 = DO1            */
-#define MB_NUM_DISCRETE  8     /* DI1-DI8, bit 0 = DI1            */
-#define MB_NUM_HOLDING   2     /* [0] LED colour RGB252, [1] buzzer Hz */
+/* DI1-DI8, then AUX1-AUX3 (DI 10009-10011) when the board offers the pads;
+   a pad that is not an input reads 0. */
+#define MB_NUM_DISCRETE  APP_CFG_DI_COUNT
+/* [0] LED colour RGB252, [1] buzzer Hz, then per pad 1..3 three registers:
+   duty cycle in 0.1 %, frequency in Hz high word, low word. They act on the
+   running PWM and are not stored -- see aux_io_pwm_set(). */
+#define MB_HR_BASE       2
+#define MB_HR_PER_PAD    3
+#define MB_NUM_HOLDING   (MB_HR_BASE + MB_HR_PER_PAD * APP_CFG_DI_AUX_COUNT)
+/* Input registers 100.. after the identification block: AUX1 analog mV, then
+   the mode of pads 1..3 (0 standard, 1 input, 2 PWM, 3 analog). */
+#define MB_IR_AUX_BASE   100
+#define MB_IR_AUX_COUNT  (APP_CFG_DI_AUX_COUNT ? 1 + APP_CFG_DI_AUX_COUNT : 0)
 
 /* The RTU stack still wants descriptors for the areas it serves, but they are
    not the data path: the access callbacks below are overridden, so nothing
    reads or writes these buffers. Reads are answered from the live I/O state
    and writes are captured as commands. */
 static struct { uint8_t  b[1]; } s_coils_unused;
-static struct { uint8_t  b[1]; } s_di_unused;
+static struct { uint8_t  b[(MB_NUM_DISCRETE + 7) / 8]; } s_di_unused;
 static struct { uint16_t r[MB_NUM_HOLDING]; } s_hr_unused;
-static struct { uint16_t r[MB_IDENT_REG_COUNT]; } s_ir_unused;
+static struct { uint16_t r[MB_IR_AUX_COUNT ? MB_IR_AUX_BASE + MB_IR_AUX_COUNT : MB_IDENT_REG_COUNT]; } s_ir_unused;
 
 static void *s_handle = NULL;        /* the RTU slave instance, if any */
 
@@ -184,8 +196,22 @@ static uint8_t local_read_holding(uint16_t addr, uint16_t count, uint8_t *out)
     if ((uint32_t)addr + count > MB_NUM_HOLDING) return MB_EXC_ILLEGAL_ADDR;
 
     CMD_LOCK();
-    for (uint16_t i = 0; i < count; i++)             /* big endian on the wire */
-        mb_put16(&out[i * 2], s_hr_shadow[addr + i]);
+    for (uint16_t i = 0; i < count; i++) {           /* big endian on the wire */
+        uint16_t reg = (uint16_t)(addr + i);
+        uint16_t v   = 0;
+        if (reg < MB_HR_BASE) {
+            v = s_hr_shadow[reg];
+        } else {
+            /* The PWM as it runs -- changed by Modbus, MQTT or a rule alike.
+               A pad that is not a PWM output reads 0. */
+            uint8_t  a   = (uint8_t)((reg - MB_HR_BASE) / MB_HR_PER_PAD);
+            uint8_t  k   = (uint8_t)((reg - MB_HR_BASE) % MB_HR_PER_PAD);
+            uint32_t f = 0; uint16_t d = 0; uint8_t bits;
+            if (aux_io_pwm_info(a, &f, &d, &bits))
+                v = (k == 0) ? d : (k == 1) ? (uint16_t)(f >> 16) : (uint16_t)f;
+        }
+        mb_put16(&out[i * 2], v);
+    }
     CMD_UNLOCK();
     return MB_EXC_NONE;
 }
@@ -216,21 +242,101 @@ static uint8_t local_write_coils(uint16_t addr, uint16_t count, const uint8_t *b
     return exc;
 }
 
+/* The PWM part of a holding write, checked as a whole before anything moves:
+   every pad it touches must be a PWM output, and the duty cycle and the
+   frequency it ends up with -- written registers over the running values --
+   must be in range. A write of only one frequency word combines with the
+   other as it runs; FC 16 over both words changes the frequency in one step. */
+typedef struct { bool touched; uint32_t freq; uint16_t duty; } pwm_req_t;
+
+static uint8_t plan_pwm(uint16_t addr, uint16_t count, const uint8_t *regs_be,
+                        pwm_req_t req[APP_CFG_DI_AUX_COUNT ? APP_CFG_DI_AUX_COUNT : 1])
+{
+    for (uint16_t i = 0; i < count; i++) {
+        uint16_t reg = (uint16_t)(addr + i);
+        if (reg < MB_HR_BASE) continue;
+        uint8_t a = (uint8_t)((reg - MB_HR_BASE) / MB_HR_PER_PAD);
+        uint8_t k = (uint8_t)((reg - MB_HR_BASE) % MB_HR_PER_PAD);
+        if (!req[a].touched) {
+            uint8_t bits;
+            if (!aux_io_pwm_info(a, &req[a].freq, &req[a].duty, &bits))
+                return MB_EXC_ILLEGAL_VALUE;          /* not a PWM output */
+            req[a].touched = true;
+        }
+        uint16_t v = mb_be16(&regs_be[i * 2]);
+        if      (k == 0) req[a].duty = v;
+        else if (k == 1) req[a].freq = ((uint32_t)v << 16) | (req[a].freq & 0xFFFFu);
+        else             req[a].freq = (req[a].freq & 0xFFFF0000u) | v;
+    }
+#if APP_CFG_DI_AUX_COUNT
+    for (uint8_t a = 0; a < APP_CFG_DI_AUX_COUNT; a++)
+        if (req[a].touched &&
+            (req[a].duty > AUX_PWM_DUTY_MAX ||
+             req[a].freq < AUX_PWM_FREQ_MIN || req[a].freq > AUX_PWM_FREQ_MAX))
+            return MB_EXC_ILLEGAL_VALUE;
+#endif
+    return MB_EXC_NONE;
+}
+
 static uint8_t local_write_holding(uint16_t addr, uint16_t count, const uint8_t *regs_be)
 {
     if (!s_local_ready) return MB_EXC_DEVICE_FAILURE;
     if ((uint32_t)addr + count > MB_NUM_HOLDING) return MB_EXC_ILLEGAL_ADDR;
 
-    mb_cmd_t cmd = { .area = MB_PARAM_HOLDING, .offset = addr, .count = count };
-    for (uint16_t i = 0; i < count; i++)
-        cmd.regs[i] = mb_be16(&regs_be[i * 2]);
+    pwm_req_t pwm[APP_CFG_DI_AUX_COUNT ? APP_CFG_DI_AUX_COUNT : 1] = {0};
+    uint8_t exc = plan_pwm(addr, count, regs_be, pwm);
+    if (exc != MB_EXC_NONE) return exc;
 
-    CMD_LOCK();
-    uint8_t exc = enqueue(&cmd, "holding register write");
-    if (exc == MB_EXC_NONE)                       /* read-back follows the command */
-        for (uint16_t i = 0; i < count; i++) s_hr_shadow[addr + i] = cmd.regs[i];
-    CMD_UNLOCK();
-    return exc;
+    /* LED and buzzer go through the command task as before. */
+    uint16_t base_n = (addr < MB_HR_BASE) ? (uint16_t)(MB_HR_BASE - addr) : 0;
+    if (base_n > count) base_n = count;
+    if (base_n) {
+        mb_cmd_t cmd = { .area = MB_PARAM_HOLDING, .offset = addr, .count = base_n };
+        for (uint16_t i = 0; i < base_n; i++)
+            cmd.regs[i] = mb_be16(&regs_be[i * 2]);
+
+        CMD_LOCK();
+        exc = enqueue(&cmd, "holding register write");
+        if (exc == MB_EXC_NONE)                   /* read-back follows the command */
+            for (uint16_t i = 0; i < base_n; i++) s_hr_shadow[addr + i] = cmd.regs[i];
+        CMD_UNLOCK();
+        if (exc != MB_EXC_NONE) return exc;
+    }
+
+    /* PWM at once, not queued: it is a few register writes under a mutex,
+       publishing is left to the pad task, and a read straight after the
+       write then shows the new values without a shadow. */
+#if APP_CFG_DI_AUX_COUNT
+    bool any = false;
+    for (uint8_t a = 0; a < APP_CFG_DI_AUX_COUNT; a++) {
+        if (!pwm[a].touched) continue;
+        if (aux_io_pwm_set(a, pwm[a].freq, pwm[a].duty) != ESP_OK) return MB_EXC_DEVICE_FAILURE;
+        any = true;
+    }
+    if (any) scripting_on_modbus_activity();
+#endif
+    return MB_EXC_NONE;
+}
+
+/* Input registers: the identification block, then the pads. */
+static uint8_t local_read_input(uint16_t addr, uint16_t count, uint32_t local_ip, uint8_t *out)
+{
+    if (addr < MB_IR_AUX_BASE)
+        return mb_ident_read_input(addr, count, local_ip, out);
+    if ((uint32_t)addr + count > (uint32_t)MB_IR_AUX_BASE + MB_IR_AUX_COUNT)
+        return MB_EXC_ILLEGAL_ADDR;
+    for (uint16_t i = 0; i < count; i++) {
+        uint16_t r = (uint16_t)(addr + i - MB_IR_AUX_BASE);
+        uint16_t v = 0;
+        if (r == 0) {
+            int mv;
+            if (aux_io_analog_mv(0, &mv) == ESP_OK) v = (uint16_t)(mv < 0 ? 0 : mv > 65535 ? 65535 : mv);
+        } else {
+            v = (uint16_t)aux_io_mode((uint8_t)(r - 1));
+        }
+        mb_put16(&out[i * 2], v);
+    }
+    return MB_EXC_NONE;
 }
 
 /* ------------------------------------------------------------ request handler */
@@ -261,7 +367,7 @@ uint8_t mb_server_handle(const mb_request_t *req, uint8_t *resp, uint16_t *resp_
         return exc;
 
     case MB_FC_READ_INPUT:
-        exc = mb_ident_read_input(req->addr, req->count, req->local_ip, resp);
+        exc = local_read_input(req->addr, req->count, req->local_ip, resp);
         if (!exc) *resp_len = (uint16_t)(req->count * 2u);
         return exc;
 
@@ -352,7 +458,7 @@ mb_err_enum_t mbc_reg_input_slave_cb(mb_base_t *inst, uint8_t *reg_buffer,
     (void)inst;
     if (!reg_buffer) return MB_EINVAL;
     address--;
-    return exc_to_err(mb_ident_read_input(address, n_regs, 0, reg_buffer));
+    return exc_to_err(local_read_input(address, n_regs, 0, reg_buffer));
 }
 
 /* FC 43 on RS-485. The stack has no idea of Read Device Identification but

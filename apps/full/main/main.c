@@ -51,8 +51,28 @@ const char DEMO_SCRIPT[] =
     "    output(0).set(true);\n"
     "  });\n";
 
+/* The rule engine numbers the pads 1..3, like AUX1..AUX3; aux_io 0..2. */
+static esp_err_t rules_pwm_set(uint8_t pad, uint32_t freq_hz, uint16_t duty_pm)
+{
+    return (pad >= 1 && pad <= 3) ? aux_io_pwm_set((uint8_t)(pad - 1), freq_hz, duty_pm)
+                                  : ESP_ERR_INVALID_ARG;
+}
+static bool rules_pwm_get(uint8_t pad, uint32_t *freq_hz, uint16_t *duty_pm)
+{
+    uint8_t bits;
+    return pad >= 1 && pad <= 3 && aux_io_pwm_info((uint8_t)(pad - 1), freq_hz, duty_pm, &bits);
+}
+static esp_err_t rules_analog_get(uint8_t pad, int *mv)
+{
+    return (pad >= 1 && pad <= 3) ? aux_io_analog_mv((uint8_t)(pad - 1), mv) : ESP_ERR_INVALID_ARG;
+}
+
 static const scripting_io_t s_scripting_io = {
     .di_get         = di_get,
+    .di_count       = APP_CFG_DI_COUNT,
+    .aux_pwm_set    = rules_pwm_set,
+    .aux_pwm_get    = rules_pwm_get,
+    .aux_analog_get = rules_analog_get,
     .dout_set       = dout_set,
     .dout_get       = dout_get,
     .dout_toggle    = dout_toggle,
@@ -103,6 +123,7 @@ static void on_mqtt_connected(void)
     led_status_set_mqtt(true);
     di_on_mqtt_connected();
     dout_on_mqtt_connected();
+    aux_io_on_mqtt_connected();
     led_on_mqtt_connected();
     buzzer_on_mqtt_connected();
     scripting_on_mqtt_connected();
@@ -121,6 +142,7 @@ static void on_mqtt_message(const char *topic, size_t tlen,
     led_status_flash_rx();
     di_on_mqtt_message(topic, tlen, data, dlen);
     dout_on_mqtt_message(topic, tlen, data, dlen);
+    aux_io_on_mqtt_message(topic, tlen, data, dlen);
     led_on_mqtt_message(topic, tlen, data, dlen);
     buzzer_on_mqtt_message(topic, tlen, data, dlen);
     scripting_on_mqtt_message(topic, tlen, data, dlen);

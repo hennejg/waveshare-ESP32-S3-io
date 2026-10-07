@@ -10,6 +10,11 @@ typedef bool      (*scripting_di_get_fn_t)(uint8_t ch);
 typedef esp_err_t (*scripting_dout_set_fn_t)(uint8_t ch, bool state);
 typedef bool      (*scripting_dout_get_fn_t)(uint8_t ch);
 typedef esp_err_t (*scripting_dout_toggle_fn_t)(uint8_t ch);   /* atomic flip */
+/* The IO1/RXD/TXD pads, numbered 1..3. Optional: NULL where the board has none.
+   duty in tenths of a percent; freq 0 / duty 0xFFFF keep the current value. */
+typedef esp_err_t (*scripting_aux_pwm_set_fn_t)(uint8_t pad, uint32_t freq_hz, uint16_t duty_pm);
+typedef bool      (*scripting_aux_pwm_get_fn_t)(uint8_t pad, uint32_t *freq_hz, uint16_t *duty_pm);
+typedef esp_err_t (*scripting_aux_analog_get_fn_t)(uint8_t pad, int *mv);
 typedef int       (*scripting_mqtt_subscribe_fn_t)(const char *topic, int qos);
 typedef int       (*scripting_mqtt_publish_fn_t)(const char *topic, const char *payload, int len, int qos, bool retain);
 typedef esp_err_t (*scripting_led_set_fn_t)(uint8_t r, uint8_t g, uint8_t b);
@@ -20,6 +25,10 @@ typedef struct {
     scripting_dout_set_fn_t       dout_set;
     scripting_dout_get_fn_t       dout_get;
     scripting_dout_toggle_fn_t    dout_toggle;
+    uint8_t                       di_count;     /* inputs input() accepts; 0 = 8 */
+    scripting_aux_pwm_set_fn_t    aux_pwm_set;
+    scripting_aux_pwm_get_fn_t    aux_pwm_get;
+    scripting_aux_analog_get_fn_t aux_analog_get;
     scripting_mqtt_subscribe_fn_t mqtt_subscribe;
     scripting_mqtt_publish_fn_t   mqtt_publish;
     scripting_led_set_fn_t        led_set;      /* drive the RGB LED (IO mode only) */
@@ -42,6 +51,10 @@ void scripting_on_mqtt_message(const char *topic, size_t topic_len,
 // Notify the rule engine that a digital input changed state.
 // Safe to call from any task.
 void scripting_on_input_change(uint8_t channel, bool state);
+
+// A new analog reading of pad 1..3 in millivolts (only when it moved by the
+// driver's step). Safe to call from any task.
+void scripting_on_analog(uint8_t pad, int mv);
 
 // Replace the running script with new_script and restart rule evaluation.
 // The script is evaluated into a fresh context and only takes over if that

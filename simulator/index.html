@@ -222,6 +222,17 @@ function _dout_set(ch, v) {
     logMsg('do', '↑', 'DO' + ch + ' → ' + (doutState[ch] ? 'ON' : 'OFF'));
 }
 function _dout_toggle(ch) { _dout_set(ch, !doutState[ch]); }
+// IO1/RXD/TXD pads: the simulator has no pad configuration -- every pad acts as
+// a PWM output and pad 1 as an analog input reading 0 mV.
+var auxPwm = { 1: { duty: 0, freq: 1000 }, 2: { duty: 0, freq: 1000 }, 3: { duty: 0, freq: 1000 } };
+function _aux_pwm_set(pad, duty, freq) {
+  if (!auxPwm[pad]) throw new RangeError('pwm pad must be 1-3');
+  if (!(duty >= 0 && duty <= 100)) throw new RangeError('pwm duty must be 0-100 (%)');
+  auxPwm[pad] = { duty: duty, freq: freq || auxPwm[pad].freq };
+  logConsole('info', 'PWM pad ' + pad + ' → ' + duty + ' % @ ' + auxPwm[pad].freq + ' Hz');
+}
+function _aux_pwm_get(pad)    { return auxPwm[pad] ? { duty: auxPwm[pad].duty, freq: auxPwm[pad].freq } : null; }
+function _aux_analog_get(pad) { return pad === 1 ? 0 : null; }
 function print() {
   logConsole('print', Array.prototype.slice.call(arguments).join(' '));
 }

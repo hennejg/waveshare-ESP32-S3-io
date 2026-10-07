@@ -53,11 +53,11 @@ config APP_AUX_DI_ENABLE
         GPIO44 (AUX2) is U0RXD, an input, and has no such
         problem; GPIO1 is unaffected and otherwise unused by this firmware.
 
-        The extra inputs are reported over the web UI, the REST API and MQTT.
-        They are NOT carried over CAN or Modbus: both pack the input states
-        into a single byte (can_server.c, mb_server.c), which has room for
-        eight.  The scripting engine does not see them either: its di/do
-        bindings reject channels above 7 with a RangeError.
+        Inputs, PWM and the analog reading are available over the web UI, the
+        REST API, MQTT (aux/...), Modbus (discrete inputs 10009-10011, holding
+        registers 40003-40011, input registers 30101-30104) and the rule
+        engine (input(8..10), pwm(), analog()).  Not over CAN, which packs the
+        input states into a single byte.
 
         Not offered in a Matter build.  The Matter app exposes exactly eight
         Contact Sensor endpoints and its own web UI builds eight input rows, so

@@ -1197,16 +1197,17 @@ static esp_err_t api_io_state(httpd_req_t *req)
         cJSON_AddItemToArray(act, cJSON_CreateBool(di_is_active((uint8_t)i)));
     /* The pads as they run: PWM as the timer really produces it, analog as
        read now. */
-    const app_config_t *acfg = app_config_get();
     cJSON *aux = cJSON_AddArrayToObject(root, "aux");
     for (int a = 0; a < APP_CFG_DI_AUX_COUNT; a++) {
         cJSON *o = cJSON_CreateObject();
         aux_mode_t m = aux_io_mode((uint8_t)a);
         cJSON_AddStringToObject(o, "mode", aux_mode_name(m));
-        uint32_t f; uint8_t bits; int mv;
-        if (m == AUX_MODE_PWM && aux_io_pwm_info((uint8_t)a, &f, &bits)) {
+        uint32_t f; uint16_t d; uint8_t bits; int mv;
+        if (m == AUX_MODE_PWM && aux_io_pwm_info((uint8_t)a, &f, &d, &bits)) {
+            /* As it runs, which Modbus, MQTT or a rule may have changed since
+               the configuration was saved. */
             cJSON_AddNumberToObject(o, "pwm_freq", f);
-            cJSON_AddNumberToObject(o, "pwm_duty", acfg->aux_pwm[a].duty_pm / 10.0);
+            cJSON_AddNumberToObject(o, "pwm_duty", d / 10.0);
             cJSON_AddNumberToObject(o, "pwm_bits", bits);
         } else if (m == AUX_MODE_ANALOG && aux_io_analog_mv((uint8_t)a, &mv) == ESP_OK) {
             cJSON_AddNumberToObject(o, "mv", mv);

@@ -138,6 +138,24 @@ Published on broker connect, after every successful state change, and when `outp
 
 ---
 
+## Header pads IO1 / RXD / TXD
+
+The three non-isolated header pads are set to a mode on the web UI's Device tab. A pad set to *digital input*
+publishes like any other input (`input/9` to `input/11`, see above). For the other modes, `<n>` is 1 for IO1, 2 for
+RXD, 3 for TXD:
+
+| Topic | Direction | Payload |
+|-------|-----------|---------|
+| `<prefix>/aux/<n>/mode` | published, retained | `standard`, `input`, `pwm` or `analog` |
+| `<prefix>/aux/<n>/pwm` | published, retained | `{"duty":25.0,"freq":1000}` — the PWM as it runs |
+| `<prefix>/aux/<n>/pwm/set` | subscribed | `25` (duty in %) or `{"duty":25,"freq":1000}`; either field may be left out |
+| `<prefix>/aux/1/analog` | published | IO1 analog input in millivolts, whenever it moves by 20 mV or more |
+| `<prefix>/aux/read` | subscribed | anything — publishes all of the above |
+
+A `pwm/set` takes effect at once and is not stored: after a reboot the pad starts with the configured values. A
+command for a pad that is not a PWM output, or with a value out of range (duty 0–100, frequency 5–1000000 Hz), is
+ignored and logged.
+
 ## LED (WS2812)
 
 Single RGB LED on GPIO38. Operates in one of two modes set in the web UI:

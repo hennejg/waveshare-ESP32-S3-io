@@ -37,12 +37,24 @@ function createEngine(opts) {
   let ledState   = { r: 0, g: 0, b: 0 };   // last led().set(...)
   let buzzerFreq = 0;                       // last buzzer().set(...) Hz (0 = off)
   const published = [];                     // messages sent via mqtt(topic).publish()
+  // IO1/RXD/TXD pads 1..3: which are PWM outputs (as set in the web UI), their
+  // PWM state, and analog readings (mV, null = pad not analog).
+  const pwmPads  = { 1: null, 2: null, 3: null };   // null = not a PWM output, else {duty, freq}
+  const analogMv = { 1: null, 2: null, 3: null };
 
   const sandbox = {
     _di_get(ch)        { return !!di[ch]; },
     _dout_set(ch, v)   { dout[ch] = !!v; },
     _dout_get(ch)      { return !!dout[ch]; },
     _dout_toggle(ch)   { dout[ch] = !dout[ch]; },
+    _aux_pwm_set(pad, duty, freq) {
+      if (!(pad in pwmPads)) throw new RangeError('pwm pad must be 1-3');
+      if (!(duty >= 0 && duty <= 100)) throw new RangeError('pwm duty must be 0-100 (%)');
+      if (!pwmPads[pad]) throw new Error('pad ' + pad + ' is not set to PWM output');
+      pwmPads[pad] = { duty: Math.round(duty * 10) / 10, freq: freq ? freq : pwmPads[pad].freq };
+    },
+    _aux_pwm_get(pad)    { return pwmPads[pad] ? { duty: pwmPads[pad].duty, freq: pwmPads[pad].freq } : null; },
+    _aux_analog_get(pad) { return analogMv[pad] === undefined ? null : analogMv[pad]; },
     _led_set(r, g, b)  { ledState = { r: r | 0, g: g | 0, b: b | 0 }; },
     _buzzer_set(freq)  { buzzerFreq = freq | 0; },
     _mqtt_publish(topic, payload, qos, retain) {
@@ -93,6 +105,9 @@ function createEngine(opts) {
     input(ch, v)    { di[ch] = !!v; sandbox._on_input(ch, !!v); },   // set DI + fire
     setInput(ch, v) { di[ch] = !!v; },                              // set DI without firing
     publish(t, p)   { sandbox._on_mqtt(t, p); },                    // fire _on_mqtt
+    analog(pad, mv) { analogMv[pad] = mv; sandbox._on_analog(pad, mv); },   // new reading + fire
+    setPwmPad(pad, on, freq) { pwmPads[pad] = on ? { duty: 0, freq: freq || 1000 } : null; },
+    pwmState(pad)   { return pwmPads[pad]; },
     reload(script)  { sandbox._reset_rules(); if (script) this.load(script); },
 
     // ── observe ──

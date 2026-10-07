@@ -43,7 +43,7 @@ extern const char dsl_js_start[] asm("_binary_dsl_js_start");
 /* ── Event queue ─────────────────────────────────────────────────────────── */
 
 typedef enum { EVT_MQTT, EVT_INPUT_CHANGE, EVT_RELOAD, EVT_TIMER, EVT_TIME_SYNC,
-               EVT_ACTIVITY, EVT_TZ_CHANGE } evt_type_t;
+               EVT_ACTIVITY, EVT_TZ_CHANGE, EVT_ANALOG } evt_type_t;
 
 /* Input changes the event queue could not take, one bit per channel. Set by
    whoever reports the change, cleared by the engine when it resyncs. */
@@ -61,6 +61,7 @@ typedef struct {
         struct { char *script; uint32_t ticket; } reload;  // script heap-allocated; task frees after eval
         struct { uint32_t id; } timer;     // a rule timer fired (see _set_timer)
         struct { uint8_t source; } activity;  // ACT_MODBUS / ACT_CAN
+        struct { uint8_t pad; int32_t mv; } analog;
     };
 } scripting_evt_t;
 
@@ -508,6 +509,17 @@ static void scripting_task(void *arg)
                       JS_NewInt32(ctx, ev.input.channel),
                       JS_NewBool(ctx,  ev.input.state));
                 break;
+            case EVT_ANALOG: {
+                /* Looked up per event rather than bound once: analog events
+                   are a few per second at most. */
+                JSValue global = JS_GetGlobalObject(ctx);
+                JSValue fn = JS_GetPropertyStr(ctx, global, "_on_analog");
+                JS_FreeValue(ctx, global);
+                if (JS_IsFunction(ctx, fn))
+                    call2(ctx, fn, JS_NewInt32(ctx, ev.analog.pad), JS_NewInt32(ctx, ev.analog.mv));
+                JS_FreeValue(ctx, fn);
+                break;
+            }
             case EVT_RELOAD: {
                 /* A reload gets its own JSContext instead of being evaluated on
                    top of the old one. Re-evaluating in the same context kept
@@ -763,6 +775,16 @@ static void post_activity(uint8_t source)
 
 void scripting_on_modbus_activity(void) { post_activity(ACT_MODBUS); }
 void scripting_on_can_activity(void)    { post_activity(ACT_CAN); }
+
+void scripting_on_analog(uint8_t pad, int mv)
+{
+    if (!s_queue) return;
+    scripting_evt_t ev = { .type = EVT_ANALOG, .analog = { .pad = pad, .mv = mv } };
+    /* Dropped when the queue is full: the next reading that moves by the
+       driver's step is delivered, and .value always reads live. */
+    if (xQueueSend(s_queue, &ev, 0) != pdTRUE)
+        ESP_LOGW(TAG, "Event queue full — analog reading dropped");
+}
 
 void scripting_on_input_change(uint8_t channel, bool state)
 {

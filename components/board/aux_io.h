@@ -10,6 +10,7 @@
  * All three pads are bare 3.3 V GPIOs: no isolation, no protection.
  */
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
 
@@ -41,9 +42,33 @@ esp_err_t   aux_io_apply(void);
 /* The mode pad a is in now. */
 aux_mode_t  aux_io_mode(uint8_t a);
 
-/* PWM as it actually runs: frequency in Hz and duty resolution in bits.
-   False if pad a is not a PWM output. */
-bool        aux_io_pwm_info(uint8_t a, uint32_t *freq_hz, uint8_t *bits);
+/* PWM as it actually runs: frequency in Hz as the timer produces it, duty in
+   tenths of a percent, duty resolution in bits. False if pad a is not a PWM
+   output. */
+bool        aux_io_pwm_info(uint8_t a, uint32_t *freq_hz, uint16_t *duty_pm, uint8_t *bits);
+
+/* Changes a running PWM output at run time -- Modbus, MQTT, rules. Not stored:
+   the configuration keeps the values a reboot starts with, and a controller
+   writing a duty cycle every second must not wear out the flash. freq_hz 0
+   keeps the frequency, duty_pm AUX_PWM_DUTY_KEEP keeps the duty cycle.
+   ESP_ERR_INVALID_STATE if the pad is not a PWM output, ESP_ERR_INVALID_ARG
+   for a value out of range. */
+#define AUX_PWM_DUTY_KEEP      0xFFFFu
+esp_err_t   aux_io_pwm_set(uint8_t a, uint32_t freq_hz, uint16_t duty_pm);
+
+/* Change of the analog reading that counts as a new value -- for MQTT and
+   the rule engine; below it the reading is noise. */
+#define AUX_ANALOG_STEP_MV     20
+
+/* MQTT, wired into main.c next to the other drivers:
+     aux/<1..3>/mode       standard | input | pwm | analog  (published)
+     aux/<1..3>/pwm        {"duty":25.0,"freq":1000}         (published)
+     aux/<1..3>/pwm/set    25.0  or  {"duty":25.0,"freq":1000} (subscribed)
+     aux/1/analog          millivolts                         (published)
+     aux/read              publish all of the above           (subscribed) */
+void        aux_io_on_mqtt_connected(void);
+void        aux_io_on_mqtt_message(const char *topic, size_t topic_len,
+                                   const char *data,  size_t data_len);
 
 /* Reads the analog input of pad a in millivolts. ESP_ERR_INVALID_STATE if
    the pad is not an analog input. */
