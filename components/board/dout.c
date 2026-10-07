@@ -333,7 +333,7 @@ void dout_on_mqtt_message(const char *topic, size_t tlen,
             size_t clen = strlen(cmd);
             if (tlen == clen && memcmp(topic, cmd, clen) == 0) {
                 bool state;
-                if (parse_toggle(data, dlen))              dout_set(i, !dout_get(i));
+                if (parse_toggle(data, dlen))              dout_modify(0u, 0u, (uint8_t)(1u << i));
                 else if (parse_payload(data, dlen, &state)) dout_set(i, state);
                 else ESP_LOGW(TAG, "Unrecognised payload for %s", cmd);
                 return;

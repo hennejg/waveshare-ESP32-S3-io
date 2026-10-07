@@ -54,13 +54,29 @@ void mb_ident_init(void)
 
 /* ------------------------------------------------------------ registers */
 
-/* The interface a client most likely reached us through: the first of
-   Ethernet and WiFi that is up and has an address, else whichever exists.
-   Only ETH_DEF used to be asked, so a board on WiFi told its clients it was
-   reachable at 0.0.0.0. */
-static esp_netif_t *reachable_netif(void)
+static bool has_ip(esp_netif_t *n, void *ctx)
 {
-    static const char *const keys[] = { "ETH_DEF", "WIFI_STA_DEF" };
+    esp_netif_ip_info_t ip;
+    return esp_netif_get_ip_info(n, &ip) == ESP_OK &&
+           ip.ip.addr == *(const uint32_t *)ctx;
+}
+
+/* The interface the client reached us through. Over TCP that is known
+   exactly: the connection's local address. Only ETH_DEF used to be asked, so
+   a board on WiFi told its clients it was reachable at 0.0.0.0, and with both
+   up a client on one was given the other's address and gateway.
+
+   Over RS-485 there is no such address, and the first interface that is up
+   with an address is the best answer there is -- Ethernet, then WiFi, then
+   the provisioning access point. */
+static esp_netif_t *reachable_netif(uint32_t local_ip)
+{
+    if (local_ip) {
+        esp_netif_t *n = esp_netif_find_if(has_ip, &local_ip);
+        if (n) return n;
+    }
+
+    static const char *const keys[] = { "ETH_DEF", "WIFI_STA_DEF", "WIFI_AP_DEF" };
     esp_netif_t *fallback = NULL;
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
         esp_netif_t *n = esp_netif_get_handle_from_ifkey(keys[i]);
@@ -77,7 +93,7 @@ static esp_netif_t *reachable_netif(void)
 /* Builds the whole block, 160 bytes, on the stack of whichever task asks;
    a read then copies the slice it wants. Simpler than filling only the
    requested slice, and a client reads this perhaps once a day. */
-static void build(uint8_t *regs)
+static void build(uint8_t *regs, uint32_t local_ip)
 {
     memset(regs, 0, MB_IDENT_REG_COUNT * 2);
     const app_config_t *cfg = app_config_get();
@@ -92,7 +108,7 @@ static void build(uint8_t *regs)
           ((uint32_t)s_mac[4] << 8)  |  (uint32_t)s_mac[5]);
     mb_put32(&regs[2 * MB_IDENT_REG_UPTIME], (uint32_t)(esp_timer_get_time() / 1000000LL));
 
-    esp_netif_t *netif = reachable_netif();
+    esp_netif_t *netif = reachable_netif(local_ip);
     esp_netif_ip_info_t ip = {0};
     if (netif && esp_netif_get_ip_info(netif, &ip) == ESP_OK) {
         mb_put32(&regs[2 * MB_IDENT_REG_IP],      ntohl(ip.ip.addr));
@@ -109,11 +125,12 @@ static void build(uint8_t *regs)
     mb_ascii_to_regs(s_version,        16, &regs[MB_IDENT_REG_FW_VERSION * 2]);
 }
 
-uint8_t mb_ident_read_input(uint16_t addr, uint16_t count, uint8_t *out)
+uint8_t mb_ident_read_input(uint16_t addr, uint16_t count, uint32_t local_ip,
+                            uint8_t *out)
 {
     if ((uint32_t)addr + count > MB_IDENT_REG_COUNT) return MB_EXC_ILLEGAL_ADDR;
     uint8_t regs[MB_IDENT_REG_COUNT * 2];
-    build(regs);
+    build(regs, local_ip);
     memcpy(out, &regs[addr * 2], (size_t)count * 2u);
     return MB_EXC_NONE;
 }

@@ -410,9 +410,9 @@ static esp_err_t api_config_get(httpd_req_t *req)
         cJSON_AddNumberToObject(o, "reg",         e->reg);
         cJSON_AddStringToObject(o, "type",        mbm_type_name(e->type));
         cJSON_AddBoolToObject  (o, "word_swap",   e->word_swap);
-        /* Reported as stored. Substituting 1 for 0 here would describe a
-           configuration other than the one in effect; 0 is refused on the way
-           in instead. */
+        /* Reported as stored. A stored 0 cannot occur: an enabled row with it
+           is refused on the way in, a disabled one stores 1, and
+           app_config_init() turns one from an older blob into 1. */
         cJSON_AddNumberToObject(o, "scale",       e->scale);
         cJSON_AddNumberToObject(o, "interval_ms", e->interval_ms);
         cJSON_AddItemToArray(mbm, o);
@@ -673,8 +673,13 @@ static esp_err_t api_config_post(httpd_req_t *req)
                 double sc = v->valuedouble;
                 if (isfinite(sc) && sc != 0.0 && sc > -1e9 && sc < 1e9)
                     e->scale = (float)sc;
-                else
+                else if (e->enable)
                     e->scale = 0.0f;   /* flagged below */
+                else
+                    /* Nothing reads a disabled row, so nothing to refuse --
+                       but storing 0 would hand it out on GET, and enabling
+                       the row as it stands would then be refused. */
+                    e->scale = 1.0f;
             }
             if ((v = cJSON_GetObjectItem(o, "interval_ms")) && cJSON_IsNumber(v)) {
                 uint32_t t = (uint32_t)v->valuedouble;
@@ -1152,21 +1157,25 @@ static esp_err_t api_io_output(httpd_req_t *req)
     }
     uint8_t ch = (uint8_t)ch_j->valuedouble;
 
-    bool new_val;
+    /* A toggle goes to dout_modify() as one: read and flip under the output
+       lock. Reading here and setting the opposite lost one of two toggles
+       arriving together, and the output ended where neither asked for. */
+    esp_err_t set_ret;
     cJSON *tog = cJSON_GetObjectItem(root, "toggle");
     cJSON *val = cJSON_GetObjectItem(root, "value");
     if (cJSON_IsTrue(tog)) {
-        new_val = !dout_get(ch);
+        cJSON_Delete(root);
+        set_ret = dout_modify(0u, 0u, (uint8_t)(1u << ch));
     } else if (cJSON_IsBool(val)) {
-        new_val = cJSON_IsTrue(val);
+        bool new_val = cJSON_IsTrue(val);
+        cJSON_Delete(root);
+        set_ret = dout_set(ch, new_val);
     } else {
         cJSON_Delete(root);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "value or toggle required");
         return ESP_OK;
     }
-    cJSON_Delete(root);
 
-    esp_err_t set_ret = dout_set(ch, new_val);
     if (set_ret != ESP_OK) {
         /* dout_set() restores the previous state when the transfer fails, so
            confirming the command here would report a switch that never

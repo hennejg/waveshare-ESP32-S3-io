@@ -97,8 +97,8 @@ static int recv(int fd, void *buf, size_t n, int flags)
 }
 
 static int  close(int fd)                                   { (void)fd; closes++; return 0; }
-static uint16_t process(const uint8_t *f, uint16_t n, uint8_t *o)
-{ (void)f; assert(n == sizeof FRAME); answers++; memset(o, 0xA5, 9); return 9; }
+static uint16_t process(const uint8_t *f, uint16_t n, uint8_t *o, uint32_t lip)
+{ (void)f; (void)lip; assert(n == sizeof FRAME); answers++; memset(o, 0xA5, 9); return 9; }
 /* Per fd: how many bytes its receive window will still take, and what went
    out of it. A send is non-blocking by contract and never advances the clock,
    so a test that ends with time on it means the code under test waited. The

@@ -127,6 +127,8 @@ typedef struct {
     uint16_t         out_len;      /* 0 = nothing pending                 */
     uint16_t         out_sent;
     int64_t          out_deadline_us;
+
+    uint32_t         local_ip;     /* our address on this connection, network order */
 } conn_t;
 
 /* The slot, not the frame. A worker owns its connection outright for the
@@ -189,7 +191,8 @@ static bool is_local(uint8_t uid)
 
 /* Answers one frame. Called on the polling task for a request this board can
    answer itself, and on a worker for one that has to go to the segment. */
-static uint16_t process(const uint8_t *frame, uint16_t len, uint8_t *out)
+static uint16_t process(const uint8_t *frame, uint16_t len, uint8_t *out,
+                        uint32_t local_ip)
 {
     const uint8_t *pdu     = &frame[MB_MBAP_LEN];
     uint16_t       pdu_len = (uint16_t)(len - MB_MBAP_LEN);
@@ -200,6 +203,7 @@ static uint16_t process(const uint8_t *frame, uint16_t len, uint8_t *out)
     uint16_t data_len = 0;
 
     uint8_t exc = mb_parse_pdu(pdu, pdu_len, &req);
+    req.local_ip = local_ip;             /* after the parse, which clears req */
     if (exc == MB_EXC_NONE) {
         if (is_local(uid)) {
             exc = mb_server_handle(&req, data, &data_len);
@@ -255,7 +259,7 @@ static void worker_task(void *arg)
            and is the only task that may wait on a socket without holding a
            connection hostage. */
         conn_t *c = &s_conn[job.slot];
-        arm_out(job.slot, process(c->frame, job.len, c->out));
+        arm_out(job.slot, process(c->frame, job.len, c->out, c->local_ip));
 
         c->state = SLOT_IDLE;                 /* after the answer is armed */
 
@@ -366,6 +370,13 @@ static bool accept_one(void)
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
     setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
 
+    /* Which of our addresses the client used, for the identification
+       registers: with Ethernet and WiFi both up they differ. */
+    struct sockaddr_in local;
+    socklen_t llen = sizeof(local);
+    s_conn[slot].local_ip = getsockname(fd, (struct sockaddr *)&local, &llen) == 0
+                            ? local.sin_addr.s_addr : 0;
+
     s_conn[slot].fd    = fd;
     s_conn[slot].state = SLOT_IDLE;
     s_stats.accepted++;
@@ -443,7 +454,7 @@ static void pump_slot(int i)
        answers "gateway path unavailable" without touching anything that can
        block, and a worker would add a task switch for nothing. */
     if (is_local(c->frame[6]) || !s_jobs) {
-        send_now(i, process(c->frame, len, c->out));
+        send_now(i, process(c->frame, len, c->out, c->local_ip));
         return;
     }
 

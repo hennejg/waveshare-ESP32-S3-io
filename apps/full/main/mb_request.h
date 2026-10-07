@@ -19,6 +19,9 @@ typedef struct {
     const uint8_t *data;      /* write payload: packed bits, or big-endian
                                  registers, or the two value bytes of FC05/06  */
     uint16_t       data_len;
+    uint32_t       local_ip;  /* the board's address the request arrived on,
+                                 network order; 0 on RS-485. Set by the
+                                 transport after parsing.                       */
 } mb_request_t;
 
 /* What a handler returns: 0 for success, otherwise the Modbus exception code

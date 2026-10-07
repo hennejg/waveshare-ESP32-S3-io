@@ -9,6 +9,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <arpa/inet.h>
 #include <unistd.h>
 
 #include "esp_check.h"
@@ -74,9 +75,34 @@ _Static_assert(MBM_VAL_U16 == MB_VAL_U16 && MBM_VAL_S16 == MB_VAL_S16 &&
 typedef struct {
     char     host[APP_CFG_MBM_HOST_LEN + 1];
     uint16_t port;
+    uint32_t addr_be;      /* the address it was opened to, network order */
     int      fd;
     int64_t  used_ms;
 } conn_t;
+
+/* Names are resolved per host, not per entry: eight registers of one meter
+   are eight entries and one name, and with DNS down each of them paying its
+   own resolver timeout on the one polling task is the stall this exists to
+   prevent.
+
+   lwIP's resolver blocks the calling task for its whole retry sequence when
+   nobody answers -- several seconds. So a name is looked up at most once per
+   DNS_RETRY_MS while it fails, and once per DNS_TTL_MS while it works: often
+   enough that a name moved to another address is followed within minutes,
+   rarely enough that the lookup costs nothing. A failed lookup keeps the
+   last good address, so a DNS outage does not take down devices whose
+   address has not changed. */
+#define DNS_TTL_MS     600000
+#define DNS_RETRY_MS    10000
+
+typedef struct {
+    char     host[APP_CFG_MBM_HOST_LEN + 1];
+    uint32_t addr_be;      /* last good answer, 0 = never resolved            */
+    int64_t  next_ms;      /* when to ask DNS again                           */
+    int64_t  used_ms;
+} dns_entry_t;
+
+static dns_entry_t s_dns[APP_CFG_MBM_COUNT];   /* at most one host per entry */
 
 typedef struct {
     int64_t  due_ms;
@@ -85,7 +111,6 @@ typedef struct {
     uint32_t reads;
     uint32_t errors;
     uint32_t backoff_ms;
-    uint32_t addr_be;      /* the host's address, network order; 0 = not resolved */
     char     last_error[48];
 } entry_state_t;
 
@@ -135,46 +160,76 @@ static void conn_close(conn_t *c)
     c->host[0] = '\0';
 }
 
-/* Resolves the host once and keeps the answer in *addr_be. A literal address
-   never reaches the resolver; a name costs a DNS round trip, and lwIP's
-   resolver blocks the calling task for its whole retry sequence when nobody
-   answers -- several seconds, on the one polling task, which connect() below
-   is carefully kept from doing. So a name is looked up on the first poll and
-   then not again until a connect to the answer fails (the address may have
-   moved) or the table is reloaded; an unresolvable name is retried under the
-   entry's backoff, not at its poll interval. */
+static dns_entry_t *dns_slot(const char *host)
+{
+    dns_entry_t *free_e = NULL, *oldest = &s_dns[0];
+    for (int i = 0; i < APP_CFG_MBM_COUNT; i++) {
+        dns_entry_t *d = &s_dns[i];
+        if (d->host[0] && strcmp(d->host, host) == 0) return d;
+        if (!d->host[0] && !free_e) free_e = d;
+        if (d->used_ms < oldest->used_ms) oldest = d;
+    }
+    dns_entry_t *d = free_e ? free_e : oldest;
+    memset(d, 0, sizeof(*d));
+    strlcpy(d->host, host, sizeof(d->host));
+    return d;
+}
+
+/* The address to dial for host. A literal address never reaches the
+   resolver. Needs no socket, so it runs before anything is given up for the
+   connection it is for. */
 static bool resolve(const char *host, uint32_t *addr_be, char *err, size_t err_len)
 {
-    if (*addr_be) return true;
+    struct in_addr lit;
+    if (inet_aton(host, &lit)) { *addr_be = lit.s_addr; return true; }
 
-    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
-    struct addrinfo *ai = NULL;
-    if (getaddrinfo(host, NULL, &hints, &ai) != 0 || !ai) {
+    int64_t now = now_ms();
+    dns_entry_t *d = dns_slot(host);
+    d->used_ms = now;
+
+    if (now >= d->next_ms) {
+        struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+        struct addrinfo *ai = NULL;
+        uint32_t got = 0;
+        if (getaddrinfo(host, NULL, &hints, &ai) == 0 && ai) {
+            got = ((struct sockaddr_in *)ai->ai_addr)->sin_addr.s_addr;
+            freeaddrinfo(ai);
+        }
+        now = now_ms();                          /* the lookup may have taken a while */
+        if (got) { d->addr_be = got; d->next_ms = now + DNS_TTL_MS; }
+        else     {                   d->next_ms = now + DNS_RETRY_MS; }
+    }
+
+    if (!d->addr_be) {
         snprintf(err, err_len, "name not resolved");
         return false;
     }
-    *addr_be = ((struct sockaddr_in *)ai->ai_addr)->sin_addr.s_addr;
-    freeaddrinfo(ai);
-    if (!*addr_be) {
-        snprintf(err, err_len, "name resolved to 0.0.0.0");
-        return false;
-    }
+    *addr_be = d->addr_be;
     return true;
+}
+
+/* A connect to the address failed: it may have moved, so the next attempt
+   asks DNS again -- once, for every entry naming this host. */
+static void dns_recheck(const char *host)
+{
+    for (int i = 0; i < APP_CFG_MBM_COUNT; i++)
+        if (s_dns[i].host[0] && strcmp(s_dns[i].host, host) == 0) s_dns[i].next_ms = 0;
+}
+
+static void dns_flush(void)
+{
+    memset(s_dns, 0, sizeof(s_dns));
 }
 
 /* Non-blocking connect with a deadline. A blocking one would sit on lwIP's
    own retransmission schedule -- tens of seconds -- for a device that is
-   simply not there, and the whole polling task with it. A connect that fails
-   forgets the resolved address, so the next attempt asks DNS again. */
-static int dial(const char *host, uint16_t port, uint32_t *addr_be,
-                char *err, size_t err_len)
+   simply not there, and the whole polling task with it. */
+static int dial(uint32_t addr_be, uint16_t port, char *err, size_t err_len)
 {
-    if (!resolve(host, addr_be, err, err_len)) return -1;
-
     struct sockaddr_in sa = {
         .sin_family      = AF_INET,
         .sin_port        = htons(port),
-        .sin_addr.s_addr = *addr_be,
+        .sin_addr.s_addr = addr_be,
     };
 
     int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -200,7 +255,6 @@ static int dial(const char *host, uint16_t port, uint32_t *addr_be,
         if (errno != EINPROGRESS) {
             snprintf(err, err_len, "connect: errno %d", errno);
             close(fd);
-            *addr_be = 0;
             return -1;
         }
         fd_set wr;
@@ -211,7 +265,6 @@ static int dial(const char *host, uint16_t port, uint32_t *addr_be,
         if (select(fd + 1, NULL, &wr, NULL, &tv) <= 0) {
             snprintf(err, err_len, "no answer in %d ms", CONNECT_MS);
             close(fd);
-            *addr_be = 0;
             return -1;
         }
         int soerr = 0;
@@ -220,7 +273,6 @@ static int dial(const char *host, uint16_t port, uint32_t *addr_be,
         if (soerr) {
             snprintf(err, err_len, "refused: errno %d", soerr);
             close(fd);
-            *addr_be = 0;
             return -1;
         }
     }
@@ -238,17 +290,28 @@ static int dial(const char *host, uint16_t port, uint32_t *addr_be,
     return fd;
 }
 
-static conn_t *conn_get(const char *host, uint16_t port, uint32_t *addr_be,
-                        bool *fresh, char *err, size_t err_len)
+static conn_t *conn_get(const char *host, uint16_t port, bool *fresh,
+                        char *err, size_t err_len)
 {
-    int64_t now = now_ms();
     *fresh = false;
 
+    /* First, and before any connection is touched: a name that does not
+       resolve must not cost some other entry its connection. */
+    uint32_t addr_be = 0;
+    if (!resolve(host, &addr_be, err, err_len)) return NULL;
+    int64_t now = now_ms();
+
     for (int i = 0; i < CONN_CACHE; i++) {
-        if (s_conns[i].fd >= 0 && s_conns[i].port == port &&
-            strcmp(s_conns[i].host, host) == 0) {
-            s_conns[i].used_ms = now;
-            return &s_conns[i];   /* kept from an earlier poll; may be stale */
+        conn_t *c = &s_conns[i];
+        if (c->fd >= 0 && c->port == port && strcmp(c->host, host) == 0) {
+            if (c->addr_be == addr_be) {
+                c->used_ms = now;
+                return c;         /* kept from an earlier poll; may be stale */
+            }
+            /* The name has moved. Whatever answers at the old address is
+               not the device this entry names. */
+            ESP_LOGI(TAG, "%s has moved, reconnecting", host);
+            conn_close(c);
         }
     }
 
@@ -269,11 +332,12 @@ static conn_t *conn_get(const char *host, uint16_t port, uint32_t *addr_be,
     }
 
     if (pick->fd >= 0) conn_close(pick);
-    int fd = dial(host, port, addr_be, err, err_len);
-    if (fd < 0) return NULL;
+    int fd = dial(addr_be, port, err, err_len);
+    if (fd < 0) { dns_recheck(host); return NULL; }
 
     strlcpy(pick->host, host, sizeof(pick->host));
     pick->port    = port;
+    pick->addr_be = addr_be;
     pick->fd      = fd;
     pick->used_ms = now;
     *fresh = true;
@@ -322,11 +386,11 @@ typedef enum { RD_OK, RD_FAILED, RD_STALE_CONN } rd_result_t;
    fresh connection might cure: the connection was one kept from an earlier
    poll and the exchange on it went wrong. A connection that could not be
    opened at all, or a device that answered, are not that. */
-static rd_result_t read_once(const mbm_poll_t *e, entry_state_t *st, uint16_t regs,
-                             double *value, char *err, size_t err_len)
+static rd_result_t read_once(const mbm_poll_t *e, uint16_t regs, double *value,
+                             char *err, size_t err_len)
 {
     bool fresh = false;
-    conn_t *c = conn_get(e->host, e->port, &st->addr_be, &fresh, err, err_len);
+    conn_t *c = conn_get(e->host, e->port, &fresh, err, err_len);
     if (!c) return RD_FAILED;        /* no connection; dialling again is the same */
 
     uint8_t  req[MB_MBAP_LEN + 5];
@@ -411,16 +475,15 @@ static rd_result_t read_once(const mbm_poll_t *e, entry_state_t *st, uint16_t re
    single pass would block for most of a minute and every healthy entry would
    miss its turn. And a device that answered with an exception has said what
    it has to say. */
-static bool read_value(const mbm_poll_t *e, entry_state_t *st, double *value,
-                       char *err, size_t err_len)
+static bool read_value(const mbm_poll_t *e, double *value, char *err, size_t err_len)
 {
     uint16_t regs = mb_value_regs(e->type);
     if (regs == 0) { snprintf(err, err_len, "unknown value type %u", e->type); return false; }
 
-    rd_result_t r = read_once(e, st, regs, value, err, err_len);
+    rd_result_t r = read_once(e, regs, value, err, err_len);
     if (r == RD_OK)     return true;
     if (r == RD_FAILED) return false;
-    return read_once(e, st, regs, value, err, err_len) == RD_OK;   /* once more, fresh */
+    return read_once(e, regs, value, err, err_len) == RD_OK;   /* once more, fresh */
 }
 
 /* ------------------------------------------------------------- publishing */
@@ -459,7 +522,7 @@ static void poll_entry(const mbm_poll_t *e, entry_state_t *st)
 {
     double value = 0;
     char   err[sizeof(st->last_error)];
-    bool   ok = read_value(e, st, &value, err, sizeof(err));
+    bool   ok = read_value(e, &value, err, sizeof(err));
 
     ST_LOCK();
     if (ok) {
@@ -509,9 +572,11 @@ static void apply_staged_config(void)
     for (int i = 0; i < APP_CFG_MBM_COUNT; i++) s_state[i].due_ms = now + i * 200;
     ST_UNLOCK();
 
-    /* A cached socket may lead to a device nobody asks about any more. */
+    /* A cached socket may lead to a device nobody asks about any more, and a
+       cached name to an address nobody has looked at since the save. */
     for (int i = 0; i < CONN_CACHE; i++)
         if (s_conns[i].fd >= 0) conn_close(&s_conns[i]);
+    dns_flush();
 }
 
 static void master_task(void *arg)

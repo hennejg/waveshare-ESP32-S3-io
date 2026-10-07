@@ -32,8 +32,14 @@
 #define NET_SOCK_MB_REFUSE       1
 #define NET_SOCK_MB_MASTER       3   /* kept open to the devices this board polls */
 
+/* The WiFi provisioning portal (esp32-wifi-bootstrap, wifi_config.c): its own
+   HTTP listener, the one client it serves at a time, and the captive DNS
+   responder. It runs while the access point is up, and Ethernet -- with
+   everything above -- can be up at the same time. */
+#define NET_SOCK_PORTAL          3
+
 _Static_assert(NET_SOCK_HTTPD + NET_SOCK_MQTT + NET_SOCK_SNTP +
                NET_SOCK_MB_LISTEN + NET_SOCK_MB_CONN + NET_SOCK_MB_REFUSE +
-               NET_SOCK_MB_MASTER
+               NET_SOCK_MB_MASTER + NET_SOCK_PORTAL
                <= CONFIG_LWIP_MAX_SOCKETS,
                "net_budget.h hands out more sockets than CONFIG_LWIP_MAX_SOCKETS has");

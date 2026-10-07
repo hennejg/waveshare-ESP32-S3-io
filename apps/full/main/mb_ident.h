@@ -36,7 +36,8 @@ void mb_ident_init(void);
 
 /* FC 04 for the local unit: count registers from addr into out, big endian.
    Returns 0 or the exception code. */
-uint8_t mb_ident_read_input(uint16_t addr, uint16_t count, uint8_t *out);
+uint8_t mb_ident_read_input(uint16_t addr, uint16_t count, uint32_t local_ip,
+                            uint8_t *out);
 
 /* FC 43/14 for the local unit: the response data after the function code.
    Same contract as a read handler. */

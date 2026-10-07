@@ -148,9 +148,15 @@ static uint8_t local_read_coils(uint16_t addr, uint16_t count, uint8_t *out)
     if ((uint32_t)addr + count > MB_NUM_COILS) return MB_EXC_ILLEGAL_ADDR;
 
     memset(out, 0, (size_t)MB_BIT_BYTES(count));
-    uint8_t live = dout_get_all();
 
     CMD_LOCK();
+    /* Inside the lock, not before it. The command task stores the new relay
+       state before it takes this lock to clear the pending count, so a read
+       that finds the count cleared also finds the new state. Taken outside,
+       a read could hold the state from before the write and find the count
+       already cleared -- and a client would read OFF straight after its ON
+       had been acknowledged. */
+    uint8_t live = dout_get_all();
     for (uint16_t i = 0; i < count; i++) {
         uint8_t ch = (uint8_t)(addr + i);
         uint8_t v  = s_do_pending[ch] ? (s_do_shadow & (1u << ch))
@@ -255,7 +261,7 @@ uint8_t mb_server_handle(const mb_request_t *req, uint8_t *resp, uint16_t *resp_
         return exc;
 
     case MB_FC_READ_INPUT:
-        exc = mb_ident_read_input(req->addr, req->count, resp);
+        exc = mb_ident_read_input(req->addr, req->count, req->local_ip, resp);
         if (!exc) *resp_len = (uint16_t)(req->count * 2u);
         return exc;
 
@@ -346,7 +352,7 @@ mb_err_enum_t mbc_reg_input_slave_cb(mb_base_t *inst, uint8_t *reg_buffer,
     (void)inst;
     if (!reg_buffer) return MB_EINVAL;
     address--;
-    return exc_to_err(mb_ident_read_input(address, n_regs, reg_buffer));
+    return exc_to_err(mb_ident_read_input(address, n_regs, 0, reg_buffer));
 }
 
 /* FC 43 on RS-485. The stack has no idea of Read Device Identification but

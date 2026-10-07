@@ -44,6 +44,8 @@ typedef struct { int fd; } conn_t;
 static conn_t   s_conns[CONN_CACHE];
 static unsigned conn_closes;
 static void conn_close(conn_t *c) { c->fd = -1; conn_closes++; }
+static unsigned dns_flushes;
+static void dns_flush(void) { dns_flushes++; }
 
 static entry_state_t s_state[APP_CFG_MBM_COUNT];
 static int64_t  fake_now = 1000;
@@ -72,10 +74,10 @@ static void      (*during_read)(void);
 
 static uint16_t mb_value_regs(uint8_t type) { return type <= MBM_VAL_S16 ? 1 : 2; }
 
-static rd_result_t read_once(const mbm_poll_t *e, entry_state_t *st, uint16_t regs,
-                             double *value, char *err, size_t err_len)
+static rd_result_t read_once(const mbm_poll_t *e, uint16_t regs, double *value,
+                             char *err, size_t err_len)
 {
-    (void)st; (void)regs;
+    (void)regs;
     strlcpy(read_host_seen, e->host, sizeof(read_host_seen));
     strlcpy(read_name_seen, e->name, sizeof(read_name_seen));
     if (during_read) { void (*f)(void) = during_read; during_read = NULL; f(); }
@@ -151,7 +153,7 @@ int main(void)
 
     /* 2. The new table takes effect at the next handover, and everything the
           old entry left behind goes with it. */
-    conn_closes = 0;
+    conn_closes = 0; dns_flushes = 0;
     for (int i = 0; i < CONN_CACHE; i++) s_conns[i].fd = 5;   /* as if open */
     fake_now = 5000;
     apply_staged_config();
@@ -169,6 +171,7 @@ int main(void)
               "Termin %d nicht gegen %d versetzt (%lld vs %lld)", i, i - 1,
               (long long)s_state[i].due_ms, (long long)s_state[i - 1].due_ms);
     CHECK(conn_closes == CONN_CACHE, "Verbindungen nicht verworfen");
+    CHECK(dns_flushes == 1, "Namensauflösung nicht verworfen (%u)", dns_flushes);
     printf("  Uebernahme danach: Status geleert, Termine gefaechert, Verbindungen verworfen\n");
 
     /* 3. The new entry is polled with the new scale, under the new name. */
@@ -205,23 +208,23 @@ int main(void)
     char err[48]; double v = 0;
 
     read_calls = 0; read_script[0] = RD_OK;
-    CHECK(read_value(&s_active[0], &s_state[0], &v, err, sizeof err) && read_calls == 1,
+    CHECK(read_value(&s_active[0], &v, err, sizeof err) && read_calls == 1,
           "Erfolg brauchte %u Versuche", read_calls);
 
     read_calls = 0; read_script[0] = RD_FAILED;
-    CHECK(!read_value(&s_active[0], &s_state[0], &v, err, sizeof err) && read_calls == 1,
+    CHECK(!read_value(&s_active[0], &v, err, sizeof err) && read_calls == 1,
           "endgueltiger Fehler wurde wiederholt (%u Versuche)", read_calls);
 
     read_calls = 0; read_script[0] = RD_STALE_CONN; read_script[1] = RD_OK;
-    CHECK(read_value(&s_active[0], &s_state[0], &v, err, sizeof err) && read_calls == 2,
+    CHECK(read_value(&s_active[0], &v, err, sizeof err) && read_calls == 2,
           "veraltete Verbindung: %u Versuche, erwartet 2", read_calls);
 
     read_calls = 0; read_script[0] = RD_STALE_CONN; read_script[1] = RD_FAILED;
-    CHECK(!read_value(&s_active[0], &s_state[0], &v, err, sizeof err) && read_calls == 2,
+    CHECK(!read_value(&s_active[0], &v, err, sizeof err) && read_calls == 2,
           "veraltete Verbindung mit zweitem Fehlschlag: %u Versuche", read_calls);
 
     read_calls = 0; read_script[0] = RD_STALE_CONN; read_script[1] = RD_STALE_CONN;
-    CHECK(!read_value(&s_active[0], &s_state[0], &v, err, sizeof err) && read_calls == 2,
+    CHECK(!read_value(&s_active[0], &v, err, sizeof err) && read_calls == 2,
           "mehr als ein zweiter Versuch (%u)", read_calls);
     read_script[1] = RD_OK;
     printf("  Wiederholung nur bei veralteter Verbindung, und nur einmal\n");
@@ -235,7 +238,7 @@ int main(void)
 '''
 
 cuts = "".join(src.func(sig) for sig in (
-    "static bool read_value(const mbm_poll_t *e, entry_state_t *st, double *value,",
+    "static bool read_value(const mbm_poll_t *e, double *value, char *err, size_t err_len)",
     "static void publish(const mbm_poll_t *e, double value)",
     "static void poll_entry(const mbm_poll_t *e, entry_state_t *st)",
     "static void apply_staged_config(void)",
