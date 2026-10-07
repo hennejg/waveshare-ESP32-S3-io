@@ -27,6 +27,10 @@ If `mqtt_topic_prefix` is empty, topics are published without a prefix.
 
 Topics starting with `/` in the API calls bypass the prefix and are used as-is (absolute topics).
 
+Incoming commands are matched on the whole topic, prefix removed: `<prefix>/output/set`
+is the bulk command, `<prefix>/rules/output/set` is not — it reaches the device through
+the rule engine's `rules/#` subscription and is a rule topic, nothing else.
+
 The client reconnects automatically with exponential backoff if the broker becomes unreachable.
 
 ---

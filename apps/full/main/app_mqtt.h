@@ -8,7 +8,9 @@
 typedef void (*app_mqtt_connected_cb_t)(void);
 
 /* Called for each incoming message. topic and data are NOT null-terminated.
-   Runs inside the MQTT task — keep it short, no blocking calls. */
+   The topic is relative: the configured prefix has been stripped, so it is
+   the string a handler subscribed with. Runs inside the MQTT task — keep it
+   short, no blocking calls. */
 typedef void (*app_mqtt_msg_cb_t)(const char *topic, size_t topic_len,
                                    const char *data,  size_t data_len);
 
