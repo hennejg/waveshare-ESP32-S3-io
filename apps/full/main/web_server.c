@@ -6,6 +6,7 @@
 #include "buzzer.h"
 #include "di.h"
 #include "dout.h"
+#include "aux_io.h"
 #include "led.h"
 #ifdef CONFIG_APP_MATTER_ENABLE
 #include "matter.h"
@@ -436,10 +437,20 @@ static esp_err_t api_config_get(httpd_req_t *req)
     /* Inputs from this index on are not optocoupler-isolated. */
     cJSON_AddNumberToObject(root, "di_isolated", APP_CFG_DI_ISOLATED_COUNT);
 #if APP_CFG_DI_AUX_COUNT
-    /* Per auxiliary pin: true = digital input, false = standard function. */
-    cJSON *aux = cJSON_AddArrayToObject(root, "aux_in");
-    for (int a = 0; a < APP_CFG_DI_AUX_COUNT; a++)
-        cJSON_AddItemToArray(aux, cJSON_CreateBool((cfg->aux_in >> a) & 1u));
+    /* The IO1/RXD/TXD pads: mode, the modes this pad offers, and the PWM
+       settings (kept while the pad is in another mode). */
+    cJSON *aux = cJSON_AddArrayToObject(root, "aux");
+    for (int a = 0; a < APP_CFG_DI_AUX_COUNT; a++) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "mode", aux_mode_name((aux_mode_t)cfg->aux_mode[a]));
+        cJSON *modes = cJSON_AddArrayToObject(o, "modes");
+        for (int m = 0; m < AUX_MODE_COUNT; m++)
+            if (aux_mode_allowed((uint8_t)a, (aux_mode_t)m))
+                cJSON_AddItemToArray(modes, cJSON_CreateString(aux_mode_name((aux_mode_t)m)));
+        cJSON_AddNumberToObject(o, "pwm_freq", cfg->aux_pwm[a].freq_hz);
+        cJSON_AddNumberToObject(o, "pwm_duty", cfg->aux_pwm[a].duty_pm / 10.0);
+        cJSON_AddItemToArray(aux, o);
+    }
 #endif
 
     cJSON *dout = cJSON_AddArrayToObject(root, "dout");
@@ -541,17 +552,48 @@ static esp_err_t api_config_post(httpd_req_t *req)
 
     parse_invert_array(cJSON_GetObjectItem(root, "di"),   cfg.di,   APP_CFG_DI_COUNT);
 #if APP_CFG_DI_AUX_COUNT
-    /* Only what is sent changes: a request without aux_in, or with a shorter
-       array, leaves the other pins as they are. */
-    cJSON *aux_j = cJSON_GetObjectItem(root, "aux_in");
+    /* Only what is sent changes: a request without "aux", a shorter array, or
+       an entry without a field leaves the rest as it is. A value outside its
+       range is refused rather than clamped -- a PWM output is driving
+       something, and quietly running it at another frequency or duty than
+       asked is not a safe guess. */
+    const char *aux_err = NULL;
+    cJSON *aux_j = cJSON_GetObjectItem(root, "aux");
     if (cJSON_IsArray(aux_j)) {
         int n = cJSON_GetArraySize(aux_j);
-        for (int a = 0; a < n && a < APP_CFG_DI_AUX_COUNT; a++) {
-            cJSON *v = cJSON_GetArrayItem(aux_j, a);
-            if (!cJSON_IsBool(v)) continue;
-            if (cJSON_IsTrue(v)) cfg.aux_in |=  (uint8_t)(1u << a);
-            else                 cfg.aux_in &= (uint8_t)~(1u << a);
+        for (int a = 0; a < n && a < APP_CFG_DI_AUX_COUNT && !aux_err; a++) {
+            cJSON *o = cJSON_GetArrayItem(aux_j, a);
+            if (!cJSON_IsObject(o)) continue;
+            cJSON *v;
+            if ((v = cJSON_GetObjectItem(o, "mode"))) {
+                aux_mode_t m;
+                if (!cJSON_IsString(v) || !aux_mode_parse(v->valuestring, &m) ||
+                    !aux_mode_allowed((uint8_t)a, m))
+                    aux_err = "aux mode not available on this pad";
+                else
+                    cfg.aux_mode[a] = (uint8_t)m;
+            }
+            if (!aux_err && (v = cJSON_GetObjectItem(o, "pwm_freq"))) {
+                double f = cJSON_IsNumber(v) ? v->valuedouble : -1;
+                if (!(f >= AUX_PWM_FREQ_MIN && f <= AUX_PWM_FREQ_MAX) || f != (double)(uint32_t)f)
+                    aux_err = "pwm_freq must be a whole number of Hz from 5 to 1000000";
+                else
+                    cfg.aux_pwm[a].freq_hz = (uint32_t)f;
+            }
+            if (!aux_err && (v = cJSON_GetObjectItem(o, "pwm_duty"))) {
+                double d = cJSON_IsNumber(v) ? v->valuedouble : -1;
+                if (!(d >= 0.0 && d <= 100.0))
+                    aux_err = "pwm_duty must be a percentage from 0 to 100";
+                else
+                    cfg.aux_pwm[a].duty_pm = (uint16_t)(d * 10.0 + 0.5);
+            }
         }
+    }
+    if (aux_err) {
+        cJSON_Delete(root);
+        char msg[96];
+        snprintf(msg, sizeof(msg), "{\"error\":\"%s\"}", aux_err);
+        return send_json(req, "400 Bad Request", msg);
     }
 #endif
     parse_invert_array(cJSON_GetObjectItem(root, "dout"), cfg.dout, APP_CFG_DO_COUNT);
@@ -782,7 +824,7 @@ static esp_err_t api_config_post(httpd_req_t *req)
        describes the new ones. Everything else on this page needs a reboot,
        which is what the form says; this one does not have to. */
     if (mbm_present) mb_tcp_master_reload();
-    di_set_aux(app_config_get()->aux_in);   /* before di_publish_all() below */
+    aux_io_apply();       /* before di_publish_all() below */
     app_time_apply_tz();  /* timezone first, so a sync that follows computes in it */
     sntp_sync_apply();    /* apply any SNTP server / enable change immediately */
     di_publish_all();
@@ -1148,11 +1190,29 @@ static esp_err_t api_io_state(httpd_req_t *req)
         cJSON_AddItemToArray(di,   cJSON_CreateBool(di_get((uint8_t)i)));
     }
 #if APP_CFG_DI_AUX_COUNT
-    /* Which channels are inputs right now; an auxiliary one in its standard
-       function reads false above without meaning "low". */
+    /* Which channels are inputs right now; an auxiliary one in another mode
+       reads false above without meaning "low". */
     cJSON *act = cJSON_AddArrayToObject(root, "di_active");
     for (int i = 0; i < APP_CFG_DI_COUNT; i++)
         cJSON_AddItemToArray(act, cJSON_CreateBool(di_is_active((uint8_t)i)));
+    /* The pads as they run: PWM as the timer really produces it, analog as
+       read now. */
+    const app_config_t *acfg = app_config_get();
+    cJSON *aux = cJSON_AddArrayToObject(root, "aux");
+    for (int a = 0; a < APP_CFG_DI_AUX_COUNT; a++) {
+        cJSON *o = cJSON_CreateObject();
+        aux_mode_t m = aux_io_mode((uint8_t)a);
+        cJSON_AddStringToObject(o, "mode", aux_mode_name(m));
+        uint32_t f; uint8_t bits; int mv;
+        if (m == AUX_MODE_PWM && aux_io_pwm_info((uint8_t)a, &f, &bits)) {
+            cJSON_AddNumberToObject(o, "pwm_freq", f);
+            cJSON_AddNumberToObject(o, "pwm_duty", acfg->aux_pwm[a].duty_pm / 10.0);
+            cJSON_AddNumberToObject(o, "pwm_bits", bits);
+        } else if (m == AUX_MODE_ANALOG && aux_io_analog_mv((uint8_t)a, &mv) == ESP_OK) {
+            cJSON_AddNumberToObject(o, "mv", mv);
+        }
+        cJSON_AddItemToArray(aux, o);
+    }
 #endif
     for (int i = 0; i < APP_CFG_DO_COUNT; i++) {
         cJSON_AddItemToArray(dout, cJSON_CreateBool(dout_get((uint8_t)i)));

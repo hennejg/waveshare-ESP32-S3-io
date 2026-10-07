@@ -22,12 +22,6 @@ void scripting_on_input_change(uint8_t channel, bool state);
 #include <freertos/task.h>
 #include <freertos/semphr.h>
 #include <esp_log.h>
-#if CONFIG_APP_AUX_DI_ENABLE
-#include <driver/uart.h>
-#include <esp_rom_gpio.h>
-#include <esp_private/esp_gpio_reserve.h>
-#include <soc/gpio_sig_map.h>
-#endif
 
 #define TAG          "di"
 #define NUM_DI       APP_CFG_DI_COUNT
@@ -45,7 +39,7 @@ static const gpio_num_t s_gpios[NUM_DI] = {
 static bool         s_state[NUM_DI];
 static TaskHandle_t s_task;
 /* Which auxiliary pins are inputs, bit i = channel 8+i.  Written under s_mux
-   by di_set_aux() (HTTP task), read by the input task under the same lock. */
+   by di_aux_input(), read by the input task under the same lock. */
 static uint8_t           s_aux;
 static SemaphoreHandle_t s_mux;
 static bool              s_isr_ready;
@@ -156,73 +150,39 @@ static void input_config(gpio_num_t g)
     ESP_ERROR_CHECK(gpio_config(&cfg));
 }
 
-#if CONFIG_APP_AUX_DI_ENABLE
-/* Takes a pin from its standard function. gpio_config() selects the plain
-   GPIO function on the pad, which takes U0TXD off GPIO43; U0RXD is fed a
-   constant high instead of GPIO44, so the UART sees an idle line rather than
-   whatever is wired to the input. The console reserved both pins at boot. */
-static void aux_take(gpio_num_t g)
-{
-    if (g == GPIO_NUM_43 || g == GPIO_NUM_44) esp_gpio_revoke(BIT64(g));
-    if (g == GPIO_NUM_44)
-        esp_rom_gpio_connect_in_signal(GPIO_MATRIX_CONST_ONE_INPUT, U0RXD_IN_IDX, false);
-    input_config(g);
-}
-
-/* Gives a pin back. GPIO1 has no function in this firmware and is left an
-   input with its pull-up, as gpio_reset_pin() leaves every pin; GPIO44/43 go
-   back to UART0 through the IO MUX, which needs no UART driver installed. */
-static void aux_release(gpio_num_t g)
-{
-    if (g == GPIO_NUM_43)
-        uart_set_pin(UART_NUM_0, GPIO_NUM_43, UART_PIN_NO_CHANGE,
-                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    else if (g == GPIO_NUM_44)
-        uart_set_pin(UART_NUM_0, UART_PIN_NO_CHANGE, GPIO_NUM_44,
-                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    else
-        gpio_reset_pin(g);
-}
-#endif
-
-void di_set_aux(uint8_t mask)
+/* The input path of an auxiliary pin, nothing else: aux_io.c decides what
+   the pad is for and has already taken it off UART0 when on is true. */
+void di_aux_input(uint8_t a, bool on)
 {
 #if CONFIG_APP_AUX_DI_ENABLE
-    mask &= (uint8_t)((1u << APP_CFG_DI_AUX_COUNT) - 1u);
-    if (!s_mux) { s_aux = mask; return; }        /* di_init() applies it */
+    if (a >= APP_CFG_DI_AUX_COUNT || !s_mux) return;
+    uint8_t    n = (uint8_t)(APP_CFG_DI_ISOLATED_COUNT + a);
+    gpio_num_t g = s_gpios[n];
 
     xSemaphoreTake(s_mux, portMAX_DELAY);
-    uint8_t changed = (uint8_t)(s_aux ^ mask);
-    for (uint8_t a = 0; a < APP_CFG_DI_AUX_COUNT; a++) {
-        if (!(changed & (1u << a))) continue;
-        uint8_t    n = (uint8_t)(APP_CFG_DI_ISOLATED_COUNT + a);
-        gpio_num_t g = s_gpios[n];
-        if (mask & (1u << a)) {
-            aux_take(g);
-            s_aux |= (uint8_t)(1u << a);
-            s_state[n] = read_pin(n);
-            if (s_isr_ready) {
-                gpio_isr_handler_add(g, gpio_isr, NULL);
-                gpio_set_intr_type(g, GPIO_INTR_ANYEDGE);
-            }
-            ESP_LOGW(TAG, "AUX%u (GPIO%d) is now a NON-ISOLATED input", a + 1, g);
-            notify_one(n, s_state[n]);
-        } else {
-            /* Off the input path first, so nothing reads the pin while it
-               changes hands. */
-            s_aux &= (uint8_t)~(1u << a);
-            if (s_isr_ready) {
-                gpio_set_intr_type(g, GPIO_INTR_DISABLE);
-                gpio_isr_handler_remove(g);
-            }
-            aux_release(g);
-            s_state[n] = false;
-            ESP_LOGI(TAG, "AUX%u (GPIO%d) back to its standard function", a + 1, g);
+    bool was = (s_aux >> a) & 1u;
+    if (on && !was) {
+        input_config(g);
+        s_aux |= (uint8_t)(1u << a);
+        s_state[n] = read_pin(n);
+        if (s_isr_ready) {
+            gpio_isr_handler_add(g, gpio_isr, NULL);
+            gpio_set_intr_type(g, GPIO_INTR_ANYEDGE);
         }
+        notify_one(n, s_state[n]);
+    } else if (!on && was) {
+        /* Off the input path first, so nothing reads the pin while it
+           changes hands. */
+        s_aux &= (uint8_t)~(1u << a);
+        if (s_isr_ready) {
+            gpio_set_intr_type(g, GPIO_INTR_DISABLE);
+            gpio_isr_handler_remove(g);
+        }
+        s_state[n] = false;
     }
     xSemaphoreGive(s_mux);
 #else
-    (void)mask;
+    (void)a; (void)on;
 #endif
 }
 
@@ -235,22 +195,11 @@ esp_err_t di_init(void)
 
     /* Configure GPIOs with interrupts initially disabled to avoid a race
        between gpio_config and gpio_isr_handler_add. Only the isolated inputs
-       here: the auxiliary pins are taken below, and only those selected. */
+       here: aux_io_init() hands over the auxiliary pins set to input. */
     for (uint8_t i = 0; i < APP_CFG_DI_ISOLATED_COUNT; i++) {
         input_config(s_gpios[i]);
         s_state[i] = read_pin(i);
     }
-#if CONFIG_APP_AUX_DI_ENABLE
-    uint8_t want = (uint8_t)(app_config_get()->aux_in & ((1u << APP_CFG_DI_AUX_COUNT) - 1u));
-    for (uint8_t a = 0; a < APP_CFG_DI_AUX_COUNT; a++) {
-        if (!(want & (1u << a))) continue;
-        uint8_t n = (uint8_t)(APP_CFG_DI_ISOLATED_COUNT + a);
-        aux_take(s_gpios[n]);
-        s_state[n] = read_pin(n);
-    }
-    s_aux = want;
-#endif
-
     xTaskCreate(di_task, "di", 4096, NULL, 5, &s_task);
 
     /* Install ISR service (ignore ESP_ERR_INVALID_STATE if already done). */
@@ -272,12 +221,6 @@ esp_err_t di_init(void)
     ESP_LOGI(TAG, "Initialized %d inputs (GPIO%d..GPIO%d)",
              APP_CFG_DI_ISOLATED_COUNT, s_gpios[0],
              s_gpios[APP_CFG_DI_ISOLATED_COUNT - 1]);
-#if CONFIG_APP_AUX_DI_ENABLE
-    for (uint8_t a = 0; a < APP_CFG_DI_AUX_COUNT; a++)
-        if (s_aux & (1u << a))
-            ESP_LOGW(TAG, "AUX%u (GPIO%d) is a NON-ISOLATED input", a + 1,
-                     s_gpios[APP_CFG_DI_ISOLATED_COUNT + a]);
-#endif
     return ESP_OK;
 }
 

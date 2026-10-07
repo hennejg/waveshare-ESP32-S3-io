@@ -652,12 +652,13 @@ rule('my-rule')
     const AUX_GPIO = [1, 44, 43];
     /* Silkscreen names of the same three pads, in channel order. */
     const AUX_PAD  = ['IO1', 'RXD', 'TXD'];
-    /* What each pad does when it is not an input. */
+    /* What each pad does in its standard function, and how a mode reads. */
     const AUX_STD  = ['unused', 'UART0 RX', 'UART0 TX (console)'];
+    const AUX_MODE_LABEL = { input: 'Digital input', pwm: 'PWM output', analog: 'Analog input (0–3.1 V)' };
     const AUX_HEAD = 'Direct GPIO inputs — not isolated';
     const AUX_TXD  = 'TXD (GPIO43) is driven as an output by the ROM bootloader at every reset and while flashing — ' +
                      'wire it through a series resistor of at least 1 kΩ.';
-    let auxIn = null;   /* from /api/config; null = firmware without the switch */
+    let aux = null;     /* cfg.aux from /api/config; null = firmware without the switch */
     const AUX_WARN = 'No optocoupler, no protection: 0–3.3 V logic levels only. ' +
                      'A field voltage destroys the MCU — condition these signals externally.';
     let diCount    = 8;
@@ -692,11 +693,18 @@ rule('my-rule')
         }
         const pin = auxPin(i);
         const a   = i - diIsolated;
-        /* The switch only where the firmware reports one for this pad. */
-        const sel = (a >= 0 && Array.isArray(auxIn) && a < auxIn.length)
-          ? `<br><select id="aux_${a}_mode" style="margin-top:.2rem">` +
-            `<option value="std">Standard: ${AUX_STD[a] ?? 'standard function'}</option>` +
-            `<option value="in">Digital input</option></select>` +
+        /* The switch only where the firmware reports one for this pad, with
+           the modes it reports for it. */
+        const p   = (a >= 0 && Array.isArray(aux)) ? aux[a] : undefined;
+        const sel = p
+          ? `<br><select id="aux_${a}_mode" style="margin-top:.2rem" onchange="auxModeChanged(${a})">` +
+            (p.modes || ['standard']).map(m =>
+              `<option value="${esc(m)}">${m === 'standard'
+                 ? `Standard: ${AUX_STD[a] ?? 'standard function'}` : (AUX_MODE_LABEL[m] ?? esc(m))}</option>`).join('') +
+            `</select>` +
+            `<div id="aux_${a}_pwm" style="margin-top:.2rem">` +
+            `<input type="number" id="aux_${a}_freq" min="5" max="1000000" step="1" style="width:6.5rem"> Hz ` +
+            `<input type="number" id="aux_${a}_duty" min="0" max="100" step="0.1" style="width:4.5rem"> %</div>` +
             (AUX_PAD[a] === 'TXD' ? `<div class="hint err">${AUX_TXD}</div>` : '')
           : '';
         const tr = document.createElement('tr');
@@ -705,9 +713,20 @@ rule('my-rule')
           `<td><input type="text" id="di_${i}_name" maxlength="20" style="width:9rem"></td>` +
           `<td style="text-align:center"><input type="checkbox" id="di_${i}_invert"></td>`;
         diTbl.appendChild(tr);
-        const s = document.getElementById(`aux_${a}_mode`);
-        if (s) s.value = auxIn[a] ? 'in' : 'std';
+        if (p) {
+          document.getElementById(`aux_${a}_mode`).value = p.mode ?? 'standard';
+          document.getElementById(`aux_${a}_freq`).value = p.pwm_freq ?? 1000;
+          document.getElementById(`aux_${a}_duty`).value = p.pwm_duty ?? 0;
+          auxModeChanged(a);
+        }
       }
+    }
+
+    /* Frequency and duty only next to a pad set to PWM. */
+    function auxModeChanged(a) {
+      const box = document.getElementById(`aux_${a}_pwm`);
+      if (box) box.style.display =
+        document.getElementById(`aux_${a}_mode`)?.value === 'pwm' ? '' : 'none';
     }
     buildDiRows();
 
@@ -718,7 +737,7 @@ rule('my-rule')
       diCount    = (cfg.di ?? []).length || 8;
       diIsolated = Number.isInteger(cfg.di_isolated)
                    ? Math.min(cfg.di_isolated, diCount) : 0;
-      auxIn      = Array.isArray(cfg.aux_in) ? cfg.aux_in.map(Boolean) : null;
+      aux        = Array.isArray(cfg.aux) ? cfg.aux : null;
       buildDiRows();
     }
 
@@ -889,9 +908,12 @@ rule('my-rule')
           di,
           dout,
         };
-        if (Array.isArray(auxIn))
-          cfg.aux_in = auxIn.map((_, a) =>
-            document.getElementById(`aux_${a}_mode`)?.value === 'in');
+        if (Array.isArray(aux))
+          cfg.aux = aux.map((_, a) => ({
+            mode:     document.getElementById(`aux_${a}_mode`).value,
+            pwm_freq: Number(document.getElementById(`aux_${a}_freq`).value),
+            pwm_duty: Number(document.getElementById(`aux_${a}_duty`).value),
+          }));
         const r = await apiFetch('/api/config', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1248,7 +1270,7 @@ rule('my-rule')
                                     : `${n} — ${pin}, not isolated`;
         diG.insertAdjacentHTML('beforeend',
           `<div class="io-cell"><span id="di-dot-${i}" class="io-dot" title="${t}"></span>` +
-          `<span class="io-lbl" title="${t}">${n}</span></div>`);
+          `<span class="io-lbl" title="${t}">${n}<span id="aux-val-${i}" class="hint"></span></span></div>`);
       }
       for (let i = 0; i < 8; i++) {
         const n = esc(cfg.dout?.[i]?.name || `DO${i + 1}`);
@@ -1284,13 +1306,20 @@ rule('my-rule')
         const d = await r.json();
         (d.di   || []).forEach((v, i) => {
           const el = document.getElementById(`di-dot-${i}`);
-          /* A pad in its standard function is not an input: no level to show. */
+          /* A pad that is not an input has no level to show; say what it does. */
           const off = Array.isArray(d.di_active) && d.di_active[i] === false;
+          const p   = Array.isArray(d.aux) ? d.aux[i - diIsolated] : undefined;
           if (el) {
             el.className = 'io-dot' + (v ? ' on' : '');
             el.style.opacity = off ? '.25' : '';
-            if (off) el.title = 'standard function — not used as an input';
+            if (off) el.title = p?.mode === 'pwm' ? 'PWM output' : p?.mode === 'analog'
+                              ? 'analog input' : 'standard function — not used as an input';
           }
+          const val = document.getElementById(`aux-val-${i}`);
+          if (val) val.textContent =
+              p?.mode === 'pwm'    ? ` PWM ${p.pwm_duty} % @ ${p.pwm_freq} Hz`
+            : p?.mode === 'analog' ? ` ${p.mv} mV`
+            : '';
         });
         (d.dout || []).forEach((v, i) => {
           const el = document.getElementById(`do-btn-${i}`);

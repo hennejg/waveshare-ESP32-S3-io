@@ -238,18 +238,35 @@ Status mode all LED commands from MQTT, Modbus, and CAN are ignored.
 
 > Switched per pin in the web UI. Every pin starts in its **standard function**.
 
-The **IO1, RXD and TXD** pads (GPIO1, GPIO44, GPIO43) can each be used either in their standard function or as a
-further digital input. The choice is made per pin on the *Inputs* tab, or with `"aux_in": [true, false, false]` in
-`POST /api/config`, and takes effect on saving, without a reboot. As inputs they show up as **AUX1–AUX3** behind the
-eight isolated ones and occupy DI indices 8, 9 and 10.
+The **IO1, RXD and TXD** pads (GPIO1, GPIO44, GPIO43) can each be put in their standard function, used as a digital
+input, or driven as a PWM output; IO1 can also be an analog input. The choice is made per pin on the *Inputs* tab, or
+with `"aux"` in `POST /api/config`, and takes effect on saving, without a reboot. As inputs they show up as
+**AUX1–AUX3** behind the eight isolated ones and occupy DI indices 8, 9 and 10.
 
-| Pad | GPIO | Standard function                         | As input |
-|-----|------|-------------------------------------------|----------|
-| IO1 | 1    | unused by this firmware                   | AUX1     |
-| RXD | 44   | UART0 RX                                  | AUX2     |
-| TXD | 43   | UART0 TX — the serial console             | AUX3     |
+| Pad | GPIO | Standard function             | Modes                                     |
+|-----|------|-------------------------------|-------------------------------------------|
+| IO1 | 1    | unused by this firmware       | input (AUX1), PWM output, analog input    |
+| RXD | 44   | UART0 RX                      | input (AUX2), PWM output                  |
+| TXD | 43   | UART0 TX — the serial console | input (AUX3), PWM output                  |
 
-A pad switched to input is taken off UART0. The console carries on over USB-Serial/JTAG; on UART0 it no longer
+```json
+"aux": [
+  { "mode": "analog" },
+  { "mode": "pwm", "pwm_freq": 1000, "pwm_duty": 25.0 },
+  { "mode": "standard" }
+]
+```
+
+- **PWM**: 5 Hz to 1 MHz, duty 0–100 % in steps of 0.1 %. Each pad has its own timer, so the three frequencies are
+  independent. The duty resolution follows from the frequency: 14 bits up to about 4.9 kHz, fewer above — 6 bits
+  at 1 MHz. `/api/io/state` reports the frequency the timer really produces and the resolution in bits. The output
+  is a 3.3 V logic signal straight from the MCU, a few milliamperes at most: drive a MOSFET, an LED driver or a
+  0–10 V converter from it, never a load.
+- **Analog** (IO1 only, ADC1 channel 0): 0 to about 3.1 V, calibrated from eFuse, averaged over 16 conversions,
+  reported in millivolts in `/api/io/state`. Divide larger voltages down externally.
+- Not on MQTT yet: PWM and analog are set and read through the web UI and REST API only.
+
+A pad in any mode other than its standard function is taken off UART0. The console carries on over USB-Serial/JTAG; on UART0 it no longer
 reaches the pin until the pad is switched back. A channel in its standard function reads `false`, is not published,
 and `/api/io/state` marks it in `di_active`.
 

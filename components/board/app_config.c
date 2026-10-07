@@ -1,4 +1,5 @@
 #include "app_config.h"
+#include "aux_io.h"
 #include <string.h>
 #include <math.h>
 #include <nvs_flash.h>
@@ -26,7 +27,9 @@ _Static_assert(sizeof(app_config_t) < 2600,
 #define K_DOUT_CFG      "dout_cfg"
 #define K_MODBUS_CFG    "mb_cfg"
 #define K_LED_MODE      "led_mode"
-#define K_AUX_IN        "aux_in"
+#define K_AUX_IN        "aux_in"     /* older bitmask, read once to migrate */
+#define K_AUX_MODE      "aux_mode"
+#define K_AUX_PWM       "aux_pwm"
 #define K_CAN_CFG       "can_cfg"
 #define K_SNTP_CFG      "sntp_cfg"
 #define K_MBM_CFG       "mbm_cfg"
@@ -55,6 +58,7 @@ static app_config_t s_cfg = {
     /* No entries by default: an empty table starts no task and opens no
        connection. */
     .tz     = "",   /* empty = UTC */
+    .aux_pwm = { { .freq_hz = 1000 }, { .freq_hz = 1000 }, { .freq_hz = 1000 } },
 };
 
 #define NVS_GET_STR(h, key, dst) \
@@ -63,6 +67,19 @@ static app_config_t s_cfg = {
 /* A blob written before a field existed reads it as zero, and a blob written
    by a hand-edited request can hold a value outside its range. Settled here,
    once, after loading: every reader then takes the structure as it is. */
+/* Pad modes and PWM settings outside their range -- an older firmware's
+   blob, a hand-made request -- fall back to the safe value. */
+static void aux_normalize(app_config_t *c)
+{
+    for (int a = 0; a < 3; a++) {
+        aux_mode_t m = (aux_mode_t)c->aux_mode[a];
+        if (!aux_mode_allowed((uint8_t)a, m)) c->aux_mode[a] = AUX_MODE_STANDARD;
+        if (c->aux_pwm[a].freq_hz < AUX_PWM_FREQ_MIN || c->aux_pwm[a].freq_hz > AUX_PWM_FREQ_MAX)
+            c->aux_pwm[a].freq_hz = AUX_PWM_FREQ_DEFAULT;
+        if (c->aux_pwm[a].duty_pm > AUX_PWM_DUTY_MAX) c->aux_pwm[a].duty_pm = 0;
+    }
+}
+
 static void modbus_normalize(app_config_t *c)
 {
     if (c->modbus.tcp_uid < MB_UID_MIN || c->modbus.tcp_uid > MB_UID_MAX)
@@ -108,9 +125,15 @@ esp_err_t app_config_init(void)
     uint8_t led_mode_val = 0;
     nvs_get_u8(h, K_LED_MODE, &led_mode_val);
     s_cfg.led_mode = led_mode_val;
-    uint8_t aux_in_val = 0;
-    nvs_get_u8(h, K_AUX_IN, &aux_in_val);
-    s_cfg.aux_in = aux_in_val & 0x07u;
+    sz = sizeof(s_cfg.aux_mode);
+    if (nvs_get_blob(h, K_AUX_MODE, s_cfg.aux_mode, &sz) != ESP_OK) {
+        /* The first version of the pad switch stored inputs as a bitmask. */
+        uint8_t aux_in_val = 0;
+        nvs_get_u8(h, K_AUX_IN, &aux_in_val);
+        for (int a = 0; a < 3; a++) s_cfg.aux_mode[a] = (aux_in_val >> a) & 1u;   /* 1 = input */
+    }
+    sz = sizeof(s_cfg.aux_pwm);
+    nvs_get_blob(h, K_AUX_PWM, s_cfg.aux_pwm, &sz);
     sz = sizeof(s_cfg.can);
     nvs_get_blob(h, K_CAN_CFG, &s_cfg.can, &sz);
     sz = sizeof(s_cfg.sntp);
@@ -120,6 +143,7 @@ esp_err_t app_config_init(void)
 
     nvs_close(h);
     modbus_normalize(&s_cfg);
+    aux_normalize(&s_cfg);
     return ESP_OK;
 }
 
@@ -160,7 +184,8 @@ esp_err_t app_config_update(const app_config_t *cfg)
     PUT(nvs_set_blob(h, K_DOUT_CFG,   cfg->dout, sizeof(cfg->dout)));
     PUT(nvs_set_blob(h, K_MODBUS_CFG, &cfg->modbus, sizeof(cfg->modbus)));
     PUT(nvs_set_u8(h, K_LED_MODE,     cfg->led_mode));
-    PUT(nvs_set_u8(h, K_AUX_IN,       cfg->aux_in));
+    PUT(nvs_set_blob(h, K_AUX_MODE,   cfg->aux_mode, sizeof(cfg->aux_mode)));
+    PUT(nvs_set_blob(h, K_AUX_PWM,    cfg->aux_pwm,  sizeof(cfg->aux_pwm)));
     PUT(nvs_set_blob(h, K_CAN_CFG,    &cfg->can, sizeof(cfg->can)));
     PUT(nvs_set_blob(h, K_SNTP_CFG,   &cfg->sntp, sizeof(cfg->sntp)));
     PUT(nvs_set_blob(h, K_MBM_CFG,    cfg->mbm, sizeof(cfg->mbm)));

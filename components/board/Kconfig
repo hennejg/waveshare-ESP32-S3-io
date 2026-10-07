@@ -16,21 +16,23 @@ config APP_SNTP_ENABLE
         accurate local time (e.g. Matter-only builds).
 
 config APP_AUX_DI_ENABLE
-    bool "Offer GPIO1, GPIO44 and GPIO43 as extra NON-ISOLATED digital inputs"
+    bool "Offer GPIO1, GPIO44 and GPIO43 as NON-ISOLATED inputs, PWM and analog"
     depends on !APP_MATTER_ENABLE
     default y
     help
         Lets each of the three header pins IO1, RXD and TXD (GPIO1, GPIO44,
-        GPIO43) be switched between its standard function and a digital input,
-        per pin, in the web UI (Inputs tab) or with "aux_in" in /api/config.
-        The change takes effect on saving; no reboot.  Every pin starts in its
-        standard function, so a board that never touches the setting behaves
-        as it did without this option.
+        GPIO43) be switched, per pin, in the web UI (Inputs tab) or with "aux"
+        in /api/config: standard function, digital input, or PWM output with
+        its own frequency (5 Hz .. 1 MHz) and duty cycle; GPIO1 also as analog
+        input (ADC1 channel 0, 0..3.1 V).  The change takes effect on saving;
+        no reboot.  Every pin starts in its standard function, so a board that
+        never touches the setting behaves as it did without this option.
 
         Standard function: GPIO1 is left alone (this firmware does not use it);
         GPIO44 and GPIO43 are UART0 RX and TX, which is where the console is.
-        As an input, the pin is taken off UART0 -- the console keeps running
-        on USB-Serial/JTAG, and on UART0 it simply no longer reaches the pin.
+        In any other mode the pin is taken off UART0 -- the console keeps
+        running on USB-Serial/JTAG, and on UART0 it simply no longer reaches
+        the pin.
 
         The channels are AUX1, AUX2 and AUX3, channels 8..10 of the DI array
         behind the eight isolated ones.  A channel in its standard function

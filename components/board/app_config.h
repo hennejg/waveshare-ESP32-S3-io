@@ -119,9 +119,8 @@ typedef struct {
     di_config_t  dout[APP_CFG_DO_COUNT];
 
     uint8_t led_mode;    /* LED_MODE_IO or LED_MODE_STATUS */
-    uint8_t aux_in;      /* bit i: AUX(i+1) is an input, else its standard
-                            function (APP_AUX_DI_ENABLE); 0 by default */
-    uint8_t _led_pad[2];
+    uint8_t aux_mode[3]; /* IO1/RXD/TXD pads: aux_mode_t, see aux_io.h
+                            (APP_AUX_DI_ENABLE); 0 = standard function */
 
     /* CAN bus */
     struct {
@@ -169,6 +168,13 @@ typedef struct {
     /* POSIX TZ string for local time (cron + UI display). Empty = UTC.
        e.g. "CET-1CEST,M3.5.0,M10.5.0/3" for Europe/Berlin. */
     char tz[APP_CFG_TZ_LEN];
+
+    /* PWM of the IO1/RXD/TXD pads, used while aux_mode is pwm. */
+    struct {
+        uint32_t freq_hz;   /* AUX_PWM_FREQ_MIN..AUX_PWM_FREQ_MAX */
+        uint16_t duty_pm;   /* tenths of a percent, 0..1000       */
+        uint16_t _pad;
+    } aux_pwm[3];
 } app_config_t;
 
 esp_err_t           app_config_init(void);

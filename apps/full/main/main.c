@@ -20,6 +20,7 @@
 #include "buzzer.h"
 #include "di.h"
 #include "dout.h"
+#include "aux_io.h"
 #include "eth.h"
 #include "led.h"
 #include "can_server.h"
@@ -258,6 +259,11 @@ void app_main(void)
     ESP_ERROR_CHECK(auth_init());
     button_init();
     ESP_ERROR_CHECK(di_init());
+    /* After di_init(): a pad set to input joins the input path. Not fatal --
+       a pad that cannot take its mode is left in its standard function. */
+    esp_err_t aux_ret = aux_io_init();
+    if (aux_ret != ESP_OK)
+        ESP_LOGE(TAG, "IO1/RXD/TXD pads: %s", esp_err_to_name(aux_ret));
     ESP_ERROR_CHECK(dout_init());
 
     /* RTC: seed the system clock from the battery-backed PCF85063 if its stored time
