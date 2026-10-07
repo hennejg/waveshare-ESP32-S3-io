@@ -27,9 +27,44 @@
 #define CHUNK_SIZE  4096
 #define BODY_MAX    2048
 
+/* Longest password whose HTTP Basic header still fits check_auth()'s 160-byte
+   buffer: "Basic " + base64(":" + password) must stay within 159 characters,
+   which 113 does at 158 and 114 exceeds at 162. Same figure as in apps/full. */
+#define APP_CFG_PASSWORD_MAX 113
+
+/* Total time a request body may take to arrive. */
+#define BODY_RECV_TIMEOUT_MS 5000
+
 static httpd_handle_t s_server = NULL;
 
 /* ------------------------------------------------------------------ helpers */
+
+/* Reads the whole body, as many socket reads as that takes. httpd_req_recv()
+   returns what one read delivered, which is less than content_len whenever
+   the body arrives in more than one segment -- and parsing that as JSON
+   failed valid configuration and password requests at random. Same helper
+   as in apps/full, with the same absolute deadline: a client that dribbles
+   one byte at a time must not hold the server's single handler task open. */
+static int recv_body(httpd_req_t *req, char *buf, size_t cap)
+{
+    size_t want = req->content_len;
+    if (want > cap) return -1;
+
+    const int64_t deadline = esp_timer_get_time() + (int64_t)BODY_RECV_TIMEOUT_MS * 1000;
+    size_t got = 0;
+    while (got < want) {
+        int r = httpd_req_recv(req, buf + got, want - got);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            if (esp_timer_get_time() >= deadline) return -1;
+            continue;
+        }
+        if (r <= 0) return -1;
+        got += (size_t)r;
+        if (esp_timer_get_time() >= deadline && got < want) return -1;
+    }
+    buf[got] = '\0';
+    return (int)got;
+}
 
 static const char *mime_type(const char *path)
 {
@@ -198,9 +233,8 @@ static esp_err_t api_auth_set_password(httpd_req_t *req)
     }
     char *body = malloc(req->content_len + 1);
     if (!body) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_OK; }
-    int n = httpd_req_recv(req, body, req->content_len);
-    if (n <= 0) { free(body); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
-    body[n] = '\0';
+    int n = recv_body(req, body, req->content_len);
+    if (n < 0) { free(body); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
     cJSON *root = cJSON_Parse(body);
     free(body);
@@ -215,14 +249,19 @@ static esp_err_t api_auth_set_password(httpd_req_t *req)
         return ESP_OK;
     }
 
-    if (!auth_token_consume(token_j->valuestring)) {
+    /* Check the password before spending the token. It is single use and only
+       obtainable by pressing the button on the device, so rejecting the input
+       afterwards would send the user back to the hardware for a typo.
+
+       The Basic-auth parser reads the header into a 160-byte buffer, so a
+       password that cannot fit there could be set and would then lock the user
+       out of the very API that set it -- see APP_CFG_PASSWORD_MAX. */
+    if (strlen(pw_j->valuestring) > APP_CFG_PASSWORD_MAX) {
         cJSON_Delete(root);
-        httpd_resp_set_status(req, "403 Forbidden");
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, "{\"error\":\"invalid_token\"}");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "password too long (max 113 characters)");
         return ESP_OK;
     }
-
     if (strlen(pw_j->valuestring) < 8) {
         cJSON_Delete(root);
         httpd_resp_set_status(req, "400 Bad Request");
@@ -231,8 +270,24 @@ static esp_err_t api_auth_set_password(httpd_req_t *req)
         return ESP_OK;
     }
 
-    auth_set_password(pw_j->valuestring);
+    if (!auth_token_consume(token_j->valuestring)) {
+        cJSON_Delete(root);
+        httpd_resp_set_status(req, "403 Forbidden");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"invalid_token\"}");
+        return ESP_OK;
+    }
+
+    esp_err_t set_ret = auth_set_password(pw_j->valuestring);
     cJSON_Delete(root);
+    if (set_ret != ESP_OK) {
+        /* The token is spent either way; say what happened rather than
+           reporting a protection the flash does not have. */
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"password could not be stored\"}");
+        return ESP_OK;
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
     return ESP_OK;
@@ -284,13 +339,12 @@ static esp_err_t api_config_post(httpd_req_t *req)
     char *body = malloc(req->content_len + 1);
     if (!body) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_OK; }
 
-    int received = httpd_req_recv(req, body, req->content_len);
-    if (received <= 0) {
+    int received = recv_body(req, body, req->content_len);
+    if (received < 0) {
         free(body);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv failed");
         return ESP_OK;
     }
-    body[received] = '\0';
 
     cJSON *root = cJSON_Parse(body);
     free(body);
@@ -320,7 +374,12 @@ static esp_err_t api_config_post(httpd_req_t *req)
         return ESP_OK;
     }
 
-    app_config_update(&cfg);
+    if (app_config_update(&cfg) != ESP_OK) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"error\":\"configuration could not be stored\"}");
+        return ESP_OK;
+    }
     matter_set_node_label(cfg.device_name);
 
     httpd_resp_set_type(req, "application/json");
@@ -484,9 +543,8 @@ static esp_err_t api_io_output(httpd_req_t *req)
         return ESP_OK;
     }
     char body[65];
-    int n = httpd_req_recv(req, body, req->content_len);
-    if (n <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
-    body[n] = '\0';
+    int n = recv_body(req, body, sizeof(body) - 1);
+    if (n < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
     cJSON *root = cJSON_Parse(body);
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
@@ -527,9 +585,8 @@ static esp_err_t api_io_led(httpd_req_t *req)
         return ESP_OK;
     }
     char body[65];
-    int n = httpd_req_recv(req, body, req->content_len);
-    if (n <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
-    body[n] = '\0';
+    int n = recv_body(req, body, sizeof(body) - 1);
+    if (n < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
     cJSON *root = cJSON_Parse(body);
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }

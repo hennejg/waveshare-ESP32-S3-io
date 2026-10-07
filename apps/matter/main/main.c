@@ -20,7 +20,8 @@
 
 #define TAG "main"
 
-static bool s_eth_connected = false;
+static bool s_eth_connected  = false;
+static bool s_wifi_connected = false;
 static bool is_eth_connected(void) { return s_eth_connected; }
 
 static void on_network_ready(void)
@@ -37,7 +38,17 @@ static void on_eth_ready(void)
 
 static void on_ip_lost(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
-    if (id == IP_EVENT_ETH_LOST_IP) s_eth_connected = false;
+    if (id == IP_EVENT_ETH_LOST_IP) s_eth_connected  = false;
+    if (id == IP_EVENT_STA_LOST_IP) s_wifi_connected = false;
+
+    /* The web server listens on INADDR_ANY and is shared by both interfaces.
+       Stopping it whenever either one lost its address took the Ethernet UI
+       down when WiFi dropped -- and nothing brought it back: the Ethernet
+       link never produces a new Got-IP event, and the WiFi one was ignored
+       while Ethernet counted as connected. Only stop once no usable
+       interface is left. Same rule as in apps/full. */
+    if (s_eth_connected || s_wifi_connected) return;
+
     led_status_set_network(false);
     web_server_stop();
 }
@@ -45,8 +56,8 @@ static void on_ip_lost(void *arg, esp_event_base_t base, int32_t id, void *data)
 static void on_matter_wifi_got_ip(void *arg, esp_event_base_t base,
                                    int32_t id, void *data)
 {
-    if (!s_eth_connected)
-        on_network_ready();
+    s_wifi_connected = true;
+    on_network_ready();          /* web_server_start() is idempotent */
 }
 
 static void on_wifi_ap(void *arg, esp_event_base_t base, int32_t id, void *data)
