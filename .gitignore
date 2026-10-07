@@ -17,3 +17,5 @@ dependencies.lock
 /test/host/test_mb_poller.c
 /test/host/test_mb_master
 /test/host/test_mb_master.c
+/test/host/test_mb_dns
+/test/host/test_mb_dns.c

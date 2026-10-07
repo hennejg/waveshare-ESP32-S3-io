@@ -236,6 +236,12 @@ esp_err_t dout_set(uint8_t n, bool state)
     return dout_modify(state ? bit : 0u, state ? 0u : bit, 0u);
 }
 
+esp_err_t dout_toggle(uint8_t n)
+{
+    if (n >= NUM_DO) return ESP_ERR_INVALID_ARG;
+    return dout_modify(0u, 0u, (uint8_t)(1u << n));
+}
+
 esp_err_t dout_publish_all(void)
 {
     dout_lock();
@@ -333,7 +339,7 @@ void dout_on_mqtt_message(const char *topic, size_t tlen,
             size_t clen = strlen(cmd);
             if (tlen == clen && memcmp(topic, cmd, clen) == 0) {
                 bool state;
-                if (parse_toggle(data, dlen))              dout_modify(0u, 0u, (uint8_t)(1u << i));
+                if (parse_toggle(data, dlen))              dout_toggle(i);
                 else if (parse_payload(data, dlen, &state)) dout_set(i, state);
                 else ESP_LOGW(TAG, "Unrecognised payload for %s", cmd);
                 return;

@@ -221,6 +221,7 @@ function _dout_set(ch, v) {
   if (was !== doutState[ch])
     logMsg('do', '↑', 'DO' + ch + ' → ' + (doutState[ch] ? 'ON' : 'OFF'));
 }
+function _dout_toggle(ch) { _dout_set(ch, !doutState[ch]); }
 function print() {
   logConsole('print', Array.prototype.slice.call(arguments).join(' '));
 }

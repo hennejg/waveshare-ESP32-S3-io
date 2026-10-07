@@ -58,8 +58,8 @@
 #define MB_TCP_MAX_CONN       NET_SOCK_MB_CONN
 
 /* Room for a burst of connections to wait while the poller is busy elsewhere;
-   they cost a PCB each, not a slot. */
-#define MB_TCP_BACKLOG        (2 * MB_TCP_MAX_CONN)
+   they cost a TCP PCB each, not a socket -- net_budget.h counts both. */
+#define MB_TCP_BACKLOG        NET_BACKLOG_MB
 
 #define MBAP_HDR              (MB_MBAP_LEN - 1)   /* the part before uid */
 #define FRAME_MAX             (MB_MBAP_LEN + MB_PDU_MAX)

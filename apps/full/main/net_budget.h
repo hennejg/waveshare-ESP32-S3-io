@@ -38,6 +38,30 @@
    everything above -- can be up at the same time. */
 #define NET_SOCK_PORTAL          3
 
+/* Listen backlogs. A connection lwIP has completed but the application has
+   not yet accepted holds no socket -- that is taken by accept() -- but it
+   does hold a TCP PCB, and those are limited too (below). lwIP queues at most
+   CONFIG_LWIP_TCP_ACCEPTMBOX_SIZE of them per listener whatever the backlog
+   says; the rest are aborted. */
+#define NET_BACKLOG_MB          16   /* listen() in mb_tcp_server.c          */
+#define NET_BACKLOG_HTTPD        5   /* HTTPD_DEFAULT_CONFIG's backlog_conn  */
+#define NET_BACKLOG_PORTAL       4   /* listen() in wifi_config.c            */
+#define NET_PENDING(b) ((b) < CONFIG_LWIP_TCP_ACCEPTMBOX_SIZE ? (b) : CONFIG_LWIP_TCP_ACCEPTMBOX_SIZE)
+
+/* TCP connections, as opposed to sockets: lwIP refuses a PCB past
+   CONFIG_LWIP_MAX_ACTIVE_TCP, and before refusing it kills the oldest
+   connection of lower priority -- an established Modbus or MQTT connection
+   dropped to make room for a new one. Listening PCBs are counted apart, and
+   one in TIME_WAIT is reclaimed first, so neither is in this sum. */
+#define NET_TCP_ACTIVE (NET_SOCK_HTTPD_CLIENTS + NET_SOCK_MQTT +                  \
+                        NET_SOCK_MB_CONN + NET_SOCK_MB_REFUSE + NET_SOCK_MB_MASTER + \
+                        1 /* the portal's one client */ +                          \
+                        NET_PENDING(NET_BACKLOG_MB) + NET_PENDING(NET_BACKLOG_HTTPD) + \
+                        NET_PENDING(NET_BACKLOG_PORTAL))
+
+_Static_assert(NET_TCP_ACTIVE <= CONFIG_LWIP_MAX_ACTIVE_TCP,
+               "net_budget.h hands out more TCP connections than CONFIG_LWIP_MAX_ACTIVE_TCP has");
+
 _Static_assert(NET_SOCK_HTTPD + NET_SOCK_MQTT + NET_SOCK_SNTP +
                NET_SOCK_MB_LISTEN + NET_SOCK_MB_CONN + NET_SOCK_MB_REFUSE +
                NET_SOCK_MB_MASTER + NET_SOCK_PORTAL

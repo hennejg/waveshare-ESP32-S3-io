@@ -9,6 +9,7 @@
 typedef bool      (*scripting_di_get_fn_t)(uint8_t ch);
 typedef esp_err_t (*scripting_dout_set_fn_t)(uint8_t ch, bool state);
 typedef bool      (*scripting_dout_get_fn_t)(uint8_t ch);
+typedef esp_err_t (*scripting_dout_toggle_fn_t)(uint8_t ch);   /* atomic flip */
 typedef int       (*scripting_mqtt_subscribe_fn_t)(const char *topic, int qos);
 typedef int       (*scripting_mqtt_publish_fn_t)(const char *topic, const char *payload, int len, int qos, bool retain);
 typedef esp_err_t (*scripting_led_set_fn_t)(uint8_t r, uint8_t g, uint8_t b);
@@ -18,6 +19,7 @@ typedef struct {
     scripting_di_get_fn_t         di_get;
     scripting_dout_set_fn_t       dout_set;
     scripting_dout_get_fn_t       dout_get;
+    scripting_dout_toggle_fn_t    dout_toggle;
     scripting_mqtt_subscribe_fn_t mqtt_subscribe;
     scripting_mqtt_publish_fn_t   mqtt_publish;
     scripting_led_set_fn_t        led_set;      /* drive the RGB LED (IO mode only) */

@@ -123,9 +123,11 @@ function _emit(factKey) {
 
 // Drive an output through the host binding; emit only on an actual change, and only
 // when some rule is watching outputs (keeps the common no-watcher case free of cost).
+// v === null flips the output in one host call, under the output lock;
+// reading it here and setting the opposite lost one of two concurrent toggles.
 function _drive_output(ch, v) {
     var before = _dout_get(ch);
-    _dout_set(ch, v);
+    if (v === null) _dout_toggle(ch); else _dout_set(ch, v);
     var after = _dout_get(ch);
     if (after !== before && _watchOutputs) _emit('output:' + ch);
     return after;
@@ -247,7 +249,7 @@ function OutputCondition(ch) {
 OutputCondition.prototype.set    = function(v) { return _drive_output(this.channel, !!v); };
 OutputCondition.prototype.on     = function()  { return _drive_output(this.channel, true); };
 OutputCondition.prototype.off    = function()  { return _drive_output(this.channel, false); };
-OutputCondition.prototype.toggle = function()  { return _drive_output(this.channel, !_dout_get(this.channel)); };
+OutputCondition.prototype.toggle = function()  { return _drive_output(this.channel, null); };
 OutputCondition.prototype.get    = function()  { return _dout_get(this.channel); };
 Object.defineProperty(OutputCondition.prototype, 'value', {
     get: function() { return _dout_get(this.channel); }

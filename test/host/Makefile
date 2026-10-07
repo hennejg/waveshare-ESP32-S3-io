@@ -9,8 +9,8 @@ CFLAGS := -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 PORT ?= 15020
 
-.PHONY: all clean client poller master
-all: test_mb_pdu client poller master
+.PHONY: all clean client poller master dns
+all: test_mb_pdu client poller master dns
 	./test_mb_pdu
 
 # The firmware's framing against a Modbus TCP server written independently of
@@ -32,6 +32,14 @@ test_mb_master: gen_master_test.py $(MAIN)/mb_tcp_master.c ../../components/boar
 	python3 gen_master_test.py
 	$(CC) $(CFLAGS) -I../../components/board -Istubs test_mb_master.c -o $@
 
+# The Modbus master's name cache and connection pick, cut out of the real source.
+dns: test_mb_dns
+	./test_mb_dns
+
+test_mb_dns: gen_dns_test.py $(MAIN)/mb_tcp_master.c $(MAIN)/net_budget.h ../../components/board/app_config.h
+	python3 gen_dns_test.py
+	$(CC) $(CFLAGS) -I../../components/board -Istubs test_mb_dns.c -o $@
+
 # The TCP server's receive path, cut out of the real source by the generator
 # so the test cannot drift away from the code.
 poller: test_mb_poller
@@ -49,4 +57,5 @@ test_mb_pdu: test_mb_pdu.c $(MAIN)/mb_pdu.c $(MAIN)/mb_pdu.h $(MAIN)/mb_request.
 
 clean:
 	rm -rf test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c \
-	       test_mb_master test_mb_master.c *.dSYM
+	       test_mb_master test_mb_master.c \
+	       test_mb_dns test_mb_dns.c *.dSYM

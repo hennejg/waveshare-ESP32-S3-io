@@ -30,6 +30,10 @@ esp_err_t dout_modify(uint8_t set, uint8_t clear, uint8_t toggle);
    Shorthand for dout_modify() on a single channel. */
 esp_err_t dout_set(uint8_t n, bool state);
 
+/* Flips output n in one step under the output lock. Reading dout_get() and
+   setting the opposite loses one of two toggles that arrive together. */
+esp_err_t dout_toggle(uint8_t n);
+
 /* Re-apply current logical states to hardware (e.g. after invert config
    change) and publish all states. */
 /* Re-apply the logical state to the chip and publish it. Returns the result of

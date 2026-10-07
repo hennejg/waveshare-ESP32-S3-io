@@ -27,6 +27,18 @@ static JSValue js_dout_set(JSContext *ctx, JSValue this_val, int argc, JSValue *
     return JS_UNDEFINED;
 }
 
+static JSValue js_dout_toggle(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
+{
+    int32_t ch;
+    if (JS_ToInt32(ctx, &ch, argv[0]) < 0) return JS_EXCEPTION;
+    if (ch < 0 || ch > 7)
+        return JS_ThrowRangeError(ctx, "output channel must be 0-7");
+    esp_err_t err = g_scripting_io->dout_toggle((uint8_t)ch);
+    if (err != ESP_OK)
+        return JS_ThrowInternalError(ctx, "dout_toggle failed: %d", (int)err);
+    return JS_UNDEFINED;
+}
+
 static JSValue js_dout_get(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
 {
     int32_t ch;
@@ -118,6 +130,7 @@ void scripting_register_bindings(JSContext *ctx)
     JS_SetPropertyStr(ctx, g, "_di_get",       JS_NewCFunction(ctx, js_di_get,       "_di_get",       1));
     JS_SetPropertyStr(ctx, g, "_dout_set",     JS_NewCFunction(ctx, js_dout_set,     "_dout_set",     2));
     JS_SetPropertyStr(ctx, g, "_dout_get",     JS_NewCFunction(ctx, js_dout_get,     "_dout_get",     1));
+    JS_SetPropertyStr(ctx, g, "_dout_toggle",  JS_NewCFunction(ctx, js_dout_toggle,  "_dout_toggle",  1));
     JS_SetPropertyStr(ctx, g, "_led_set",      JS_NewCFunction(ctx, js_led_set,      "_led_set",      3));
     JS_SetPropertyStr(ctx, g, "_buzzer_set",   JS_NewCFunction(ctx, js_buzzer_set,   "_buzzer_set",   1));
     JS_SetPropertyStr(ctx, g, "_mqtt_publish", JS_NewCFunction(ctx, js_mqtt_publish, "_mqtt_publish", 4));

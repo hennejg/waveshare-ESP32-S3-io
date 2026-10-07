@@ -33,6 +33,8 @@
 #include "app_rtc.h"
 #include "sntp_sync.h"
 #include <sys/time.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #define TAG          "main"
 
@@ -52,6 +54,7 @@ static const scripting_io_t s_scripting_io = {
     .di_get         = di_get,
     .dout_set       = dout_set,
     .dout_get       = dout_get,
+    .dout_toggle    = dout_toggle,
     .mqtt_subscribe = app_mqtt_subscribe,
     .mqtt_publish   = app_mqtt_publish,
     .led_set        = led_set_rgb,      /* effective in IO mode (no-op in status mode) */
@@ -126,8 +129,17 @@ static void on_mqtt_publish(void) { led_status_flash_tx(); }
 
 /* ------------------------------------------------- network callbacks */
 
+/* on_network_ready() runs once per interface, and the two arrive on
+   different tasks: WiFi from the wifi-bootstrap timer, Ethernet from the
+   event loop. Every start function below checks "already running" and then
+   starts, which only holds if no second caller can get between the two --
+   with both links coming up together at boot, two Modbus TCP pollers ran on
+   one set of slots. Serialised here, once, for all of them. */
+static SemaphoreHandle_t s_net_ready_mux;
+
 static void on_network_ready(const char *iface)
 {
+    if (s_net_ready_mux) xSemaphoreTake(s_net_ready_mux, portMAX_DELAY);
     ESP_LOGI(TAG, "%s connected — starting services", iface);
     led_status_set_network(true);
     esp_err_t ws_ret = web_server_start();
@@ -149,6 +161,7 @@ static void on_network_ready(const char *iface)
     if (mqtt_ret != ESP_OK)
         ESP_LOGE(TAG, "MQTT start failed: %s", esp_err_to_name(mqtt_ret));
     sntp_sync_apply();   /* start NTP sync now that the network is up */
+    if (s_net_ready_mux) xSemaphoreGive(s_net_ready_mux);
 }
 
 static bool s_eth_connected  = false;
@@ -230,6 +243,9 @@ static void on_matter_wifi_got_ip(void *arg, esp_event_base_t base,
 
 void app_main(void)
 {
+    /* Before anything that can bring a network interface up. */
+    s_net_ready_mux = xSemaphoreCreateMutex();
+    if (!s_net_ready_mux) ESP_LOGE(TAG, "network start mutex: out of memory");
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());

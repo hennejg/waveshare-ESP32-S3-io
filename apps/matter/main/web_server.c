@@ -543,24 +543,27 @@ static esp_err_t api_io_output(httpd_req_t *req)
     }
     uint8_t ch = (uint8_t)ch_j->valuedouble;
 
-    bool new_val;
+    /* A toggle is one dout_toggle() call, under the output lock: reading
+       and setting the opposite lost one of two toggles arriving together. */
+    esp_err_t set_ret;
     cJSON *tog = cJSON_GetObjectItem(root, "toggle");
     cJSON *val = cJSON_GetObjectItem(root, "value");
     if (cJSON_IsTrue(tog)) {
-        new_val = !dout_get(ch);
+        cJSON_Delete(root);
+        set_ret = dout_toggle(ch);
     } else if (cJSON_IsBool(val)) {
-        new_val = cJSON_IsTrue(val);
+        bool new_val = cJSON_IsTrue(val);
+        cJSON_Delete(root);
+        set_ret = dout_set(ch, new_val);
     } else {
         cJSON_Delete(root);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "value or toggle required");
         return ESP_OK;
     }
-    cJSON_Delete(root);
 
     /* The hardware moved; tell the Matter side, or a controller keeps
        showing the state before this request. dout_get(): what the port
        really holds, not what was asked. */
-    esp_err_t set_ret = dout_set(ch, new_val);
     if (set_ret != ESP_OK) {
         ESP_LOGW(TAG, "output %d: set failed: %s", ch + 1, esp_err_to_name(set_ret));
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "output write failed");

@@ -42,6 +42,7 @@ function createEngine(opts) {
     _di_get(ch)        { return !!di[ch]; },
     _dout_set(ch, v)   { dout[ch] = !!v; },
     _dout_get(ch)      { return !!dout[ch]; },
+    _dout_toggle(ch)   { dout[ch] = !dout[ch]; },
     _led_set(r, g, b)  { ledState = { r: r | 0, g: g | 0, b: b | 0 }; },
     _buzzer_set(freq)  { buzzerFreq = freq | 0; },
     _mqtt_publish(topic, payload, qos, retain) {

@@ -670,9 +670,12 @@ static esp_err_t api_config_post(httpd_req_t *req)
                    1e400 as inf, cJSON_IsNumber accepts it, and the published
                    value becomes the literal "inf". Zero is refused too --
                    it silently turns every reading into nothing. */
-                double sc = v->valuedouble;
-                if (isfinite(sc) && sc != 0.0 && sc > -1e9 && sc < 1e9)
-                    e->scale = (float)sc;
+                /* Checked as stored: 1e-50 is a non-zero double and a zero
+                   float. */
+                double sc  = v->valuedouble;
+                float  scf = (float)sc;
+                if (isfinite(sc) && sc > -1e9 && sc < 1e9 && scf != 0.0f)
+                    e->scale = scf;
                 else if (e->enable)
                     e->scale = 0.0f;   /* flagged below */
                 else
@@ -1165,7 +1168,7 @@ static esp_err_t api_io_output(httpd_req_t *req)
     cJSON *val = cJSON_GetObjectItem(root, "value");
     if (cJSON_IsTrue(tog)) {
         cJSON_Delete(root);
-        set_ret = dout_modify(0u, 0u, (uint8_t)(1u << ch));
+        set_ret = dout_toggle(ch);
     } else if (cJSON_IsBool(val)) {
         bool new_val = cJSON_IsTrue(val);
         cJSON_Delete(root);

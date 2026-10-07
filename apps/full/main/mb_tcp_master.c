@@ -75,7 +75,6 @@ _Static_assert(MBM_VAL_U16 == MB_VAL_U16 && MBM_VAL_S16 == MB_VAL_S16 &&
 typedef struct {
     char     host[APP_CFG_MBM_HOST_LEN + 1];
     uint16_t port;
-    uint32_t addr_be;      /* the address it was opened to, network order */
     int      fd;
     int64_t  used_ms;
 } conn_t;
@@ -99,10 +98,12 @@ typedef struct {
     char     host[APP_CFG_MBM_HOST_LEN + 1];
     uint32_t addr_be;      /* last good answer, 0 = never resolved            */
     int64_t  next_ms;      /* when to ask DNS again                           */
-    int64_t  used_ms;
+    bool     last_ok;      /* the most recent lookup answered                 */
 } dns_entry_t;
 
-static dns_entry_t s_dns[APP_CFG_MBM_COUNT];   /* at most one host per entry */
+/* One slot per entry is enough: a table names at most APP_CFG_MBM_COUNT
+   hosts, and the cache is emptied whenever the table changes. */
+static dns_entry_t s_dns[APP_CFG_MBM_COUNT];
 
 typedef struct {
     int64_t  due_ms;
@@ -162,14 +163,15 @@ static void conn_close(conn_t *c)
 
 static dns_entry_t *dns_slot(const char *host)
 {
-    dns_entry_t *free_e = NULL, *oldest = &s_dns[0];
+    dns_entry_t *free_e = NULL;
     for (int i = 0; i < APP_CFG_MBM_COUNT; i++) {
         dns_entry_t *d = &s_dns[i];
         if (d->host[0] && strcmp(d->host, host) == 0) return d;
         if (!d->host[0] && !free_e) free_e = d;
-        if (d->used_ms < oldest->used_ms) oldest = d;
     }
-    dns_entry_t *d = free_e ? free_e : oldest;
+    /* Cannot run out (see s_dns); should it ever, the first slot is reused
+       rather than the lookup refused. */
+    dns_entry_t *d = free_e ? free_e : &s_dns[0];
     memset(d, 0, sizeof(*d));
     strlcpy(d->host, host, sizeof(d->host));
     return d;
@@ -181,11 +183,20 @@ static dns_entry_t *dns_slot(const char *host)
 static bool resolve(const char *host, uint32_t *addr_be, char *err, size_t err_len)
 {
     struct in_addr lit;
-    if (inet_aton(host, &lit)) { *addr_be = lit.s_addr; return true; }
+    if (inet_aton(host, &lit)) {
+        /* inet_aton also takes "0" and "0.0.0.0". Dialled, that is a connect
+           timeout reported as "no answer" -- a configuration error dressed
+           up as a dead device. */
+        if (lit.s_addr == 0) {
+            snprintf(err, err_len, "0.0.0.0 is not a device address");
+            return false;
+        }
+        *addr_be = lit.s_addr;
+        return true;
+    }
 
     int64_t now = now_ms();
     dns_entry_t *d = dns_slot(host);
-    d->used_ms = now;
 
     if (now >= d->next_ms) {
         struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
@@ -196,6 +207,7 @@ static bool resolve(const char *host, uint32_t *addr_be, char *err, size_t err_l
             freeaddrinfo(ai);
         }
         now = now_ms();                          /* the lookup may have taken a while */
+        d->last_ok = got != 0;
         if (got) { d->addr_be = got; d->next_ms = now + DNS_TTL_MS; }
         else     {                   d->next_ms = now + DNS_RETRY_MS; }
     }
@@ -209,11 +221,17 @@ static bool resolve(const char *host, uint32_t *addr_be, char *err, size_t err_l
 }
 
 /* A connect to the address failed: it may have moved, so the next attempt
-   asks DNS again -- once, for every entry naming this host. */
+   asks DNS again -- once, for every entry naming this host.
+
+   Only if the last lookup answered. If it did not, DNS is down and the
+   address in use is the one kept from before; asking again at once would
+   pay the resolver's whole timeout on every failed connect, entry after
+   entry, which is what DNS_RETRY_MS is there to prevent. */
 static void dns_recheck(const char *host)
 {
     for (int i = 0; i < APP_CFG_MBM_COUNT; i++)
-        if (s_dns[i].host[0] && strcmp(s_dns[i].host, host) == 0) s_dns[i].next_ms = 0;
+        if (s_dns[i].host[0] && strcmp(s_dns[i].host, host) == 0 && s_dns[i].last_ok)
+            s_dns[i].next_ms = 0;
 }
 
 static void dns_flush(void)
@@ -301,17 +319,17 @@ static conn_t *conn_get(const char *host, uint16_t port, bool *fresh,
     if (!resolve(host, &addr_be, err, err_len)) return NULL;
     int64_t now = now_ms();
 
+    /* An open connection is kept even if the name now resolves elsewhere.
+       A TCP connection cannot change peers: if another device had taken the
+       old address, it would answer this one with a reset, and the stale
+       connection retry in read_value() would dial the new address. Closing
+       on every differing answer instead tore down working connections to
+       names with several addresses, whose order the DNS server rotates. */
     for (int i = 0; i < CONN_CACHE; i++) {
         conn_t *c = &s_conns[i];
         if (c->fd >= 0 && c->port == port && strcmp(c->host, host) == 0) {
-            if (c->addr_be == addr_be) {
-                c->used_ms = now;
-                return c;         /* kept from an earlier poll; may be stale */
-            }
-            /* The name has moved. Whatever answers at the old address is
-               not the device this entry names. */
-            ESP_LOGI(TAG, "%s has moved, reconnecting", host);
-            conn_close(c);
+            c->used_ms = now;
+            return c;             /* kept from an earlier poll; may be stale */
         }
     }
 
@@ -337,7 +355,6 @@ static conn_t *conn_get(const char *host, uint16_t port, bool *fresh,
 
     strlcpy(pick->host, host, sizeof(pick->host));
     pick->port    = port;
-    pick->addr_be = addr_be;
     pick->fd      = fd;
     pick->used_ms = now;
     *fresh = true;
