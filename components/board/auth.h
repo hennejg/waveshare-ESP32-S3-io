@@ -8,7 +8,9 @@ esp_err_t auth_init(void);
 /* True if a password has been configured. */
 bool auth_is_password_set(void);
 
-/* Verify password. Returns true if correct OR if no password is set. */
+/* Verify password. Returns true only if a password is set and this is it.
+   Without one there is nothing to match, so nothing passes: a device that
+   has not been set up yet is closed, not open. */
 bool auth_check_password(const char *password);
 
 /* Hash and persist a new password. Replaces any existing one. */

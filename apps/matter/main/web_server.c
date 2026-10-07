@@ -80,9 +80,15 @@ static bool validate_names(const di_config_t *arr, int count, const char **err_m
 
 /* ------------------------------------------------------------------ auth check */
 
+/* A device without a password is one that has not been set up yet, and
+   until that happens nothing but the setup flow itself may be used: the
+   outputs, the rules (which run as code on the device) and the factory
+   reset must not be one unauthenticated request away just because nobody
+   has pressed the button yet. The physical confirmation guards the
+   password; this guards everything else until there is one. */
 static bool check_auth(httpd_req_t *req)
 {
-    if (!auth_is_password_set()) return true;
+    if (!auth_is_password_set()) return false;
 
     char hdr[160] = "";
     httpd_req_get_hdr_value_str(req, "Authorization", hdr, sizeof(hdr));
@@ -107,8 +113,14 @@ static bool check_auth(httpd_req_t *req)
 static esp_err_t send_401(httpd_req_t *req)
 {
     httpd_resp_set_status(req, "401 Unauthorized");
-    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"Device\"");
     httpd_resp_set_type(req, "application/json");
+    if (!auth_is_password_set()) {
+        /* No WWW-Authenticate here: there is no password a browser dialog
+           could ask for. The body tells a client what to do instead. */
+        httpd_resp_sendstr(req, "{\"error\":\"setup_required\"}");
+        return ESP_OK;
+    }
+    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"Device\"");
     httpd_resp_sendstr(req, "{\"error\":\"unauthorized\"}");
     return ESP_OK;
 }
