@@ -459,7 +459,8 @@ static inline void budget_start(void)
    every finally, so dsl.js is left with the flags its passes set around their
    work -- a noLoop rule that never fires again, an mqtt().once() that keeps
    matching -- and _after_interrupt() clears them. Called after every entry
-   into JS from the loop, before the next one. */
+   into JS, before the next one -- also between the calls of a function that
+   makes several, like drain_overflow(). */
 static void recover_interrupt(JSContext *ctx)
 {
     if (!s_interrupted) return;
@@ -578,6 +579,7 @@ static void resync_lost_inputs(JSContext *ctx)
                 __atomic_fetch_or(&s_input_lost, 1u << ch, __ATOMIC_RELAXED);
             }
             JS_FreeValue(ctx, r);
+            recover_interrupt(ctx);   /* before the next channel's call, as in drain_overflow() */
         }
     }
     JS_FreeValue(ctx, fn);
@@ -598,6 +600,10 @@ static void drain_overflow(JSContext *ctx)
         s_of_tail = (uint8_t)((s_of_tail + 1u) % TIMER_OVERFLOW_SLOTS);
         budget_start();
         run_timer(ctx, id);
+        /* Before the next one, not after the loop: a callback the budget cut
+           short leaves _firing set, and the next timer's pass skipped the
+           noLoop rule it was meant to run. */
+        recover_interrupt(ctx);
     }
 }
 

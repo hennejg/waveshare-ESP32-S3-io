@@ -1555,7 +1555,15 @@ rule('my-rule')
       if (rulesLoaded) return;
       try {
         const r = await apiFetch('/api/rules');
-        if (!r.ok) return;
+        if (!r.ok) {
+          // Never the demo or a stale editor in place of rules that could not be read.
+          let msg = 'HTTP ' + r.status;
+          try { msg = (await r.json()).error || msg; } catch (_) {}
+          const st = document.getElementById('rules-status');
+          st.className = 'err';
+          st.textContent = 'Could not load the stored rules: ' + msg;
+          return;
+        }
         const d = await r.json();
         setRulesText(d.script || '');
         if (rulesCM) rulesCM.refresh();
@@ -1598,10 +1606,12 @@ rule('my-rule')
 
     function saveRules() {
       const script = rulesText().trim();
-      if (script.length > 3900) {
+      // The device counts bytes of UTF-8: an umlaut is two, not one.
+      const bytes = new TextEncoder().encode(script).length;
+      if (bytes > 3900) {
         const st = document.getElementById('rules-status');
         st.className = 'err';
-        st.textContent = 'Script too long: ' + script.length + ' / 3900 characters.';
+        st.textContent = 'Script too long: ' + bytes + ' / 3900 bytes (UTF-8; umlauts count as 2).';
         return;
       }
       return postRules(script, 'Saved and applied.');

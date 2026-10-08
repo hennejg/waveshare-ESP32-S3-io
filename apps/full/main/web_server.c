@@ -24,8 +24,19 @@
 
 extern const char DEMO_SCRIPT[];
 
-#define RULES_NVS_NS  "scripting"
-#define RULES_NVS_KEY "script"
+#define RULES_NVS_NS   "scripting"
+/* A blob, which NVS spreads over pages. A string has to fit in one page next
+   to whatever else is on it: after a garbage collection moved a few entries
+   onto the free page, a script of 3840 bytes no longer went in
+   (ESP_ERR_NVS_NOT_ENOUGH_SPACE) -- below RULES_MAX_LEN, and depending on
+   the state of the flash. The string key is what older firmware stored; it
+   is still read, and removed once a blob has been stored. */
+#define RULES_NVS_BLOB "script_b"
+#define RULES_NVS_KEY  "script"
+/* In bytes of UTF-8, not characters: what NVS stores and the boot's buffer
+   (main.c, 4096) holds. Checked on the script itself -- the request body is
+   JSON, longer by its escapes, and a limit on the body alone let a script of
+   3942 bytes through that GET then could not read back. */
 #define RULES_MAX_LEN 3900
 
 #include <math.h>
@@ -1392,21 +1403,52 @@ static esp_err_t api_io_buzzer(httpd_req_t *req)
 
 /* ------------------------------------------------------------ rules endpoints */
 
-/* GET /api/rules — returns {"script":"..."} from NVS, or the demo script if unset */
+/* GET /api/rules — returns {"script":"..."} from NVS, or the demo script if unset.
+   Only "unset" means the demo: a stored script that cannot be read is an
+   error, not the demo -- the UI reloads the script after saving and showed
+   the demo in place of the user's code, ready to be saved over it. */
+esp_err_t rules_nvs_read(char **out)
+{
+    *out = NULL;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(RULES_NVS_NS, NVS_READONLY, &h);
+    if (err != ESP_OK) return err;
+    size_t len = 0;
+    bool blob = true;
+    err = nvs_get_blob(h, RULES_NVS_BLOB, NULL, &len);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        blob = false;
+        err = nvs_get_str(h, RULES_NVS_KEY, NULL, &len);
+    }
+    if (err == ESP_OK) {
+        char *buf = malloc(len + 1);
+        if (!buf) err = ESP_ERR_NO_MEM;
+        else {
+            err = blob ? nvs_get_blob(h, RULES_NVS_BLOB, buf, &len)
+                       : nvs_get_str(h, RULES_NVS_KEY, buf, &len);
+            buf[len] = '\0';
+            if (err == ESP_OK) *out = buf;
+            else free(buf);
+        }
+    }
+    nvs_close(h);
+    return err;
+}
+
 static esp_err_t api_rules_get(httpd_req_t *req)
 {
     if (!check_auth(req)) return send_denied(req);
 
-    char *buf = malloc(RULES_MAX_LEN + 1);
-    if (!buf) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_OK; }
-
+    char *buf = NULL;
     const char *script = DEMO_SCRIPT;
-    nvs_handle_t h;
-    size_t len = RULES_MAX_LEN + 1;
-    if (nvs_open(RULES_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
-        if (nvs_get_str(h, RULES_NVS_KEY, buf, &len) == ESP_OK)
-            script = buf;
-        nvs_close(h);
+    esp_err_t err = rules_nvs_read(&buf);
+    if (err == ESP_OK) script = buf;
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGE(TAG, "stored rules unreadable: %s", esp_err_to_name(err));
+        char msg[128];
+        snprintf(msg, sizeof(msg), "{\"status\":\"error\",\"error\":\"stored rules unreadable: %s\"}",
+                 esp_err_to_name(err));
+        return send_json(req, "500 Internal Server Error", msg);
     }
 
     cJSON *root = cJSON_CreateObject();
@@ -1430,9 +1472,18 @@ static esp_err_t store_rules(const char *to_store)
     nvs_handle_t h;
     esp_err_t ret = nvs_open(RULES_NVS_NS, NVS_READWRITE, &h);
     if (ret != ESP_OK) return ret;
-    ret = (to_store[0] == '\0') ? nvs_erase_key(h, RULES_NVS_KEY)
-                                : nvs_set_str(h, RULES_NVS_KEY, to_store);
-    if (ret == ESP_ERR_NVS_NOT_FOUND) ret = ESP_OK;   /* erasing what was not there */
+    if (to_store[0] == '\0') {
+        ret = nvs_erase_key(h, RULES_NVS_BLOB);
+        if (ret == ESP_ERR_NVS_NOT_FOUND) ret = ESP_OK;   /* erasing what was not there */
+    } else {
+        ret = nvs_set_blob(h, RULES_NVS_BLOB, to_store, strlen(to_store));
+    }
+    if (ret == ESP_OK) {
+        /* The blob comes first when reading, but the old string would take
+           up a page's worth of entries for nothing. */
+        esp_err_t e = nvs_erase_key(h, RULES_NVS_KEY);
+        if (e != ESP_OK && e != ESP_ERR_NVS_NOT_FOUND) ret = e;
+    }
     if (ret == ESP_OK) ret = nvs_commit(h);
     nvs_close(h);
     return ret;
@@ -1441,7 +1492,9 @@ static esp_err_t store_rules(const char *to_store)
 static esp_err_t api_rules_post(httpd_req_t *req)
 {
     if (!check_auth(req)) return send_denied(req);
-    if (req->content_len == 0 || req->content_len > RULES_MAX_LEN + 100) {
+    /* Room for the escapes, at worst six bytes for one (\u00e4 for an umlaut,
+       as Python's json writes it); the script's own length is checked below. */
+    if (req->content_len == 0 || req->content_len > 6 * RULES_MAX_LEN + 100) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body too large");
         return ESP_OK;
     }
@@ -1464,6 +1517,14 @@ static esp_err_t api_rules_post(httpd_req_t *req)
     }
 
     const char *script = script_j->valuestring;
+    size_t script_len = strlen(script);
+    if (script_len > RULES_MAX_LEN) {
+        cJSON_Delete(root);
+        char msg[160];
+        snprintf(msg, sizeof(msg), "{\"status\":\"rejected\",\"error\":\"script too long: %u bytes of UTF-8, at most %d\","
+                 "\"detail\":\"previous rules still running\"}", (unsigned)script_len, RULES_MAX_LEN);
+        return send_json(req, "400 Bad Request", msg);
+    }
 
     /* The engine first, the flash second. Stored before the verdict, a
        script the engine refused -- a syntax error, say -- was what the
@@ -1523,7 +1584,11 @@ static esp_err_t api_rules_post(httpd_req_t *req)
        discarded: the rules run until the next reboot, when the previous
        script comes back, and the caller has to know that. */
     if (!now.store_tried || now.store_err != ESP_OK) {
-        return send_json(req, "500 Internal Server Error", "{\"status\":\"error\",\"error\":\"rules running but not stored\"," "\"detail\":\"the previous script returns at the next reboot\"}");
+        char msg[192];
+        snprintf(msg, sizeof(msg), "{\"status\":\"error\",\"error\":\"rules running but not stored: %s\","
+                 "\"detail\":\"the previous script returns at the next reboot\"}",
+                 now.store_tried ? esp_err_to_name(now.store_err) : "not tried");
+        return send_json(req, "500 Internal Server Error", msg);
     }
 
     httpd_resp_set_type(req, "application/json");

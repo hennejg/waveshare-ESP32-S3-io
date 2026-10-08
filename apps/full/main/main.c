@@ -334,15 +334,14 @@ void app_main(void)
 
     /* Load user script from NVS; fall back to built-in demo if none stored. */
     const char *startup_script = DEMO_SCRIPT;
-    static char s_nvs_script_buf[4096];
     {
-        nvs_handle_t h;
-        size_t len = sizeof(s_nvs_script_buf);
-        if (nvs_open("scripting", NVS_READONLY, &h) == ESP_OK) {
-            if (nvs_get_str(h, "script", s_nvs_script_buf, &len) == ESP_OK)
-                startup_script = s_nvs_script_buf;
-            nvs_close(h);
-        }
+        char *stored = NULL;   /* kept for good: scripting_init() wants it for life */
+        esp_err_t err = rules_nvs_read(&stored);
+        if (err == ESP_OK)
+            startup_script = stored;
+        else if (err != ESP_ERR_NVS_NOT_FOUND)
+            /* Not quietly: the demo runs in place of the user's rules. */
+            ESP_LOGE(TAG, "stored rules unreadable (%s) - running the demo", esp_err_to_name(err));
     }
     /* The script task runs at a higher priority than app_main and evaluates
        the stored script the moment it exists, so everything a top-level

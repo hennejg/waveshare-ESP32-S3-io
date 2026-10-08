@@ -94,6 +94,7 @@ static BaseType_t xQueueSend(QueueHandle_t q, const scripting_evt_t *e, int t)
     Q.e[(Q.h + Q.n++) % QCAP] = *e; return pdTRUE;
 }
 static void budget_start(void) {}
+static void recover_interrupt(JSContext *ctx) { (void)ctx; }   /* no budget in this model */
 
 /* The engine: one input and a heldFor() rule on it, armed while HIGH. */
 static bool input_high = true, output_on, time_valid, s_time_valid;
