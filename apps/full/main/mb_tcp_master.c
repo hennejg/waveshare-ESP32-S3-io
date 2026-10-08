@@ -689,6 +689,14 @@ static void stage_config(void)
     ST_UNLOCK();
 }
 
+bool mb_tcp_master_has_rtu(void)
+{
+    const app_config_t *cfg = app_config_get();
+    for (int i = 0; i < APP_CFG_MBM_COUNT; i++)
+        if (entry_active(&cfg->mbm[i]) && cfg->mbm[i].transport == MBM_TRANSPORT_RTU) return true;
+    return false;
+}
+
 esp_err_t mb_tcp_master_init(void)
 {
     if (!s_state_mux) s_state_mux = xSemaphoreCreateMutex();
@@ -716,7 +724,7 @@ static esp_err_t start_locked(void)
         ESP_ERR_NO_MEM, TAG, "master task");
 
     s_running = true;
-    ESP_LOGI(TAG, "reading %d value%s from other Modbus TCP devices",
+    ESP_LOGI(TAG, "reading %d value%s from other Modbus devices",
              enabled, enabled == 1 ? "" : "s");
     return ESP_OK;
 }

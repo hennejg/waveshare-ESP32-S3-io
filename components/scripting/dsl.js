@@ -465,16 +465,34 @@ function _cronDayOk(f, d) {
 // Next epoch ms strictly after fromMs matching the cron fields in LOCAL time; -1 if none
 // in ~5y. Field tests/steps use local Date getters/setters (so the JS engine applies the
 // TZ + DST when mapping local fields ↔ epoch); the returned d.getTime() is still UTC ms.
+// Minutes are stepped in absolute time, the coarser fields in local time. Stepping the
+// minute through the local fields jumped from 02:59 summer time to 03:00 winter time on
+// the night clocks go back, and the repeated hour never came: a "* * * * *" rule went
+// silent for an hour. Absolute steps walk through the repeated hour like any other, so a
+// rule with a wildcard hour runs in both of them (as Vixie cron does); one with a fixed
+// hour runs once -- the second pass through the same local time is skipped below.
 function _cronNext(f, fromMs) {
-    var d = new Date(fromMs);
-    d.setSeconds(0, 0);
-    d.setMinutes(d.getMinutes() + 1);              // minute granularity, strictly after
+    var d = new Date(Math.floor(fromMs / 60000) * 60000 + 60000);   // the next whole minute
     var capYear = new Date(fromMs).getFullYear() + 5;
+    var anyHour = true;
+    for (var h = 0; h < 24; h++) if (f.hour[h] !== true) { anyHour = false; break; }
     while (d.getFullYear() <= capYear) {
         if (f.month[d.getMonth() + 1] !== true) { d.setMonth(d.getMonth() + 1, 1); d.setHours(0, 0, 0, 0); continue; }
         if (!_cronDayOk(f, d))                   { d.setDate(d.getDate() + 1);     d.setHours(0, 0, 0, 0); continue; }
         if (f.hour[d.getHours()] !== true)       { d.setHours(d.getHours() + 1, 0, 0, 0); continue; }
-        if (f.minute[d.getMinutes()] !== true)   { d.setMinutes(d.getMinutes() + 1, 0, 0); continue; }
+        if (f.minute[d.getMinutes()] !== true)   { d = new Date(d.getTime() + 60000); continue; }
+        // Never a time at or before fromMs. Local-time arithmetic around a
+        // daylight saving switch is where engines go wrong (QuickJS put "the
+        // next minute" an hour in the past on the spring-forward night); a
+        // match in the past would fire at once and re-arm into the past again,
+        // running the action over and over. Step on to the next minute instead.
+        if (d.getTime() <= fromMs) { d = new Date(Math.floor(fromMs / 60000) * 60000 + 60000); continue; }
+        // The hour repeated when clocks go back: the same local time an hour earlier.
+        // A job at a fixed hour has run then already.
+        if (!anyHour) {
+            var e = new Date(d.getTime() - 3600000);
+            if (e.getHours() === d.getHours() && e.getMinutes() === d.getMinutes()) { d = new Date(d.getTime() + 60000); continue; }
+        }
         return d.getTime();
     }
     return -1;

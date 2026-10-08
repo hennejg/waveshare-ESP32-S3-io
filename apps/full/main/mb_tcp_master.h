@@ -20,6 +20,10 @@
    the network can come up. */
 esp_err_t mb_tcp_master_init(void);
 
+/* True if an enabled, complete entry reads a device on RS-485: such an entry
+   needs no network, and the poller is started at boot for it. */
+bool mb_tcp_master_has_rtu(void);
+
 /* Starts the polling task if any entry is enabled. Needs a working IP stack,
    so call it once the network is up; calling it again is harmless, from any
    task. */

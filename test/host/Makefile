@@ -9,8 +9,8 @@ CFLAGS := -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 PORT ?= 15020
 
-.PHONY: all clean client poller master dns tz resync
-all: test_mb_pdu client poller master dns tz resync
+.PHONY: all clean client poller master dns tz resync qjscron
+all: test_mb_pdu client poller master dns tz resync qjscron
 	./test_mb_pdu
 
 # The firmware's framing against a Modbus TCP server written independently of
@@ -48,6 +48,22 @@ test_resync: gen_resync_test.py ../../components/scripting/scripting.c
 	python3 gen_resync_test.py
 	$(CC) $(CFLAGS) test_resync.c -o $@
 
+# QuickJS itself, with the firmware's patches, running the real dsl.js: local
+# time around the DST switches and a minute cron across them. The engine is
+# built once into qjs-obj/ without sanitizers -- it is large, and upstream's.
+QJS     := ../../components/quickjs/extern/quickjs
+QJS_SRC := quickjs.c libregexp.c libunicode.c cutils.c dtoa.c
+QJS_OBJ := $(QJS_SRC:%.c=qjs-obj/%.o)
+qjs-obj/%.o: $(QJS)/%.c
+	@mkdir -p qjs-obj
+	$(CC) -O1 -w -D_GNU_SOURCE -DCONFIG_VERSION='"host"' -I$(QJS) -c $< -o $@
+
+qjscron: test_qjs_cron
+	./test_qjs_cron
+
+test_qjs_cron: test_qjs_cron.c $(QJS_OBJ) ../../components/scripting/dsl.js
+	$(CC) -O1 -Wall -Wextra -Wno-unused-parameter -I$(QJS) test_qjs_cron.c $(QJS_OBJ) -lm -o $@
+
 # QuickJS's timezone offset, newlib branch, cut out of the patched quickjs.c.
 tz: test_tz
 	./test_tz
@@ -74,4 +90,4 @@ test_mb_pdu: test_mb_pdu.c $(MAIN)/mb_pdu.c $(MAIN)/mb_pdu.h $(MAIN)/mb_request.
 clean:
 	rm -rf test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c \
 	       test_mb_master test_mb_master.c \
-	       test_mb_dns test_mb_dns.c test_tz test_tz.c test_resync test_resync.c *.dSYM
+	       test_mb_dns test_mb_dns.c test_tz test_tz.c test_resync test_resync.c test_qjs_cron qjs-obj *.dSYM

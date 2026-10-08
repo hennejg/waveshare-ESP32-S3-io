@@ -459,6 +459,17 @@ void app_main(void)
         ESP_LOGW(TAG, "Ethernet init failed: %s", esp_err_to_name(eth_ret));
 #endif
 
+    /* RS-485 rows of the poll table need no network: a board with neither an
+       Ethernet link nor WiFi still reads the devices on its own segment, and
+       rules get their values. Started here, once the IP stack exists -- the
+       poller's network rows only fail until a link comes up, and
+       on_network_ready()'s start is then a no-op. */
+    if (mb_tcp_master_has_rtu()) {
+        esp_err_t mbm_ret = mb_tcp_master_start();
+        if (mbm_ret != ESP_OK)
+            ESP_LOGE(TAG, "Modbus master start failed: %s", esp_err_to_name(mbm_ret));
+    }
+
     if (!eth_only) {
 #ifdef CONFIG_APP_MATTER_ENABLE
         /* Do NOT call wifi_config_init when BLE is active (uncommissioned state):

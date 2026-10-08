@@ -23,3 +23,5 @@ dependencies.lock
 /test/host/test_tz.c
 /test/host/test_resync
 /test/host/test_resync.c
+/test/host/test_qjs_cron
+/test/host/qjs-obj/

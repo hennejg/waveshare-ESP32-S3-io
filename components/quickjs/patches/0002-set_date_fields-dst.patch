@@ -1,0 +1,24 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -55218,8 +55218,20 @@
+ 
+     /* adjust for local time and clip */
+     if (is_local) {
++        /* The offset belongs to the UTC instant being computed, not to the
++           local fields read as UTC: a step later they lie on different sides
++           of a daylight saving switch for the hour after it in UTC, and the
++           result was an hour off -- 01:31 CET on the night clocks go forward
++           came out as 23:31 UTC the day before, and a cron "next minute"
++           landed in the past. So the offset is taken at the fields, then
++           again at the instant that gives. A local time in the hour skipped
++           in spring gets the offset from before the switch, as
++           ECMA-262 21.4.1.26 asks; one in the hour repeated in autumn gets
++           the later of the two. */
+         int64_t ti = tv < INT64_MIN ? INT64_MIN : tv >= 0x1p63 ? INT64_MAX : (int64_t)tv;
+-        tv += getTimezoneOffset(ti) * 60000;
++        double t1 = tv + getTimezoneOffset(ti) * 60000;
++        int64_t t1i = t1 < INT64_MIN ? INT64_MIN : t1 >= 0x1p63 ? INT64_MAX : (int64_t)t1;
++        tv += getTimezoneOffset(t1i) * 60000;
+     }
+     return time_clip(tv);
+ }

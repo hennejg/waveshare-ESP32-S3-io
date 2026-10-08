@@ -235,35 +235,46 @@ static uint8_t local_write_coils(uint16_t addr, uint16_t count, const uint8_t *b
     if (!s_local_ready) return MB_EXC_DEVICE_FAILURE;
     if ((uint32_t)addr + count > MB_NUM_COILS) return MB_EXC_ILLEGAL_ADDR;
 
-    /* The pads first, and all checked before any moves: each must be an
-       output. They are set at once -- a GPIO, no I2C -- before DO1-DO8 are
-       queued, so a refusal has queued nothing. */
+    /* Everything is checked before anything moves: each pad must be an
+       output, and -- if the request also carries DO1-DO8 -- the command queue
+       must have room for them. The pads are set at once (a GPIO, no I2C) and
+       DO1-DO8 queued after, all under CMD_LOCK, which every enqueue holds: no
+       one can take the free slot in between, so a request refused as busy has
+       switched nothing. */
     for (uint16_t i = 0; i < count; i++) {
         uint16_t ch = (uint16_t)(addr + i);
         if (ch >= MB_NUM_DO && !aux_io_out_get((uint8_t)(ch - MB_NUM_DO), NULL))
             return MB_EXC_ILLEGAL_VALUE;
     }
+    uint16_t do_n = (addr < MB_NUM_DO) ? (uint16_t)(MB_NUM_DO - addr) : 0;
+    if (do_n > count) do_n = count;
+
+    CMD_LOCK();
+    if (do_n && uxQueueSpacesAvailable(s_cmd_q) == 0) {
+        CMD_UNLOCK();
+        ESP_LOGW(TAG, "command queue full, refused coil write");
+        return MB_EXC_DEVICE_BUSY;
+    }
     bool any_pad = false;
     for (uint16_t i = 0; i < count; i++) {
         uint16_t ch = (uint16_t)(addr + i);
         if (ch < MB_NUM_DO) continue;
-        if (aux_io_out_set((uint8_t)(ch - MB_NUM_DO), (bits[i >> 3] >> (i & 7)) & 1u) != ESP_OK)
-            return MB_EXC_ILLEGAL_VALUE;                  /* switched mode since the check */
+        if (aux_io_out_set((uint8_t)(ch - MB_NUM_DO), (bits[i >> 3] >> (i & 7)) & 1u) != ESP_OK) {
+            CMD_UNLOCK();
+            return MB_EXC_ILLEGAL_VALUE;              /* switched mode since the check */
+        }
         any_pad = true;
     }
     if (any_pad) scripting_on_modbus_activity();
+    if (!do_n) { CMD_UNLOCK(); return MB_EXC_NONE; }
 
     /* DO1-DO8 through the command task, as before. */
-    uint16_t do_n = (addr < MB_NUM_DO) ? (uint16_t)(MB_NUM_DO - addr) : 0;
-    if (do_n > count) do_n = count;
-    if (!do_n) return MB_EXC_NONE;
     count = do_n;
     mb_cmd_t cmd = { .area = MB_PARAM_COIL, .offset = addr, .count = count };
     for (uint16_t i = 0; i < count; i++)
         if (bits[i >> 3] & (1u << (i & 7)))
             cmd.bits |= (uint8_t)(1u << (addr + i));
 
-    CMD_LOCK();
     uint8_t exc = enqueue(&cmd, "coil write");
     if (exc == MB_EXC_NONE) {
         for (uint16_t i = 0; i < count; i++) {
@@ -325,35 +336,44 @@ static uint8_t local_write_holding(uint16_t addr, uint16_t count, const uint8_t 
     uint8_t exc = plan_pwm(addr, count, regs_be, pwm);
     if (exc != MB_EXC_NONE) return exc;
 
-    /* PWM first and at once, not queued: a few register writes under a
-       mutex, publishing left to the pad task, and a read straight after the
-       write shows the new values. First, so that a refusal here -- the pad
-       changed mode since the plan -- has not already queued the LED. */
+    /* Capacity before anything moves: if the request carries LED or buzzer
+       registers, the command queue must have room for them. Checked, the PWM
+       applied at once and the command queued, all under CMD_LOCK -- which
+       every enqueue holds -- so no one takes the free slot in between, and a
+       request refused as busy has changed nothing. */
+    uint16_t base_n = (addr < MB_HR_BASE) ? (uint16_t)(MB_HR_BASE - addr) : 0;
+    if (base_n > count) base_n = count;
+
+    CMD_LOCK();
+    if (base_n && uxQueueSpacesAvailable(s_cmd_q) == 0) {
+        CMD_UNLOCK();
+        ESP_LOGW(TAG, "command queue full, refused holding register write");
+        return MB_EXC_DEVICE_BUSY;
+    }
     bool any = false;
     for (uint8_t a = 0; a < AUX_PAD_COUNT; a++) {
         if (!pwm[a].touched) continue;
         esp_err_t r = aux_io_pwm_set(a, pwm[a].freq,
                                      pwm[a].has_duty ? pwm[a].duty : AUX_PWM_DUTY_KEEP);
-        if (r == ESP_ERR_INVALID_STATE || r == ESP_ERR_INVALID_ARG) return MB_EXC_ILLEGAL_VALUE;
-        if (r != ESP_OK) return MB_EXC_DEVICE_FAILURE;
+        if (r != ESP_OK) {
+            CMD_UNLOCK();
+            return (r == ESP_ERR_INVALID_STATE || r == ESP_ERR_INVALID_ARG)
+                   ? MB_EXC_ILLEGAL_VALUE : MB_EXC_DEVICE_FAILURE;
+        }
         any = true;
     }
     if (any) scripting_on_modbus_activity();
 
     /* LED and buzzer go through the command task as before. */
-    uint16_t base_n = (addr < MB_HR_BASE) ? (uint16_t)(MB_HR_BASE - addr) : 0;
-    if (base_n > count) base_n = count;
     if (base_n) {
         mb_cmd_t cmd = { .area = MB_PARAM_HOLDING, .offset = addr, .count = base_n };
         for (uint16_t i = 0; i < base_n; i++)
             cmd.regs[i] = mb_be16(&regs_be[i * 2]);
-
-        CMD_LOCK();
-        exc = enqueue(&cmd, "holding register write");
+        exc = enqueue(&cmd, "holding register write");   /* room checked above */
         if (exc == MB_EXC_NONE)                   /* read-back follows the command */
             for (uint16_t i = 0; i < base_n; i++) s_hr_shadow[addr + i] = cmd.regs[i];
-        CMD_UNLOCK();
     }
+    CMD_UNLOCK();
     return exc;
 }
 

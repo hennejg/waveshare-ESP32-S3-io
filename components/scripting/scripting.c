@@ -451,7 +451,22 @@ static void resync_lost_inputs(JSContext *ctx)
             input_mark_resync((uint8_t)ch);
             JSValue args[2] = { JS_NewInt32(ctx, ch),
                                 JS_NewBool(ctx, g_scripting_io->di_get((uint8_t)ch)) };
+            /* A budget of its own, like every event: the one left over from
+               the previous event may be spent, and the interrupt handler
+               would abort this call before it delivered anything. */
+            budget_start();
             JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 2, args);
+            if (JS_IsException(r)) {
+                /* Not given up: the channel is offered again on the next pass.
+                   _resync_input() does nothing once the engine holds the live
+                   level, so this cannot repeat a rule's action. */
+                JSValue exc = JS_GetException(ctx);
+                const char *msg = JS_ToCString(ctx, exc);
+                ESP_LOGE(TAG, "input %d resync: %s", ch, msg ? msg : "(unknown)");
+                JS_FreeCString(ctx, msg);
+                JS_FreeValue(ctx, exc);
+                __atomic_fetch_or(&s_input_lost, 1u << ch, __ATOMIC_RELAXED);
+            }
             JS_FreeValue(ctx, r);
         }
     }
