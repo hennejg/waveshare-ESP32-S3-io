@@ -74,38 +74,70 @@ static void publish_one(uint8_t n, bool state)
 }
 #endif
 
-static void notify_one(uint8_t n, bool state)
+/* Who hears of a change, and in which order.
+
+   The rule engine hears of it under s_mux, in the same step that read the
+   pin. Told after the lock, a task could read HIGH, block in the MQTT publish
+   before it, and meanwhile di_publish_all() read LOW and delivered it: the
+   engine got LOW, then the stale HIGH, kept HIGH with the pin LOW -- and a
+   heldFor() on it switched an output. Under the lock the engine gets the
+   levels in the order they were read. scripting_on_input_change() only
+   numbers and queues the event (its lock is never held while taking s_mux),
+   it does not wait on the network.
+
+   MQTT and Matter cannot be told under the lock (see s_mux). Their messages
+   may still go out of order, so each sender looks again after sending: if the
+   level has moved on from the one it sent, it sends the current one. The last
+   message out is then always followed by a look that found it current. A pin
+   that keeps changing is sent by di_task anyway, so the look-again is
+   bounded. */
+static void deliver_rules(uint8_t n, bool state)
 {
-#ifdef CONFIG_APP_MQTT_ENABLE
-    if (app_mqtt_is_connected())
-        publish_one(n, state);
-#endif
-#ifdef CONFIG_APP_MATTER_ENABLE
-    /* The Matter app exposes exactly 8 contact sensors; the auxiliary inputs
-       have no endpoint and are reported over MQTT and the web UI only. */
-    if (di_is_isolated(n))
-        matter_di_update(n, state);
-#endif
 #ifdef CONFIG_APP_SCRIPTING_ENABLE
     scripting_on_input_change(n, state);
+#else
+    (void)n; (void)state;
 #endif
+}
+
+static void notify_ext(uint8_t n, bool state)
+{
+    for (int tries = 0; tries < 4; tries++) {
+#ifdef CONFIG_APP_MQTT_ENABLE
+        if (app_mqtt_is_connected())
+            publish_one(n, state);
+#endif
+#ifdef CONFIG_APP_MATTER_ENABLE
+        /* The Matter app exposes exactly 8 contact sensors; the auxiliary inputs
+           have no endpoint and are reported over MQTT and the web UI only. */
+        if (di_is_isolated(n))
+            matter_di_update(n, state);
+#endif
+        xSemaphoreTake(s_mux, portMAX_DELAY);
+        bool active = di_is_active(n), now = s_state[n];
+        xSemaphoreGive(s_mux);
+        if (!active || now == state) return;
+        state = now;
+    }
 }
 
 void di_publish_all(void)
 {
     /* Refreshed from the pins under the lock, so that a pad changing hands
-       cannot be read as an input after it stopped being one; published
-       after it. */
+       cannot be read as an input after it stopped being one; the rule engine
+       told under it, MQTT and Matter after it. */
     bool active[NUM_DI], val[NUM_DI];
-    if (s_mux) xSemaphoreTake(s_mux, portMAX_DELAY);
+    if (!s_mux) return;
+    xSemaphoreTake(s_mux, portMAX_DELAY);
     for (uint8_t i = 0; i < NUM_DI; i++) {
         active[i] = di_is_active(i);
         if (active[i]) s_state[i] = read_pin(i);
         val[i] = s_state[i];
+        if (active[i]) deliver_rules(i, val[i]);
     }
-    if (s_mux) xSemaphoreGive(s_mux);
+    xSemaphoreGive(s_mux);
     for (uint8_t i = 0; i < NUM_DI; i++)
-        if (active[i]) notify_one(i, val[i]);
+        if (active[i]) notify_ext(i, val[i]);
 }
 
 bool di_is_active(uint8_t n)
@@ -135,35 +167,39 @@ static void IRAM_ATTR gpio_isr(void *arg)
     portYIELD_FROM_ISR(woken);
 }
 
+/* One pass over the pins after an edge. */
+static void di_scan(void)
+{
+    bool    send[NUM_DI] = {0}, val[NUM_DI];
+    xSemaphoreTake(s_mux, portMAX_DELAY);
+    uint8_t report = s_report, gone = s_gone;
+    s_report = s_gone = 0;
+    for (uint8_t i = 0; i < NUM_DI; i++) {
+        uint8_t a   = (uint8_t)(i - APP_CFG_DI_ISOLATED_COUNT);
+        bool    aux = i >= APP_CFG_DI_ISOLATED_COUNT;
+        val[i] = s_state[i];
+        /* A pad that is no longer an input reads false; the rule engine
+           holds the last level it was given and has to be told. */
+        if (aux && (gone >> a) & 1u) deliver_rules(i, false);
+        if (!di_is_active(i)) continue;
+        bool cur = read_pin(i);
+        if (cur != s_state[i]) { s_state[i] = val[i] = cur; send[i] = true; }
+        if (aux && (report >> a) & 1u) send[i] = true;
+        if (send[i]) deliver_rules(i, val[i]);
+    }
+    xSemaphoreGive(s_mux);
+
+    for (uint8_t i = 0; i < NUM_DI; i++)
+        if (send[i]) notify_ext(i, val[i]);
+}
+
 static void di_task(void *arg)
 {
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS));
 
-        bool    changed[NUM_DI] = {0}, val[NUM_DI];
-        uint8_t report, gone;
-        xSemaphoreTake(s_mux, portMAX_DELAY);
-        for (uint8_t i = 0; i < NUM_DI; i++) {
-            val[i] = s_state[i];
-            if (!di_is_active(i)) continue;
-            bool cur = read_pin(i);
-            if (cur != s_state[i]) { s_state[i] = val[i] = cur; changed[i] = true; }
-        }
-        report = s_report; s_report = 0;
-        gone   = s_gone;   s_gone   = 0;
-        xSemaphoreGive(s_mux);
-
-        for (uint8_t i = 0; i < NUM_DI; i++) {
-            uint8_t a   = (uint8_t)(i - APP_CFG_DI_ISOLATED_COUNT);
-            bool    aux = i >= APP_CFG_DI_ISOLATED_COUNT;
-            if (changed[i] || (aux && (report >> a) & 1u)) notify_one(i, val[i]);
-#ifdef CONFIG_APP_SCRIPTING_ENABLE
-            /* A pad that is no longer an input reads false; the rule engine
-               holds the last level it was given and has to be told. */
-            if (aux && (gone >> a) & 1u) scripting_on_input_change(i, false);
-#endif
-        }
+        di_scan();
     }
 }
 

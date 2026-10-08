@@ -636,22 +636,108 @@ static void bind_handlers(JSContext *ctx, JSValue *mqtt, JSValue *input,
    never shrink). So the script is first loaded the way a boot loads it: a
    runtime of its own, the normal limit, the same allocator and budget. Writes
    to the hardware, MQTT and timers go nowhere -- the script's top level runs
-   once more, and must not switch anything twice. */
-static esp_err_t dry_dout_set(uint8_t ch, bool on)                 { (void)ch; (void)on; return ESP_OK; }
-static esp_err_t dry_dout_toggle(uint8_t ch)                       { (void)ch; return ESP_OK; }
-static esp_err_t dry_pwm_set(uint8_t p, uint32_t f, uint16_t d)    { (void)p; (void)f; (void)d; return ESP_OK; }
+   once more, and must not switch anything twice.
+
+   Going nowhere is not forgetting, though. The trial keeps what the script
+   would keep at boot, or it measures less and accepts a script the boot
+   cannot load, or refuses one the boot would load:
+     - a timer holds its callback until it is cleared, like the real table
+       does: dropped at once, twelve watchdogs' closures were collected, the
+       trial fitted and the boot ran out of memory; and the table holds
+       MAX_TIMERS, as at boot, when it starts empty;
+     - an output or a PWM pad reads back what the trial wrote to it, starting
+       from the hardware's state: reading the hardware, `output(0).on()`
+       followed by a check that it is on failed in the trial and nowhere
+       else. */
+#define DRY_OUTPUTS 32
+#define DRY_PADS    4                   /* pads 1..3, as the bindings number them */
+static bool s_dry_out[DRY_OUTPUTS];
+static struct { bool pwm; uint32_t freq; uint16_t duty; } s_dry_pad[DRY_PADS];
+static struct { bool used; int32_t id; JSValue fn; } s_dry_timers[MAX_TIMERS];
+
+static esp_err_t dry_dout_set(uint8_t ch, bool on)
+{
+    if (ch < DRY_OUTPUTS) s_dry_out[ch] = on;
+    return ESP_OK;
+}
+static esp_err_t dry_dout_toggle(uint8_t ch)
+{
+    if (ch < DRY_OUTPUTS) s_dry_out[ch] = !s_dry_out[ch];
+    return ESP_OK;
+}
+static bool dry_dout_get(uint8_t ch) { return ch < DRY_OUTPUTS && s_dry_out[ch]; }
+static esp_err_t dry_pwm_set(uint8_t p, uint32_t f, uint16_t d)
+{
+    if (p < 1 || p >= DRY_PADS) return ESP_ERR_INVALID_ARG;
+    if (!s_dry_pad[p].pwm)      return ESP_ERR_INVALID_STATE;
+    if (f)       s_dry_pad[p].freq = f;
+    if (d != 0xFFFF) s_dry_pad[p].duty = d;
+    return ESP_OK;
+}
+static bool dry_pwm_get(uint8_t p, uint32_t *f, uint16_t *d)
+{
+    if (p < 1 || p >= DRY_PADS || !s_dry_pad[p].pwm) return false;
+    *f = s_dry_pad[p].freq;
+    *d = s_dry_pad[p].duty;
+    return true;
+}
 static esp_err_t dry_led_set(uint8_t r, uint8_t g, uint8_t b)      { (void)r; (void)g; (void)b; return ESP_OK; }
 static void      dry_buzzer_set(uint32_t f)                        { (void)f; }
 static int       dry_mqtt_publish(const char *t, const char *p, int l, int q, bool r)
                                                                    { (void)t; (void)p; (void)l; (void)q; (void)r; return 0; }
 static int       dry_mqtt_subscribe(const char *t, int q)          { (void)t; (void)q; return 0; }
 
+/* The trial's outputs and pads, as the hardware has them now. */
+static void dry_io_start(const scripting_io_t *real)
+{
+    int n = real->do_count ? real->do_count : 8;
+    for (int ch = 0; ch < DRY_OUTPUTS; ch++)
+        s_dry_out[ch] = ch < n && real->dout_get && real->dout_get((uint8_t)ch);
+    for (int p = 0; p < DRY_PADS; p++) {
+        s_dry_pad[p].pwm = p >= 1 && real->aux_pwm_get &&
+                           real->aux_pwm_get((uint8_t)p, &s_dry_pad[p].freq, &s_dry_pad[p].duty);
+    }
+}
+
+/* _set_timer's checks and table, without the esp_timer. */
 static JSValue js_dry_set_timer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
 {
     static int32_t next;
-    (void)this_val; (void)argc; (void)argv;
-    if (++next <= 0) next = 1;
-    return JS_NewInt32(ctx, next);
+    double ms;
+    (void)this_val; (void)argc;
+    if (JS_ToFloat64(ctx, &ms, argv[0]) < 0) return JS_EXCEPTION;
+    if (!JS_IsFunction(ctx, argv[1]))
+        return JS_ThrowTypeError(ctx, "_set_timer: second argument must be a function");
+    for (int i = 0; i < MAX_TIMERS; i++) {
+        if (s_dry_timers[i].used) continue;
+        if (++next <= 0) next = 1;
+        s_dry_timers[i].used = true;
+        s_dry_timers[i].id   = next;
+        s_dry_timers[i].fn   = JS_DupValue(ctx, argv[1]);
+        return JS_NewInt32(ctx, next);
+    }
+    return JS_NewInt32(ctx, -1);
+}
+static JSValue js_dry_clear_timer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
+{
+    int32_t id;
+    (void)this_val; (void)argc;
+    if (JS_ToInt32(ctx, &id, argv[0]) < 0) return JS_EXCEPTION;
+    for (int i = 0; i < MAX_TIMERS; i++) {
+        if (!s_dry_timers[i].used || s_dry_timers[i].id != id) continue;
+        JS_FreeValue(ctx, s_dry_timers[i].fn);
+        s_dry_timers[i].used = false;
+    }
+    return JS_UNDEFINED;
+}
+/* Before the trial's context goes: the references are held against it. */
+static void dry_timers_free(JSContext *ctx)
+{
+    for (int i = 0; i < MAX_TIMERS; i++) {
+        if (!s_dry_timers[i].used) continue;
+        JS_FreeValue(ctx, s_dry_timers[i].fn);
+        s_dry_timers[i].used = false;
+    }
 }
 static JSValue js_dry_nop(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
 {
@@ -672,11 +758,15 @@ static bool trial_load(const char *script, char *err, size_t errlen)
     scripting_io_t dry = *real;
     dry.dout_set       = dry_dout_set;
     dry.dout_toggle    = dry_dout_toggle;
+    dry.dout_get       = dry_dout_get;
     if (dry.aux_pwm_set) dry.aux_pwm_set = dry_pwm_set;
+    if (dry.aux_pwm_get) dry.aux_pwm_get = dry_pwm_get;
     if (dry.led_set)     dry.led_set     = dry_led_set;
     if (dry.buzzer_set)  dry.buzzer_set  = dry_buzzer_set;
     if (dry.mqtt_publish)   dry.mqtt_publish   = dry_mqtt_publish;
     if (dry.mqtt_subscribe) dry.mqtt_subscribe = dry_mqtt_subscribe;
+
+    dry_io_start(real);
 
     bool ok = false;
     JSContext *tctx = JS_NewContext(trt);
@@ -688,7 +778,7 @@ static bool trial_load(const char *script, char *err, size_t errlen)
         register_timer_bindings(tctx);
         JSValue g = JS_GetGlobalObject(tctx);
         JS_SetPropertyStr(tctx, g, "_set_timer",   JS_NewCFunction(tctx, js_dry_set_timer, "_set_timer",   2));
-        JS_SetPropertyStr(tctx, g, "_clear_timer", JS_NewCFunction(tctx, js_dry_nop,       "_clear_timer", 1));
+        JS_SetPropertyStr(tctx, g, "_clear_timer", JS_NewCFunction(tctx, js_dry_clear_timer, "_clear_timer", 1));
         JS_SetPropertyStr(tctx, g, "print",        JS_NewCFunction(tctx, js_dry_nop,       "print",        1));
         JS_FreeValue(tctx, g);
         budget_start();
@@ -699,6 +789,7 @@ static bool trial_load(const char *script, char *err, size_t errlen)
         }
         if (ok) drain_jobs(trt);
         g_scripting_io = real;
+        dry_timers_free(tctx);
         JS_FreeContext(tctx);
     }
     JS_FreeRuntime(trt);
