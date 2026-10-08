@@ -28,7 +28,8 @@
     /* Modbus-Master-Liste: ein Block je Eintrag statt einer Tabelle. Die
        Tabelle brauchte 52rem, der Seitenkoerper ist 560px breit -- sie liess
        sich nur seitlich scrollen. Das Raster bricht stattdessen um. Ein
-       Eintrag ohne Haken, Namen und Host zeigt nur seine Kopfzeile. */
+       Eintrag ohne Haken bei "Poll" zeigt nur seine Kopfzeile: der Haken
+       schaltet die Abfrage und klappt die Einstellungen auf und zu. */
     .mbm-entry { border:1px solid #e8e8e8; border-radius:4px; padding:.45rem .55rem; margin-top:.45rem; }
     .mbm-entry.off { background:#fafafa; }
     .mbm-head { display:flex; align-items:center; gap:.5rem; }
@@ -39,6 +40,10 @@
     .mbm-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(6.5rem,1fr));
                 gap:.35rem .5rem; margin-top:.45rem; }
     .mbm-entry.off .mbm-grid { display:none; }
+    .mbm-poll { display:flex; align-items:center; gap:.25rem; margin:0; font-size:.75rem;
+                font-weight:600; color:#555; white-space:nowrap; cursor:pointer; }
+    .mbm-poll input { margin:0; }
+    .mbm-entry.off .mbm-poll { color:#999; }
     .mbm-f { margin-top:0; font-size:.7rem; font-weight:600; color:#777; text-transform:uppercase; }
     .mbm-f input, .mbm-f select { width:100%; margin-top:.1rem; padding:.3rem .4rem; font-size:.85rem; }
     .mbm-f input[type="checkbox"] { width:auto; margin-top:.35rem; }
@@ -316,7 +321,7 @@
       <label>This device is
         <select id="mb_role" onchange="updateModbusFields()">
           <option value="slave">a slave — it answers requests addressed to it</option>
-          <option value="master">the master — it reads other devices for Modbus TCP clients</option>
+          <option value="master">the master — it reads the devices on the segment</option>
         </select>
       </label>
       <label id="mb_address_row">Slave Address (1–247)
@@ -348,17 +353,21 @@
       device can read its inputs and switch its outputs — and, with RS485 set to master, everything
       on the RS485 segment as well. Only enable it on a network you control.</p>
       <label>This device answers unit ID
-        <input type="number" id="mb_tcp_uid" min="1" max="247" value="247">
+        <input type="number" id="mb_tcp_uid" min="1" max="247" value="247" oninput="updateModbusFields()">
       </label>
+      <label style="display:flex;align-items:center;gap:.5rem;font-weight:600;color:#555">
+        <input type="checkbox" id="mb_gateway" onchange="updateModbusFields()"> Gateway: forward every other unit ID to RS485
+      </label>
+      <p class="hint" id="mb_gateway_off_hint">Needs RS485 set to master and Modbus TCP answered.</p>
       <p class="hint" id="mb_tcp_hint"></p>
 
-      <h2 style="margin-top:1.5rem">Read other Modbus TCP devices</h2>
+      <h2 style="margin-top:1.5rem">Read other Modbus devices</h2>
       <p class="hint">Each row is one value this device fetches by itself. It is published on
       MQTT as <code>modbus/&lt;name&gt;</code> and is readable in a rule as
       <code>mqtt('modbus/&lt;name&gt;')</code> — that works even with no broker configured.
-      Reading only; nothing is ever written to the other device. Independent of the settings
-      above: this works whether RS485 is a slave or the master, and unlike them it takes
-      effect on save without a reboot.</p>
+      Reading only; nothing is ever written to the other device. A row reads a device on the
+      network (host and port) or on RS485 — the latter needs RS485 set to master above, with or
+      without the gateway. Rows take effect on save without a reboot.</p>
       <div id="mbm_rows"></div>
       <p class="hint">The register number is the zero-based one from the device's manual — the
       same number a Modbus master would put on the wire, not the 4xxxx form. If a 32-bit value
@@ -875,13 +884,13 @@ rule('my-rule')
         // inside the block below and would otherwise apply a snapshot taken
         // before this load -- turning Modbus TCP off from a value the user
         // never chose, on the next switch back to slave.
-        mbSavedTcp = null;
         if (cfg.modbus) {
           document.getElementById('mb_enable').checked  = !!cfg.modbus.enable;
           document.getElementById('mb_address').value   = cfg.modbus.address  ?? 1;
           document.getElementById('mb_baudrate').value  = cfg.modbus.baudrate ?? 9600;
           document.getElementById('mb_role').value      = cfg.modbus.rs485_role ?? 'slave';
           document.getElementById('mb_tcp_server').checked = !!cfg.modbus.tcp_server;
+          document.getElementById('mb_gateway').checked    = !!cfg.modbus.gateway;
           document.getElementById('mb_tcp_uid').value   = cfg.modbus.tcp_uid ?? 247;
           document.getElementById('mb_tout').value      = cfg.modbus.rs485_tout_ms ?? 1000;
           updateModbusFields();
@@ -1006,6 +1015,8 @@ rule('my-rule')
             baudrate:   parseInt(document.getElementById('mb_baudrate').value, 10),
             rs485_role: document.getElementById('mb_role').value,
             tcp_server: document.getElementById('mb_tcp_server').checked,
+            gateway:    document.getElementById('mb_gateway').checked
+                        && !document.getElementById('mb_gateway').disabled,
             tcp_uid:    parseInt(document.getElementById('mb_tcp_uid').value, 10),
             rs485_tout_ms: parseInt(document.getElementById('mb_tout').value, 10),
           },
@@ -1089,11 +1100,15 @@ rule('my-rule')
 
     /* Ein Eintrag, den niemand angefasst hat, klappt auf seine Kopfzeile zu --
        acht volle Bloecke waeren sonst fast nur Leerformular. */
+    /* The Poll checkbox switches the row's polling and opens or closes its
+       settings with it: a row that is not polled shows only its header. */
     function mbmToggle(i) {
-      var used = document.getElementById('mbm_en_' + i).checked
-              || document.getElementById('mbm_name_' + i).value.trim()
-              || document.getElementById('mbm_host_' + i).value.trim();
-      document.getElementById('mbm_row_' + i).classList.toggle('off', !used);
+      var row = document.getElementById('mbm_row_' + i);
+      row.classList.toggle('off', !document.getElementById('mbm_en_' + i).checked);
+      // A device on RS485 has no host or port: the unit ID is its address.
+      var rtu = document.getElementById('mbm_tr_' + i).value === 'rtu';
+      document.getElementById('mbm_host_' + i).disabled = rtu;
+      document.getElementById('mbm_port_' + i).disabled = rtu;
     }
 
     function renderMbm(list) {
@@ -1111,13 +1126,17 @@ rule('my-rule')
         d.id = 'mbm_row_' + i;
         d.innerHTML =
           '<div class="mbm-head">' +
-            '<input type="checkbox" id="mbm_en_' + i + '"' + (e.enable ? ' checked' : '') +
-                   ' onchange="mbmToggle(' + i + ')" title="Poll this value">' +
+            '<label class="mbm-poll" title="Poll this value; the settings open while it is on">' +
+              '<input type="checkbox" id="mbm_en_' + i + '"' + (e.enable ? ' checked' : '') +
+                     ' onchange="mbmToggle(' + i + ')">Poll</label>' +
             '<input type="text" id="mbm_name_' + i + '" maxlength="20" ' +
                    'placeholder="name — row ' + (i + 1) + '" oninput="mbmToggle(' + i + ')">' +
             '<span class="mbm-stat" id="mbm_stat_' + i + '">\u2014</span>' +
           '</div>' +
           '<div class="mbm-grid">' +
+            _mbmF('On', '<select id="mbm_tr_' + i + '" onchange="mbmToggle(' + i + ')">' +
+                          '<option value="tcp"' + (e.transport !== 'rtu' ? ' selected' : '') + '>network</option>' +
+                          '<option value="rtu"' + (e.transport === 'rtu' ? ' selected' : '') + '>RS485</option></select>') +
             _mbmF('Host', '<input type="text" id="mbm_host_' + i + '" maxlength="48" ' +
                           'oninput="mbmToggle(' + i + ')">') +
             _mbmF('Port', '<input type="number" id="mbm_port_' + i + '" min="1" max="65535" value="' +
@@ -1159,6 +1178,7 @@ rule('my-rule')
           enable:      on,
           name:        name,
           host:        host,
+          transport:   document.getElementById('mbm_tr_' + i).value,
           port:        parseInt(document.getElementById('mbm_port_'  + i).value, 10),
           unit_id:     parseInt(document.getElementById('mbm_uid_'   + i).value, 10),
           fc:          document.getElementById('mbm_fc_' + i).value,
@@ -1190,7 +1210,6 @@ rule('my-rule')
       }).catch(function () { /* the page is still usable without it */ });
     }
 
-    let mbSavedTcp = null;   // what the TCP fields held before 'master' took them over
 
     function updateModbusFields() {
       const on     = document.getElementById('mb_enable').checked;
@@ -1209,30 +1228,24 @@ rule('my-rule')
       // As a master the device has no address of its own on the segment.
       document.getElementById('mb_address_row').style.display = master ? 'none' : '';
 
-      if (master) {
-        // Master forces both, so remember what was there to put back if the
-        // role is changed again -- otherwise a look at 'master' would leave
-        // Modbus TCP switched on behind the user.
-        if (mbSavedTcp === null) mbSavedTcp = { on: tcp.checked, uid: uid.value };
-        tcp.checked  = true;             // nothing else would drive the segment
-        tcp.disabled = true;
-        uid.value    = 247;              // every lower ID belongs to the segment
-        uid.disabled = true;
-      } else {
-        if (mbSavedTcp !== null) {
-          tcp.checked = mbSavedTcp.on;
-          uid.value   = mbSavedTcp.uid;
-          mbSavedTcp  = null;
-        }
-        uid.disabled = !on;
-      }
-
-      document.getElementById('mb_tcp_hint').textContent = master
-        ? 'Unit ID 247 reaches this device\u2019s own inputs and outputs. Every other unit ID is '
-          + 'forwarded to that address on RS485; a device that does not answer gives exception 0x0B.'
+      /* Master and gateway are separate: the master reads the RS485 rows of
+         the table below by itself; the gateway additionally forwards Modbus TCP
+         requests for other unit IDs, and needs both the master and the TCP
+         server. The unit ID stays editable in every mode. */
+      const gw = document.getElementById('mb_gateway');
+      gw.disabled = !(on && master && tcp.checked);
+      document.getElementById('mb_gateway_off_hint').style.display = gw.disabled ? '' : 'none';
+      uid.disabled = !(on && tcp.checked);
+      const fwd = gw.checked && !gw.disabled;
+      const u   = parseInt(uid.value, 10) || 247;
+      document.getElementById('mb_tcp_hint').textContent = fwd
+        ? `Unit ID ${u} reaches this device\u2019s own inputs and outputs. Every other unit ID is `
+          + 'forwarded to that address on RS485; a device that does not answer gives exception 0x0B. '
+          + `A device on RS485 with address ${u} cannot be reached through the gateway`
+          + (u === 247 ? ' — 247 is the highest address and the least likely to be taken.' : '; 247 avoids that best.')
         : 'Only this unit ID is answered. Unit IDs 0 and 255 reach this device as well, since a '
           + 'client with nothing to address sends one of them. Any other gives exception 0x0A, '
-          + 'because the RS485 side is a slave and there is nothing to forward to.';
+          + 'because nothing is forwarded to RS485.';
     }
 
     function updateTzFields() {

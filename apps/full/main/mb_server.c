@@ -696,18 +696,19 @@ esp_err_t mb_server_init(void)
     ESP_RETURN_ON_ERROR(start_command_task(), TAG, "command task");
 
     if (cfg->modbus.rs485_role == MB_ROLE_MASTER) {
-        /* Nothing but the TCP server ever asks the master for anything, so
-           say plainly that the segment will sit idle rather than leave
-           someone wondering why their meters are not being read. */
-        if (!cfg->modbus.tcp_server)
-            ESP_LOGW(TAG, "RS-485 is set to master but the TCP server is off — "
-                          "nothing will drive the segment");
-
-        /* The TCP server that feeds it needs a working IP stack, which
-           app_main() does not have yet; mb_server_net_start() finishes up. */
-        return mb_gateway_start(MB_UART, cfg->modbus.baudrate,
-                                MB_TX_GPIO, MB_RX_GPIO, MB_RTS_GPIO,
-                                cfg->modbus.rs485_tout_ms);
+        /* The master serves two clients: the poll table, which reads devices
+           on the segment by itself, and -- with the gateway on -- Modbus TCP
+           clients asking for other unit IDs. Forwarding needs the TCP server,
+           which needs a working IP stack app_main() does not have yet;
+           mb_server_net_start() finishes that part. */
+        bool fwd = cfg->modbus.gateway && cfg->modbus.tcp_server;
+        if (cfg->modbus.gateway && !cfg->modbus.tcp_server)
+            ESP_LOGW(TAG, "gateway is on but the Modbus TCP server is off — nothing to forward");
+        esp_err_t r = mb_gateway_start(MB_UART, cfg->modbus.baudrate,
+                                       MB_TX_GPIO, MB_RX_GPIO, MB_RTS_GPIO,
+                                       cfg->modbus.rs485_tout_ms);
+        mb_gateway_set_forwarding(r == ESP_OK && fwd);
+        return r;
     }
 
     return start_rtu_slave(cfg);
@@ -730,12 +731,12 @@ esp_err_t mb_server_net_start(void)
     esp_err_t ret = mb_tcp_server_start(MB_TCP_PORT, cfg->modbus.tcp_uid);
     if (ret != ESP_OK) return ret;
 
-    if (cfg->modbus.rs485_role == MB_ROLE_MASTER)
+    if (mb_gateway_forwarding())
         ESP_LOGI(TAG, "Modbus TCP: own I/Os at unit ID %u, every other unit ID "
                       "forwarded to RS-485 at %"PRIu32" baud",
                  cfg->modbus.tcp_uid, cfg->modbus.baudrate);
     else
-        ESP_LOGI(TAG, "Modbus TCP: own I/Os at unit ID %u; no gateway, the "
-                      "RS-485 side is a slave", cfg->modbus.tcp_uid);
+        ESP_LOGI(TAG, "Modbus TCP: own I/Os at unit ID %u; no gateway, other unit "
+                      "IDs answer 0x0A", cfg->modbus.tcp_uid);
     return ESP_OK;
 }

@@ -73,6 +73,9 @@ static char        read_name_seen[APP_CFG_MBM_NAME_LEN + 1];
 static void      (*during_read)(void);
 
 static uint16_t mb_value_regs(uint8_t type) { return type <= MBM_VAL_S16 ? 1 : 2; }
+/* RS-485 entries go elsewhere; this test is about the TCP path. */
+static bool read_rtu(const mbm_poll_t *e, uint16_t regs, double *v, char *err, size_t n)
+{ (void)e; (void)regs; (void)v; snprintf(err, n, "rtu"); return false; }
 
 static rd_result_t read_once(const mbm_poll_t *e, uint16_t regs, double *value,
                              char *err, size_t err_len)

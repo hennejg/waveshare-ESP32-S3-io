@@ -28,7 +28,9 @@
 /* What the board does on the RS-485 segment. The two cannot be combined: one
    UART, and a half-duplex segment has exactly one master. */
 #define MB_ROLE_SLAVE   0   /* answers requests addressed to it            */
-#define MB_ROLE_MASTER  1   /* drives the segment on behalf of TCP clients */
+#define MB_ROLE_MASTER  1   /* drives the segment: polls devices (Modbus
+                               master table) and, with modbus.gateway on,
+                               forwards Modbus TCP requests to them        */
 
 /* The unit ID the board answers to over TCP when nothing else is set. 247 is
    the highest address the protocol allows and is almost never given to a real
@@ -74,6 +76,11 @@
 #define MBM_VAL_F32   4
 
 #define MBM_INTERVAL_MIN_MS   200
+
+/* Where a polled device is: on the network (host, port) or on the RS-485
+   segment, which needs the RS-485 side set to master. */
+#define MBM_TRANSPORT_TCP     0
+#define MBM_TRANSPORT_RTU     1
 #define MBM_INTERVAL_MAX_MS 86400000   /* a day */
 
 typedef struct {
@@ -82,7 +89,7 @@ typedef struct {
     uint8_t  fc;           /* 3 = holding register, 4 = input register       */
     uint8_t  type;         /* MBM_VAL_*                                      */
     uint8_t  word_swap;    /* 1 = the two registers of a 32-bit value swapped */
-    uint8_t  _pad;
+    uint8_t  transport;    /* MBM_TRANSPORT_*; was padding, so 0 = TCP       */
     uint16_t reg;          /* zero-based, as on the wire                     */
     uint16_t port;         /* usually 502                                    */
     uint16_t _pad2;
@@ -149,9 +156,10 @@ typedef struct {
         uint8_t  rs485_role; /* MB_ROLE_SLAVE or MB_ROLE_MASTER            */
         uint8_t  tcp_server; /* 1 = answer Modbus TCP on port 502          */
         uint8_t  tcp_uid;    /* unit ID the board answers to over TCP, 1–247 */
-        uint8_t  _pad2;
+        uint8_t  gateway;    /* master: forward other TCP unit IDs to RS-485 */
         uint16_t rs485_tout_ms;  /* master: how long a device may take, 50–10000 */
-        uint8_t  _pad3[2];
+        uint8_t  cfg_ver;    /* layout of this block, see app_config_init() */
+        uint8_t  _pad3;
     } modbus;
 
     /* Modbus TCP master. Stored as its own blob, so it grows and shrinks

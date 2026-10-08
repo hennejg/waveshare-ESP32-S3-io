@@ -54,6 +54,11 @@ bool mb_gateway_is_running(void)
     return s_master != NULL;
 }
 
+static bool s_forwarding;
+
+void mb_gateway_set_forwarding(bool on) { s_forwarding = on; }
+bool mb_gateway_forwarding(void)        { return s_forwarding && s_master != NULL; }
+
 /* Takes back a half-finished start. This matters more than it looks: the
    controller fills in s_master at create time, so leaving it set after a
    later step failed would make mb_gateway_is_running() say yes and the TCP
@@ -183,6 +188,13 @@ static void wire_to_regs(uint16_t *regs, const uint8_t *wire, uint16_t count)
 {
     for (uint16_t i = 0; i < count; i++)
         regs[i] = mb_be16(&wire[i * 2]);
+}
+
+uint8_t mb_gateway_read_regs(uint8_t uid, uint8_t fc, uint16_t addr,
+                             uint16_t count, uint16_t *regs)
+{
+    if (fc != MB_FC_READ_HOLDING && fc != MB_FC_READ_INPUT) return MB_EXC_ILLEGAL_FUNC;
+    return transact(uid, fc, addr, count, regs);
 }
 
 uint8_t mb_gateway_handle(uint8_t uid, const mb_request_t *req,

@@ -22,6 +22,7 @@
 #include "app_config.h"
 #include "app_mqtt.h"
 #include "mb_pdu.h"
+#include "mb_gateway.h"
 #include "net_budget.h"
 #include "scripting.h"
 
@@ -151,6 +152,12 @@ static mbm_poll_t    s_staged[APP_CFG_MBM_COUNT];   /* under s_state_mux    */
 static volatile bool s_reload_pending;
 
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
+
+/* Enabled and complete: a name, and a host unless it is on RS-485. */
+static bool entry_active(const mbm_poll_t *e)
+{
+    return e->enable && e->name[0] && (e->transport == MBM_TRANSPORT_RTU || e->host[0]);
+}
 
 /* ------------------------------------------------------------ connections */
 
@@ -396,6 +403,47 @@ static bool io_all(int fd, uint8_t *buf, size_t len, bool sending, bool *closed)
     return true;
 }
 
+/* The registers of an answer -- big endian, as on the wire -- into the scaled
+   value. Shared by both transports. */
+static bool decode_scaled(const mbm_poll_t *e, const uint8_t *data, double *value,
+                          char *err, size_t err_len)
+{
+    double raw;
+    if (!mb_value_decode(data, e->type, e->word_swap != 0, &raw)) {
+        snprintf(err, err_len, "cannot decode type %u", e->type);
+        return false;
+    }
+    double scaled = raw * (double)e->scale;
+    /* A meter that reports "no reading" as 0xFFFFFFFF decodes to NaN, and
+       0x7F800000 to infinity. Publishing either gives the rule engine a value
+       every comparison is false against, and MQTT the literal text "nan". */
+    if (!isfinite(scaled)) {
+        snprintf(err, err_len, "device returned a value that is not a number");
+        return false;
+    }
+    *value = scaled;
+    return true;
+}
+
+/* An entry on the RS-485 segment: one transaction through the bus master,
+   shared with forwarded Modbus TCP requests. Nothing to retry on a fresh
+   connection here -- a device that did not answer gets the entry's backoff. */
+static bool read_rtu(const mbm_poll_t *e, uint16_t regs, double *value,
+                     char *err, size_t err_len)
+{
+    if (!mb_gateway_is_running()) {
+        snprintf(err, err_len, "RS-485 is not set to master");
+        return false;
+    }
+    uint16_t r[2] = {0};
+    uint8_t exc = mb_gateway_read_regs(e->unit_id, e->fc, e->reg, regs, r);
+    if (exc == MB_EXC_GW_TARGET) { snprintf(err, err_len, "no answer on RS-485"); return false; }
+    if (exc != MB_EXC_NONE)      { snprintf(err, err_len, "device says exception 0x%02X", exc); return false; }
+    uint8_t wire[4];
+    for (uint16_t i = 0; i < regs; i++) mb_put16(&wire[i * 2], r[i]);
+    return decode_scaled(e, wire, value, err, err_len);
+}
+
 /* What happened to one attempt, and whether trying again could change it. */
 typedef enum { RD_OK, RD_FAILED, RD_STALE_CONN } rd_result_t;
 
@@ -462,21 +510,7 @@ static rd_result_t read_once(const mbm_poll_t *e, uint16_t regs, double *value,
         return RD_FAILED;
     }
 
-    double raw;
-    if (!mb_value_decode(data, e->type, e->word_swap != 0, &raw)) {
-        snprintf(err, err_len, "cannot decode type %u", e->type);
-        return RD_FAILED;
-    }
-    double scaled = raw * (double)e->scale;
-    /* A meter that reports "no reading" as 0xFFFFFFFF decodes to NaN, and
-       0x7F800000 to infinity. Publishing either gives the rule engine a value
-       every comparison is false against, and MQTT the literal text "nan". */
-    if (!isfinite(scaled)) {
-        snprintf(err, err_len, "device returned a value that is not a number");
-        return RD_FAILED;
-    }
-    *value = scaled;
-    return RD_OK;
+    return decode_scaled(e, data, value, err, err_len) ? RD_OK : RD_FAILED;
 }
 
 /* A connection kept from an earlier poll may have been closed at the other
@@ -496,6 +530,8 @@ static bool read_value(const mbm_poll_t *e, double *value, char *err, size_t err
 {
     uint16_t regs = mb_value_regs(e->type);
     if (regs == 0) { snprintf(err, err_len, "unknown value type %u", e->type); return false; }
+
+    if (e->transport == MBM_TRANSPORT_RTU) return read_rtu(e, regs, value, err, err_len);
 
     rd_result_t r = read_once(e, regs, value, err, err_len);
     if (r == RD_OK)     return true;
@@ -608,7 +644,7 @@ static void master_task(void *arg)
         for (int i = 0; i < APP_CFG_MBM_COUNT; i++) {
             const mbm_poll_t *e  = &s_active[i];
             entry_state_t    *st = &s_state[i];
-            if (!e->enable || !e->name[0] || !e->host[0]) continue;
+            if (!entry_active(e)) continue;
 
             if (now >= st->due_ms) {
                 poll_entry(e, st);
@@ -670,7 +706,7 @@ static esp_err_t start_locked(void)
 
     int enabled = 0;
     for (int i = 0; i < APP_CFG_MBM_COUNT; i++)
-        if (s_staged[i].enable && s_staged[i].name[0] && s_staged[i].host[0]) enabled++;
+        if (entry_active(&s_staged[i])) enabled++;
     if (!enabled) return ESP_OK;              /* nothing to do, no task */
 
     for (int i = 0; i < CONN_CACHE; i++) s_conns[i].fd = -1;

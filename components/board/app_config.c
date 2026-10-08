@@ -50,7 +50,7 @@ static app_config_t s_cfg = {
        been. */
     .modbus = { .enable = 0, .address = 1, .baudrate = 9600,
                 .rs485_role = MB_ROLE_SLAVE, .tcp_server = 0,
-                .tcp_uid = MB_TCP_UID_DEFAULT,
+                .tcp_uid = MB_TCP_UID_DEFAULT, .gateway = 0, .cfg_ver = 1,
                 .rs485_tout_ms = MB_RS485_TOUT_DEFAULT_MS },
     .can    = { .mode = 0, .n2k_addr = 0x50, .base_id = 0x100,
                 .bitrate = 250000, .tx_interval_ms = 1000 },
@@ -94,6 +94,7 @@ static void modbus_normalize(app_config_t *c)
         if (e->unit_id < MB_UID_MIN || e->unit_id > MB_UID_MAX) e->unit_id = MBM_UNIT_ID_DEFAULT;
         if (e->fc != 3 && e->fc != 4)                      e->fc          = MBM_FC_DEFAULT;
         if (!e->interval_ms)                               e->interval_ms = MBM_INTERVAL_DEFAULT_MS;
+        if (e->transport > MBM_TRANSPORT_RTU)              e->transport   = MBM_TRANSPORT_TCP;
         /* The one value the web API refuses on the way in: an untouched row
            handed out with scale 0 came straight back as a 400 the moment a
            client enabled it without changing anything else. */
@@ -122,7 +123,13 @@ esp_err_t app_config_init(void)
     sz = sizeof(s_cfg.dout);
     nvs_get_blob(h, K_DOUT_CFG, s_cfg.dout, &sz);
     sz = sizeof(s_cfg.modbus);
-    nvs_get_blob(h, K_MODBUS_CFG, &s_cfg.modbus, &sz);
+    if (nvs_get_blob(h, K_MODBUS_CFG, &s_cfg.modbus, &sz) == ESP_OK && s_cfg.modbus.cfg_ver == 0) {
+        /* Stored before the gateway was a setting of its own: a master then
+           always forwarded Modbus TCP requests. Such a board keeps doing so;
+           the next save stores the new layout. */
+        s_cfg.modbus.gateway = (s_cfg.modbus.rs485_role == MB_ROLE_MASTER);
+        s_cfg.modbus.cfg_ver = 1;
+    }
     uint8_t led_mode_val = 0;
     nvs_get_u8(h, K_LED_MODE, &led_mode_val);
     s_cfg.led_mode = led_mode_val;

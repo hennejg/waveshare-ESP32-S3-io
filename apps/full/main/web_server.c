@@ -424,6 +424,7 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON_AddStringToObject(mb, "rs485_role",
                             cfg->modbus.rs485_role == MB_ROLE_MASTER ? "master" : "slave");
     cJSON_AddBoolToObject  (mb, "tcp_server", cfg->modbus.tcp_server);
+    cJSON_AddBoolToObject  (mb, "gateway",    cfg->modbus.gateway);
     cJSON_AddNumberToObject(mb, "tcp_uid",     cfg->modbus.tcp_uid);
     cJSON *mbm = cJSON_AddArrayToObject(root, "mbm");
     for (int i = 0; i < APP_CFG_MBM_COUNT; i++) {
@@ -438,6 +439,7 @@ static esp_err_t api_config_get(httpd_req_t *req)
         cJSON_AddNumberToObject(o, "reg",         e->reg);
         cJSON_AddStringToObject(o, "type",        mbm_type_name(e->type));
         cJSON_AddBoolToObject  (o, "word_swap",   e->word_swap);
+        cJSON_AddStringToObject(o, "transport",   e->transport == MBM_TRANSPORT_RTU ? "rtu" : "tcp");
         /* Reported as stored. A stored 0 cannot occur: an enabled row with it
            is refused on the way in, a disabled one stores 1, and
            app_config_init() turns one from an older blob into 1. */
@@ -684,6 +686,8 @@ static esp_err_t api_config_post(httpd_req_t *req)
         }
         if ((v = cJSON_GetObjectItem(mb, "tcp_server")) && cJSON_IsBool(v))
             cfg.modbus.tcp_server = cJSON_IsTrue(v) ? 1 : 0;
+        if ((v = cJSON_GetObjectItem(mb, "gateway")) && cJSON_IsBool(v))
+            cfg.modbus.gateway = cJSON_IsTrue(v) ? 1 : 0;
         if ((v = cJSON_GetObjectItem(mb, "tcp_uid")) && cJSON_IsNumber(v)) {
             uint32_t u = (uint32_t)v->valuedouble;
             if (u >= 1 && u <= 247) cfg.modbus.tcp_uid = (uint8_t)u;
@@ -699,14 +703,18 @@ static esp_err_t api_config_post(httpd_req_t *req)
            ID in the range the gateway forwards would shadow the device that
            really has that address -- a request meant for it would be answered
            by this board's own two registers instead. */
-        if (cfg.modbus.enable && cfg.modbus.rs485_role == MB_ROLE_MASTER) {
+        /* The gateway forwards Modbus TCP requests to the segment, so it
+           needs both: the segment's master, and the TCP server. The master on
+           its own is fine -- it reads the RS-485 rows of the poll table. The
+           unit ID is the user's to choose with the gateway on as well; the
+           page says that a device with that address on the segment is then
+           unreachable through it. */
+        if (cfg.modbus.enable && cfg.modbus.gateway) {
             const char *why = NULL;
-            if (!cfg.modbus.tcp_server)
-                why = "rs485_role 'master' needs tcp_server enabled — "
-                      "nothing else would drive the segment";
-            else if (cfg.modbus.tcp_uid < MB_TCP_UID_DEFAULT)
-                why = "tcp_uid below 247 would shadow the device with that "
-                      "address on the RS-485 segment";
+            if (cfg.modbus.rs485_role != MB_ROLE_MASTER)
+                why = "the gateway needs RS-485 set to master";
+            else if (!cfg.modbus.tcp_server)
+                why = "the gateway needs the Modbus TCP server enabled";
             if (why) {
                 cJSON_Delete(root);
                 httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, why);
@@ -762,6 +770,8 @@ static esp_err_t api_config_post(httpd_req_t *req)
                 mbm_type_value(v->valuestring, &e->type);
             if ((v = cJSON_GetObjectItem(o, "word_swap")) && cJSON_IsBool(v))
                 e->word_swap = cJSON_IsTrue(v) ? 1 : 0;
+            if ((v = cJSON_GetObjectItem(o, "transport")) && cJSON_IsString(v))
+                e->transport = strcmp(v->valuestring, "rtu") == 0 ? MBM_TRANSPORT_RTU : MBM_TRANSPORT_TCP;
             if ((v = cJSON_GetObjectItem(o, "scale")) && cJSON_IsNumber(v)) {
                 /* The only field with no natural range, and the one that can
                    carry an infinity straight through to MQTT: cJSON parses
@@ -795,7 +805,8 @@ static esp_err_t api_config_post(httpd_req_t *req)
                 const char *why = NULL;
                 if (!e->name[0])                  why = "a Modbus master entry needs a name";
                 else if (strpbrk(e->name, "#+/")) why = "a Modbus master name must not contain '#', '+' or '/'";
-                else if (!e->host[0])             why = "a Modbus master entry needs a host";
+                else if (!e->host[0] && e->transport != MBM_TRANSPORT_RTU)
+                                                  why = "a Modbus master entry needs a host";
                 else if (e->scale == 0.0f)        why = "a Modbus master scale must be a non-zero finite number";
                 else {
                     /* Two entries of the same name would publish to one topic

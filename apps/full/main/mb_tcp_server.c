@@ -207,7 +207,7 @@ static uint16_t process(const uint8_t *frame, uint16_t len, uint8_t *out,
     if (exc == MB_EXC_NONE) {
         if (is_local(uid)) {
             exc = mb_server_handle(&req, data, &data_len);
-        } else if (mb_gateway_is_running()) {
+        } else if (mb_gateway_forwarding()) {
             s_stats.forwarded++;
             exc = mb_gateway_handle(uid, &req, data, &data_len);
         } else {
@@ -594,11 +594,11 @@ esp_err_t mb_tcp_server_start(uint16_t port, uint8_t local_uid)
     for (int i = 0; i < MB_TCP_MAX_CONN; i++) { s_conn[i].fd = -1; s_conn[i].state = SLOT_FREE; }
 
     /* The pool exists to keep a slow RS-485 segment off the polling task.
-       With the segment configured as a slave there is no segment to be slow:
-       nothing is ever forwarded, and four task stacks would stand idle for
-       the life of the board. The role is fixed at boot -- changing it needs a
-       reboot -- so asking once here is enough. */
-    if (mb_gateway_is_running()) {
+       Without forwarding there is no segment to be slow: nothing is ever
+       forwarded, and four task stacks would stand idle for the life of the
+       board. Both are fixed at boot -- changing them needs a reboot -- so
+       asking once here is enough. */
+    if (mb_gateway_forwarding()) {
         s_jobs = xQueueCreate(MB_TCP_WORKERS, sizeof(job_t));
         ESP_RETURN_ON_FALSE(s_jobs, ESP_ERR_NO_MEM, TAG, "job queue");
     }

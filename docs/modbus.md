@@ -19,8 +19,12 @@ The segment has one master, and the board is either it or a slave on it:
 
 - **Slave** (default) — answers requests sent to its address. The register map
   below is what it answers with.
-- **Master** — drives the segment for Modbus TCP clients. The board has no
-  address of its own then, and nothing else may be master.
+- **Master** — drives the segment. The board has no address of its own then,
+  and nothing else may be master. It reads the RS-485 rows of the poll table
+  (see "Reading other Modbus devices") by itself, and with the **gateway**
+  switched on it also forwards Modbus TCP requests to the devices on the
+  segment. Master and gateway are separate settings: a master without the
+  gateway needs no Modbus TCP at all.
 
 As master the board also needs to know how long a device may take to answer.
 *MODBUS over serial line V1.02* §2.4.1 leaves the value to the application and
@@ -35,8 +39,8 @@ Off by default. Enabled, the board answers on **port 502**, up to eight
 connections at once.
 
 > Modbus TCP has no authentication. Anything that can reach the board can read
-> its inputs and switch its outputs — and, with RS-485 set to master,
-> everything on the segment as well. Only enable it on a network you control.
+> its inputs and switch its outputs — and, with the gateway on, everything on
+> the segment as well. Only enable it on a network you control.
 
 Which device a request is for is decided by the MBAP unit identifier:
 
@@ -44,13 +48,19 @@ Which device a request is for is decided by the MBAP unit identifier:
 |--------------------|----------------------------------------------------------|
 | 247 (configurable) | This board — the register map below                       |
 | 0 and 255          | This board as well; a client with nothing to address sends one of them |
-| anything else      | The device with that address on RS-485, if the board is master |
+| anything else      | The device with that address on RS-485, if the gateway is on |
 
 The board also answers FC 43/14, Read Device Identification, for its own
 unit ID — see "Read Device Identification" under the register map.
 
-With RS-485 set to slave there is nothing to forward to, and any other unit ID
-is answered with exception `0x0A`.
+Without the gateway nothing is forwarded, and any other unit ID is answered
+with exception `0x0A`. The gateway needs RS-485 set to master and Modbus TCP
+on; the web UI offers it only then, and the API refuses it otherwise.
+
+The board's own unit ID can be set to anything from 1 to 247 in every mode.
+With the gateway on, a device on the segment with that same address cannot be
+reached through the gateway — requests for it are answered by the board. 247,
+the highest address, is the default because it is the least likely to be taken.
 
 ### Forwarded requests
 
@@ -61,7 +71,7 @@ including its exception code. Two codes are the gateway's own:
 | Exception | Meaning                                                   |
 |-----------|-----------------------------------------------------------|
 | `0x0B`    | The device did not answer within the configured timeout    |
-| `0x0A`    | There is no route to it — RS-485 is not in master mode     |
+| `0x0A`    | There is no route to it — the gateway is off               |
 | `0x06`    | Every worker is busy on the segment; retry                 |
 
 A request the board answers itself is never delayed by the segment: measured
@@ -85,17 +95,20 @@ A connection is kept open for as long as the client wants it. One whose peer
 has disappeared without closing is found by TCP keepalive after about 90 s and
 its slot released.
 
-## Reading other Modbus TCP devices
+## Reading other Modbus devices
 
-Independent of everything above: whatever the RS485 side is doing, the board
-can fetch values from other Modbus TCP devices by itself. Up to eight, each
-configured in the web UI (**Modbus** tab) with where the value lives and how to
-read it.
+The board can fetch values from other Modbus devices by itself, on the network
+over Modbus TCP or on the RS-485 segment. Up to eight, each configured in the
+web UI (**Modbus** tab) with where the value lives and how to read it. A row on
+RS-485 needs RS-485 set to master, with or without the gateway; its unit ID is
+the device's address on the segment, and it shares the segment with forwarded
+requests, one transaction at a time.
 
 | Field | Meaning |
 |---|---|
 | Name | what the value is called; becomes the MQTT topic and the rule key |
-| Host, Port | the other device; port is usually 502 |
+| On | `network` (Modbus TCP) or `RS485` |
+| Host, Port | the other device on the network; port is usually 502. Not used on RS485 |
 | Unit | its Modbus unit ID |
 | Register | **zero-based**, the number a master puts on the wire — not the 4xxxx form |
 | holding / input | function code 3 or 4 |
@@ -330,5 +343,5 @@ from a device without the function.
 - The Modbus stack and MQTT/Ethernet operate concurrently. A coil write via Modbus will also publish the new DO state on
   the corresponding MQTT topic.
 - Modbus is disabled by default. Enable in the web UI and reboot to activate.
-- The local unit ID must stay 247 while RS-485 is in master mode: a lower one
-  would shadow the device that really has that address on the segment.
+- With the gateway on, the local unit ID shadows the device that has that
+  address on the segment; 247 is the default for that reason.
