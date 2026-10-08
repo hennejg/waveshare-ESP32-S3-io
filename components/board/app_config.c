@@ -53,7 +53,7 @@ static app_config_t s_cfg = {
                 .rs485_role = MB_ROLE_SLAVE, .tcp_server = 0,
                 .tcp_uid = MB_TCP_UID_DEFAULT, .gateway = 0, .cfg_ver = 1,
                 .rs485_tout_ms = MB_RS485_TOUT_DEFAULT_MS },
-    .can    = { .mode = 0, .n2k_addr = 0x50, .base_id = 0x100,
+    .can    = { .mode = 0, .n2k_addr = 0x50, .base_id = APP_CFG_CAN_BASE_ID_DEFAULT,
                 .bitrate = 250000, .tx_interval_ms = 1000 },
     .sntp   = { .enable = 1, .server = "pool.ntp.org" },
     /* No entries by default: an empty table starts no task and opens no
@@ -190,6 +190,16 @@ static void io_names_normalize(app_config_t *c)
     io_space_normalize(&out);
 }
 
+/* A base ID past the 11-bit block, stored before the web check compared
+   as a double: 4294967295 wrapped through "+ 5" and was saved as 0xFFFF,
+   and the CAN server then sent on IDs folded to 16 bits. Back to the
+   default, as a request with a bad value would have left it. */
+static void can_normalize(app_config_t *c)
+{
+    if (c->can.base_id > APP_CFG_CAN_BASE_ID_MAX)
+        c->can.base_id = APP_CFG_CAN_BASE_ID_DEFAULT;
+}
+
 /* A blob written before a field existed reads it as zero, and a blob written
    by a hand-edited request can hold a value outside its range. Settled here,
    once, after loading: every reader then takes the structure as it is. */
@@ -268,6 +278,7 @@ esp_err_t app_config_init(void)
 
     nvs_close(h);
     modbus_normalize(&s_cfg);
+    can_normalize(&s_cfg);
     aux_normalize(&s_cfg);
     io_names_normalize(&s_cfg);
     return ESP_OK;

@@ -40,3 +40,5 @@ dependencies.lock
 /test/host/test_names.c
 /test/host/test_auth
 /test/host/test_auth.c
+/test/host/test_cfgnum
+/test/host/test_cfgnum.c

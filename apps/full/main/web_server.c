@@ -125,6 +125,21 @@ static void parse_invert_array(cJSON *arr, di_config_t *out, int max)
    parse and answered 400 Invalid JSON.
 
    buf must hold content_len + 1 bytes. Returns the length read, or -1. */
+/* A JSON number as an unsigned integer within [lo, hi]; false if it is not
+   a number or lies outside. Checked as a double, before any conversion: a
+   double outside the target type's range converts undefined in C, and in
+   practice it wrapped -- base_id 4294967295 became 0xFFFFFFFF, "+ 5" made
+   it 4, the 11-bit check passed and 0xFFFF was stored. Fractions are cut
+   off, as the casts did before. NaN fails both comparisons. */
+static bool json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out)
+{
+    if (!cJSON_IsNumber(v)) return false;
+    double d = v->valuedouble;
+    if (!(d >= lo && d < (double)hi + 1.0)) return false;
+    *out = (uint32_t)d;
+    return true;
+}
+
 static int recv_body(httpd_req_t *req, char *buf, size_t cap)
 {
     size_t want = req->content_len;
@@ -603,35 +618,26 @@ static esp_err_t api_config_post(httpd_req_t *req)
 #endif
     parse_invert_array(cJSON_GetObjectItem(root, "dout"), cfg.dout, APP_CFG_DO_COUNT);
 
-    cJSON *led_mode_v = cJSON_GetObjectItem(root, "led_mode");
-    if (cJSON_IsNumber(led_mode_v))
-        cfg.led_mode = (uint8_t)led_mode_v->valuedouble;
+    uint32_t n;
+    if (json_uint(cJSON_GetObjectItem(root, "led_mode"), LED_MODE_IO, LED_MODE_STATUS, &n))
+        cfg.led_mode = (uint8_t)n;
 
     cJSON *can_j = cJSON_GetObjectItem(root, "can");
     if (cJSON_IsObject(can_j)) {
-        cJSON *v;
-        if ((v = cJSON_GetObjectItem(can_j, "mode")) && cJSON_IsNumber(v)) {
-            uint8_t m = (uint8_t)v->valuedouble;
-            if (m <= 2) cfg.can.mode = m;
-        }
-        if ((v = cJSON_GetObjectItem(can_j, "n2k_addr")) && cJSON_IsNumber(v)) {
-            uint8_t a = (uint8_t)v->valuedouble;
-            if (a >= 1 && a <= 251) cfg.can.n2k_addr = a;
-        }
-        if ((v = cJSON_GetObjectItem(can_j, "base_id")) && cJSON_IsNumber(v)) {
-            uint32_t id = (uint32_t)v->valuedouble;
-            /* base_id + 1 .. base_id + 5 are used for TX and RX matching, so
-               the whole block has to fit in the 11-bit standard range. */
-            if (id + 5 <= 0x7FF) cfg.can.base_id = (uint16_t)id;
-        }
-        if ((v = cJSON_GetObjectItem(can_j, "bitrate")) && cJSON_IsNumber(v)) {
-            uint32_t br = (uint32_t)v->valuedouble;
-            /* Outside this range twai_new_node_onchip() refuses the value and
-               can_server_init() fails — see the boot-order note in main.c. */
-            if (br >= 10000 && br <= 1000000) cfg.can.bitrate = br;
-        }
-        if ((v = cJSON_GetObjectItem(can_j, "tx_interval_ms")) && cJSON_IsNumber(v))
-            cfg.can.tx_interval_ms = (uint16_t)v->valuedouble;
+        if (json_uint(cJSON_GetObjectItem(can_j, "mode"), 0, 2, &n))
+            cfg.can.mode = (uint8_t)n;
+        if (json_uint(cJSON_GetObjectItem(can_j, "n2k_addr"), 1, 251, &n))
+            cfg.can.n2k_addr = (uint8_t)n;
+        /* base_id .. base_id + 5 are used for TX and RX matching, so the
+           whole block has to fit in the 11-bit standard range. */
+        if (json_uint(cJSON_GetObjectItem(can_j, "base_id"), 0, APP_CFG_CAN_BASE_ID_MAX, &n))
+            cfg.can.base_id = (uint16_t)n;
+        /* Outside this range twai_new_node_onchip() refuses the value and
+           can_server_init() fails — see the boot-order note in main.c. */
+        if (json_uint(cJSON_GetObjectItem(can_j, "bitrate"), 10000, 1000000, &n))
+            cfg.can.bitrate = n;
+        if (json_uint(cJSON_GetObjectItem(can_j, "tx_interval_ms"), 0, UINT16_MAX, &n))
+            cfg.can.tx_interval_ms = (uint16_t)n;
     }
 
     cJSON *mb = cJSON_GetObjectItem(root, "modbus");
@@ -639,14 +645,10 @@ static esp_err_t api_config_post(httpd_req_t *req)
         cJSON *v;
         if ((v = cJSON_GetObjectItem(mb, "enable"))   && cJSON_IsBool(v))
             cfg.modbus.enable = cJSON_IsTrue(v) ? 1 : 0;
-        if ((v = cJSON_GetObjectItem(mb, "address"))  && cJSON_IsNumber(v)) {
-            uint32_t a = (uint32_t)v->valuedouble;
-            if (a >= 1 && a <= 247) cfg.modbus.address = (uint8_t)a;
-        }
-        if ((v = cJSON_GetObjectItem(mb, "baudrate")) && cJSON_IsNumber(v)) {
-            uint32_t bd = (uint32_t)v->valuedouble;
-            if (bd >= 1200 && bd <= 921600) cfg.modbus.baudrate = bd;
-        }
+        if (json_uint(cJSON_GetObjectItem(mb, "address"), 1, 247, &n))
+            cfg.modbus.address = (uint8_t)n;
+        if (json_uint(cJSON_GetObjectItem(mb, "baudrate"), 1200, 921600, &n))
+            cfg.modbus.baudrate = n;
         if ((v = cJSON_GetObjectItem(mb, "rs485_role")) && cJSON_IsString(v)) {
             if      (!strcmp(v->valuestring, "slave"))  cfg.modbus.rs485_role = MB_ROLE_SLAVE;
             else if (!strcmp(v->valuestring, "master")) cfg.modbus.rs485_role = MB_ROLE_MASTER;
@@ -655,15 +657,10 @@ static esp_err_t api_config_post(httpd_req_t *req)
             cfg.modbus.tcp_server = cJSON_IsTrue(v) ? 1 : 0;
         if ((v = cJSON_GetObjectItem(mb, "gateway")) && cJSON_IsBool(v))
             cfg.modbus.gateway = cJSON_IsTrue(v) ? 1 : 0;
-        if ((v = cJSON_GetObjectItem(mb, "tcp_uid")) && cJSON_IsNumber(v)) {
-            uint32_t u = (uint32_t)v->valuedouble;
-            if (u >= 1 && u <= 247) cfg.modbus.tcp_uid = (uint8_t)u;
-        }
-        if ((v = cJSON_GetObjectItem(mb, "rs485_tout_ms")) && cJSON_IsNumber(v)) {
-            uint32_t t = (uint32_t)v->valuedouble;
-            if (t >= MB_RS485_TOUT_MIN_MS && t <= MB_RS485_TOUT_MAX_MS)
-                cfg.modbus.rs485_tout_ms = (uint16_t)t;
-        }
+        if (json_uint(cJSON_GetObjectItem(mb, "tcp_uid"), 1, 247, &n))
+            cfg.modbus.tcp_uid = (uint8_t)n;
+        if (json_uint(cJSON_GetObjectItem(mb, "rs485_tout_ms"), MB_RS485_TOUT_MIN_MS, MB_RS485_TOUT_MAX_MS, &n))
+            cfg.modbus.rs485_tout_ms = (uint16_t)n;
 
         /* Two combinations are worth refusing rather than quietly accepting.
            A master with no TCP server has nobody to act for, and a local unit
@@ -705,6 +702,7 @@ static esp_err_t api_config_post(httpd_req_t *req)
             if (!cJSON_IsObject(o)) continue;
             mbm_poll_t *e = &cfg.mbm[i];
             cJSON *v;
+            uint32_t u;
 
             e->port = MBM_PORT_DEFAULT; e->unit_id = MBM_UNIT_ID_DEFAULT;
             e->fc = MBM_FC_DEFAULT; e->scale = 1.0f; e->interval_ms = MBM_INTERVAL_DEFAULT_MS;
@@ -719,20 +717,14 @@ static esp_err_t api_config_post(httpd_req_t *req)
                 strlcpy(e->name, v->valuestring, sizeof(e->name));
             if ((v = cJSON_GetObjectItem(o, "host")) && cJSON_IsString(v))
                 strlcpy(e->host, v->valuestring, sizeof(e->host));
-            if ((v = cJSON_GetObjectItem(o, "port")) && cJSON_IsNumber(v)) {
-                uint32_t p = (uint32_t)v->valuedouble;
-                if (p >= 1 && p <= 65535) e->port = (uint16_t)p;
-            }
-            if ((v = cJSON_GetObjectItem(o, "unit_id")) && cJSON_IsNumber(v)) {
-                uint32_t u = (uint32_t)v->valuedouble;
-                if (u >= 1 && u <= 247) e->unit_id = (uint8_t)u;
-            }
+            if (json_uint(cJSON_GetObjectItem(o, "port"), 1, 65535, &u))
+                e->port = (uint16_t)u;
+            if (json_uint(cJSON_GetObjectItem(o, "unit_id"), 1, 247, &u))
+                e->unit_id = (uint8_t)u;
             if ((v = cJSON_GetObjectItem(o, "fc")) && cJSON_IsString(v))
                 e->fc = strcmp(v->valuestring, "input") == 0 ? 4 : 3;
-            if ((v = cJSON_GetObjectItem(o, "reg")) && cJSON_IsNumber(v)) {
-                uint32_t r = (uint32_t)v->valuedouble;
-                if (r <= 65535) e->reg = (uint16_t)r;
-            }
+            if (json_uint(cJSON_GetObjectItem(o, "reg"), 0, 65535, &u))
+                e->reg = (uint16_t)u;
             if ((v = cJSON_GetObjectItem(o, "type")) && cJSON_IsString(v))
                 mbm_type_value(v->valuestring, &e->type);
             if ((v = cJSON_GetObjectItem(o, "word_swap")) && cJSON_IsBool(v))
@@ -759,11 +751,8 @@ static esp_err_t api_config_post(httpd_req_t *req)
                        the row as it stands would then be refused. */
                     e->scale = 1.0f;
             }
-            if ((v = cJSON_GetObjectItem(o, "interval_ms")) && cJSON_IsNumber(v)) {
-                uint32_t t = (uint32_t)v->valuedouble;
-                if (t >= MBM_INTERVAL_MIN_MS && t <= MBM_INTERVAL_MAX_MS)
-                    e->interval_ms = t;
-            }
+            if (json_uint(cJSON_GetObjectItem(o, "interval_ms"), MBM_INTERVAL_MIN_MS, MBM_INTERVAL_MAX_MS, &u))
+                e->interval_ms = u;
 
             /* A name that is empty or carries MQTT syntax would make a topic
                nothing can subscribe to, so the entry is refused rather than
@@ -940,7 +929,10 @@ static esp_err_t api_time_post(httpd_req_t *req)
     }
 
     cJSON *epoch = cJSON_GetObjectItem(root, "epoch");
-    if (!cJSON_IsNumber(epoch) || epoch->valuedouble < 1000000000.0) {
+    /* Up to 2099: the RTC counts years 2000..2099 (rtc.c), and beyond
+       time_t the cast below would be undefined. */
+    if (!cJSON_IsNumber(epoch) || !(epoch->valuedouble >= 1000000000.0 &&
+                                    epoch->valuedouble < 4102444800.0)) {
         cJSON_Delete(root);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing/invalid epoch");
         return ESP_OK;
@@ -1361,9 +1353,10 @@ static esp_err_t api_io_led(httpd_req_t *req)
         cJSON *rj = cJSON_GetObjectItem(root, "r");
         cJSON *gj = cJSON_GetObjectItem(root, "g");
         cJSON *bj = cJSON_GetObjectItem(root, "b");
-        if (cJSON_IsNumber(rj)) r = (uint8_t)(int)rj->valuedouble;
-        if (cJSON_IsNumber(gj)) g = (uint8_t)(int)gj->valuedouble;
-        if (cJSON_IsNumber(bj)) b = (uint8_t)(int)bj->valuedouble;
+        uint32_t n;
+        if (json_uint(rj, 0, 255, &n)) r = (uint8_t)n;
+        if (json_uint(gj, 0, 255, &n)) g = (uint8_t)n;
+        if (json_uint(bj, 0, 255, &n)) b = (uint8_t)n;
     }
     cJSON_Delete(root);
 
@@ -1391,8 +1384,9 @@ static esp_err_t api_io_buzzer(httpd_req_t *req)
     uint32_t freq = 440, dur = 200;
     cJSON *fj = cJSON_GetObjectItem(root, "freq");
     cJSON *dj = cJSON_GetObjectItem(root, "duration");
-    if (cJSON_IsNumber(fj)) freq = (uint32_t)fj->valuedouble;
-    if (cJSON_IsNumber(dj)) dur  = (uint32_t)dj->valuedouble;
+    /* buzzer_beep_once() clamps both; out of uint32_t they are left. */
+    json_uint(fj, 0, UINT32_MAX, &freq);
+    json_uint(dj, 0, UINT32_MAX, &dur);
     cJSON_Delete(root);
 
     buzzer_beep_once(freq, dur);

@@ -130,10 +130,14 @@ typedef struct {
                             (APP_AUX_DI_ENABLE); 0 = standard function */
 
     /* CAN bus */
+    /* Basic mode sends and matches base_id .. base_id + 5, all of it in the
+       11-bit standard range. */
+#define APP_CFG_CAN_BASE_ID_DEFAULT 0x100
+#define APP_CFG_CAN_BASE_ID_MAX     (0x7FF - 5)
     struct {
         uint8_t  mode;             /* 0=off  1=basic (11-bit)  2=NMEA2000 (29-bit) */
         uint8_t  n2k_addr;         /* NMEA2000 preferred source address (1–251) */
-        uint16_t base_id;          /* 11-bit base CAN ID for basic mode */
+        uint16_t base_id;          /* 11-bit base CAN ID for basic mode, <= APP_CFG_CAN_BASE_ID_MAX */
         uint32_t bitrate;          /* 125000/250000/500000/1000000; N2k forces 250000 */
         uint16_t tx_interval_ms;   /* periodic DI TX interval; 0 = on-change only */
         uint8_t  _pad[2];
