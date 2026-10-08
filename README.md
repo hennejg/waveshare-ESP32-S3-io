@@ -74,6 +74,13 @@ the tab is closed).
 **Password reset** (forgotten password): click **"Forgot password?"** on the login screen and repeat the BOOT button
 flow — no prior authentication required, physical access is sufficient.
 
+**Transport security — plain HTTP only.** The web server speaks HTTP, not HTTPS, and the password travels with every
+request as HTTP Basic authentication, i.e. Base64 — readable to anyone who can see the traffic. The same holds for the
+setup token, the configuration (including MQTT credentials) and the rules. Run the device only on a network you trust
+for this: a separate management VLAN or segment, not a shared, guest or public network, and not reachable from the
+internet. Reach it from elsewhere through a VPN or a TLS-terminating reverse proxy on that trusted segment. Choose a
+password used nowhere else. This is an accepted limitation, not an oversight: there is no TLS on the HTTP server.
+
 ### Web Configuration UI
 
 Served at `http://<device-ip>/` on port 80. Settings include (full firmware):

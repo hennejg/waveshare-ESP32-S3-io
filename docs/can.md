@@ -29,7 +29,7 @@ Three modes are available, selected in the web UI (CAN Bus section). Changes tak
 
 | Field       | Description                       | Default    |
 |-------------|-----------------------------------|------------|
-| Base CAN ID | 11-bit base address (0x000–0x7FF) | `0x100`    |
+| Base CAN ID | 11-bit base address (0x000–0x7FA, so that base + 5 stays ≤ 0x7FF; other values are ignored) | `0x100`    |
 | Bit rate    | 125 / 250 / 500 / 1000 kbit/s     | 250 kbit/s |
 
 ### Frame Map
