@@ -25,6 +25,8 @@ extern const char dsl_js_start[] asm("_binary_dsl_js_start");
 
 // QuickJS heap allocated from PSRAM via custom allocator.
 #define JS_HEAP_LIMIT    (1 * 1024 * 1024)
+/* Room to work kept free above what a reload leaves in use. */
+#define HANDOVER_SLACK   (64 * 1024)
 
 /* Upper bound on how long one event may spend inside JavaScript. Without it an
    endless loop in a user script stops the engine for the rest of the boot --
@@ -49,41 +51,16 @@ typedef enum { EVT_MQTT, EVT_INPUT_CHANGE, EVT_RELOAD, EVT_TIMER, EVT_TIME_SYNC,
    whoever reports the change, cleared by the engine when it resyncs. */
 static volatile uint32_t s_input_lost;
 
-/* Every input event carries a sequence number. A resync reads the live level
-   of a channel whose change was dropped -- but events older than that read
-   may still be waiting in the queue behind it, and delivered afterwards one of
-   them would overwrite the level just resynced: a HIGH from before a dropped
-   LOW put the rule engine back on HIGH with the pin LOW, and a heldFor() on it
-   fired. So a resync remembers, per channel, the last number handed out
-   BEFORE it reads the level, and an event at or below that mark is stale. */
-static volatile uint32_t s_input_seq;          /* last number handed out       */
-static uint32_t          s_input_mark[32];     /* scripting task only          */
-
-static inline uint32_t input_seq_next(void)
-{
-    return __atomic_add_fetch(&s_input_seq, 1u, __ATOMIC_RELAXED);
-}
-
-static inline void input_mark_resync(uint8_t ch)
-{
-    s_input_mark[ch & 31] = __atomic_load_n(&s_input_seq, __ATOMIC_RELAXED);
-}
-
-static inline bool input_event_stale(uint8_t ch, uint32_t seq)
-{
-    return (int32_t)(seq - s_input_mark[ch & 31]) <= 0;   /* wrap-safe */
-}
-
 // Fieldbus command-activity sources (DSL _on_activity key); see scripting_on_*_activity.
 #define ACT_MODBUS 0
 #define ACT_CAN    1
 
 typedef struct {
     evt_type_t type;
-    uint32_t   seq;     /* order of posting, see evt_send() */
+    uint64_t   seq;     /* order of posting, see evt_send() */
     union {
         struct { char topic[MAX_TOPIC_LEN]; char payload[MAX_PAYLOAD_LEN]; } mqtt;
-        struct { uint8_t channel; bool state; uint32_t seq; } input;
+        struct { uint8_t channel; bool state; } input;
         struct { char *script; uint32_t ticket;            // script heap-allocated; task frees after eval
                  char *store; scripting_store_fn_t store_fn; } reload;  // store: heap, NULL = not stored
         struct { uint32_t id; } timer;     // a rule timer fired (see _set_timer)
@@ -96,21 +73,60 @@ typedef struct {
    -- a timer when it is full -- takes the number too, and waits until the
    events posted before it have been handled: run ahead of them, a heldFor()
    timer checked an input whose LOW was still in the queue, saw the HIGH
-   before it, and switched the output on. */
-static volatile uint32_t s_evt_seq;
+   before it, and switched the output on.
 
-static inline bool evt_seq_after(uint32_t a, uint32_t b)   /* a later than b, wrap-safe */
-{
-    return (int32_t)(a - b) > 0;
-}
+   Numbering and queueing happen under one lock. Taken one after the other, a
+   producer could be preempted between them and another queue a later number
+   first: queue 6, 4 with timer 5 deferred -- head 6 is past 5, the timer ran,
+   and LOW 4 behind it came too late. Under the lock the queue holds the
+   numbers in order. Every producer is a task (the timers dispatch on the
+   esp_timer task, the inputs on di_task), none an ISR.
+
+   64 bits wide, so no comparison ever wraps: at 32 bits a channel whose mark
+   was never set took every event past 2^31 for stale. */
+static SemaphoreHandle_t s_send_lock;
+static uint64_t          s_evt_seq;       /* last number handed out, under s_send_lock */
+
+static inline bool evt_seq_after(uint64_t a, uint64_t b) { return a > b; }
 
 static QueueHandle_t       s_queue;
 
 static BaseType_t evt_send(scripting_evt_t *ev)
 {
-    ev->seq = __atomic_add_fetch(&s_evt_seq, 1u, __ATOMIC_RELAXED);
-    return xQueueSend(s_queue, ev, 0);
+    xSemaphoreTake(s_send_lock, portMAX_DELAY);
+    ev->seq = ++s_evt_seq;
+    BaseType_t r = xQueueSend(s_queue, ev, 0);
+    xSemaphoreGive(s_send_lock);
+    return r;
 }
+
+static uint64_t evt_seq_now(void)
+{
+    xSemaphoreTake(s_send_lock, portMAX_DELAY);
+    uint64_t v = s_evt_seq;
+    xSemaphoreGive(s_send_lock);
+    return v;
+}
+
+/* Input events and resync. A resync reads the live level of a channel whose
+   change was dropped -- but events older than that read may still be waiting
+   in the queue, and delivered afterwards one of them would overwrite the level
+   just resynced: a HIGH from before a dropped LOW put the rule engine back on
+   HIGH with the pin LOW, and a heldFor() on it fired. So a resync remembers,
+   per channel, the last number handed out BEFORE it reads the level, and an
+   input event at or below that mark is stale. */
+static uint64_t s_input_mark[32];          /* scripting task only */
+
+static inline void input_mark_resync(uint8_t ch)
+{
+    s_input_mark[ch & 31] = evt_seq_now();
+}
+
+static inline bool input_event_stale(uint8_t ch, uint64_t seq)
+{
+    return seq <= s_input_mark[ch & 31];
+}
+
 static const char         *s_user_script;
 const  scripting_io_t     *g_scripting_io;  // used by bindings.c
 
@@ -190,7 +206,7 @@ static timer_slot_t *timer_find(uint32_t id)
    task), so head and tail need no lock. */
 #define TIMER_OVERFLOW_SLOTS (MAX_TIMERS + 1)   /* one slot is the empty marker */
 static volatile uint32_t s_overflow[TIMER_OVERFLOW_SLOTS];
-static volatile uint32_t s_overflow_seq[TIMER_OVERFLOW_SLOTS];   /* its event number */
+static uint64_t          s_overflow_seq[TIMER_OVERFLOW_SLOTS];   /* its event number */
 static volatile uint8_t  s_of_head, s_of_tail;
 
 // esp_timer task context — must NOT touch QuickJS; just hand the id to our task.
@@ -209,6 +225,7 @@ static void timer_fired_cb(void *arg)
     }
     s_overflow[s_of_head]     = ev.timer.id;
     s_overflow_seq[s_of_head] = ev.seq;    /* numbered by the failed evt_send() */
+    __atomic_thread_fence(__ATOMIC_RELEASE);   /* the entry before the head that publishes it */
     s_of_head = next;
     ESP_LOGW(TAG, "event queue full - rule timer %u deferred",
              (unsigned)ev.timer.id);
@@ -572,6 +589,7 @@ static void resync_lost_inputs(JSContext *ctx)
 static void drain_overflow(JSContext *ctx)
 {
     while (s_of_tail != s_of_head) {
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
         scripting_evt_t head;
         if (xQueuePeek(s_queue, &head, 0) == pdTRUE &&
             !evt_seq_after(head.seq, s_overflow_seq[s_of_tail]))
@@ -605,6 +623,94 @@ static void bind_handlers(JSContext *ctx, JSValue *mqtt, JSValue *input,
     *time_sync = JS_GetPropertyStr(ctx, global, "_on_time_sync");
     *activity  = JS_GetPropertyStr(ctx, global, "_on_activity");
     JS_FreeValue(ctx, global);
+}
+
+/* ── Trial load at the boot limit ───────────────────────────────────────── */
+
+/* A reload evaluates the new script while the old context is still alive,
+   so the runtime's limit is doubled for the handover. A script that only fits
+   under the doubled limit was accepted, stored -- and failed with "out of
+   memory" at the next boot, which runs it under the normal one: no rules at
+   all. Measuring the new context inside the shared runtime does not tell
+   reliably what it will need alone (atoms and hash tables are shared and
+   never shrink). So the script is first loaded the way a boot loads it: a
+   runtime of its own, the normal limit, the same allocator and budget. Writes
+   to the hardware, MQTT and timers go nowhere -- the script's top level runs
+   once more, and must not switch anything twice. */
+static esp_err_t dry_dout_set(uint8_t ch, bool on)                 { (void)ch; (void)on; return ESP_OK; }
+static esp_err_t dry_dout_toggle(uint8_t ch)                       { (void)ch; return ESP_OK; }
+static esp_err_t dry_pwm_set(uint8_t p, uint32_t f, uint16_t d)    { (void)p; (void)f; (void)d; return ESP_OK; }
+static esp_err_t dry_led_set(uint8_t r, uint8_t g, uint8_t b)      { (void)r; (void)g; (void)b; return ESP_OK; }
+static void      dry_buzzer_set(uint32_t f)                        { (void)f; }
+static int       dry_mqtt_publish(const char *t, const char *p, int l, int q, bool r)
+                                                                   { (void)t; (void)p; (void)l; (void)q; (void)r; return 0; }
+static int       dry_mqtt_subscribe(const char *t, int q)          { (void)t; (void)q; return 0; }
+
+static JSValue js_dry_set_timer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
+{
+    static int32_t next;
+    (void)this_val; (void)argc; (void)argv;
+    if (++next <= 0) next = 1;
+    return JS_NewInt32(ctx, next);
+}
+static JSValue js_dry_nop(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
+{
+    (void)ctx; (void)this_val; (void)argc; (void)argv;
+    return JS_UNDEFINED;
+}
+
+static bool trial_load(const char *script, char *err, size_t errlen)
+{
+    JSRuntime *trt = JS_NewRuntime2(&s_psram_alloc, NULL);
+    if (!trt) { snprintf(err, errlen, "out of memory"); return false; }
+    JS_SetMemoryLimit(trt, JS_HEAP_LIMIT);
+    JS_SetMaxStackSize(trt, JS_STACK_LIMIT);
+    JS_SetGCThreshold(trt, 256 * 1024);
+    JS_SetInterruptHandler(trt, js_interrupt, NULL);
+
+    const scripting_io_t *real = g_scripting_io;
+    scripting_io_t dry = *real;
+    dry.dout_set       = dry_dout_set;
+    dry.dout_toggle    = dry_dout_toggle;
+    if (dry.aux_pwm_set) dry.aux_pwm_set = dry_pwm_set;
+    if (dry.led_set)     dry.led_set     = dry_led_set;
+    if (dry.buzzer_set)  dry.buzzer_set  = dry_buzzer_set;
+    if (dry.mqtt_publish)   dry.mqtt_publish   = dry_mqtt_publish;
+    if (dry.mqtt_subscribe) dry.mqtt_subscribe = dry_mqtt_subscribe;
+
+    bool ok = false;
+    JSContext *tctx = JS_NewContext(trt);
+    if (!tctx) {
+        snprintf(err, errlen, "out of memory");
+    } else {
+        g_scripting_io = &dry;          /* the bindings read it on this task only */
+        scripting_register_bindings(tctx);
+        register_timer_bindings(tctx);
+        JSValue g = JS_GetGlobalObject(tctx);
+        JS_SetPropertyStr(tctx, g, "_set_timer",   JS_NewCFunction(tctx, js_dry_set_timer, "_set_timer",   2));
+        JS_SetPropertyStr(tctx, g, "_clear_timer", JS_NewCFunction(tctx, js_dry_nop,       "_clear_timer", 1));
+        JS_SetPropertyStr(tctx, g, "print",        JS_NewCFunction(tctx, js_dry_nop,       "print",        1));
+        JS_FreeValue(tctx, g);
+        budget_start();
+        ok = eval_check(tctx, dsl_js_start, "<dsl>", err, errlen);
+        if (ok) {
+            budget_start();
+            ok = eval_check(tctx, script, "<user>", err, errlen);
+        }
+        if (ok) drain_jobs(trt);
+        g_scripting_io = real;
+        JS_FreeContext(tctx);
+    }
+    JS_FreeRuntime(trt);
+    s_interrupted = false;              /* the trial's, not the running rules' */
+    if (!ok) {
+        char why[64];
+        strlcpy(why, err, sizeof(why));
+        /* Cut short if it must be: the reason comes first. */
+        if (snprintf(err, errlen, "%s (loaded as at boot, %d KiB heap)", why, JS_HEAP_LIMIT / 1024) < 0)
+            strlcpy(err, why, errlen);
+    }
+    return ok;
 }
 
 /* ── Scripting task ──────────────────────────────────────────────────────── */
@@ -658,7 +764,7 @@ static void scripting_task(void *arg)
             case EVT_INPUT_CHANGE:
                 /* Older than a resync of this channel: the resync already
                    delivered a later level, and this one would undo it. */
-                if (input_event_stale(ev.input.channel, ev.input.seq)) break;
+                if (input_event_stale(ev.input.channel, ev.seq)) break;
                 call2(ctx, on_input,
                       JS_NewInt32(ctx, ev.input.channel),
                       JS_NewBool(ctx,  ev.input.state));
@@ -689,6 +795,14 @@ static void scripting_task(void *arg)
                    first. Only if that works is it swapped in; otherwise the old
                    one carries on serving the rules it already has. */
                 char err[96] = "";
+
+                if (!trial_load(ev.reload.script, err, sizeof(err))) {
+                    ESP_LOGE(TAG, "rules not applied, they would not load at boot: %s", err);
+                    free(ev.reload.script);
+                    free(ev.reload.store);
+                    publish_reload_result(ev.reload.ticket, false, err, false, ESP_OK);
+                    break;
+                }
 
                 /* Both generations are alive while the new script is being
                    evaluated, and the memory limit applies to the runtime as a
@@ -766,7 +880,24 @@ static void scripting_task(void *arg)
                 JS_FreeValue(ctx, on_time_sync);
                 JS_FreeValue(ctx, on_activity);
                 JS_FreeContext(ctx);
-                JS_SetMemoryLimit(rt, JS_HEAP_LIMIT);   /* old one is gone */
+                /* The old one is gone. The trial load showed the script
+                   fits the normal limit alone, but this runtime keeps the
+                   atom and shape tables the handover grew -- QuickJS never
+                   shrinks them. Should that leave it above the limit, the
+                   limit is raised to what is in use plus room to work until
+                   the next boot, which starts at the normal one again;
+                   enforced as it was, every allocation would fail and the
+                   rules would stop. */
+                JS_RunGC(rt);
+                JSMemoryUsage mu;
+                JS_ComputeMemoryUsage(rt, &mu);
+                size_t in_use = (size_t)mu.malloc_size, limit = JS_HEAP_LIMIT;
+                if (in_use + HANDOVER_SLACK > limit) {
+                    limit = in_use + HANDOVER_SLACK;
+                    ESP_LOGW(TAG, "rule heap after the reload %u KiB: limit %u KiB until the next boot",
+                             (unsigned)(in_use / 1024), (unsigned)(limit / 1024));
+                }
+                JS_SetMemoryLimit(rt, limit);
 
                 ctx = nctx;
                 bind_handlers(ctx, &on_mqtt, &on_input, &on_time_sync, &on_activity);
@@ -815,6 +946,12 @@ esp_err_t scripting_init(const char *user_script, const scripting_io_t *io)
     s_reload_lock = xSemaphoreCreateMutex();
     if (!s_reload_lock) {
         ESP_LOGE(TAG, "Failed to create reload status lock");
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_send_lock = xSemaphoreCreateMutex();
+    if (!s_send_lock) {
+        ESP_LOGE(TAG, "Failed to create event lock");
         return ESP_ERR_NO_MEM;
     }
 
@@ -949,7 +1086,7 @@ void scripting_on_input_change(uint8_t channel, bool state)
     if (!s_queue) return;
     scripting_evt_t ev = {
         .type  = EVT_INPUT_CHANGE,
-        .input = { .channel = channel, .state = state, .seq = input_seq_next() },
+        .input = { .channel = channel, .state = state },
     };
     if (evt_send(&ev) != pdTRUE) {
         /* Remembered, not lost: the engine re-reads the channel's live level

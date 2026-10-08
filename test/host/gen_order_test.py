@@ -5,13 +5,19 @@ Cut out of scripting.c verbatim: the event numbering, the timer callback with
 its overflow ring, drain_overflow(), and the pending time sync. The scripting
 task's loop is modelled in its real order around them.
 
-What it pins down, both found by an outside review:
+What it pins down, found by outside reviews:
   - a timer the full queue pushed into the overflow ring ran before the
     events queued ahead of it: a heldFor() timer saw the HIGH before a
     queued LOW and switched the output on;
   - a time sync the full queue dropped was lost: cron stayed off until the
-    next sync an hour later.
-OLD=1 runs the loop the way it was before (overflow first, no wait).
+    next sync an hour later;
+  - numbering and queueing were two steps: a producer preempted between
+    them let another queue a later number first (queue 6, 4 with timer 5
+    deferred), the timer ran ahead of LOW 4 and switched the output on.
+    The model preempts evt_send() inside its lock; a task that wants the
+    lock then waits for it, as under FreeRTOS.
+OLD=1 runs the loop the way it was before (overflow first, no wait);
+NOLOCK=1 takes the lock out, as evt_send() was before.
 
   make -C test/host order
 """
@@ -20,8 +26,7 @@ from cutter import Source
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 src  = Source(ROOT / "components/scripting/scripting.c")
-cuts  = src.span("static volatile uint32_t s_evt_seq;", "    return (int32_t)(a - b) > 0;\n}")
-cuts += src.func("static BaseType_t evt_send(scripting_evt_t *ev)")
+cuts  = src.span("static SemaphoreHandle_t s_send_lock;", "    return seq <= s_input_mark[ch & 31];\n}")
 cuts += src.span("#define TIMER_OVERFLOW_SLOTS", "static volatile uint8_t  s_of_head, s_of_tail;")
 cuts += src.func("static void timer_fired_cb(void *arg)")
 cuts += src.span("static volatile uint8_t s_pending;", "#define PENDING_TZ_CHANGE  0x02u")
@@ -44,11 +49,12 @@ HARNESS = r"""
 typedef int BaseType_t;
 #define pdTRUE  1
 #define pdFALSE 0
+#define portMAX_DELAY 0
 typedef int JSContext; typedef int JSValue;
-typedef enum { EVT_INPUT_CHANGE, EVT_TIMER, EVT_TIME_SYNC, EVT_TZ_CHANGE } evt_type_t;
+typedef enum { EVT_INPUT_CHANGE, EVT_TIMER, EVT_TIME_SYNC, EVT_TZ_CHANGE, EVT_OTHER } evt_type_t;
 typedef struct {
     evt_type_t type;
-    uint32_t   seq;
+    uint64_t   seq;
     union { struct { uint8_t channel; bool state; } input; struct { uint32_t id; } timer; };
 } scripting_evt_t;
 
@@ -56,17 +62,42 @@ typedef struct {
 #define QCAP 4
 static struct { scripting_evt_t e[QCAP]; int h, n; } Q;
 typedef void *QueueHandle_t;
-static QueueHandle_t s_queue = &Q;
-static BaseType_t xQueueSend(QueueHandle_t q, const scripting_evt_t *e, int t)
-{ (void)q; (void)t; if (Q.n == QCAP) return pdFALSE; Q.e[(Q.h + Q.n++) % QCAP] = *e; return pdTRUE; }
+static void (*preempt)(void);      /* runs once, between numbering and queueing */
 static BaseType_t xQueuePeek(QueueHandle_t q, scripting_evt_t *e, int t)
 { (void)q; (void)t; if (!Q.n) return pdFALSE; *e = Q.e[Q.h]; return pdTRUE; }
 static BaseType_t xQueueReceive(QueueHandle_t q, scripting_evt_t *e, int t)
 { (void)q; (void)t; if (!Q.n) return pdFALSE; *e = Q.e[Q.h]; Q.h = (Q.h + 1) % QCAP; Q.n--; return pdTRUE; }
+
+/* The lock. A task that wants it while it is held is parked and runs when
+   it is given back -- FreeRTOS blocks it in xSemaphoreTake(). */
+typedef int *SemaphoreHandle_t;
+static int nolock, held;
+static void (*parked[8])(void); static int nparked;
+static void lock_or_park(void (*task)(void))
+{ if (held) parked[nparked++] = task; else task(); }
+static void xSemaphoreTake(SemaphoreHandle_t l, int t) { (void)l; (void)t; if (!nolock) held = 1; }
+static void xSemaphoreGive(SemaphoreHandle_t l)
+{
+    (void)l; if (nolock) return;
+    held = 0;
+    while (nparked) {   /* in arrival order */
+        void (*t)(void) = parked[0];
+        for (int i = 1; i < nparked; i++) parked[i - 1] = parked[i];
+        nparked--; t();
+    }
+}
+static BaseType_t xQueueSend(QueueHandle_t q, const scripting_evt_t *e, int t)
+{
+    (void)q; (void)t;
+    if (preempt) { void (*p)(void) = preempt; preempt = NULL; p(); }
+    if (Q.n == QCAP) return pdFALSE;
+    Q.e[(Q.h + Q.n++) % QCAP] = *e; return pdTRUE;
+}
 static void budget_start(void) {}
 
 /* The engine: one input and a heldFor() rule on it, armed while HIGH. */
 static bool input_high = true, output_on, time_valid, s_time_valid;
+static void handle(const scripting_evt_t *e);
 static void run_timer(JSContext *ctx, uint32_t id)
 { (void)ctx; (void)id; if (input_high) output_on = true; }
 static void handle_time_sync(JSContext *ctx, JSValue f, bool sync)
@@ -95,12 +126,30 @@ static void pass(void)
     scripting_evt_t e;
     if (xQueueReceive(s_queue, &e, 0) == pdTRUE) handle(&e);
 }
+static void post_other(void)
+{ scripting_evt_t e = { .type = EVT_OTHER }; evt_send(&e); }
+/* While the LOW producer sits between numbering and queueing: the timer
+   fires with the queue full and is deferred, the engine takes two events,
+   and another producer posts. Each producer task waits for the lock. */
+static void fire_timer(void) { timer_fired_cb((void *)(uintptr_t)9); }
+static void preempt_low(void)
+{
+    scripting_evt_t e;
+    lock_or_park(post_other);                     /* fills the queue */
+    lock_or_park(fire_timer);                     /* deferred: queue full */
+    xQueueReceive(s_queue, &e, 0); handle(&e);    /* the engine runs */
+    xQueueReceive(s_queue, &e, 0); handle(&e);
+    lock_or_park(post_other);
+}
 static void post_input(bool st)
 { scripting_evt_t e = { .type = EVT_INPUT_CHANGE, .input = { 0, st } }; if (evt_send(&e) != pdTRUE) printf("    input verloren\n"); }
 
 int main(void)
 {
     old_loop = getenv("OLD") && atoi(getenv("OLD"));
+    nolock   = getenv("NOLOCK") && atoi(getenv("NOLOCK"));
+    s_queue  = &Q;
+    (void)input_event_stale; (void)input_mark_resync;
 
     printf("  heldFor-Timer bei voller Queue, LOW davor eingereiht:\n");
     post_input(false);                       /* the input drops */
@@ -125,6 +174,16 @@ int main(void)
     for (int i = 0; i < 8; i++) pass();
     printf("  Uhr %s (erwartet gueltig)\n", time_valid ? "gueltig" : "UNGUELTIG");
     if (!time_valid) { failures++; printf("  FEHLER: Time-Sync ging verloren\n"); }
+
+    printf("  Produzent zwischen Nummer und Einreihen verdraengt:\n");
+    while (Q.n) pass();
+    output_on = false; input_high = true;
+    post_other(); post_other(); post_other();   /* queue: 3 others */
+    preempt = preempt_low;
+    post_input(false);                       /* LOW: numbered, then preempted */
+    while (Q.n || s_of_tail != s_of_head) pass();
+    printf("  Ausgang %s (erwartet aus)\n", output_on ? "EIN" : "aus");
+    if (output_on) { failures++; printf("  FEHLER: Timer lief vor dem frueher nummerierten LOW\n"); }
 
     printf(failures ? "order: %d FEHLER\n" : "order: alles OK\n", failures);
     return failures ? 1 : 0;
