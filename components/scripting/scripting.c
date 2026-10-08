@@ -461,27 +461,47 @@ static inline void budget_start(void)
    matching -- and _after_interrupt() clears them. Called after every entry
    into JS, before the next one -- also between the calls of a function that
    makes several, like drain_overflow(). */
+/* _after_interrupt() also takes up the rule passes the interrupt cut short,
+   past the rule that ran over, so the later rules still get the event. A
+   later rule that runs over as well is cut short in its turn, and the next
+   call goes on past it -- up to RESUME_TRIES times per interrupted call, so a
+   script full of slow rules holds the task for a bounded time (at most
+   RESUME_TRIES + 2 budgets, the interrupted call included). The last call
+   passes false: it drops what is left and only clears flags, which evaluates
+   no rule. */
+#define RESUME_TRIES 3
+
 static void recover_interrupt(JSContext *ctx)
 {
     if (!s_interrupted) return;
-    s_interrupted = false;
     ESP_LOGW(TAG, "time budget exceeded: rule state reset after the interrupted call");
     JSValue global = JS_GetGlobalObject(ctx);
     JSValue fn = JS_GetPropertyStr(ctx, global, "_after_interrupt");
     JS_FreeValue(ctx, global);
-    if (JS_IsFunction(ctx, fn)) {
+    if (!JS_IsFunction(ctx, fn)) s_interrupted = false;
+    for (int i = 0; s_interrupted && i <= RESUME_TRIES; i++) {
+        s_interrupted = false;
+        /* Each try can take a whole budget; a tick between them lets this
+           core's idle task run, which the task watchdog waits for. */
+        if (i) vTaskDelay(1);
         budget_start();
-        JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 0, NULL);
+        JSValue resume = JS_NewBool(ctx, i < RESUME_TRIES);
+        JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 1, &resume);
         if (JS_IsException(r)) {
             JSValue exc = JS_GetException(ctx);
-            const char *msg = JS_ToCString(ctx, exc);
-            ESP_LOGE(TAG, "_after_interrupt error: %s", msg ? msg : "(unknown)");
-            JS_FreeCString(ctx, msg);
+            /* Cut short by the budget: the next rule that ran over, which
+               dsl.js names when it goes on past it -- not an error of its own. */
+            if (!s_interrupted) {
+                const char *msg = JS_ToCString(ctx, exc);
+                ESP_LOGE(TAG, "_after_interrupt error: %s", msg ? msg : "(unknown)");
+                JS_FreeCString(ctx, msg);
+            }
             JS_FreeValue(ctx, exc);
         }
         JS_FreeValue(ctx, r);
-        /* Interrupted itself: tried again on the next pass of the loop. */
     }
+    /* Still interrupted after the last call: tried again on the next pass
+       of the loop. */
     JS_FreeValue(ctx, fn);
 }
 

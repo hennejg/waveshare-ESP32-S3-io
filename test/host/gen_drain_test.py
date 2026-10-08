@@ -27,6 +27,8 @@ cuts  = src.span("#define MAX_TIMERS", "static uint32_t     s_next_timer_id = 1;
 cuts += src.func("static timer_slot_t *timer_find(uint32_t id)")
 cuts += src.span("#define TIMER_OVERFLOW_SLOTS", "static volatile uint8_t  s_of_head, s_of_tail;")
 cuts += src.span("static bool    s_interrupted;", "static bool    s_interrupted;")
+if "#define RESUME_TRIES" in src.text:
+    cuts += src.defines("RESUME_TRIES")
 cuts += src.func("static void recover_interrupt(JSContext *ctx)")
 cuts += src.func("static void run_timer(JSContext *ctx, uint32_t id)")
 cuts += src.func("static void drain_overflow(JSContext *ctx)")
@@ -46,6 +48,7 @@ HARNESS = r"""
 #define ESP_LOGE ESP_LOGW
 typedef void *esp_timer_handle_t;
 static void esp_timer_delete(esp_timer_handle_t h) { (void)h; }
+#define vTaskDelay(t) ((void)(t))
 typedef int BaseType_t;
 #define pdTRUE 1
 #define pdFALSE 0

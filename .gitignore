@@ -42,3 +42,6 @@ dependencies.lock
 /test/host/test_auth.c
 /test/host/test_cfgnum
 /test/host/test_cfgnum.c
+/test/host/test_resume
+/test/host/test_resume.c
+/test/host/test_resume_old_dsl.js

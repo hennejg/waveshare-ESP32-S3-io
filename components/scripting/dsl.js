@@ -141,6 +141,8 @@ function _reset_rules() {
     _cronTriggers = [];        // timers already cancelled above; drop the old trigger registry
     _activityWatchdogs = {};   // drop modbus()/can() health watchdogs from the old rule set
     _watchOutputs = false;
+    _passes = [];              // a cut-short pass of the old rules has nothing left to visit
+    _heldCheck = null;
     _resetCascade();
 }
 
@@ -865,7 +867,31 @@ function _run_action(r) {
 // (an mqtt().once() or a time trigger would keep matching on later, unrelated
 // events) -- and a time trigger whose callback was cut short never re-armed
 // itself. All of these are only true during a pass, and no pass is running now.
-function _after_interrupt() {
+//
+// Before the flags are cleared, the passes the interrupt cut short are taken
+// up again past the rule that ran over (see _pass), so the later rules still
+// see the event -- with the edge flags it armed. Cut short again, the next
+// call goes on past the next such rule. resume === false (the host's last
+// try) drops what is left of them instead: clearing flags evaluates no rule.
+// A heldFor check cut short is set again for another held period.
+function _after_interrupt(resume) {
+    _resetCascade();
+    for (var f = 0; f < _rules.length; f++) _rules[f]._firing = false;
+    var h = _heldCheck;
+    _heldCheck = null;
+    if (h && h._timer == null && !h._fired) {
+        print('[rule:' + h.name + '] time budget exceeded in the heldFor() check -- checked again after another ' + h.heldFor + ' ms');
+        h._timer = _schedule(h.heldFor, _held_elapsed(h));
+    }
+    if (resume === false) {
+        if (_passes.length) print('[rules] time budget exceeded again -- the event is not passed on to the remaining rules');
+        _passes = [];
+    }
+    while (_passes.length) {
+        var p = _passes.pop();
+        print('[rule:' + (p.rule ? p.rule.name : '?') + '] time budget exceeded -- the event goes on to the rules after it');
+        _pass(p);
+    }
     _resetCascade();
     var rearm = [];
     for (var i = 0; i < _rules.length; i++) {
@@ -897,6 +923,21 @@ function _analogEdge(r) {
     return false;
 }
 
+// The heldFor timer's callback. The check runs with _heldCheck naming the
+// rule: cut short by the time budget there, the timer is gone and nothing
+// has fired, and with no further event the rule would never fire although
+// its conditions keep holding -- _after_interrupt() sets it again.
+var _heldCheck = null;
+function _held_elapsed(rule) {
+    return function() {
+        rule._timer = null;
+        _heldCheck = rule;
+        var m = _rule_matches(rule);
+        _heldCheck = null;
+        if (m) { rule._fired = true; _run_action(rule); }
+    };
+}
+
 // Fire, arm or disarm one rule for a match result -- shared by _fire_matching()
 // and _on_analog(). The analog latch follows every evaluation, not only those
 // from analog readings: a band rule fired by another fact while the reading is
@@ -907,14 +948,7 @@ function _apply_match(r, matched) {
         if (r.heldFor > 0) {
             // sustained gate: arm a timer once; fire only if still matching at
             // elapse; latch so it fires once per held period, not every event
-            if (r._timer == null && !r._fired) {
-                r._timer = _schedule(r.heldFor, (function(rule) {
-                    return function() {
-                        rule._timer = null;
-                        if (_rule_matches(rule)) { rule._fired = true; _run_action(rule); }
-                    };
-                })(r));
-            }
+            if (r._timer == null && !r._fired) r._timer = _schedule(r.heldFor, _held_elapsed(r));
         } else {
             _run_action(r);
         }
@@ -931,11 +965,28 @@ function _apply_match(r, matched) {
 // evaluates every rule.
 function _fire_matching(factKey, _isCascade) {
     if (!_isCascade) _resetCascade();   // a root event/timer starts a fresh cascade budget
-    for (var i = 0; i < _rules.length; i++) {
-        var r = _rules[i];
-        if (factKey != null && !r._wildcard && !r._facts[factKey]) continue;
-        _apply_match(r, _rule_matches(r));
+    _pass({ key: factKey, analog: false, next: 0, rule: null });
+}
+
+// One event's walk over the rules. The passes in progress are kept on
+// _passes, innermost last, each with the index of the next rule to take:
+// when the time budget cuts a rule short, the interrupt unwinds the whole
+// pass -- and every pass around it -- and the rules after that one never
+// saw the event. _after_interrupt() goes on from `next`, past the rule that
+// ran over. `next` moves before the rule runs, in the one expression that
+// reads it, so wherever the interrupt lands no rule runs twice.
+var _passes = [];
+function _pass(p) {
+    _passes.push(p);
+    while (p.next < _rules.length) {
+        var r = _rules[p.next++];
+        if (p.key != null && !r._wildcard && !r._facts[p.key]) continue;
+        p.rule = r;
+        var m = _rule_matches(r);
+        if (p.analog && m && r._analogIn && !(r.heldFor > 0) && _analogEdge(r)) continue;   // edge taken
+        _apply_match(r, m);
     }
+    _passes.pop();
 }
 
 // A new analog reading. Edge-triggered per rule: a rule fires when its
@@ -947,12 +998,5 @@ function _on_analog(pad, mv) {
     if (mv === null || mv === undefined) delete _an_seen[pad];
     else _an_seen[pad] = mv;
     _resetCascade();
-    var key = 'analog:' + pad;
-    for (var i = 0; i < _rules.length; i++) {
-        var r = _rules[i];
-        if (!r._wildcard && !r._facts[key]) continue;
-        var m = _rule_matches(r);
-        if (m && r._analogIn && !(r.heldFor > 0) && _analogEdge(r)) continue;   // edge taken
-        _apply_match(r, m);
-    }
+    _pass({ key: 'analog:' + pad, analog: true, next: 0, rule: null });
 }
