@@ -9,8 +9,8 @@ CFLAGS := -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 PORT ?= 15020
 
-.PHONY: all clean client poller master dns
-all: test_mb_pdu client poller master dns
+.PHONY: all clean client poller master dns tz resync
+all: test_mb_pdu client poller master dns tz resync
 	./test_mb_pdu
 
 # The firmware's framing against a Modbus TCP server written independently of
@@ -40,6 +40,22 @@ test_mb_dns: gen_dns_test.py $(MAIN)/mb_tcp_master.c $(MAIN)/net_budget.h ../../
 	python3 gen_dns_test.py
 	$(CC) $(CFLAGS) -I../../components/board -Istubs test_mb_dns.c -o $@
 
+# The rule engine's resync of dropped input changes, helpers cut out of scripting.c.
+resync: test_resync
+	./test_resync
+
+test_resync: gen_resync_test.py ../../components/scripting/scripting.c
+	python3 gen_resync_test.py
+	$(CC) $(CFLAGS) test_resync.c -o $@
+
+# QuickJS's timezone offset, newlib branch, cut out of the patched quickjs.c.
+tz: test_tz
+	./test_tz
+
+test_tz: gen_tz_test.py ../../components/quickjs/extern/quickjs/quickjs.c
+	python3 gen_tz_test.py
+	$(CC) $(CFLAGS) test_tz.c -o $@
+
 # The TCP server's receive path, cut out of the real source by the generator
 # so the test cannot drift away from the code.
 poller: test_mb_poller
@@ -58,4 +74,4 @@ test_mb_pdu: test_mb_pdu.c $(MAIN)/mb_pdu.c $(MAIN)/mb_pdu.h $(MAIN)/mb_request.
 clean:
 	rm -rf test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c \
 	       test_mb_master test_mb_master.c \
-	       test_mb_dns test_mb_dns.c *.dSYM
+	       test_mb_dns test_mb_dns.c test_tz test_tz.c test_resync test_resync.c *.dSYM

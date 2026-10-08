@@ -1,15 +1,29 @@
 diff --git a/quickjs.c b/quickjs.c
-index e3716a4..f065580 100644
+index e3716a4..cdcfd8b 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -47478,7 +47478,9 @@ static int getTimezoneOffset(int64_t time)
-         }
+@@ -47495,6 +47495,24 @@ static int getTimezoneOffset(int64_t time)
+ 
+         res = (gm_ti - loc_ti) / 60;
      }
-     ti = time;
--#if defined(_WIN32)
-+/* Use the portable gmtime/localtime difference on Windows and on embedded
-+   targets (e.g. ESP32 / newlib) where struct tm has no tm_gmtoff. */
-+#if defined(_WIN32) || !defined(__GLIBC__)
++#elif !defined(__GLIBC__)
++    /* Embedded targets (ESP32 / newlib): struct tm has no tm_gmtoff. The
++       offset is the difference of the broken-down local and UTC times. Not
++       through mktime() of gmtime()'s fields, as above: gmtime() sets
++       tm_isdst = 0, mktime() takes that as standard time, and the result is
++       an hour short whenever daylight saving time is in effect. */
++    {
++        struct tm g, l;
++        int days;
++
++        if (!gmtime_r(&ti, &g) || !localtime_r(&ti, &l))
++            return 0;
++        if (l.tm_year != g.tm_year)
++            days = l.tm_year > g.tm_year ? 1 : -1;
++        else
++            days = l.tm_yday - g.tm_yday;
++        res = -((days * 24 + l.tm_hour - g.tm_hour) * 60 + (l.tm_min - g.tm_min));
++    }
+ #else
      {
-         struct tm *tm;
-         time_t gm_ti, loc_ti;
+         struct tm tm;

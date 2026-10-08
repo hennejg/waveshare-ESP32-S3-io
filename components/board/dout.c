@@ -16,6 +16,7 @@ bool app_mqtt_is_connected(void);
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "i2c_bus.h"
 
 #define TAG          "dout"
@@ -140,13 +141,47 @@ static esp_err_t write_outputs(void)
 }
 
 #ifdef CONFIG_APP_MQTT_ENABLE
+/* Only confirmed states are published, and only by one task.
+
+   s_state[] is the working copy dout_modify() changes before the I2C
+   transfer and puts back when it fails; read from there, a publish could
+   announce a state the relays never reached and that no later publish
+   corrected. s_port holds what the expander confirmed. And publishing
+   happens on a task of its own rather than in the caller: under the output
+   lock it would deadlock against the MQTT task, which calls in here while
+   holding its client's lock, and outside it two callers could publish their
+   states in the opposite order of the writes. The one publisher reads the
+   current confirmed state whenever it runs, so the last thing it publishes is
+   the last thing the relays did. */
+static TaskHandle_t     s_pub_task;
+static volatile uint8_t s_pub_dirty;      /* bit n: publish output n */
+
 static void publish_one(uint8_t n)
 {
     const char *name = app_config_get()->dout[n].name;
     char topic[32];
     if (name[0]) snprintf(topic, sizeof(topic), "output/%.20s",   name);
     else         snprintf(topic, sizeof(topic), "output/%u",    n + 1);
-    app_mqtt_publish(topic, s_state[n] ? "true" : "false", -1, 0, false);
+    app_mqtt_publish(topic, ((s_port >> n) & 1u) ? "true" : "false", -1, 0, false);
+}
+
+static void mark_publish(uint8_t mask)
+{
+    if (!mask) return;
+    __atomic_fetch_or(&s_pub_dirty, mask, __ATOMIC_RELAXED);
+    if (s_pub_task) xTaskNotifyGive(s_pub_task);
+}
+
+static void publish_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        uint8_t dirty = __atomic_exchange_n(&s_pub_dirty, 0, __ATOMIC_RELAXED);
+        if (!app_mqtt_is_connected()) continue;   /* reconnect publishes all */
+        for (uint8_t i = 0; i < NUM_DO; i++)
+            if (dirty & (1u << i)) publish_one(i);
+    }
 }
 #endif
 
@@ -180,6 +215,10 @@ esp_err_t dout_init(void)
     uint8_t cfg_cmd[2] = {REG_CONFIG, 0x00};
     ESP_RETURN_ON_ERROR(i2c_transmit_safe(cfg_cmd, sizeof(cfg_cmd)), TAG, "TCA9554 config");
 
+#ifdef CONFIG_APP_MQTT_ENABLE
+    if (!s_pub_task && xTaskCreate(publish_task, "dout_pub", 3072, NULL, 4, &s_pub_task) != pdPASS)
+        ESP_LOGE(TAG, "publish task: out of memory -- output states are not published");
+#endif
     ESP_LOGI(TAG, "Initialized %d outputs via TCA9554 (I2C addr 0x%02X)", NUM_DO, TCA9554_ADDR);
     return ESP_OK;
 }
@@ -218,13 +257,10 @@ esp_err_t dout_modify(uint8_t set, uint8_t clear, uint8_t toggle)
     s_port = after;         /* what the relays are now doing, in one store */
     dout_unlock();
 
-    /* Only publish channels that actually moved — avoids an echo loop from our
-       own confirmations coming back off the broker. */
+    /* Only channels that actually moved, as confirmed -- avoids an echo loop
+       from our own confirmations coming back off the broker. */
 #ifdef CONFIG_APP_MQTT_ENABLE
-    uint8_t changed = (uint8_t)(before ^ after);
-    if (changed && app_mqtt_is_connected())
-        for (uint8_t i = 0; i < NUM_DO; i++)
-            if (changed & (1u << i)) publish_one(i);
+    mark_publish((uint8_t)(before ^ after));
 #endif
     return ret;
 }
@@ -250,7 +286,7 @@ esp_err_t dout_publish_all(void)
     if (ret != ESP_OK)
         ESP_LOGW(TAG, "outputs: re-apply failed (%s)", esp_err_to_name(ret));
 #ifdef CONFIG_APP_MQTT_ENABLE
-    for (uint8_t i = 0; i < NUM_DO; i++) publish_one(i);
+    mark_publish(0xFFu);
 #endif
     return ret;
 }

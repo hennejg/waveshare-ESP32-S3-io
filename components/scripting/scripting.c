@@ -49,6 +49,31 @@ typedef enum { EVT_MQTT, EVT_INPUT_CHANGE, EVT_RELOAD, EVT_TIMER, EVT_TIME_SYNC,
    whoever reports the change, cleared by the engine when it resyncs. */
 static volatile uint32_t s_input_lost;
 
+/* Every input event carries a sequence number. A resync reads the live level
+   of a channel whose change was dropped -- but events older than that read
+   may still be waiting in the queue behind it, and delivered afterwards one of
+   them would overwrite the level just resynced: a HIGH from before a dropped
+   LOW put the rule engine back on HIGH with the pin LOW, and a heldFor() on it
+   fired. So a resync remembers, per channel, the last number handed out
+   BEFORE it reads the level, and an event at or below that mark is stale. */
+static volatile uint32_t s_input_seq;          /* last number handed out       */
+static uint32_t          s_input_mark[32];     /* scripting task only          */
+
+static inline uint32_t input_seq_next(void)
+{
+    return __atomic_add_fetch(&s_input_seq, 1u, __ATOMIC_RELAXED);
+}
+
+static inline void input_mark_resync(uint8_t ch)
+{
+    s_input_mark[ch & 31] = __atomic_load_n(&s_input_seq, __ATOMIC_RELAXED);
+}
+
+static inline bool input_event_stale(uint8_t ch, uint32_t seq)
+{
+    return (int32_t)(seq - s_input_mark[ch & 31]) <= 0;   /* wrap-safe */
+}
+
 // Fieldbus command-activity sources (DSL _on_activity key); see scripting_on_*_activity.
 #define ACT_MODBUS 0
 #define ACT_CAN    1
@@ -57,7 +82,7 @@ typedef struct {
     evt_type_t type;
     union {
         struct { char topic[MAX_TOPIC_LEN]; char payload[MAX_PAYLOAD_LEN]; } mqtt;
-        struct { uint8_t channel; bool state; } input;
+        struct { uint8_t channel; bool state; uint32_t seq; } input;
         struct { char *script; uint32_t ticket; } reload;  // script heap-allocated; task frees after eval
         struct { uint32_t id; } timer;     // a rule timer fired (see _set_timer)
         struct { uint8_t source; } activity;  // ACT_MODBUS / ACT_CAN
@@ -421,6 +446,9 @@ static void resync_lost_inputs(JSContext *ctx)
     if (JS_IsFunction(ctx, fn)) {
         for (int ch = 0; lost; ch++, lost >>= 1) {
             if (!(lost & 1)) continue;
+            /* The mark first, then the read: an event numbered after the
+               mark may carry a level the read did not see yet, and is kept. */
+            input_mark_resync((uint8_t)ch);
             JSValue args[2] = { JS_NewInt32(ctx, ch),
                                 JS_NewBool(ctx, g_scripting_io->di_get((uint8_t)ch)) };
             JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 2, args);
@@ -505,6 +533,9 @@ static void scripting_task(void *arg)
                       JS_NewString(ctx, ev.mqtt.payload));
                 break;
             case EVT_INPUT_CHANGE:
+                /* Older than a resync of this channel: the resync already
+                   delivered a later level, and this one would undo it. */
+                if (input_event_stale(ev.input.channel, ev.input.seq)) break;
                 call2(ctx, on_input,
                       JS_NewInt32(ctx, ev.input.channel),
                       JS_NewBool(ctx,  ev.input.state));
@@ -791,7 +822,7 @@ void scripting_on_input_change(uint8_t channel, bool state)
     if (!s_queue) return;
     scripting_evt_t ev = {
         .type  = EVT_INPUT_CHANGE,
-        .input = { .channel = channel, .state = state },
+        .input = { .channel = channel, .state = state, .seq = input_seq_next() },
     };
     if (xQueueSend(s_queue, &ev, 0) != pdTRUE) {
         /* Remembered, not lost: the engine re-reads the channel's live level

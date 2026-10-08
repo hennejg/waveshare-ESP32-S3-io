@@ -19,3 +19,7 @@ dependencies.lock
 /test/host/test_mb_master.c
 /test/host/test_mb_dns
 /test/host/test_mb_dns.c
+/test/host/test_tz
+/test/host/test_tz.c
+/test/host/test_resync
+/test/host/test_resync.c
