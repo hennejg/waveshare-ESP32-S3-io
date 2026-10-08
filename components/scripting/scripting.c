@@ -779,7 +779,7 @@ static bool trial_load(const char *script, char *err, size_t errlen)
     if (!tctx) {
         snprintf(err, errlen, "out of memory");
     } else {
-        g_scripting_io = &dry;          /* the bindings read it on this task only */
+        JS_SetContextOpaque(tctx, &dry);   /* this context's bindings only */
         scripting_register_bindings(tctx);
         register_timer_bindings(tctx);
         JSValue g = JS_GetGlobalObject(tctx);
@@ -794,7 +794,6 @@ static bool trial_load(const char *script, char *err, size_t errlen)
             ok = eval_check(tctx, script, "<user>", err, errlen);
         }
         if (ok) drain_jobs(trt);
-        g_scripting_io = real;
         dry_timers_free(tctx);
         JS_FreeContext(tctx);
     }

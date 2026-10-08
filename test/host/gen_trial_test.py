@@ -3,11 +3,12 @@
 a reload takes over, the script is loaded once the way a boot loads it, at
 the boot's heap limit, with writes going nowhere.
 
-Cut out of scripting.c and bindings.c verbatim: the trial's outputs, PWM
-pads and timer table, and the output bindings. QuickJS with the firmware's
-patches and the real dsl.js. Each script is loaded twice under the same
-limit -- as the trial, and as the boot (timers that hold their callbacks,
-outputs on the hardware) -- and both must come to the same verdict.
+Cut out of scripting.c and bindings.c verbatim: trial_load() itself with
+its outputs, PWM pads and timer table, the output bindings, and the MQTT
+connect callback. QuickJS with the firmware's patches and the real dsl.js.
+Each script is loaded twice under the same limit -- by trial_load(), and as
+the boot (timers that hold their callbacks, outputs on the hardware) -- and
+both must come to the same verdict.
 
 What it pins down, found by an outside review:
   - the trial's timers dropped their callbacks at once: twelve watchdogs'
@@ -15,8 +16,12 @@ What it pins down, found by an outside review:
     a script stored that did not load at the next boot;
   - the trial read the outputs from the hardware while its writes went
     nowhere: `if (!output(0).on()) throw ...` failed in the trial only, and
-    a valid script was refused.
-OLD=1 cuts scripting.c as it was at OLDREV (default HEAD).
+    a valid script was refused;
+  - trial_load() swapped the global I/O for the dry set, and the MQTT connect
+    callback on another task subscribed rules/# through it: a reconnect
+    during a trial subscribed nothing, and MQTT rules went deaf.
+OLD=1 cuts scripting.c, bindings.c and scripting_priv.h as they were at
+OLDREV (default HEAD); OLDREV=dd92b51~1 shows the first two failures too.
 
   make -C test/host trial
 """
@@ -26,22 +31,23 @@ from cutter import Source
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sc   = Source(ROOT / "components/scripting/scripting.c")
 bd   = Source(ROOT / "components/scripting/bindings.c")
-old  = os.environ.get("OLD") == "1"
-if old:
-    sc.text = subprocess.run(["git", "show", os.environ.get("OLDREV", "HEAD") + ":components/scripting/scripting.c"],
-                             cwd=ROOT, capture_output=True, text=True, check=True).stdout
+pv   = Source(ROOT / "components/scripting/scripting_priv.h")
+if os.environ.get("OLD") == "1":
+    rev = os.environ.get("OLDREV", "HEAD")
+    for s_, f in ((sc, "scripting.c"), (bd, "bindings.c"), (pv, "scripting_priv.h")):
+        s_.text = subprocess.run(["git", "show", rev + ":components/scripting/" + f],
+                                 cwd=ROOT, capture_output=True, text=True, check=True).stdout
 
-cuts  = sc.defines("JS_HEAP_LIMIT", "MAX_TIMERS")
-if old:
+cuts  = sc.defines("JS_HEAP_LIMIT", "MAX_TIMERS", "RULES_TOPIC")
+if "scripting_io_of" in pv.text:
+    cuts += pv.func("static inline const scripting_io_t *scripting_io_of(JSContext *ctx)")
+cuts += sc.func("static void drain_jobs(JSRuntime *rt)")
+cuts += sc.func("static bool eval_check(JSContext *ctx, const char *src, const char *name,")
+if "#define DRY_OUTPUTS" not in sc.text:
+    # Before the dry outputs and timer table (dd92b51~1).
     cuts += sc.span("static esp_err_t dry_dout_set(uint8_t ch, bool on)", "{ (void)t; (void)q; return 0; }")
     cuts += sc.func("static JSValue js_dry_set_timer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)")
     cuts += sc.func("static JSValue js_dry_nop(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)")
-    cuts += """
-static bool dry_dout_get(uint8_t ch) { return hw_get(ch); }   /* the hardware, as before */
-static void dry_io_start(const scripting_io_t *real) { (void)real; }
-#define js_dry_clear_timer js_dry_nop
-static void dry_timers_free(JSContext *ctx) { (void)ctx; }
-"""
 else:
     cuts += sc.span("#define DRY_OUTPUTS 32", "static int       dry_mqtt_subscribe(const char *t, int q)          { (void)t; (void)q; return 0; }")
     cuts += sc.func("static void dry_io_start(const scripting_io_t *real)")
@@ -49,7 +55,9 @@ else:
     cuts += sc.func("static JSValue js_dry_clear_timer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)")
     cuts += sc.func("static void dry_timers_free(JSContext *ctx)")
     cuts += sc.func("static JSValue js_dry_nop(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)")
-cuts += bd.func("static int do_count(void)")
+cuts += sc.func("static bool trial_load(const char *script, char *err, size_t errlen)")
+cuts += sc.func("void scripting_on_mqtt_connected(void)")
+cuts += bd.func("static int do_count(")
 cuts += bd.func("static JSValue js_dout_set(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)")
 cuts += bd.func("static JSValue js_dout_toggle(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)")
 cuts += bd.func("static JSValue js_dout_get(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)")
@@ -73,10 +81,41 @@ static esp_err_t hw_toggle(uint8_t ch) { if (ch < 8) hw_out[ch] = !hw_out[ch]; r
 static int hw_writes;
 static esp_err_t hw_set_counted(uint8_t ch, bool on) { hw_writes++; return hw_set(ch, on); }
 static esp_err_t hw_toggle_counted(uint8_t ch) { hw_writes++; return hw_toggle(ch); }
+/* The broker: rules/# subscriptions that reached it. */
+static int subs;
+static int hw_subscribe(const char *t, int q) { (void)q; if (strcmp(t, "rules/#") == 0) subs++; return 0; }
 static const scripting_io_t s_hw = { .dout_set = hw_set_counted, .dout_get = hw_get,
-                                     .dout_toggle = hw_toggle_counted, .do_count = 8 };
+                                     .dout_toggle = hw_toggle_counted, .do_count = 8,
+                                     .mqtt_subscribe = hw_subscribe };
+
+/* What trial_load() calls around the cut code. */
+#define TAG "t"
+#define ESP_LOGE(tag, ...) do { (void)(tag); } while (0)
+#define JS_STACK_LIMIT 0          /* a 64-bit host's frames are larger: no limit */
+static int s_psram_alloc;
+#define JS_NewRuntime2(alloc, op) ((void)(alloc), (void)(op), JS_NewRuntime())
+static bool s_interrupted;
+static int js_interrupt(JSRuntime *rt, void *op) { (void)rt; (void)op; return 0; }
+static void budget_start(void) {}
+static const char *dsl_js_start;
+static void scripting_register_bindings(JSContext *ctx);
+static void register_timer_bindings(JSContext *ctx) { (void)ctx; }
 
 __CUT__
+
+/* The MQTT task, reconnecting while the trial runs the script's top level. */
+static JSValue js_reconnect(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
+{ (void)ctx; (void)this_val; (void)argc; (void)argv; scripting_on_mqtt_connected(); return JS_UNDEFINED; }
+
+static void scripting_register_bindings(JSContext *ctx)
+{
+    JSValue g = JS_GetGlobalObject(ctx);
+    JS_SetPropertyStr(ctx, g, "_dout_set",    JS_NewCFunction(ctx, js_dout_set,    "_dout_set",    2));
+    JS_SetPropertyStr(ctx, g, "_dout_get",    JS_NewCFunction(ctx, js_dout_get,    "_dout_get",    1));
+    JS_SetPropertyStr(ctx, g, "_dout_toggle", JS_NewCFunction(ctx, js_dout_toggle, "_dout_toggle", 1));
+    JS_SetPropertyStr(ctx, g, "_reconnect",   JS_NewCFunction(ctx, js_reconnect,   "_reconnect",   0));
+    JS_FreeValue(ctx, g);
+}
 
 /* The boot's timers: held until cleared, as s_timers holds them. */
 static struct { bool used; JSValue fn; } boot_timers[MAX_TIMERS];
@@ -99,32 +138,22 @@ static JSValue js_boot_clear_timer(JSContext *ctx, JSValue this_val, int argc, J
     return JS_UNDEFINED;
 }
 
-static const char *dsl;
 static char why[160];
 
-/* One load at the boot's limit. trial: the dry bindings, as trial_load()
-   sets them up; otherwise the boot's. */
-static bool load(const char *script, bool trial)
+/* As the boot loads it, at the boot's limit: the hardware, timers held. */
+static bool boot_load(const char *script)
 {
     JSRuntime *rt = JS_NewRuntime();
     JS_SetMemoryLimit(rt, JS_HEAP_LIMIT);
     JSContext *ctx = JS_NewContext(rt);
-    scripting_io_t dry = s_hw;
-    if (trial) {
-        dry.dout_set = dry_dout_set; dry.dout_toggle = dry_dout_toggle; dry.dout_get = dry_dout_get;
-        dry_io_start(&s_hw);
-        g_scripting_io = &dry;
-    } else g_scripting_io = &s_hw;
+    scripting_register_bindings(ctx);
     JSValue g = JS_GetGlobalObject(ctx);
-    JS_SetPropertyStr(ctx, g, "_dout_set",    JS_NewCFunction(ctx, js_dout_set,    "_dout_set",    2));
-    JS_SetPropertyStr(ctx, g, "_dout_get",    JS_NewCFunction(ctx, js_dout_get,    "_dout_get",    1));
-    JS_SetPropertyStr(ctx, g, "_dout_toggle", JS_NewCFunction(ctx, js_dout_toggle, "_dout_toggle", 1));
-    JS_SetPropertyStr(ctx, g, "print",        JS_NewCFunction(ctx, js_dry_nop,     "print",        1));
-    JS_SetPropertyStr(ctx, g, "_set_timer",   JS_NewCFunction(ctx, trial ? js_dry_set_timer : js_boot_set_timer, "_set_timer", 2));
-    JS_SetPropertyStr(ctx, g, "_clear_timer", JS_NewCFunction(ctx, trial ? js_dry_clear_timer : js_boot_clear_timer, "_clear_timer", 1));
+    JS_SetPropertyStr(ctx, g, "print",        JS_NewCFunction(ctx, js_dry_nop,          "print",        1));
+    JS_SetPropertyStr(ctx, g, "_set_timer",   JS_NewCFunction(ctx, js_boot_set_timer,   "_set_timer",   2));
+    JS_SetPropertyStr(ctx, g, "_clear_timer", JS_NewCFunction(ctx, js_boot_clear_timer, "_clear_timer", 1));
     JS_FreeValue(ctx, g);
     bool ok = true;
-    const char *src[2] = { dsl, script };
+    const char *src[2] = { dsl_js_start, script };
     for (int k = 0; k < 2 && ok; k++) {
         JSValue r = JS_Eval(ctx, src[k], strlen(src[k]), k ? "<user>" : "<dsl>", JS_EVAL_TYPE_GLOBAL);
         if (JS_IsException(r)) {
@@ -143,12 +172,16 @@ static bool load(const char *script, bool trial)
         if (JS_IsException(r)) { ok = false; snprintf(why, sizeof(why), "out of memory after load"); JS_FreeValue(ctx, JS_GetException(ctx)); }
         JS_FreeValue(ctx, r);
     }
-    if (trial) dry_timers_free(ctx);
-    else for (int i = 0; i < MAX_TIMERS; i++)
+    for (int i = 0; i < MAX_TIMERS; i++)
         if (boot_timers[i].used) { JS_FreeValue(ctx, boot_timers[i].fn); boot_timers[i].used = false; }
-    g_scripting_io = NULL;
     JS_FreeContext(ctx); JS_FreeRuntime(rt);
     return ok;
+}
+
+static bool load(const char *script, bool trial)
+{
+    if (!trial) return boot_load(script);
+    return trial_load(script, why, sizeof(why));
 }
 
 static int failures;
@@ -181,7 +214,8 @@ static char *slurp(const char *path)
 
 int main(int argc, char **argv)
 {
-    dsl = slurp(argc > 1 ? argv[1] : "../../components/scripting/dsl.js");
+    dsl_js_start = slurp(argc > 1 ? argv[1] : "../../components/scripting/dsl.js");
+    g_scripting_io = &s_hw;            /* as scripting_init() sets it, for good */
     (void)dry_led_set; (void)dry_buzzer_set; (void)dry_mqtt_publish; (void)dry_mqtt_subscribe; (void)dry_pwm_set;
 #ifdef DRY_PADS
     (void)dry_pwm_get;
@@ -201,6 +235,11 @@ int main(int argc, char **argv)
     both("output(1).toggle() zweimal, Ausgang an",
          "output(1).toggle(); if (output(1).get()) throw new Error('aus erwartet');"
          "output(1).toggle(); if (!output(1).get()) throw new Error('an erwartet');", true);
+
+    subs = 0;
+    both("MQTT-Reconnect waehrend des Probelaufs", "_reconnect();", true);
+    printf("  rules/# am Broker angemeldet: %d x (erwartet 2: Probelauf und Boot)\n", subs);
+    if (subs != 2) { failures++; printf("  FEHLER: der Reconnect im Probelauf meldete rules/# nicht an\n"); }
 
     printf(failures ? "trial: %d FEHLER\n" : "trial: alles OK\n", failures);
     return failures ? 1 : 0;

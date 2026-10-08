@@ -9,8 +9,8 @@ CFLAGS := -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 PORT ?= 15020
 
-.PHONY: all clean client poller master dns tz resync qjscron qjsint names order di trial drain
-all: test_mb_pdu client poller master dns tz resync qjscron qjsint names order di trial drain
+.PHONY: all clean client poller master dns tz resync qjscron qjsint names order di trial drain nvsread
+all: test_mb_pdu client poller master dns tz resync qjscron qjsint names order di trial drain nvsread
 	./test_mb_pdu
 
 # The firmware's framing against a Modbus TCP server written independently of
@@ -56,6 +56,14 @@ test_di: gen_di_test.py ../../components/board/di.c
 	python3 gen_di_test.py
 	$(CC) $(CFLAGS) test_di.c -o $@
 
+# Reading the stored rule script while a save changes it, cut out of web_server.c.
+nvsread: test_nvsread
+	./test_nvsread
+
+test_nvsread: gen_nvsread_test.py $(MAIN)/web_server.c
+	python3 gen_nvsread_test.py
+	$(CC) $(CFLAGS) test_nvsread.c -o $@
+
 names: test_names
 	./test_names
 
@@ -97,7 +105,7 @@ test_qjs_interrupt: test_qjs_interrupt.c $(QJS_OBJ) ../../components/scripting/d
 trial: test_trial
 	./test_trial
 
-test_trial: gen_trial_test.py ../../components/scripting/scripting.c ../../components/scripting/bindings.c $(QJS_OBJ) ../../components/scripting/dsl.js
+test_trial: gen_trial_test.py ../../components/scripting/scripting.c ../../components/scripting/bindings.c ../../components/scripting/scripting_priv.h $(QJS_OBJ) ../../components/scripting/dsl.js
 	python3 gen_trial_test.py
 	$(CC) -O1 -Wall -Wextra -Wno-unused-parameter -I$(QJS) -Istubs -I../../components/scripting/include test_trial.c $(QJS_OBJ) -lm -o $@
 
@@ -134,6 +142,6 @@ test_mb_pdu: test_mb_pdu.c $(MAIN)/mb_pdu.c $(MAIN)/mb_pdu.h $(MAIN)/mb_request.
 	$(CC) $(CFLAGS) test_mb_pdu.c $(MAIN)/mb_pdu.c -o $@
 
 clean:
-	rm -rf test_drain test_drain.c test_di test_di.c test_trial test_trial.c test_order test_order.c test_names test_names.c test_qjs_interrupt test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c \
+	rm -rf test_nvsread test_nvsread.c test_drain test_drain.c test_di test_di.c test_trial test_trial.c test_order test_order.c test_names test_names.c test_qjs_interrupt test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c \
 	       test_mb_master test_mb_master.c \
 	       test_mb_dns test_mb_dns.c test_tz test_tz.c test_resync test_resync.c test_qjs_cron qjs-obj *.dSYM

@@ -28,6 +28,8 @@ dependencies.lock
 /test/host/qjs-obj/
 /test/host/test_order
 /test/host/test_order.c
+/test/host/test_nvsread
+/test/host/test_nvsread.c
 /test/host/test_drain
 /test/host/test_drain.c
 /test/host/test_di

@@ -1413,23 +1413,35 @@ esp_err_t rules_nvs_read(char **out)
     nvs_handle_t h;
     esp_err_t err = nvs_open(RULES_NVS_NS, NVS_READONLY, &h);
     if (err != ESP_OK) return err;
-    size_t len = 0;
-    bool blob = true;
-    err = nvs_get_blob(h, RULES_NVS_BLOB, NULL, &len);
-    if (err == ESP_ERR_NVS_NOT_FOUND) {
-        blob = false;
-        err = nvs_get_str(h, RULES_NVS_KEY, NULL, &len);
-    }
-    if (err == ESP_OK) {
-        char *buf = malloc(len + 1);
-        if (!buf) err = ESP_ERR_NO_MEM;
-        else {
-            err = blob ? nvs_get_blob(h, RULES_NVS_BLOB, buf, &len)
-                       : nvs_get_str(h, RULES_NVS_KEY, buf, &len);
-            buf[len] = '\0';
-            if (err == ESP_OK) *out = buf;
-            else free(buf);
+    /* Size, then read -- and a save may land in between: a script stored
+       after a 202 grew past the buffer, NVS answered INVALID_LENGTH with the
+       new size in len, and the terminator went past the end of the buffer.
+       The buffer's own size bounds every write. A script that changed in
+       between -- grew, or moved from the old string to the blob -- is looked
+       up again from the start. */
+    for (int tries = 0; tries < 3; tries++) {
+        bool blob = true;
+        size_t len = 0;
+        err = nvs_get_blob(h, RULES_NVS_BLOB, NULL, &len);
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            blob = false;
+            err = nvs_get_str(h, RULES_NVS_KEY, NULL, &len);
         }
+        if (err != ESP_OK) break;            /* NOT_FOUND: none stored */
+        size_t cap = len;
+        char *buf = malloc(cap + 1);
+        if (!buf) { err = ESP_ERR_NO_MEM; break; }
+        err = blob ? nvs_get_blob(h, RULES_NVS_BLOB, buf, &len)
+                   : nvs_get_str(h, RULES_NVS_KEY, buf, &len);
+        if (err == ESP_OK && len <= cap) {
+            buf[len] = '\0';
+            *out = buf;
+            break;
+        }
+        free(buf);
+        if (err == ESP_OK) err = ESP_ERR_INVALID_SIZE;   /* never: NVS keeps within cap */
+        if (err != ESP_ERR_NVS_INVALID_LENGTH && err != ESP_ERR_NVS_NOT_FOUND) break;
+        err = ESP_ERR_INVALID_STATE;                     /* changed while read, and kept changing */
     }
     nvs_close(h);
     return err;
