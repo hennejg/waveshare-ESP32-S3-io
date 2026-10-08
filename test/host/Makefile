@@ -9,8 +9,8 @@ CFLAGS := -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 PORT ?= 15020
 
-.PHONY: all clean client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite
-all: test_mb_pdu client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite
+.PHONY: all clean client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock
+all: test_mb_pdu client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock
 	./test_mb_pdu
 
 # The firmware's framing against a Modbus TCP server written independently of
@@ -95,6 +95,15 @@ auxwrite: test_auxwrite
 test_auxwrite: gen_auxwrite_test.py $(MAIN)/mb_server.c ../../components/board/aux_io.c ../../components/board/aux_io.h
 	python3 gen_auxwrite_test.py
 	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-variable -I../../components/board -Istubs test_auxwrite.c -o $@
+
+# The header pads' status getters against a mode change, cut out of
+# aux_io.c; pthreads. Thread sanitizer instead of address sanitizer.
+auxlock: test_auxlock
+	./test_auxlock
+
+test_auxlock: gen_auxlock_test.py ../../components/board/aux_io.c ../../components/board/aux_io.h
+	python3 gen_auxlock_test.py
+	$(CC) -std=c11 -Wall -Wextra -Werror -Wno-unused-function -Wno-unused-variable -O1 -g -fsanitize=thread -I../../components/board -Istubs test_auxlock.c -lpthread -o $@
 
 names: test_names
 	./test_names
@@ -183,6 +192,6 @@ test_mb_pdu: test_mb_pdu.c $(MAIN)/mb_pdu.c $(MAIN)/mb_pdu.h $(MAIN)/mb_request.
 	$(CC) $(CFLAGS) test_mb_pdu.c $(MAIN)/mb_pdu.c -o $@
 
 clean:
-	rm -rf test_auxwrite test_auxwrite.c test_resume test_resume.c test_resume_old_dsl.js test_cfgnum test_cfgnum.c test_auth test_auth.c test_nvsread test_nvsread.c test_drain test_drain.c test_di test_di.c test_trial test_trial.c test_order test_order.c test_names test_names.c test_qjs_interrupt test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c \
+	rm -rf test_auxlock test_auxlock.c test_auxwrite test_auxwrite.c test_resume test_resume.c test_resume_old_dsl.js test_cfgnum test_cfgnum.c test_auth test_auth.c test_nvsread test_nvsread.c test_drain test_drain.c test_di test_di.c test_trial test_trial.c test_order test_order.c test_names test_names.c test_qjs_interrupt test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c \
 	       test_mb_master test_mb_master.c \
 	       test_mb_dns test_mb_dns.c test_tz test_tz.c test_resync test_resync.c test_qjs_cron qjs-obj *.dSYM

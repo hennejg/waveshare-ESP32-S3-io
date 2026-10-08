@@ -1214,24 +1214,23 @@ static esp_err_t api_io_state(httpd_req_t *req)
     cJSON *aux = cJSON_AddArrayToObject(root, "aux");
     for (int a = 0; a < APP_CFG_DI_AUX_COUNT; a++) {
         cJSON *o = cJSON_CreateObject();
-        aux_mode_t m = aux_io_mode((uint8_t)a);
-        cJSON_AddStringToObject(o, "mode", aux_mode_name(m));
-        uint32_t f; uint16_t d; uint8_t bits; int mv;
-        if (m == AUX_MODE_PWM && aux_io_pwm_info((uint8_t)a, &f, &d, &bits)) {
+        aux_status_t st;                         /* the pad at one moment */
+        aux_io_status((uint8_t)a, &st);
+        cJSON_AddStringToObject(o, "mode", aux_mode_name(st.mode));
+        if (st.mode == AUX_MODE_PWM) {
             /* As it runs, which Modbus, MQTT or a rule may have changed since
                the configuration was saved: the values as set -- what Modbus
                and MQTT report too -- and the frequency the timer actually
                produces from them. */
-            cJSON_AddNumberToObject(o, "pwm_freq", f);
-            cJSON_AddNumberToObject(o, "pwm_freq_actual", aux_io_pwm_actual_hz((uint8_t)a));
-            cJSON_AddNumberToObject(o, "pwm_duty", d / 10.0);
-            cJSON_AddNumberToObject(o, "pwm_bits", bits);
-        } else if (m == AUX_MODE_ANALOG && aux_io_analog_mv((uint8_t)a, &mv) == ESP_OK) {
-            cJSON_AddNumberToObject(o, "mv", mv);
+            cJSON_AddNumberToObject(o, "pwm_freq", st.freq_hz);
+            cJSON_AddNumberToObject(o, "pwm_freq_actual", st.actual_hz);
+            cJSON_AddNumberToObject(o, "pwm_duty", st.duty_pm / 10.0);
+            cJSON_AddNumberToObject(o, "pwm_bits", st.bits);
+        } else if (st.mode == AUX_MODE_ANALOG && st.mv_valid) {
+            cJSON_AddNumberToObject(o, "mv", st.mv);
+        } else if (st.mode == AUX_MODE_OUTPUT) {
+            cJSON_AddBoolToObject(o, "out", st.out);
         }
-        bool on;
-        if (m == AUX_MODE_OUTPUT && aux_io_out_get((uint8_t)a, &on))
-            cJSON_AddBoolToObject(o, "out", on);
         cJSON_AddItemToArray(aux, o);
     }
 #endif

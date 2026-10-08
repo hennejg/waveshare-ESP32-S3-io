@@ -71,6 +71,22 @@ bool        aux_io_pwm_info(uint8_t a, uint32_t *freq_hz, uint16_t *duty_pm, uin
 /* The frequency the timer really produces, Hz; 0 if not a PWM output. */
 uint32_t    aux_io_pwm_actual_hz(uint8_t a);
 
+/* Everything a status report shows of pad a, read at one moment: its mode
+   and the values that belong to it -- an output's state, a PWM output's
+   settings and real frequency, the analog reading. Read field by field
+   through the getters above, a report could pair a mode with values from
+   before or after a mode change. */
+typedef struct {
+    aux_mode_t mode;
+    bool       out;                      /* AUX_MODE_OUTPUT                 */
+    uint32_t   freq_hz, actual_hz;       /* AUX_MODE_PWM                    */
+    uint16_t   duty_pm;
+    uint8_t    bits;
+    bool       mv_valid;                 /* AUX_MODE_ANALOG, with a reading */
+    int        mv;
+} aux_status_t;
+void        aux_io_status(uint8_t a, aux_status_t *st);
+
 /* Changes a running PWM output at run time -- Modbus, MQTT, rules. Not stored:
    the configuration keeps the values a reboot starts with, and a controller
    writing a duty cycle every second must not wear out the flash. freq_hz 0

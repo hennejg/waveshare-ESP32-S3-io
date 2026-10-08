@@ -86,6 +86,7 @@ esp_err_t  aux_io_apply(void) { return ESP_OK; }
 aux_mode_t aux_io_mode(uint8_t a) { (void)a; return AUX_MODE_STANDARD; }
 bool aux_io_pwm_info(uint8_t a, uint32_t *f, uint16_t *d, uint8_t *b) { (void)a; (void)f; (void)d; (void)b; return false; }
 uint32_t aux_io_pwm_actual_hz(uint8_t a) { (void)a; return 0; }
+void aux_io_status(uint8_t a, aux_status_t *st) { (void)a; memset(st, 0, sizeof(*st)); st->mode = AUX_MODE_STANDARD; }
 esp_err_t aux_io_pwm_set(uint8_t a, uint32_t f, uint16_t d) { (void)a; (void)f; (void)d; return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t aux_io_analog_mv(uint8_t a, int *mv) { (void)a; (void)mv; return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t aux_io_out_set(uint8_t a, bool on) { (void)a; (void)on; return ESP_ERR_NOT_SUPPORTED; }
@@ -311,9 +312,12 @@ esp_err_t aux_io_out_set_many(uint8_t mask, uint8_t on)
 
 bool aux_io_out_get(uint8_t a, bool *on)
 {
-    if (a >= AUX_PAD_COUNT || s_mode[a] != AUX_MODE_OUTPUT) return false;
-    if (on) *on = s_out[a];
-    return true;
+    if (a >= AUX_PAD_COUNT || !s_mux) return false;
+    xSemaphoreTake(s_mux, portMAX_DELAY);           /* mode and state together */
+    bool out = s_mode[a] == AUX_MODE_OUTPUT;
+    if (out && on) *on = s_out[a];
+    xSemaphoreGive(s_mux);
+    return out;
 }
 
 /* ---------------------------------------------------------------- analog */
@@ -524,9 +528,44 @@ esp_err_t aux_io_pwm_write(const aux_pwm_write_t w[AUX_PAD_COUNT])
     return r;
 }
 
+/* The getters take s_mux like everything that changes a pad: read without
+   it, a status query running beside aux_io_apply() could see a pad between
+   two modes -- an output's state after leave() cleared it, a PWM timer
+   being reconfigured. */
 aux_mode_t aux_io_mode(uint8_t a)
 {
-    return (a < AUX_PAD_COUNT) ? s_mode[a] : AUX_MODE_STANDARD;
+    if (a >= AUX_PAD_COUNT || !s_mux) return AUX_MODE_STANDARD;
+    xSemaphoreTake(s_mux, portMAX_DELAY);
+    aux_mode_t m = s_mode[a];
+    xSemaphoreGive(s_mux);
+    return m;
+}
+
+void aux_io_status(uint8_t a, aux_status_t *st)
+{
+    memset(st, 0, sizeof(*st));
+    st->mode = AUX_MODE_STANDARD;
+    if (a >= AUX_PAD_COUNT || !s_mux) return;
+    xSemaphoreTake(s_mux, portMAX_DELAY);           /* one pad, one moment */
+    st->mode = s_mode[a];
+    switch (st->mode) {
+    case AUX_MODE_OUTPUT:
+        st->out = s_out[a];
+        break;
+    case AUX_MODE_PWM:
+        st->freq_hz   = s_freq[a];
+        st->duty_pm   = s_duty[a];
+        st->bits      = s_bits[a];
+        st->actual_hz = ledc_get_freq(PWM_MODE, PWM_TIMER(a));
+        break;
+    case AUX_MODE_ANALOG:
+        st->mv_valid = s_an_valid;
+        st->mv       = s_an_mv;
+        break;
+    default:
+        break;
+    }
+    xSemaphoreGive(s_mux);
 }
 
 bool aux_io_pwm_info(uint8_t a, uint32_t *freq_hz, uint16_t *duty_pm, uint8_t *bits)
@@ -545,8 +584,11 @@ bool aux_io_pwm_info(uint8_t a, uint32_t *freq_hz, uint16_t *duty_pm, uint8_t *b
 
 uint32_t aux_io_pwm_actual_hz(uint8_t a)
 {
-    if (a >= AUX_PAD_COUNT || s_mode[a] != AUX_MODE_PWM) return 0;
-    return ledc_get_freq(PWM_MODE, PWM_TIMER(a));
+    if (a >= AUX_PAD_COUNT || !s_mux) return 0;
+    xSemaphoreTake(s_mux, portMAX_DELAY);           /* not while the timer is reconfigured */
+    uint32_t hz = s_mode[a] == AUX_MODE_PWM ? ledc_get_freq(PWM_MODE, PWM_TIMER(a)) : 0;
+    xSemaphoreGive(s_mux);
+    return hz;
 }
 
 /* ------------------------------------------------------------- pad task */
@@ -584,25 +626,24 @@ static void publish_pad(uint8_t a)
 {
     if (!app_mqtt_is_connected()) return;
     char topic[40], payload[48];
+    aux_status_t st;                                /* one snapshot, published unlocked */
+    aux_io_status(a, &st);
     snprintf(topic, sizeof(topic), "aux/%u/mode", a + 1);
-    app_mqtt_publish(topic, aux_mode_name(aux_io_mode(a)), -1, 0, true);
-    uint32_t f; uint16_t d;
+    app_mqtt_publish(topic, aux_mode_name(st.mode), -1, 0, true);
     snprintf(topic, sizeof(topic), "aux/%u/pwm", a + 1);
-    if (aux_io_pwm_info(a, &f, &d, NULL)) {
+    if (st.mode == AUX_MODE_PWM) {
         snprintf(payload, sizeof(payload), "{\"duty\":%u.%u,\"freq\":%lu}",
-                 d / 10, d % 10, (unsigned long)f);
+                 st.duty_pm / 10, st.duty_pm % 10, (unsigned long)st.freq_hz);
         app_mqtt_publish(topic, payload, -1, 0, true);
     } else {
         /* Not a PWM output (any more): an empty retained payload removes the
            old state, so a new subscriber is not told it still runs. */
         app_mqtt_publish(topic, "", 0, 0, true);
     }
-    int mv;
-    if (a == 0 && aux_io_analog_mv(0, &mv) == ESP_OK) publish_analog(mv);
-    bool on;
-    if (aux_io_out_get(a, &on)) {
+    if (a == 0 && st.mode == AUX_MODE_ANALOG && st.mv_valid) publish_analog(st.mv);
+    if (st.mode == AUX_MODE_OUTPUT) {
         out_topic(a, topic, sizeof(topic), "");
-        app_mqtt_publish(topic, on ? "true" : "false", -1, 0, false);
+        app_mqtt_publish(topic, st.out ? "true" : "false", -1, 0, false);
     }
 }
 #endif
@@ -616,7 +657,7 @@ static void aux_task(void *arg)
            to publish, sampling again on that wake fed a rule that sets a PWM
            output from the reading a new reading, which set the PWM again. */
         TickType_t wait = portMAX_DELAY;
-        if (s_mode[0] == AUX_MODE_ANALOG || s_an_rules_has) {
+        if (aux_io_mode(0) == AUX_MODE_ANALOG || s_an_rules_has) {
             TickType_t now = xTaskGetTickCount();
             wait = ((int32_t)(next_sample - now) > 0) ? (TickType_t)(next_sample - now) : 0;
         }
@@ -652,7 +693,7 @@ static void aux_task(void *arg)
                 s_an_rules_has = true;
                 s_an_rules_mv  = mv;
             }
-        } else if (s_an_rules_has && s_mode[0] != AUX_MODE_ANALOG) {
+        } else if (s_an_rules_has && aux_io_mode(0) != AUX_MODE_ANALOG) {
             /* IO1 has left analog mode: the engine forgets its last reading. */
             if (scripting_on_analog(1, INT_MIN)) s_an_rules_has = false;
         }

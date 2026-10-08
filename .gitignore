@@ -47,3 +47,5 @@ dependencies.lock
 /test/host/test_resume_old_dsl.js
 /test/host/test_auxwrite
 /test/host/test_auxwrite.c
+/test/host/test_auxlock
+/test/host/test_auxlock.c
