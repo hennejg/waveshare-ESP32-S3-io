@@ -1,5 +1,6 @@
 #include "app_config.h"
 #include "aux_io.h"
+#include <stdio.h>
 #include <string.h>
 #include <math.h>
 #include <nvs_flash.h>
@@ -76,6 +77,117 @@ static void aux_normalize(app_config_t *c)
         if (c->aux_pwm[a].duty_pm > AUX_PWM_DUTY_MAX) c->aux_pwm[a].duty_pm = 0;
         c->aux_out[a].name[sizeof(c->aux_out[a].name) - 1] = '\0';
     }
+}
+
+/* ---- I/O names as topic fragments (see app_config_io_names_ok) ---- */
+
+#define IO_SPACE_MAX  (APP_CFG_DO_COUNT + 3 > APP_CFG_DI_COUNT ? APP_CFG_DO_COUNT + 3 : APP_CFG_DI_COUNT)
+
+typedef struct {
+    char *name[IO_SPACE_MAX];      /* the configured names, in channel order */
+    int   count;
+    const char *const *reserved;   /* NULL-terminated */
+} io_space_t;
+
+static const char *const INPUT_RESERVED[]  = { "read", NULL };
+static const char *const OUTPUT_RESERVED[] = { "read", "set", NULL };
+
+/* Inputs: DI1-DI8 and the pads' inputs 9..11. Outputs: DO1-DO8 and the
+   pads' outputs 9..11. The cast drops const only for normalisation, which
+   is given a mutable configuration. */
+static void io_spaces(const app_config_t *c, io_space_t *in, io_space_t *out)
+{
+    in->count = 0; in->reserved = INPUT_RESERVED;
+    for (int i = 0; i < APP_CFG_DI_COUNT; i++) in->name[in->count++] = (char *)c->di[i].name;
+    out->count = 0; out->reserved = OUTPUT_RESERVED;
+    for (int i = 0; i < APP_CFG_DO_COUNT; i++) out->name[out->count++] = (char *)c->dout[i].name;
+    for (int a = 0; a < 3; a++)               out->name[out->count++] = (char *)c->aux_out[a].name;
+}
+
+static void io_fragment(const io_space_t *s, int i, char *buf, size_t len)
+{
+    if (s->name[i][0]) strlcpy(buf, s->name[i], len);
+    else snprintf(buf, len, "%d", i + 1);
+}
+
+/* The problem with channel i's own name, if any. */
+static const char *io_name_problem(const io_space_t *s, int i)
+{
+    const char *n = s->name[i];
+    if (!n[0]) return NULL;
+    if (strpbrk(n, "/+#")) return "names must not contain '/', '+' or '#'";
+    for (int r = 0; s->reserved[r]; r++)
+        if (!strcmp(n, s->reserved[r]))
+            return s->reserved == OUTPUT_RESERVED ? "'set' and 'read' are reserved output names"
+                                                  : "'read' is a reserved input name";
+    return NULL;
+}
+
+/* Index of a channel before i with the same topic, or -1. */
+static int io_clash(const io_space_t *s, int i)
+{
+    char a[APP_CFG_IO_NAME_MAX + 4], b[APP_CFG_IO_NAME_MAX + 4];
+    io_fragment(s, i, a, sizeof(a));
+    for (int j = 0; j < s->count; j++) {
+        if (j == i) continue;
+        io_fragment(s, j, b, sizeof(b));
+        if (!strcmp(a, b)) return j;
+    }
+    return -1;
+}
+
+static bool io_space_ok(const io_space_t *s, const char **err_msg)
+{
+    for (int i = 0; i < s->count; i++) {
+        const char *why = io_name_problem(s, i);
+        if (why) { *err_msg = why; return false; }
+        if (io_clash(s, i) >= 0) {
+            *err_msg = s->reserved == OUTPUT_RESERVED
+                ? "output names must be unique, including the numbers of unnamed outputs (1-11)"
+                : "input names must be unique, including the numbers of unnamed inputs (1-11)";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool app_config_io_names_ok(const app_config_t *cfg, const char **err_msg)
+{
+    io_space_t in, out;
+    io_spaces(cfg, &in, &out);
+    return io_space_ok(&in, err_msg) && io_space_ok(&out, err_msg);
+}
+
+/* A stored configuration from before the check can hold such a name. It is
+   dropped -- the channel answers to its number again -- rather than left to
+   switch every relay. Names in a clash are dropped all together, and again
+   until none is left: a dropped name's number can clash in turn. */
+static void io_space_normalize(io_space_t *s)
+{
+    for (int i = 0; i < s->count; i++)
+        if (io_name_problem(s, i)) {
+            ESP_LOGW(TAG, "I/O name '%s' dropped: %s", s->name[i], io_name_problem(s, i));
+            s->name[i][0] = '\0';
+        }
+    for (int round = 0; round < IO_SPACE_MAX; round++) {
+        bool drop[IO_SPACE_MAX] = { false }, any = false;
+        for (int i = 0; i < s->count; i++)
+            if (s->name[i][0] && io_clash(s, i) >= 0) { drop[i] = true; any = true; }
+        if (!any) break;
+        for (int i = 0; i < s->count; i++)
+            if (drop[i]) {
+                ESP_LOGW(TAG, "I/O name '%s' dropped: its topic is another channel's", s->name[i]);
+                s->name[i][0] = '\0';
+            }
+    }
+}
+
+static void io_names_normalize(app_config_t *c)
+{
+    io_space_t in, out;
+    io_spaces(c, &in, &out);
+    io_space_normalize(&in);
+    io_space_normalize(&out);
 }
 
 /* A blob written before a field existed reads it as zero, and a blob written
@@ -157,6 +269,7 @@ esp_err_t app_config_init(void)
     nvs_close(h);
     modbus_normalize(&s_cfg);
     aux_normalize(&s_cfg);
+    io_names_normalize(&s_cfg);
     return ESP_OK;
 }
 

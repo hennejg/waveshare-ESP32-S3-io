@@ -9,8 +9,8 @@ CFLAGS := -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 PORT ?= 15020
 
-.PHONY: all clean client poller master dns tz resync qjscron
-all: test_mb_pdu client poller master dns tz resync qjscron
+.PHONY: all clean client poller master dns tz resync qjscron qjsint names order
+all: test_mb_pdu client poller master dns tz resync qjscron qjsint names order
 	./test_mb_pdu
 
 # The firmware's framing against a Modbus TCP server written independently of
@@ -41,6 +41,20 @@ test_mb_dns: gen_dns_test.py $(MAIN)/mb_tcp_master.c $(MAIN)/net_budget.h ../../
 	$(CC) $(CFLAGS) -I../../components/board -Istubs test_mb_dns.c -o $@
 
 # The rule engine's resync of dropped input changes, helpers cut out of scripting.c.
+order: test_order
+	./test_order
+
+test_order: gen_order_test.py ../../components/scripting/scripting.c
+	python3 gen_order_test.py
+	$(CC) $(CFLAGS) test_order.c -o $@
+
+names: test_names
+	./test_names
+
+test_names: gen_names_test.py ../../components/board/app_config.c
+	python3 gen_names_test.py
+	$(CC) $(CFLAGS) test_names.c -o $@
+
 resync: test_resync
 	./test_resync
 
@@ -63,6 +77,12 @@ qjscron: test_qjs_cron
 
 test_qjs_cron: test_qjs_cron.c $(QJS_OBJ) ../../components/scripting/dsl.js
 	$(CC) -O1 -Wall -Wextra -Wno-unused-parameter -I$(QJS) test_qjs_cron.c $(QJS_OBJ) -lm -o $@
+
+qjsint: test_qjs_interrupt
+	./test_qjs_interrupt
+
+test_qjs_interrupt: test_qjs_interrupt.c $(QJS_OBJ) ../../components/scripting/dsl.js
+	$(CC) -O1 -Wall -Wextra -Wno-unused-parameter -I$(QJS) test_qjs_interrupt.c $(QJS_OBJ) -lm -o $@
 
 # QuickJS's timezone offset, newlib branch, cut out of the patched quickjs.c.
 tz: test_tz
@@ -88,6 +108,6 @@ test_mb_pdu: test_mb_pdu.c $(MAIN)/mb_pdu.c $(MAIN)/mb_pdu.h $(MAIN)/mb_request.
 	$(CC) $(CFLAGS) test_mb_pdu.c $(MAIN)/mb_pdu.c -o $@
 
 clean:
-	rm -rf test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c \
+	rm -rf test_order test_order.c test_names test_names.c test_qjs_interrupt test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c \
 	       test_mb_master test_mb_master.c \
 	       test_mb_dns test_mb_dns.c test_tz test_tz.c test_resync test_resync.c test_qjs_cron qjs-obj *.dSYM

@@ -105,50 +105,6 @@ static void parse_invert_array(cJSON *arr, di_config_t *out, int max)
     }
 }
 
-/* Validate names: no '/', unique within the array (empty names ignored). */
-static bool validate_names(const di_config_t *arr, int count, const char **err_msg)
-{
-    for (int i = 0; i < count; i++) {
-        if (!arr[i].name[0]) continue;
-        if (strchr(arr[i].name, '/')) {
-            *err_msg = "name must not contain '/'";
-            return false;
-        }
-        for (int j = i + 1; j < count; j++) {
-            if (arr[j].name[0] && strcmp(arr[i].name, arr[j].name) == 0) {
-                *err_msg = "names must be unique";
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-/* The pads' output names share the output/... topic space with DO1-DO8, so
-   each pad's topic fragment -- its name, or its number 9..11 -- must differ
-   from every DO's -- its name, or 1..8 -- and from the other pads'. */
-static bool validate_aux_out_names(const app_config_t *c, const char **err_msg)
-{
-    char frag[APP_CFG_DO_COUNT + 3][APP_CFG_IO_NAME_MAX + 4];
-    int n = 0;
-    for (int i = 0; i < APP_CFG_DO_COUNT; i++, n++) {
-        if (c->dout[i].name[0]) strlcpy(frag[n], c->dout[i].name, sizeof(frag[n]));
-        else snprintf(frag[n], sizeof(frag[n]), "%d", i + 1);
-    }
-    for (int a = 0; a < 3; a++, n++) {
-        const char *name = c->aux_out[a].name;
-        if (strchr(name, '/')) { *err_msg = "name must not contain '/'"; return false; }
-        if (name[0]) strlcpy(frag[n], name, sizeof(frag[n]));
-        else snprintf(frag[n], sizeof(frag[n]), "%d", APP_CFG_DO_COUNT + 1 + a);
-        for (int j = 0; j < n; j++)
-            if (strcmp(frag[j], frag[n]) == 0) {
-                *err_msg = "output names must be unique, including the pads' numbers 9-11";
-                return false;
-            }
-    }
-    return true;
-}
-
 /* httpd_req_recv() returns what a single socket read yielded. The loop in
    httpd_recv_with_opt() only repeats for HTTPD_RECV_OPT_BLOCKING, and
    httpd_recv() passes HTTPD_RECV_OPT_NONE, so one call can return far less
@@ -811,8 +767,7 @@ static esp_err_t api_config_post(httpd_req_t *req)
                 else {
                     /* Two entries of the same name would publish to one topic
                        and feed one rule key, last poll winning at random.
-                       validate_names() does the same for di and dout, but only
-                       against '/': those names are not MQTT topics of their own. */
+                       app_config_io_names_ok() does the same for the I/O names. */
                     for (int j = 0; j < i; j++)
                         if (cfg.mbm[j].enable && !strcmp(cfg.mbm[j].name, e->name)) {
                             why = "two Modbus master entries have the same name";
@@ -845,10 +800,8 @@ static esp_err_t api_config_post(httpd_req_t *req)
 
     /* Validate names before saving */
     const char *err = NULL;
-    if (!validate_names(cfg.di,   APP_CFG_DI_COUNT, &err) ||
-        !validate_names(cfg.dout, APP_CFG_DO_COUNT, &err) ||
-        !validate_aux_out_names(&cfg, &err)) {
-        char msg[64];
+    if (!app_config_io_names_ok(&cfg, &err)) {
+        char msg[128];
         snprintf(msg, sizeof(msg), "{\"status\":\"error\",\"message\":\"%s\"}", err);
         httpd_resp_set_type(req, "application/json");
         httpd_resp_sendstr(req, msg);
@@ -1469,6 +1422,22 @@ static esp_err_t api_rules_get(httpd_req_t *req)
 }
 
 /* POST /api/rules — {"script":"..."} saves to NVS and hot-reloads the engine */
+/* Makes to_store the script the next boot loads ("" = the built-in demo).
+   Called by the rule engine, on its own task, once it has accepted the
+   script -- see scripting_reload_and_store(). */
+static esp_err_t store_rules(const char *to_store)
+{
+    nvs_handle_t h;
+    esp_err_t ret = nvs_open(RULES_NVS_NS, NVS_READWRITE, &h);
+    if (ret != ESP_OK) return ret;
+    ret = (to_store[0] == '\0') ? nvs_erase_key(h, RULES_NVS_KEY)
+                                : nvs_set_str(h, RULES_NVS_KEY, to_store);
+    if (ret == ESP_ERR_NVS_NOT_FOUND) ret = ESP_OK;   /* erasing what was not there */
+    if (ret == ESP_OK) ret = nvs_commit(h);
+    nvs_close(h);
+    return ret;
+}
+
 static esp_err_t api_rules_post(httpd_req_t *req)
 {
     if (!check_auth(req)) return send_denied(req);
@@ -1498,10 +1467,12 @@ static esp_err_t api_rules_post(httpd_req_t *req)
 
     /* The engine first, the flash second. Stored before the verdict, a
        script the engine refused -- a syntax error, say -- was what the
-       device booted into next time, with no fallback: the rules that were
-       running stayed in effect only until the reboot, then nothing ran at
-       all. The last script the engine accepted is the only one worth
-       keeping, so it is written once the engine has accepted this one.
+       device booted into next time, with no fallback. The last script the
+       engine accepted is the only one worth keeping -- so the engine stores
+       it itself, the moment it accepts it (store_rules, on its task).
+       Stored here after the verdict instead, a script accepted after this
+       handler had stopped waiting was running but never stored, and the next
+       boot brought the old one back.
 
        Wait for the engine's verdict instead of acknowledging a request we
        cannot see through. A reload can be refused -- a syntax error, a global
@@ -1511,16 +1482,13 @@ static esp_err_t api_rules_post(httpd_req_t *req)
        Bounded on purpose: handlers run on the server's own task, so a long
        wait here would hold up every other request. A reload normally finishes
        in milliseconds; if it has not after RULES_APPLY_TIMEOUT_MS the request
-       is answered with 202 and the outcome is left to the log. */
-    /* The verdict is matched to this request by ticket. Waiting for "any
-       change" let a request that had timed out hand its verdict to the next
-       one: that one then stored its own script on the strength of a success
-       that was not its own. */
-    uint32_t mine = scripting_reload(script[0] ? script : DEMO_SCRIPT);
-    if (!mine) {
-        cJSON_Delete(root);
+       is answered with 202, and the engine still stores the script if it
+       accepts it. The verdict is matched to this request by ticket. */
+    uint32_t mine = scripting_reload_and_store(script[0] ? script : DEMO_SCRIPT,
+                                               script, store_rules);
+    cJSON_Delete(root);
+    if (!mine)
         return send_json(req, "503 Service Unavailable", "{\"status\":\"busy\",\"detail\":\"engine queue full, nothing stored\"}");
-    }
 
     scripting_reload_status_t now = { 0 };
     for (int waited = 0; waited < RULES_APPLY_TIMEOUT_MS; waited += 10) {
@@ -1530,17 +1498,14 @@ static esp_err_t api_rules_post(httpd_req_t *req)
     }
 
     if (now.ticket != mine) {
-        /* No verdict for this request yet, or already a later one's: either
-           way nothing is stored, the flash keeps the script that was last
-           known good, and the caller is told the outcome is open. */
-        cJSON_Delete(root);
-        return send_json(req, "202 Accepted", "{\"status\":\"accepted\",\"detail\":\"not stored until accepted\"}");
+        /* No verdict for this request yet, or already a later one's: the
+           engine stores this script if and when it accepts it. */
+        return send_json(req, "202 Accepted", "{\"status\":\"accepted\",\"detail\":\"pending; stored once the engine accepts it\"}");
     }
 
     if (!now.ok) {
         /* Refused and not stored: say so plainly, including that the previous
            rules are the ones still in effect, in memory and in flash. */
-        cJSON_Delete(root);
         cJSON *resp = cJSON_CreateObject();
         cJSON_AddStringToObject(resp, "status", "rejected");
         cJSON_AddStringToObject(resp, "error", now.message);
@@ -1554,22 +1519,10 @@ static esp_err_t api_rules_post(httpd_req_t *req)
         return ESP_OK;
     }
 
-    /* Accepted and running; now make it the script the next boot loads.
-       Reported rather than discarded: a failed write leaves the rules
-       running until the next reboot, when the previous script comes back,
-       and the caller has to know that. */
-    nvs_handle_t h;
-    esp_err_t nvs_ret = nvs_open(RULES_NVS_NS, NVS_READWRITE, &h);
-    if (nvs_ret == ESP_OK) {
-        nvs_ret = (script[0] == '\0') ? nvs_erase_key(h, RULES_NVS_KEY)
-                                      : nvs_set_str(h, RULES_NVS_KEY, script);
-        if (nvs_ret == ESP_ERR_NVS_NOT_FOUND) nvs_ret = ESP_OK;   /* erasing what was not there */
-        if (nvs_ret == ESP_OK) nvs_ret = nvs_commit(h);
-        nvs_close(h);
-    }
-    cJSON_Delete(root);
-    if (nvs_ret != ESP_OK) {
-        ESP_LOGE(TAG, "storing rules failed: %s", esp_err_to_name(nvs_ret));
+    /* Accepted and running. A failed write is reported rather than
+       discarded: the rules run until the next reboot, when the previous
+       script comes back, and the caller has to know that. */
+    if (!now.store_tried || now.store_err != ESP_OK) {
         return send_json(req, "500 Internal Server Error", "{\"status\":\"error\",\"error\":\"rules running but not stored\"," "\"detail\":\"the previous script returns at the next reboot\"}");
     }
 

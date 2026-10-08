@@ -193,3 +193,16 @@ typedef struct {
 esp_err_t           app_config_init(void);
 const app_config_t *app_config_get(void);
 esp_err_t           app_config_update(const app_config_t *cfg);
+
+/* The I/O names are MQTT topic fragments: input/<name>, output/<name> and
+   output/<name>/set, a channel without a name using its number instead
+   (inputs 1..11, outputs 1..8 and the pads 9..11). Checked on what the
+   topics come out as, numbers included:
+     - no '/', '+' or '#';
+     - not a command topic of the same space -- an output called "set"
+       published its state to output/set, the bulk command, and switched
+       every relay; "read" made each publish trigger the next;
+     - unique within the space: DO1 called "2" and an unnamed DO2 both
+       listened on output/2/set, and the handler only ever switched DO1.
+   False with a message for the first problem. */
+bool                app_config_io_names_ok(const app_config_t *cfg, const char **err_msg);

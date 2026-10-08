@@ -80,17 +80,37 @@ static inline bool input_event_stale(uint8_t ch, uint32_t seq)
 
 typedef struct {
     evt_type_t type;
+    uint32_t   seq;     /* order of posting, see evt_send() */
     union {
         struct { char topic[MAX_TOPIC_LEN]; char payload[MAX_PAYLOAD_LEN]; } mqtt;
         struct { uint8_t channel; bool state; uint32_t seq; } input;
-        struct { char *script; uint32_t ticket; } reload;  // script heap-allocated; task frees after eval
+        struct { char *script; uint32_t ticket;            // script heap-allocated; task frees after eval
+                 char *store; scripting_store_fn_t store_fn; } reload;  // store: heap, NULL = not stored
         struct { uint32_t id; } timer;     // a rule timer fired (see _set_timer)
         struct { uint8_t source; } activity;  // ACT_MODBUS / ACT_CAN
         struct { uint8_t pad; int32_t mv; } analog;
     };
 } scripting_evt_t;
 
+/* Every event is numbered as it is posted. What cannot go through the queue
+   -- a timer when it is full -- takes the number too, and waits until the
+   events posted before it have been handled: run ahead of them, a heldFor()
+   timer checked an input whose LOW was still in the queue, saw the HIGH
+   before it, and switched the output on. */
+static volatile uint32_t s_evt_seq;
+
+static inline bool evt_seq_after(uint32_t a, uint32_t b)   /* a later than b, wrap-safe */
+{
+    return (int32_t)(a - b) > 0;
+}
+
 static QueueHandle_t       s_queue;
+
+static BaseType_t evt_send(scripting_evt_t *ev)
+{
+    ev->seq = __atomic_add_fetch(&s_evt_seq, 1u, __ATOMIC_RELAXED);
+    return xQueueSend(s_queue, ev, 0);
+}
 static const char         *s_user_script;
 const  scripting_io_t     *g_scripting_io;  // used by bindings.c
 
@@ -133,10 +153,13 @@ static SemaphoreHandle_t         s_reload_lock;
 
 static uint32_t s_reload_seq;           /* last ticket handed out, under s_reload_lock */
 
-static void publish_reload_result(uint32_t ticket, bool ok, const char *message)
+static void publish_reload_result(uint32_t ticket, bool ok, const char *message,
+                                  bool store_tried, esp_err_t store_err)
 {
     if (s_reload_lock) xSemaphoreTake(s_reload_lock, portMAX_DELAY);
     s_reload_status.ok = ok;
+    s_reload_status.store_tried = store_tried;
+    s_reload_status.store_err   = store_err;
     strlcpy(s_reload_status.message, message ? message : "", sizeof(s_reload_status.message));
     s_reload_status.ticket = ticket;
     if (s_reload_lock) xSemaphoreGive(s_reload_lock);
@@ -167,6 +190,7 @@ static timer_slot_t *timer_find(uint32_t id)
    task), so head and tail need no lock. */
 #define TIMER_OVERFLOW_SLOTS (MAX_TIMERS + 1)   /* one slot is the empty marker */
 static volatile uint32_t s_overflow[TIMER_OVERFLOW_SLOTS];
+static volatile uint32_t s_overflow_seq[TIMER_OVERFLOW_SLOTS];   /* its event number */
 static volatile uint8_t  s_of_head, s_of_tail;
 
 // esp_timer task context — must NOT touch QuickJS; just hand the id to our task.
@@ -175,7 +199,7 @@ static void timer_fired_cb(void *arg)
     scripting_evt_t ev = { .type = EVT_TIMER };
     ev.timer.id = (uint32_t)(uintptr_t)arg;
 
-    if (s_queue && xQueueSend(s_queue, &ev, 0) == pdTRUE) return;
+    if (s_queue && evt_send(&ev) == pdTRUE) return;
 
     uint8_t next = (uint8_t)((s_of_head + 1u) % TIMER_OVERFLOW_SLOTS);
     if (next == s_of_tail) {                 /* even the overflow ring is full */
@@ -183,7 +207,8 @@ static void timer_fired_cb(void *arg)
                  (unsigned)ev.timer.id);
         return;
     }
-    s_overflow[s_of_head] = ev.timer.id;
+    s_overflow[s_of_head]     = ev.timer.id;
+    s_overflow_seq[s_of_head] = ev.seq;    /* numbered by the failed evt_send() */
     s_of_head = next;
     ESP_LOGW(TAG, "event queue full - rule timer %u deferred",
              (unsigned)ev.timer.id);
@@ -395,11 +420,15 @@ static int64_t s_deadline_us;   /* 0 = no budget in force */
 
 /* QuickJS polls this while interpreting; a non-zero answer throws
    InternalError at that point, unwinding whatever the script was doing. */
+static bool    s_interrupted;   /* the budget cut a call short since the last recovery */
+
 static int js_interrupt(JSRuntime *rt, void *opaque)
 {
     (void)rt; (void)opaque;
     if (!s_deadline_us) return 0;
-    return esp_timer_get_time() > s_deadline_us;
+    if (esp_timer_get_time() <= s_deadline_us) return 0;
+    s_interrupted = true;
+    return 1;
 }
 
 /* Called before every entry into JS. The deadline has to be renewed per event,
@@ -407,6 +436,70 @@ static int js_interrupt(JSRuntime *rt, void *opaque)
 static inline void budget_start(void)
 {
     s_deadline_us = TIME_BUDGET_US ? esp_timer_get_time() + TIME_BUDGET_US : 0;
+}
+
+/* After the budget interrupted a call: the interrupt is uncatchable and skips
+   every finally, so dsl.js is left with the flags its passes set around their
+   work -- a noLoop rule that never fires again, an mqtt().once() that keeps
+   matching -- and _after_interrupt() clears them. Called after every entry
+   into JS from the loop, before the next one. */
+static void recover_interrupt(JSContext *ctx)
+{
+    if (!s_interrupted) return;
+    s_interrupted = false;
+    ESP_LOGW(TAG, "time budget exceeded: rule state reset after the interrupted call");
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue fn = JS_GetPropertyStr(ctx, global, "_after_interrupt");
+    JS_FreeValue(ctx, global);
+    if (JS_IsFunction(ctx, fn)) {
+        budget_start();
+        JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 0, NULL);
+        if (JS_IsException(r)) {
+            JSValue exc = JS_GetException(ctx);
+            const char *msg = JS_ToCString(ctx, exc);
+            ESP_LOGE(TAG, "_after_interrupt error: %s", msg ? msg : "(unknown)");
+            JS_FreeCString(ctx, msg);
+            JS_FreeValue(ctx, exc);
+        }
+        JS_FreeValue(ctx, r);
+        /* Interrupted itself: tried again on the next pass of the loop. */
+    }
+    JS_FreeValue(ctx, fn);
+}
+
+/* A time sync (the clock just became real, or a later sync corrected it) or
+   a time-zone change: dsl.js re-arms cron from the wall clock. Only a sync
+   declares the clock valid; after a time-zone change the timers are re-armed
+   only if it already is, since they were computed with the old offset. */
+static void handle_time_sync(JSContext *ctx, JSValue on_time_sync, bool sync)
+{
+    if (sync) s_time_valid = true;
+    if (!s_time_valid || !JS_IsFunction(ctx, on_time_sync)) return;
+    budget_start();
+    JSValue r = JS_Call(ctx, on_time_sync, JS_UNDEFINED, 0, NULL);
+    if (JS_IsException(r)) {
+        JSValue exc = JS_GetException(ctx);
+        const char *msg = JS_ToCString(ctx, exc);
+        ESP_LOGE(TAG, "_on_time_sync%s error: %s", sync ? "" : " (tz)", msg ? msg : "(unknown)");
+        JS_FreeCString(ctx, msg);
+        JS_FreeValue(ctx, exc);
+    }
+    JS_FreeValue(ctx, r);
+}
+
+/* Time syncs and time-zone changes the queue could not take. They are state,
+   not moments: dropped, the sync left cron off until the next one an hour
+   later on a device that booted without a valid RTC. Delivering one late is
+   the same as delivering it on time, and two pending are one. */
+static volatile uint8_t s_pending;      /* PENDING_* bits */
+#define PENDING_TIME_SYNC  0x01u
+#define PENDING_TZ_CHANGE  0x02u
+
+static void deliver_pending(JSContext *ctx, JSValue on_time_sync)
+{
+    uint8_t p = __atomic_exchange_n(&s_pending, 0u, __ATOMIC_RELAXED);
+    if (p & PENDING_TIME_SYNC)      handle_time_sync(ctx, on_time_sync, true);
+    else if (p & PENDING_TZ_CHANGE) handle_time_sync(ctx, on_time_sync, false);  /* a sync re-arms too */
 }
 
 /* Runs one elapsed timer. Reached from the event queue and, when that was
@@ -473,9 +566,16 @@ static void resync_lost_inputs(JSContext *ctx)
     JS_FreeValue(ctx, fn);
 }
 
+/* Runs the deferred timers whose turn it is: those posted after every event
+   still in the queue. One whose predecessors are still queued waits -- and
+   so do the ones behind it in the ring, which are later still. */
 static void drain_overflow(JSContext *ctx)
 {
     while (s_of_tail != s_of_head) {
+        scripting_evt_t head;
+        if (xQueuePeek(s_queue, &head, 0) == pdTRUE &&
+            !evt_seq_after(head.seq, s_overflow_seq[s_of_tail]))
+            break;
         uint32_t id = s_overflow[s_of_tail];
         s_of_tail = (uint8_t)((s_of_tail + 1u) % TIMER_OVERFLOW_SLOTS);
         budget_start();
@@ -536,8 +636,16 @@ static void scripting_task(void *arg)
 
     scripting_evt_t ev;
     for (;;) {
-        drain_overflow(ctx);   /* timers the event queue could not take */
+        recover_interrupt(ctx);   /* the event of the previous pass */
+        deliver_pending(ctx, on_time_sync);
+        recover_interrupt(ctx);
+        /* Resync before the deferred timers: a dropped input change has no
+           place in the order, and the live level is never older than a
+           timer that is due -- a stale one is what fired heldFor() wrongly. */
         resync_lost_inputs(ctx);
+        recover_interrupt(ctx);
+        drain_overflow(ctx);   /* timers the event queue could not take, in order */
+        recover_interrupt(ctx);
 
         if (xQueueReceive(s_queue, &ev, pdMS_TO_TICKS(200)) == pdTRUE) {
             budget_start();
@@ -600,7 +708,8 @@ static void scripting_task(void *arg)
                     JS_SetMemoryLimit(rt, JS_HEAP_LIMIT);
                     ESP_LOGE(TAG, "reload: out of memory, rules unchanged");
                     free(ev.reload.script);
-                    publish_reload_result(ev.reload.ticket, false, "out of memory");
+                    free(ev.reload.store);
+                    publish_reload_result(ev.reload.ticket, false, "out of memory", false, ESP_OK);
                     break;
                 }
 
@@ -645,7 +754,8 @@ static void scripting_task(void *arg)
                     JS_FreeContext(nctx);
                     JS_SetMemoryLimit(rt, JS_HEAP_LIMIT);   /* new one is gone again */
                     ESP_LOGE(TAG, "rules not applied, previous rules still running");
-                    publish_reload_result(ev.reload.ticket, false, err);
+                    free(ev.reload.store);
+                    publish_reload_result(ev.reload.ticket, false, err, false, ESP_OK);
                     break;
                 }
 
@@ -661,43 +771,27 @@ static void scripting_task(void *arg)
                 ctx = nctx;
                 bind_handlers(ctx, &on_mqtt, &on_input, &on_time_sync, &on_activity);
                 ESP_LOGI(TAG, "Rules reloaded");
-                publish_reload_result(ev.reload.ticket, true, "");
+                /* Stored here, before the verdict is published, and not by
+                   the caller after it: the caller may have stopped waiting. */
+                bool      tried = ev.reload.store && ev.reload.store_fn;
+                esp_err_t serr  = ESP_OK;
+                if (tried) {
+                    serr = ev.reload.store_fn(ev.reload.store);
+                    if (serr != ESP_OK)
+                        ESP_LOGE(TAG, "rules running but not stored: %s", esp_err_to_name(serr));
+                }
+                free(ev.reload.store);
+                publish_reload_result(ev.reload.ticket, true, "", tried, serr);
                 break;
             }
             case EVT_TIMER:
                 run_timer(ctx, ev.timer.id);
                 break;
             case EVT_TIME_SYNC:
-                // Clock just became real (first SNTP sync, or corrected by a later one).
-                // Mark valid and let dsl.js re-arm cron from the corrected wall-clock.
-                s_time_valid = true;
-                if (JS_IsFunction(ctx, on_time_sync)) {
-                    JSValue r = JS_Call(ctx, on_time_sync, JS_UNDEFINED, 0, NULL);
-                    if (JS_IsException(r)) {
-                        JSValue exc = JS_GetException(ctx);
-                        const char *msg = JS_ToCString(ctx, exc);
-                        ESP_LOGE(TAG, "_on_time_sync error: %s", msg ? msg : "(unknown)");
-                        JS_FreeCString(ctx, msg);
-                        JS_FreeValue(ctx, exc);
-                    }
-                    JS_FreeValue(ctx, r);
-                }
+                handle_time_sync(ctx, on_time_sync, true);
                 break;
             case EVT_TZ_CHANGE:
-                /* The timers already armed were computed with the old offset.
-                   Re-armed only if the clock is valid: unlike a time sync this
-                   must not declare it so. */
-                if (s_time_valid && JS_IsFunction(ctx, on_time_sync)) {
-                    JSValue r = JS_Call(ctx, on_time_sync, JS_UNDEFINED, 0, NULL);
-                    if (JS_IsException(r)) {
-                        JSValue exc = JS_GetException(ctx);
-                        const char *msg = JS_ToCString(ctx, exc);
-                        ESP_LOGE(TAG, "_on_time_sync (tz) error: %s", msg ? msg : "(unknown)");
-                        JS_FreeCString(ctx, msg);
-                        JS_FreeValue(ctx, exc);
-                    }
-                    JS_FreeValue(ctx, r);
-                }
+                handle_time_sync(ctx, on_time_sync, false);
                 break;
             case EVT_ACTIVITY: {
                 // A fieldbus command arrived → feed the matching DSL command-health source.
@@ -762,24 +856,38 @@ void scripting_on_mqtt_message(const char *topic, size_t tlen,
     memcpy(ev.mqtt.topic,   topic, tl); ev.mqtt.topic[tl]   = '\0';
     memcpy(ev.mqtt.payload, data,  dl); ev.mqtt.payload[dl] = '\0';
 
-    if (xQueueSend(s_queue, &ev, 0) != pdTRUE)
+    if (evt_send(&ev) != pdTRUE)
         ESP_LOGW(TAG, "Event queue full — MQTT message dropped");
 }
 
 uint32_t scripting_reload(const char *new_script)
 {
+    return scripting_reload_and_store(new_script, NULL, NULL);
+}
+
+uint32_t scripting_reload_and_store(const char *new_script, const char *to_store,
+                                    scripting_store_fn_t store)
+{
     if (!s_queue || !new_script) return 0;
     char *copy = strdup(new_script);
-    if (!copy) { ESP_LOGE(TAG, "scripting_reload: out of memory"); return 0; }
+    char *keep = (to_store && store) ? strdup(to_store) : NULL;
+    if (!copy || ((to_store && store) && !keep)) {
+        ESP_LOGE(TAG, "scripting_reload: out of memory");
+        free(copy); free(keep);
+        return 0;
+    }
     scripting_evt_t ev = { .type = EVT_RELOAD };
-    ev.reload.script = copy;
+    ev.reload.script   = copy;
+    ev.reload.store    = keep;
+    ev.reload.store_fn = store;
     if (s_reload_lock) xSemaphoreTake(s_reload_lock, portMAX_DELAY);
     ev.reload.ticket = ++s_reload_seq;
     if (ev.reload.ticket == 0) ev.reload.ticket = ++s_reload_seq;   /* 0 means "not queued" */
     if (s_reload_lock) xSemaphoreGive(s_reload_lock);
-    if (xQueueSend(s_queue, &ev, 0) != pdTRUE) {
+    if (evt_send(&ev) != pdTRUE) {
         ESP_LOGW(TAG, "scripting_reload: queue full");
         free(copy);
+        free(keep);
         return 0;
     }
     return ev.reload.ticket;
@@ -796,8 +904,10 @@ void scripting_on_tz_change(void)
 {
     if (!s_queue) return;
     scripting_evt_t ev = { .type = EVT_TZ_CHANGE };
-    if (xQueueSend(s_queue, &ev, 0) != pdTRUE)
-        ESP_LOGW(TAG, "scripting_on_tz_change: queue full");
+    if (evt_send(&ev) != pdTRUE) {
+        __atomic_fetch_or(&s_pending, PENDING_TZ_CHANGE, __ATOMIC_RELAXED);
+        ESP_LOGW(TAG, "scripting_on_tz_change: queue full, delivered on the next pass");
+    }
 }
 
 void scripting_on_time_sync(void)
@@ -807,8 +917,10 @@ void scripting_on_time_sync(void)
     // isn't up yet, the boot-time _time_valid() read covers arming.
     if (!s_queue) { s_time_valid = true; return; }
     scripting_evt_t ev = { .type = EVT_TIME_SYNC };
-    if (xQueueSend(s_queue, &ev, 0) != pdTRUE)
-        ESP_LOGW(TAG, "scripting_on_time_sync: queue full");
+    if (evt_send(&ev) != pdTRUE) {
+        __atomic_fetch_or(&s_pending, PENDING_TIME_SYNC, __ATOMIC_RELAXED);
+        ESP_LOGW(TAG, "scripting_on_time_sync: queue full, delivered on the next pass");
+    }
 }
 
 static void post_activity(uint8_t source)
@@ -817,7 +929,7 @@ static void post_activity(uint8_t source)
     scripting_evt_t ev = { .type = EVT_ACTIVITY, .activity = { .source = source } };
     // Drop silently if the queue is full — a missed health feed only risks a spurious
     // "stale" edge, and flooding the log from a busy RX task would be worse.
-    xQueueSend(s_queue, &ev, 0);
+    evt_send(&ev);
 }
 
 void scripting_on_modbus_activity(void) { post_activity(ACT_MODBUS); }
@@ -829,7 +941,7 @@ bool scripting_on_analog(uint8_t pad, int mv)
     scripting_evt_t ev = { .type = EVT_ANALOG, .analog = { .pad = pad, .mv = mv } };
     /* Not lost when the queue is full: the driver offers the reading again
        with its next sample. */
-    return xQueueSend(s_queue, &ev, 0) == pdTRUE;
+    return evt_send(&ev) == pdTRUE;
 }
 
 void scripting_on_input_change(uint8_t channel, bool state)
@@ -839,7 +951,7 @@ void scripting_on_input_change(uint8_t channel, bool state)
         .type  = EVT_INPUT_CHANGE,
         .input = { .channel = channel, .state = state, .seq = input_seq_next() },
     };
-    if (xQueueSend(s_queue, &ev, 0) != pdTRUE) {
+    if (evt_send(&ev) != pdTRUE) {
         /* Remembered, not lost: the engine re-reads the channel's live level
            on its next pass and delivers that as the event, so a condition's
            shadow of the input cannot stay behind for good. */

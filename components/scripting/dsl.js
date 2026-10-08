@@ -858,6 +858,32 @@ function _run_action(r) {
     r._firing = false;
 }
 
+// Called by the host after the time budget interrupted a call. QuickJS's
+// interrupt is uncatchable: it unwinds past every catch and finally, so the
+// flags a pass sets before its work and clears after it stay set -- a noLoop
+// rule's _firing (the rule would never run again), an edge condition's _armed
+// (an mqtt().once() or a time trigger would keep matching on later, unrelated
+// events) -- and a time trigger whose callback was cut short never re-armed
+// itself. All of these are only true during a pass, and no pass is running now.
+function _after_interrupt() {
+    _resetCascade();
+    var rearm = [];
+    for (var i = 0; i < _rules.length; i++) {
+        var r = _rules[i];
+        r._firing = false;
+        var conds = r.conditions;
+        for (var j = 0; j < conds.length; j++) {
+            var c = conds[j];
+            if (c instanceof MqttCondition) c._armed = false;
+            else if (c instanceof IntervalCondition || c instanceof CronCondition) {
+                c._armed = false;
+                if (c._timer == null) rearm.push(c);
+            }
+        }
+    }
+    for (var k = 0; k < rearm.length; k++) rearm[k]._arm();   // idempotent per trigger
+}
+
 // Whether a rule is edge-triggered on analog readings: it has a band on some
 // pad, or it is a predicate rule (wildcard), which would otherwise re-run its
 // action on every reading -- several a second -- while its predicate holds.

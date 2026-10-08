@@ -253,7 +253,7 @@
         <thead><tr><th>Input</th><th>Name</th><th>Invert</th></tr></thead>
         <tbody id="di-table"></tbody>
       </table>
-      <p class="hint">Name: used as MQTT topic fragment instead of the number (max 20 chars, no <code>/</code>, unique). Invert: checked = active-low (GPIO low → <code>true</code>).</p>
+      <p class="hint">Name: used as MQTT topic fragment instead of the number (max 20 chars, no <code>/ + #</code>, not <code>set</code> or <code>read</code>, unique including the numbers of unnamed channels). Invert: checked = active-low (GPIO low → <code>true</code>).</p>
       <div id="di-grid" class="io-grid" style="margin-top:.6rem"></div>
     </div>
 

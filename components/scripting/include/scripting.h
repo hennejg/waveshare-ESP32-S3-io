@@ -66,6 +66,16 @@ bool scripting_on_analog(uint8_t pad, int mv);
 // Returns the ticket of the queued reload, or 0 if it could not be queued.
 uint32_t scripting_reload(const char *new_script);
 
+// The same, and once the engine has accepted new_script, it calls store(to_store)
+// on its own task -- also when the caller has stopped waiting for the verdict.
+// Stored by the caller after the verdict, a script accepted after the caller's
+// timeout was running but never stored, and the next boot brought back the old
+// one. to_store is what the next boot should load ("" for the built-in demo);
+// it is copied. store's result is in the status.
+typedef esp_err_t (*scripting_store_fn_t)(const char *to_store);
+uint32_t scripting_reload_and_store(const char *new_script, const char *to_store,
+                                    scripting_store_fn_t store);
+
 // Outcome of the most recent reload the engine has finished acting on,
 // stamped with the ticket scripting_reload() handed out for it. A caller
 // waits until `ticket` reaches its own; verdicts come in ticket order, so a
@@ -76,6 +86,8 @@ typedef struct {
     uint32_t ticket;
     bool     ok;
     char     message[96];      // empty when ok
+    bool     store_tried;      // accepted, and the reload asked to be stored
+    esp_err_t store_err;       // store()'s result when store_tried
 } scripting_reload_status_t;
 
 void scripting_reload_status(scripting_reload_status_t *out);

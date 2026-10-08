@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "mqtt_client.h"
+#include "cJSON.h"
 
 #define TAG                  "app_mqtt"
 #define TOPIC_MAXLEN          256   /* prefix(63) + '/'(1) + topic(191) + NUL */
@@ -45,14 +46,21 @@ static void publish_health(void)
     const app_config_t *cfg = app_config_get();
     if (!cfg->mqtt_topic_prefix[0]) return;
 
-    char payload[128];
-    int64_t uptime_s = esp_timer_get_time() / 1000000LL;
-    snprintf(payload, sizeof(payload),
-             "{\"online\":true,\"device\":\"%s\",\"uptime_s\":%" PRId64 "}",
-             cfg->device_name, uptime_s);
+    /* Built by the serializer: the device name is free text, and pasted
+       into the JSON as it was, a name like  Pump "West"  made the message
+       unparseable for every subscriber. */
+    cJSON *o = cJSON_CreateObject();
+    if (!o) return;
+    cJSON_AddBoolToObject(o, "online", true);
+    cJSON_AddStringToObject(o, "device", cfg->device_name);
+    cJSON_AddNumberToObject(o, "uptime_s", (double)(esp_timer_get_time() / 1000000LL));
+    char *payload = cJSON_PrintUnformatted(o);
+    cJSON_Delete(o);
+    if (!payload) return;
 
     esp_mqtt_client_publish(s_client, cfg->mqtt_topic_prefix,
                             payload, 0, /*qos*/1, /*retain*/1);
+    cJSON_free(payload);
 }
 
 /* The timer only rings; the publish runs on a task of its own. Publishing

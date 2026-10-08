@@ -56,7 +56,7 @@ README for the wiring caveats.
 - Edge detection with 10 ms software debounce
 - Default sense: active = GPIO high. Set the **invert flag** in the web UI to reverse (active = GPIO low).
 
-Each input can be given a **name** in the web UI config page (max 20 characters, no `/`, unique among all inputs). The name replaces the index number in the MQTT topic.
+Each input can be given a **name** in the web UI config page (max 20 characters, no `/`, `+` or `#`, not `read`). Names must be unique among all inputs, and that includes the numbers of unnamed inputs: DI1 cannot be called `2` while DI2 has no name. The name replaces the index number in the MQTT topic.
 
 ### Published topics
 
@@ -83,7 +83,7 @@ Each input can be given a **name** in the web UI config page (max 20 characters,
 
 The board has 8 optocoupler-isolated digital outputs driven via a TCA9554 I²C expander (address 0x20, SDA GPIO42, SCL GPIO41, 100 kHz). The invert flag and an optional name per output are set in the web UI.
 
-Each output can be given a **name** (max 20 characters, no `/`, unique among all outputs). The name replaces the index number in all output-related topics.
+Each output can be given a **name** (max 20 characters, no `/`, `+` or `#`, not `set` or `read`, which are the bulk command topics). Names must be unique among all outputs, the pads' outputs 9–11 included, and that includes the numbers of unnamed outputs. A stored name that breaks these rules, from an older firmware, is dropped at boot and the channel answers to its number again. The name replaces the index number in all output-related topics.
 
 > **Note:** Commands use a `/set` suffix so the device never receives its own state publications as commands. This matches the Home Assistant MQTT switch convention (`command_topic` / `state_topic`).
 
