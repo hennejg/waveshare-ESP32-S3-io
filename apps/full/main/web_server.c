@@ -7,6 +7,7 @@
 #include "di.h"
 #include "dout.h"
 #include "aux_io.h"
+#include "app_mqtt.h"
 #include "esp_system.h"
 #include "led.h"
 #ifdef CONFIG_APP_MATTER_ENABLE
@@ -119,6 +120,31 @@ static bool validate_names(const di_config_t *arr, int count, const char **err_m
                 return false;
             }
         }
+    }
+    return true;
+}
+
+/* The pads' output names share the output/... topic space with DO1-DO8, so
+   each pad's topic fragment -- its name, or its number 9..11 -- must differ
+   from every DO's -- its name, or 1..8 -- and from the other pads'. */
+static bool validate_aux_out_names(const app_config_t *c, const char **err_msg)
+{
+    char frag[APP_CFG_DO_COUNT + 3][APP_CFG_IO_NAME_MAX + 4];
+    int n = 0;
+    for (int i = 0; i < APP_CFG_DO_COUNT; i++, n++) {
+        if (c->dout[i].name[0]) strlcpy(frag[n], c->dout[i].name, sizeof(frag[n]));
+        else snprintf(frag[n], sizeof(frag[n]), "%d", i + 1);
+    }
+    for (int a = 0; a < 3; a++, n++) {
+        const char *name = c->aux_out[a].name;
+        if (strchr(name, '/')) { *err_msg = "name must not contain '/'"; return false; }
+        if (name[0]) strlcpy(frag[n], name, sizeof(frag[n]));
+        else snprintf(frag[n], sizeof(frag[n]), "%d", APP_CFG_DO_COUNT + 1 + a);
+        for (int j = 0; j < n; j++)
+            if (strcmp(frag[j], frag[n]) == 0) {
+                *err_msg = "output names must be unique, including the pads' numbers 9-11";
+                return false;
+            }
     }
     return true;
 }
@@ -450,6 +476,8 @@ static esp_err_t api_config_get(httpd_req_t *req)
                 cJSON_AddItemToArray(modes, cJSON_CreateString(aux_mode_name((aux_mode_t)m)));
         cJSON_AddNumberToObject(o, "pwm_freq", cfg->aux_pwm[a].freq_hz);
         cJSON_AddNumberToObject(o, "pwm_duty", cfg->aux_pwm[a].duty_pm / 10.0);
+        cJSON_AddStringToObject(o, "out_name",   cfg->aux_out[a].name);
+        cJSON_AddBoolToObject  (o, "out_invert", cfg->aux_out[a].invert);
         cJSON_AddItemToArray(aux, o);
     }
 #endif
@@ -583,6 +611,16 @@ static esp_err_t api_config_post(httpd_req_t *req)
             if (!aux_err && (v = cJSON_GetObjectItem(o, "pwm_duty"))) {
                 if (!cJSON_IsNumber(v) || !aux_pwm_duty_from_pct(v->valuedouble, &cfg.aux_pwm[a].duty_pm))
                     aux_err = "pwm_duty must be a percentage from 0 to 100";
+            }
+            if (!aux_err && (v = cJSON_GetObjectItem(o, "out_name"))) {
+                if (!cJSON_IsString(v) || strlen(v->valuestring) > APP_CFG_IO_NAME_MAX)
+                    aux_err = "out_name must be a string of at most 20 characters";
+                else
+                    strlcpy(cfg.aux_out[a].name, v->valuestring, sizeof(cfg.aux_out[a].name));
+            }
+            if (!aux_err && (v = cJSON_GetObjectItem(o, "out_invert"))) {
+                if (!cJSON_IsBool(v)) aux_err = "out_invert must be true or false";
+                else cfg.aux_out[a].invert = cJSON_IsTrue(v);
             }
         }
     }
@@ -797,7 +835,8 @@ static esp_err_t api_config_post(httpd_req_t *req)
     /* Validate names before saving */
     const char *err = NULL;
     if (!validate_names(cfg.di,   APP_CFG_DI_COUNT, &err) ||
-        !validate_names(cfg.dout, APP_CFG_DO_COUNT, &err)) {
+        !validate_names(cfg.dout, APP_CFG_DO_COUNT, &err) ||
+        !validate_aux_out_names(&cfg, &err)) {
         char msg[64];
         snprintf(msg, sizeof(msg), "{\"status\":\"error\",\"message\":\"%s\"}", err);
         httpd_resp_set_type(req, "application/json");
@@ -830,6 +869,7 @@ static esp_err_t api_config_post(httpd_req_t *req)
     di_publish_all();
     /* Re-subscribe with potentially new names, then publish all DO states. */
     dout_on_mqtt_connected();
+    if (app_mqtt_is_connected()) aux_io_on_mqtt_connected();
 
     if (aux_ret != ESP_OK) {
         /* Stored, but not in effect: say so, rather than "ok" next to a mode
@@ -1222,6 +1262,9 @@ static esp_err_t api_io_state(httpd_req_t *req)
         } else if (m == AUX_MODE_ANALOG && aux_io_analog_mv((uint8_t)a, &mv) == ESP_OK) {
             cJSON_AddNumberToObject(o, "mv", mv);
         }
+        bool on;
+        if (m == AUX_MODE_OUTPUT && aux_io_out_get((uint8_t)a, &on))
+            cJSON_AddBoolToObject(o, "out", on);
         cJSON_AddItemToArray(aux, o);
     }
 #endif
@@ -1251,13 +1294,39 @@ static esp_err_t api_io_output(httpd_req_t *req)
     cJSON *root = cJSON_Parse(body);
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
 
+    /* 0-7 are DO1-DO8; 8-10 the header pads, while they are outputs. */
+    const int last = APP_CFG_DO_COUNT - 1 + APP_CFG_DI_AUX_COUNT;
     cJSON *ch_j = cJSON_GetObjectItem(root, "channel");
-    if (!cJSON_IsNumber(ch_j) || (int)ch_j->valuedouble < 0 || (int)ch_j->valuedouble > 7) {
+    if (!cJSON_IsNumber(ch_j) || ch_j->valuedouble < 0 || ch_j->valuedouble > last ||
+        ch_j->valuedouble != (int)ch_j->valuedouble) {
         cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "channel 0-7 required");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            last > 7 ? "channel 0-10 required" : "channel 0-7 required");
         return ESP_OK;
     }
     uint8_t ch = (uint8_t)ch_j->valuedouble;
+
+    if (ch >= APP_CFG_DO_COUNT) {
+        uint8_t a = (uint8_t)(ch - APP_CFG_DO_COUNT);
+        cJSON *tog = cJSON_GetObjectItem(root, "toggle");
+        cJSON *val = cJSON_GetObjectItem(root, "value");
+        esp_err_t r;
+        if (cJSON_IsTrue(tog))      r = aux_io_out_toggle(a);
+        else if (cJSON_IsBool(val)) r = aux_io_out_set(a, cJSON_IsTrue(val));
+        else {
+            cJSON_Delete(root);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "value or toggle required");
+            return ESP_OK;
+        }
+        cJSON_Delete(root);
+        if (r == ESP_ERR_INVALID_STATE) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "this pad is not set to output");
+            return ESP_OK;
+        }
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, r == ESP_OK ? "{\"status\":\"ok\"}" : "{\"status\":\"error\"}");
+        return ESP_OK;
+    }
 
     /* A toggle goes to dout_modify() as one: read and flip under the output
        lock. Reading here and setting the opposite lost one of two toggles

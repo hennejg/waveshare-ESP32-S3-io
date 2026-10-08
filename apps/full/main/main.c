@@ -51,6 +51,24 @@ const char DEMO_SCRIPT[] =
     "    output(0).set(true);\n"
     "  });\n";
 
+/* output(0..7) is DO1-DO8, output(8..10) a header pad set to output -- the
+   rule engine sees one row of outputs, as it sees one row of inputs. */
+static esp_err_t rules_out_set(uint8_t ch, bool on)
+{
+    return ch < APP_CFG_DO_COUNT ? dout_set(ch, on) : aux_io_out_set((uint8_t)(ch - APP_CFG_DO_COUNT), on);
+}
+static bool rules_out_get(uint8_t ch)
+{
+    bool on = false;
+    if (ch < APP_CFG_DO_COUNT) return dout_get(ch);
+    aux_io_out_get((uint8_t)(ch - APP_CFG_DO_COUNT), &on);
+    return on;
+}
+static esp_err_t rules_out_toggle(uint8_t ch)
+{
+    return ch < APP_CFG_DO_COUNT ? dout_toggle(ch) : aux_io_out_toggle((uint8_t)(ch - APP_CFG_DO_COUNT));
+}
+
 #if CONFIG_APP_AUX_DI_ENABLE
 /* The rule engine numbers the pads 1..3, like AUX1..AUX3; aux_io 0..2. */
 static esp_err_t rules_pwm_set(uint8_t pad, uint32_t freq_hz, uint16_t duty_pm)
@@ -76,9 +94,10 @@ static const scripting_io_t s_scripting_io = {
     .aux_pwm_get    = rules_pwm_get,
     .aux_analog_get = rules_analog_get,
 #endif
-    .dout_set       = dout_set,
-    .dout_get       = dout_get,
-    .dout_toggle    = dout_toggle,
+    .dout_set       = rules_out_set,
+    .dout_get       = rules_out_get,
+    .dout_toggle    = rules_out_toggle,
+    .do_count       = APP_CFG_DO_COUNT + APP_CFG_DI_AUX_COUNT,
     .mqtt_subscribe = app_mqtt_subscribe,
     .mqtt_publish   = app_mqtt_publish,
     .led_set        = led_set_rgb,      /* effective in IO mode (no-op in status mode) */

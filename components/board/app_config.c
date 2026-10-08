@@ -29,6 +29,7 @@ _Static_assert(sizeof(app_config_t) < 2600,
 #define K_LED_MODE      "led_mode"
 #define K_AUX_MODE      "aux_mode"
 #define K_AUX_PWM       "aux_pwm"
+#define K_AUX_OUT       "aux_out"
 #define K_CAN_CFG       "can_cfg"
 #define K_SNTP_CFG      "sntp_cfg"
 #define K_MBM_CFG       "mbm_cfg"
@@ -73,6 +74,7 @@ static void aux_normalize(app_config_t *c)
         if (c->aux_pwm[a].freq_hz < AUX_PWM_FREQ_MIN || c->aux_pwm[a].freq_hz > AUX_PWM_FREQ_MAX)
             c->aux_pwm[a].freq_hz = AUX_PWM_FREQ_DEFAULT;
         if (c->aux_pwm[a].duty_pm > AUX_PWM_DUTY_MAX) c->aux_pwm[a].duty_pm = 0;
+        c->aux_out[a].name[sizeof(c->aux_out[a].name) - 1] = '\0';
     }
 }
 
@@ -136,6 +138,8 @@ esp_err_t app_config_init(void)
     }
     sz = sizeof(s_cfg.aux_pwm);
     nvs_get_blob(h, K_AUX_PWM, s_cfg.aux_pwm, &sz);
+    sz = sizeof(s_cfg.aux_out);
+    nvs_get_blob(h, K_AUX_OUT, s_cfg.aux_out, &sz);
     sz = sizeof(s_cfg.can);
     nvs_get_blob(h, K_CAN_CFG, &s_cfg.can, &sz);
     sz = sizeof(s_cfg.sntp);
@@ -188,6 +192,7 @@ esp_err_t app_config_update(const app_config_t *cfg)
     PUT(nvs_set_u8(h, K_LED_MODE,     cfg->led_mode));
     PUT(nvs_set_blob(h, K_AUX_MODE,   cfg->aux_mode, sizeof(cfg->aux_mode)));
     PUT(nvs_set_blob(h, K_AUX_PWM,    cfg->aux_pwm,  sizeof(cfg->aux_pwm)));
+    PUT(nvs_set_blob(h, K_AUX_OUT,    cfg->aux_out,  sizeof(cfg->aux_out)));
     PUT(nvs_set_blob(h, K_CAN_CFG,    &cfg->can, sizeof(cfg->can)));
     PUT(nvs_set_blob(h, K_SNTP_CFG,   &cfg->sntp, sizeof(cfg->sntp)));
     PUT(nvs_set_blob(h, K_MBM_CFG,    cfg->mbm, sizeof(cfg->mbm)));

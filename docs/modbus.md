@@ -153,6 +153,20 @@ Connections are held open between polls and dropped after a minute idle.
 
 ---
 
+#### Coils 9–11 — header pads as outputs
+
+| Coil | Address (0-based) | Modbus notation | Pad |
+|------|-------------------|-----------------|-----|
+| 9    | 8                 | 00009           | IO1 |
+| 10   | 9                 | 00010           | RXD |
+| 11   | 10                | 00011           | TXD |
+
+For a pad set to *digital output* on the Device tab. A pad in another mode reads 0, and a write to it is refused with
+exception `0x03` — the whole request, including any DO1–DO8 coils in it. A write takes effect at once and is not
+stored: the output starts off after a reboot. Its invert flag is the pad's own, set on the Outputs tab.
+
+---
+
 ### Discrete Input Registers (function code 02) — Digital Inputs
 
 | DI | Address (0-based) | Modbus notation | Maps to |
@@ -263,7 +277,7 @@ A read that reaches past address 79 into the gap before 100 is answered with exc
 | Address | Modbus notation | Content |
 |---------|-----------------|---------|
 | 100     | 30101           | IO1 analog input in millivolts; 0 when the pad is not an analog input |
-| 101     | 30102           | Mode of pad IO1: 0 standard, 1 digital input, 2 PWM output, 3 analog input |
+| 101     | 30102           | Mode of pad IO1: 0 standard, 1 digital input, 2 PWM output, 3 analog input, 4 digital output |
 | 102     | 30103           | Mode of pad RXD |
 | 103     | 30104           | Mode of pad TXD |
 

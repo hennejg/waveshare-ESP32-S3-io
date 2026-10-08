@@ -6,6 +6,7 @@
  *   input     digital input AUX1..AUX3, DI channels 8..10
  *   pwm       PWM output, frequency and duty cycle per pad (LEDC)
  *   analog    analog input, millivolts (ADC1 channel 0) -- GPIO1 only
+ *   output    digital output, on/off; starts off, not stored
  *
  * All three pads are bare 3.3 V GPIOs: no isolation, no protection. What a
  * pad does outside the firmware's control matters for a load on it:
@@ -25,6 +26,7 @@ typedef enum {
     AUX_MODE_INPUT    = 1,
     AUX_MODE_PWM      = 2,
     AUX_MODE_ANALOG   = 3,
+    AUX_MODE_OUTPUT   = 4,      /* appended: the values are stored in NVS */
     AUX_MODE_COUNT
 } aux_mode_t;
 
@@ -77,6 +79,14 @@ uint32_t    aux_io_pwm_actual_hz(uint8_t a);
    for a value out of range. */
 esp_err_t   aux_io_pwm_set(uint8_t a, uint32_t freq_hz, uint16_t duty_pm);
 
+/* A pad in output mode: its logical state (the pad's invert flag decides the
+   level), set at run time and not stored -- it starts off after a reboot and
+   whenever the pad enters output mode. ESP_ERR_INVALID_STATE if the pad is
+   not an output. aux_io_out_get() is false then. */
+esp_err_t   aux_io_out_set(uint8_t a, bool on);
+esp_err_t   aux_io_out_toggle(uint8_t a);
+bool        aux_io_out_get(uint8_t a, bool *on);
+
 /* The analog input of pad a in millivolts, as last sampled (every 200 ms,
    averaged over 16 conversions). ESP_ERR_INVALID_STATE if the pad is not an
    analog input or has no reading yet. */
@@ -92,7 +102,12 @@ esp_err_t   aux_io_analog_mv(uint8_t a, int *mv);
                                                               emptied when not PWM)
      aux/<1..3>/pwm/set    25.0  or  {"duty":25.0,"freq":1000} (subscribed)
      aux/1/analog          millivolts                         (published)
-     aux/read              publish all of the above           (subscribed) */
+     aux/read              publish all of the above           (subscribed)
+   and for a pad in output mode, like DO1-DO8, under the pad's output name or
+   its number 9..11:
+     output/<name|9..11>      true | false                      (published)
+     output/<name|9..11>/set  true/on/1, false/off/0, toggle    (subscribed)
+     output/read              publish                           (subscribed) */
 void        aux_io_on_mqtt_connected(void);
 void        aux_io_on_mqtt_message(const char *topic, size_t topic_len,
                                    const char *data,  size_t data_len);

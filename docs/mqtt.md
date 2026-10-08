@@ -153,6 +153,11 @@ RXD, 3 for TXD:
 | `<prefix>/aux/1/analog` | published | IO1 analog input in millivolts, whenever it moves by 20 mV or more |
 | `<prefix>/aux/read` | subscribed | anything — publishes all of the above |
 
+A pad set to *digital output* behaves like DO1–DO8, numbered after them: `<prefix>/output/<name or 9..11>` is
+published (`true`/`false`) when it changes, `<prefix>/output/<name or 9..11>/set` takes the same payloads as a DO
+(`true`/`on`/`1`, `false`/`off`/`0`, `toggle`), and `<prefix>/output/read` publishes it too. The bulk command
+`output/set` covers DO1–DO8 only.
+
 A `pwm/set` takes effect at once and is not stored: after a reboot the pad starts with the configured values. Only a
 change is republished. A
 command for a pad that is not a PWM output, or with a value out of range (duty 0–100, frequency 5–1000000 Hz), is

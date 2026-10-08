@@ -1,5 +1,6 @@
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
 
@@ -33,6 +34,11 @@ esp_err_t dout_set(uint8_t n, bool state);
 /* Flips output n in one step under the output lock. Reading dout_get() and
    setting the opposite loses one of two toggles that arrive together. */
 esp_err_t dout_toggle(uint8_t n);
+
+/* The payload vocabulary of an output command, shared with the header pads
+   (aux_io.c): true 1 high on / false 0 low off, and toggle; case-insensitive. */
+bool      dout_parse_state(const char *data, size_t len, bool *out);
+bool      dout_parse_toggle(const char *data, size_t len);
 
 /* Re-apply current logical states to hardware (e.g. after invert config
    change) and publish all states. */

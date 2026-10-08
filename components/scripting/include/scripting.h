@@ -26,6 +26,7 @@ typedef struct {
     scripting_dout_get_fn_t       dout_get;
     scripting_dout_toggle_fn_t    dout_toggle;
     uint8_t                       di_count;     /* inputs input() accepts; 0 = 8 */
+    uint8_t                       do_count;     /* outputs output() accepts; 0 = 8 */
     scripting_aux_pwm_set_fn_t    aux_pwm_set;
     scripting_aux_pwm_get_fn_t    aux_pwm_get;
     scripting_aux_analog_get_fn_t aux_analog_get;

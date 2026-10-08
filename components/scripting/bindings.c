@@ -5,6 +5,11 @@
 
 #define TAG "js"
 
+static int do_count(void)
+{
+    return (g_scripting_io && g_scripting_io->do_count) ? g_scripting_io->do_count : 8;
+}
+
 static int di_count(void)
 {
     return (g_scripting_io && g_scripting_io->di_count) ? g_scripting_io->di_count : 8;
@@ -23,10 +28,12 @@ static JSValue js_dout_set(JSContext *ctx, JSValue this_val, int argc, JSValue *
 {
     int32_t ch;
     if (JS_ToInt32(ctx, &ch, argv[0]) < 0) return JS_EXCEPTION;
-    if (ch < 0 || ch > 7)
-        return JS_ThrowRangeError(ctx, "output channel must be 0-7");
+    if (ch < 0 || ch >= do_count())
+        return JS_ThrowRangeError(ctx, "output channel must be 0-%d", do_count() - 1);
     bool state = JS_ToBool(ctx, argv[1]);
     esp_err_t err = g_scripting_io->dout_set((uint8_t)ch, state);
+    if (err == ESP_ERR_INVALID_STATE)
+        return JS_ThrowInternalError(ctx, "output %d is a header pad that is not set to output", (int)ch);
     if (err != ESP_OK)
         return JS_ThrowInternalError(ctx, "dout_set failed: %d", (int)err);
     return JS_UNDEFINED;
@@ -36,9 +43,11 @@ static JSValue js_dout_toggle(JSContext *ctx, JSValue this_val, int argc, JSValu
 {
     int32_t ch;
     if (JS_ToInt32(ctx, &ch, argv[0]) < 0) return JS_EXCEPTION;
-    if (ch < 0 || ch > 7)
-        return JS_ThrowRangeError(ctx, "output channel must be 0-7");
+    if (ch < 0 || ch >= do_count())
+        return JS_ThrowRangeError(ctx, "output channel must be 0-%d", do_count() - 1);
     esp_err_t err = g_scripting_io->dout_toggle((uint8_t)ch);
+    if (err == ESP_ERR_INVALID_STATE)
+        return JS_ThrowInternalError(ctx, "output %d is a header pad that is not set to output", (int)ch);
     if (err != ESP_OK)
         return JS_ThrowInternalError(ctx, "dout_toggle failed: %d", (int)err);
     return JS_UNDEFINED;
@@ -48,8 +57,8 @@ static JSValue js_dout_get(JSContext *ctx, JSValue this_val, int argc, JSValue *
 {
     int32_t ch;
     if (JS_ToInt32(ctx, &ch, argv[0]) < 0) return JS_EXCEPTION;
-    if (ch < 0 || ch > 7)
-        return JS_ThrowRangeError(ctx, "output channel must be 0-7");
+    if (ch < 0 || ch >= do_count())
+        return JS_ThrowRangeError(ctx, "output channel must be 0-%d", do_count() - 1);
     return JS_NewBool(ctx, g_scripting_io->dout_get((uint8_t)ch));
 }
 

@@ -37,7 +37,10 @@
 
 /* ------------------------------------------------------------ register layout */
 
-#define MB_NUM_COILS     8     /* DO1-DO8, bit 0 = DO1            */
+/* DO1-DO8, then the header pads as coils 9-11 when the board offers them; a
+   pad that is not an output reads 0 and refuses a write with 0x03. */
+#define MB_NUM_DO        8
+#define MB_NUM_COILS     (MB_NUM_DO + APP_CFG_DI_AUX_COUNT)
 /* DI1-DI8, then AUX1-AUX3 (DI 10009-10011) when the board offers the pads;
    a pad that is not an input reads 0. */
 #define MB_NUM_DISCRETE  APP_CFG_DI_COUNT
@@ -56,7 +59,7 @@
    not the data path: the access callbacks below are overridden, so nothing
    reads or writes these buffers. Reads are answered from the live I/O state
    and writes are captured as commands. */
-static struct { uint8_t  b[1]; } s_coils_unused;
+static struct { uint8_t  b[(MB_NUM_COILS + 7) / 8]; } s_coils_unused;
 static struct { uint8_t  b[(MB_NUM_DISCRETE + 7) / 8]; } s_di_unused;
 static struct { uint16_t r[MB_NUM_HOLDING]; } s_hr_unused;
 static struct { uint16_t r[MB_IR_AUX_COUNT ? MB_IR_AUX_BASE + MB_IR_AUX_COUNT : MB_IDENT_REG_COUNT]; } s_ir_unused;
@@ -171,8 +174,13 @@ static uint8_t local_read_coils(uint16_t addr, uint16_t count, uint8_t *out)
     uint8_t live = dout_get_all();
     for (uint16_t i = 0; i < count; i++) {
         uint8_t ch = (uint8_t)(addr + i);
-        uint8_t v  = s_do_pending[ch] ? (s_do_shadow & (1u << ch))
-                                      : (live       & (1u << ch));
+        bool    v;
+        if (ch >= MB_NUM_DO) {
+            v = false;                           /* a pad: as it runs, 0 if not an output */
+            aux_io_out_get((uint8_t)(ch - MB_NUM_DO), &v);
+        } else {
+            v = s_do_pending[ch] ? (s_do_shadow & (1u << ch)) : (live & (1u << ch));
+        }
         if (v) out[i >> 3] |= (uint8_t)(1u << (i & 7));
     }
     CMD_UNLOCK();
@@ -227,6 +235,29 @@ static uint8_t local_write_coils(uint16_t addr, uint16_t count, const uint8_t *b
     if (!s_local_ready) return MB_EXC_DEVICE_FAILURE;
     if ((uint32_t)addr + count > MB_NUM_COILS) return MB_EXC_ILLEGAL_ADDR;
 
+    /* The pads first, and all checked before any moves: each must be an
+       output. They are set at once -- a GPIO, no I2C -- before DO1-DO8 are
+       queued, so a refusal has queued nothing. */
+    for (uint16_t i = 0; i < count; i++) {
+        uint16_t ch = (uint16_t)(addr + i);
+        if (ch >= MB_NUM_DO && !aux_io_out_get((uint8_t)(ch - MB_NUM_DO), NULL))
+            return MB_EXC_ILLEGAL_VALUE;
+    }
+    bool any_pad = false;
+    for (uint16_t i = 0; i < count; i++) {
+        uint16_t ch = (uint16_t)(addr + i);
+        if (ch < MB_NUM_DO) continue;
+        if (aux_io_out_set((uint8_t)(ch - MB_NUM_DO), (bits[i >> 3] >> (i & 7)) & 1u) != ESP_OK)
+            return MB_EXC_ILLEGAL_VALUE;                  /* switched mode since the check */
+        any_pad = true;
+    }
+    if (any_pad) scripting_on_modbus_activity();
+
+    /* DO1-DO8 through the command task, as before. */
+    uint16_t do_n = (addr < MB_NUM_DO) ? (uint16_t)(MB_NUM_DO - addr) : 0;
+    if (do_n > count) do_n = count;
+    if (!do_n) return MB_EXC_NONE;
+    count = do_n;
     mb_cmd_t cmd = { .area = MB_PARAM_COIL, .offset = addr, .count = count };
     for (uint16_t i = 0; i < count; i++)
         if (bits[i >> 3] & (1u << (i & 7)))

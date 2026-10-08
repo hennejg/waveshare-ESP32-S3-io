@@ -22,9 +22,9 @@ config APP_AUX_DI_ENABLE
     help
         Lets each of the three header pins IO1, RXD and TXD (GPIO1, GPIO44,
         GPIO43) be switched, per pin, in the web UI (Device tab) or with "aux"
-        in /api/config: standard function, digital input, or PWM output with
-        its own frequency (5 Hz .. 1 MHz) and duty cycle; GPIO1 also as analog
-        input (ADC1 channel 0, 0..3.1 V).  The change takes effect on saving;
+        in /api/config: standard function, digital input, digital output, or
+        PWM output with its own frequency (5 Hz .. 1 MHz) and duty cycle;
+        GPIO1 also as analog input (ADC1 channel 0, 0..3.1 V).  The change takes effect on saving;
         no reboot.  Every pin starts in its standard function.  One thing does
         change with the option on: the input table in NVS has eleven entries,
         which an eight-input firmware (older releases, Matter) cannot read
@@ -61,8 +61,8 @@ config APP_AUX_DI_ENABLE
 
         Inputs, PWM and the analog reading are available over the web UI, the
         REST API, MQTT (aux/...), Modbus (discrete inputs 10009-10011, holding
-        registers 40003-40011, input registers 30101-30104) and the rule
-        engine (input(8..10), pwm(), analog()).  Not over CAN, which packs the
+        registers 40003-40011, input registers 30101-30104, coils 9-11) and
+        the rule engine (input(8..10), output(8..10), pwm(), analog()).  Not over CAN, which packs the
         input states into a single byte.
 
         Not offered in a Matter build.  The Matter app exposes exactly eight

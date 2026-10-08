@@ -168,7 +168,8 @@ an **actuator**: call `.publish()` in `then()` to send a message to the broker.
 ### `input(ch)` — digital input
 
 `ch` is the channel number: 0–7 for DI1–DI8, and 8–10 for the header pads IO1, RXD and TXD when the firmware offers
-them. A pad that is not set to *digital input* reads `false`.
+them. A pad that is not set to *digital input* reads `false`. Likewise `output(8)`–`output(10)` are the pads set to
+*digital output*; writing one that is not an output throws.
 
 | Form | Meaning |
 |------|---------|

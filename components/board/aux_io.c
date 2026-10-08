@@ -1,6 +1,7 @@
 #include "aux_io.h"
 #include "app_config.h"
 #include "di.h"
+#include "dout.h"
 
 #include <limits.h>
 #include <math.h>
@@ -44,7 +45,7 @@ _Static_assert(sizeof(((app_config_t *)0)->aux_mode) == AUX_PAD_COUNT, "aux_mode
 _Static_assert(sizeof(((app_config_t *)0)->aux_pwm) / sizeof(((app_config_t *)0)->aux_pwm[0]) == AUX_PAD_COUNT,
                "aux_pwm[] is not one per pad");
 
-static const char *const s_names[AUX_MODE_COUNT] = { "standard", "input", "pwm", "analog" };
+static const char *const s_names[AUX_MODE_COUNT] = { "standard", "input", "pwm", "analog", "output" };
 
 const char *aux_mode_name(aux_mode_t m)
 {
@@ -87,6 +88,9 @@ bool aux_io_pwm_info(uint8_t a, uint32_t *f, uint16_t *d, uint8_t *b) { (void)a;
 uint32_t aux_io_pwm_actual_hz(uint8_t a) { (void)a; return 0; }
 esp_err_t aux_io_pwm_set(uint8_t a, uint32_t f, uint16_t d) { (void)a; (void)f; (void)d; return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t aux_io_analog_mv(uint8_t a, int *mv) { (void)a; (void)mv; return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t aux_io_out_set(uint8_t a, bool on) { (void)a; (void)on; return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t aux_io_out_toggle(uint8_t a) { (void)a; return ESP_ERR_NOT_SUPPORTED; }
+bool aux_io_out_get(uint8_t a, bool *on) { (void)a; (void)on; return false; }
 void aux_io_on_mqtt_connected(void) {}
 void aux_io_on_mqtt_message(const char *t, size_t tl, const char *d, size_t dl) { (void)t; (void)tl; (void)d; (void)dl; }
 
@@ -117,6 +121,11 @@ static uint8_t           s_bits[AUX_PAD_COUNT];
    them must not overwrite a duty cycle set at run time. */
 static uint32_t          s_cfg_freq[AUX_PAD_COUNT];
 static uint16_t          s_cfg_duty[AUX_PAD_COUNT];
+
+/* Output mode: the logical state, and the invert flag it was driven with --
+   a save that changes the flag re-drives the pin. */
+static bool              s_out[AUX_PAD_COUNT];
+static bool              s_out_inv[AUX_PAD_COUNT];
 
 static adc_oneshot_unit_handle_t s_adc;
 static adc_cali_handle_t         s_cali;
@@ -233,6 +242,62 @@ static void pwm_stop(uint8_t a)
     esp_gpio_revoke(BIT64(s_gpio[a]));
 }
 
+/* ---------------------------------------------------------------- output */
+
+static void out_drive(uint8_t a)
+{
+    gpio_set_level(s_gpio[a], s_out[a] ^ s_out_inv[a]);
+}
+
+/* The level is set before the pad becomes an output, so it does not show
+   whatever the output register last held for a moment. */
+static esp_err_t out_start(uint8_t a, bool invert)
+{
+    s_out[a] = false;
+    s_out_inv[a] = invert;
+    out_drive(a);
+    gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << s_gpio[a],
+        .mode         = GPIO_MODE_INPUT_OUTPUT,   /* the level reads back */
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    return gpio_config(&cfg);
+}
+
+esp_err_t aux_io_out_set(uint8_t a, bool on)
+{
+    if (a >= AUX_PAD_COUNT || !s_mux) return ESP_ERR_INVALID_ARG;
+    xSemaphoreTake(s_mux, portMAX_DELAY);
+    esp_err_t r = ESP_ERR_INVALID_STATE;
+    if (s_mode[a] == AUX_MODE_OUTPUT) {
+        r = ESP_OK;
+        if (s_out[a] != on) { s_out[a] = on; out_drive(a); mark_dirty(a); }
+    }
+    xSemaphoreGive(s_mux);
+    return r;
+}
+
+esp_err_t aux_io_out_toggle(uint8_t a)
+{
+    if (a >= AUX_PAD_COUNT || !s_mux) return ESP_ERR_INVALID_ARG;
+    xSemaphoreTake(s_mux, portMAX_DELAY);           /* read and flip as one */
+    esp_err_t r = ESP_ERR_INVALID_STATE;
+    if (s_mode[a] == AUX_MODE_OUTPUT) {
+        s_out[a] = !s_out[a]; out_drive(a); mark_dirty(a); r = ESP_OK;
+    }
+    xSemaphoreGive(s_mux);
+    return r;
+}
+
+bool aux_io_out_get(uint8_t a, bool *on)
+{
+    if (a >= AUX_PAD_COUNT || s_mode[a] != AUX_MODE_OUTPUT) return false;
+    if (on) *on = s_out[a];
+    return true;
+}
+
 /* ---------------------------------------------------------------- analog */
 
 static esp_err_t analog_start(void)
@@ -293,13 +358,14 @@ static void leave(uint8_t a)
     case AUX_MODE_INPUT:  di_aux_input(a, false); break;
     case AUX_MODE_PWM:    pwm_stop(a);            break;
     case AUX_MODE_ANALOG: s_an_valid = false;     break;
+    case AUX_MODE_OUTPUT: s_out[a] = false; out_drive(a); break;   /* off first */
     default:                                      break;
     }
 }
 
 /* Puts pad a into mode m, freq/duty for PWM. On failure the pad is left in
    its standard function, never half in one mode. */
-static esp_err_t enter(uint8_t a, aux_mode_t m, uint32_t freq, uint16_t duty)
+static esp_err_t enter(uint8_t a, aux_mode_t m, uint32_t freq, uint16_t duty, bool invert)
 {
     gpio_num_t g = s_gpio[a];
     esp_err_t  r = ESP_OK;
@@ -317,6 +383,7 @@ static esp_err_t enter(uint8_t a, aux_mode_t m, uint32_t freq, uint16_t duty)
     case AUX_MODE_INPUT:  di_aux_input(a, true);           break;
     case AUX_MODE_PWM:    r = pwm_set(a, freq, duty, true); break;
     case AUX_MODE_ANALOG: r = analog_start();               break;
+    case AUX_MODE_OUTPUT: r = out_start(a, invert);         break;
     default:              r = ESP_ERR_INVALID_ARG;          break;
     }
     if (r != ESP_OK) {
@@ -348,6 +415,7 @@ esp_err_t aux_io_apply(void)
         if (!aux_mode_allowed(a, m)) m = AUX_MODE_STANDARD;
         uint32_t f = cfg->aux_pwm[a].freq_hz;
         uint16_t d = cfg->aux_pwm[a].duty_pm;
+        bool     inv = cfg->aux_out[a].invert;
         bool cfg_changed = f != s_cfg_freq[a] || d != s_cfg_duty[a];
 
         esp_err_t r = ESP_OK;
@@ -361,8 +429,12 @@ esp_err_t aux_io_apply(void)
                              (unsigned long)f, esp_err_to_name(r));
                 mark_dirty(a);
             }
+            if (m == AUX_MODE_OUTPUT && inv != s_out_inv[a]) {
+                s_out_inv[a] = inv;                    /* same state, new level */
+                out_drive(a);
+            }
         } else {
-            r = enter(a, m, f, d);
+            r = enter(a, m, f, d, inv);
             mark_dirty(a);
         }
         /* Remembered only once applied, so that saving the same values again
@@ -436,6 +508,15 @@ static bool s_an_mqtt_has;
 static int  s_an_mqtt_mv;
 
 #ifdef CONFIG_APP_MQTT_ENABLE
+/* "output/<name>" or "output/<9..11>" plus suffix: numbered after DO1-DO8,
+   as the pads' inputs are numbered after DI1-DI8. */
+static void out_topic(uint8_t a, char *buf, size_t len, const char *suffix)
+{
+    const char *name = app_config_get()->aux_out[a].name;
+    if (name[0]) snprintf(buf, len, "output/%.20s%s", name, suffix);
+    else         snprintf(buf, len, "output/%u%s", (unsigned)(APP_CFG_DO_COUNT + 1 + a), suffix);
+}
+
 static void publish_analog(int mv)
 {
     char payload[16];
@@ -448,7 +529,7 @@ static void publish_analog(int mv)
 static void publish_pad(uint8_t a)
 {
     if (!app_mqtt_is_connected()) return;
-    char topic[24], payload[48];
+    char topic[40], payload[48];
     snprintf(topic, sizeof(topic), "aux/%u/mode", a + 1);
     app_mqtt_publish(topic, aux_mode_name(aux_io_mode(a)), -1, 0, true);
     uint32_t f; uint16_t d;
@@ -464,6 +545,11 @@ static void publish_pad(uint8_t a)
     }
     int mv;
     if (a == 0 && aux_io_analog_mv(0, &mv) == ESP_OK) publish_analog(mv);
+    bool on;
+    if (aux_io_out_get(a, &on)) {
+        out_topic(a, topic, sizeof(topic), "");
+        app_mqtt_publish(topic, on ? "true" : "false", -1, 0, false);
+    }
 }
 #endif
 
@@ -541,6 +627,14 @@ void aux_io_on_mqtt_connected(void)
 #ifdef CONFIG_APP_MQTT_ENABLE
     app_mqtt_subscribe("aux/+/pwm/set", 0);
     app_mqtt_subscribe("aux/read", 0);
+    /* Output command topics for every pad, whatever its mode: a pad switched
+       to output later is then reachable without a reconnect. Called again
+       after a save, for changed names. */
+    for (uint8_t a = 0; a < AUX_PAD_COUNT; a++) {
+        char topic[40];
+        out_topic(a, topic, sizeof(topic), "/set");
+        app_mqtt_subscribe(topic, 0);
+    }
     for (uint8_t a = 0; a < AUX_PAD_COUNT; a++) mark_dirty(a);
 #endif
 }
@@ -553,6 +647,26 @@ void aux_io_on_mqtt_message(const char *topic, size_t tlen, const char *data, si
         for (uint8_t a = 0; a < AUX_PAD_COUNT; a++) mark_dirty(a);
         return;
     }
+    static const char OREAD[] = "output/read";
+    if (tlen == sizeof(OREAD) - 1 && memcmp(topic, OREAD, tlen) == 0) {
+        for (uint8_t a = 0; a < AUX_PAD_COUNT; a++)
+            if (aux_io_mode(a) == AUX_MODE_OUTPUT) mark_dirty(a);
+        return;
+    }
+    for (uint8_t a = 0; a < AUX_PAD_COUNT; a++) {
+        char cmd[40];
+        out_topic(a, cmd, sizeof(cmd), "/set");
+        size_t clen = strlen(cmd);
+        if (tlen != clen || memcmp(topic, cmd, clen) != 0) continue;
+        bool st;
+        esp_err_t r;
+        if (dout_parse_toggle(data, dlen))            r = aux_io_out_toggle(a);
+        else if (dout_parse_state(data, dlen, &st))   r = aux_io_out_set(a, st);
+        else { ESP_LOGW(TAG, "%s: unrecognised payload", cmd); return; }
+        if (r == ESP_ERR_INVALID_STATE) ESP_LOGW(TAG, "%s: pad is not an output", cmd);
+        return;
+    }
+
     /* aux/<n>/pwm/set, compared whole. */
     static const char TAIL[] = "/pwm/set";
     const size_t tail = sizeof(TAIL) - 1;

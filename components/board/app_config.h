@@ -169,6 +169,11 @@ typedef struct {
        e.g. "CET-1CEST,M3.5.0,M10.5.0/3" for Europe/Berlin. */
     char tz[APP_CFG_TZ_LEN];
 
+    /* Name and invert of the IO1/RXD/TXD pads as outputs (aux_mode output),
+       apart from their input entries in di[8..10]: a pad is one or the other,
+       and its output name is an MQTT topic among DO1-DO8's. */
+    di_config_t aux_out[3];
+
     /* PWM of the IO1/RXD/TXD pads, used while aux_mode is pwm. */
     struct {
         uint32_t freq_hz;   /* AUX_PWM_FREQ_MIN..AUX_PWM_FREQ_MAX */

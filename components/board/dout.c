@@ -60,10 +60,9 @@ static inline void dout_unlock(void)
 
 /* ------------------------------------------------------------------ helpers */
 
-#ifdef CONFIG_APP_MQTT_ENABLE
 /* Accepted on-payloads: true 1 high on   (case-insensitive)
    Accepted off-payloads: false 0 low off */
-static bool parse_payload(const char *data, size_t len, bool *out)
+bool dout_parse_state(const char *data, size_t len, bool *out)
 {
     char buf[8];
     if (len == 0 || len >= sizeof(buf)) return false;
@@ -78,7 +77,7 @@ static bool parse_payload(const char *data, size_t len, bool *out)
     return false;
 }
 
-static bool parse_toggle(const char *data, size_t len)
+bool dout_parse_toggle(const char *data, size_t len)
 {
     char buf[8];
     if (len == 0 || len >= sizeof(buf)) return false;
@@ -88,6 +87,7 @@ static bool parse_toggle(const char *data, size_t len)
     return !strcmp(buf, "toggle");
 }
 
+#ifdef CONFIG_APP_MQTT_ENABLE
 /* Apply a single cJSON item (bool / number / string) to output n.
    Strings use the same vocabulary as individual output commands. */
 /* Collect what one array element asks for into the masks, rather than editing
@@ -105,8 +105,8 @@ static void apply_json_item(cJSON *item, uint8_t n,
         const char *s = item->valuestring;
         size_t slen   = strlen(s);
         bool state;
-        if (parse_toggle(s, slen))               *toggle |= bit;
-        else if (parse_payload(s, slen, &state)) { if (state) *set |= bit; else *clear |= bit; }
+        if (dout_parse_toggle(s, slen))               *toggle |= bit;
+        else if (dout_parse_state(s, slen, &state)) { if (state) *set |= bit; else *clear |= bit; }
     }
 }
 #endif /* CONFIG_APP_MQTT_ENABLE */
@@ -309,9 +309,9 @@ void dout_on_mqtt_message(const char *topic, size_t tlen,
             dout_modify(set, clear, toggle);
         } else {
             bool state;
-            if (parse_toggle(data, dlen)) {
+            if (dout_parse_toggle(data, dlen)) {
                 dout_modify(0u, 0u, 0xFFu);
-            } else if (parse_payload(data, dlen, &state)) {
+            } else if (dout_parse_state(data, dlen, &state)) {
                 dout_modify(state ? 0xFFu : 0u, state ? 0u : 0xFFu, 0u);
             } else {
                 ESP_LOGW(TAG, "output/set: unrecognised payload");
@@ -339,8 +339,8 @@ void dout_on_mqtt_message(const char *topic, size_t tlen,
             size_t clen = strlen(cmd);
             if (tlen == clen && memcmp(topic, cmd, clen) == 0) {
                 bool state;
-                if (parse_toggle(data, dlen))              dout_toggle(i);
-                else if (parse_payload(data, dlen, &state)) dout_set(i, state);
+                if (dout_parse_toggle(data, dlen))              dout_toggle(i);
+                else if (dout_parse_state(data, dlen, &state)) dout_set(i, state);
                 else ESP_LOGW(TAG, "Unrecognised payload for %s", cmd);
                 return;
             }

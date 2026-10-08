@@ -200,6 +200,7 @@ RS-485, configurable baud rate and slave address. Register map:
 | Register    | Type                  | Description                           |
 |-------------|-----------------------|---------------------------------------|
 | 1–8         | Coil (RW)             | DO1–DO8                               |
+| 9–11        | Coil (RW)             | Header pads set to output (DO9–DO11)  |
 | 10001–10008 | Discrete input (RO)   | DI1–DI8                               |
 | 10009–10011 | Discrete input (RO)   | AUX1–AUX3 (header pads set to input)  |
 | 30001–30080 | Input register (RO)   | Device identification                 |
@@ -243,15 +244,15 @@ Status mode all LED commands from MQTT, Modbus, and CAN are ignored.
 > Switched per pin in the web UI. Every pin starts in its **standard function**.
 
 The **IO1, RXD and TXD** pads (GPIO1, GPIO44, GPIO43) can each be put in their standard function, used as a digital
-input, or driven as a PWM output; IO1 can also be an analog input. The choice is made per pin on the *Device* tab, or
+input, or driven as a digital output or a PWM output; IO1 can also be an analog input. The choice is made per pin on the *Device* tab, or
 with `"aux"` in `POST /api/config`, and takes effect on saving, without a reboot. As inputs they show up as
 **AUX1–AUX3** behind the eight isolated ones and occupy DI indices 8, 9 and 10.
 
 | Pad | GPIO | Standard function             | Modes                                     |
 |-----|------|-------------------------------|-------------------------------------------|
-| IO1 | 1    | unused by this firmware       | input (AUX1), PWM output, analog input    |
-| RXD | 44   | UART0 RX                      | input (AUX2), PWM output                  |
-| TXD | 43   | UART0 TX — the serial console | input (AUX3), PWM output                  |
+| IO1 | 1    | unused by this firmware       | input (AUX1), output (DO9), PWM, analog   |
+| RXD | 44   | UART0 RX                      | input (AUX2), output (DO10), PWM          |
+| TXD | 43   | UART0 TX — the serial console | input (AUX3), output (DO11), PWM          |
 
 ```json
 "aux": [
@@ -268,8 +269,11 @@ with `"aux"` in `POST /api/config`, and takes effect on saving, without a reboot
   MOSFET, an LED driver or a 0–10 V converter from it, never a load.
 - **Analog** (IO1 only, ADC1 channel 0): 0 to about 3.1 V, calibrated from eFuse, averaged over 16 conversions,
   reported in millivolts in `/api/io/state`. Divide larger voltages down externally.
-- The mode is chosen on the *Device* tab, PWM frequency and duty cycle on the *Outputs* tab, input names on the
-  *Inputs* tab.
+- **Digital output**: on/off like DO1–DO8, with its own name and invert flag, as channel 8–10 after them. It
+  starts off after a reboot and whenever the pad enters output mode; its state is not stored.
+- The mode is chosen on the *Device* tab. A pad appears on the *Inputs* tab only as a digital or analog input, and on
+  the *Outputs* tab only as a digital or PWM output — name and invert of an output, frequency and duty of a PWM
+  output; a pad in its standard function appears on neither.
 - At run time the PWM can also be changed over Modbus (holding registers 40003–40011), MQTT (`aux/<n>/pwm/set`)
   and from rules (`pwm(pad).set()`); such changes are not stored. The analog reading is available over Modbus
   (input register 30101), MQTT (`aux/1/analog`) and to rules (`analog(1)`). See [docs/modbus.md](docs/modbus.md),
@@ -279,13 +283,14 @@ A pad in any mode other than its standard function is taken off UART0. The conso
 reaches the pin until the pad is switched back. A channel that is not set to input reads `false`, is not published,
 and `/api/io/state` marks it in `di_active`.
 
-**A PWM output is under control only while the firmware runs.** Plan the load's driver for the rest of the time:
+**An output or PWM output is under control only while the firmware runs.** Plan the load's driver for the rest of
+the time:
 
-- **Switching a PWM pad to another mode does not switch its load off.** As an input the pad has its pull-up on, and
-  RXD/TXD in their standard function idle high as UART lines. Set the duty cycle to 0 to switch off.
+- **Switching such a pad to another mode does not switch its load off.** As an input the pad has its pull-up on, and
+  RXD/TXD in their standard function idle high as UART lines. Switch the output off, or set the duty cycle to 0.
 - **TXD is driven at every reset.** It is UART0 TX: the ROM bootloader, the second-stage bootloader and the early
   application log drive it from every reset until the pads are set up, and indefinitely while the chip sits in
-  download mode (esptool, BOOT button). A load on TXD sees that traffic. Prefer IO1 or RXD for PWM.
+  download mode (esptool, BOOT button). A load on TXD sees that traffic. Prefer IO1 or RXD for outputs.
 - **Give the driver input a pull-down.** Until the firmware sets a pad up after reset, IO1 and RXD are undriven
   inputs (RXD with its reset pull-up), so a MOSFET gate on them is only held low by an external pull-down.
 

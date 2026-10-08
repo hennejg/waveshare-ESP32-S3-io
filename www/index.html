@@ -202,15 +202,18 @@
       <div id="aux-dev" style="display:none">
         <h2>Header pads IO1 / RXD / TXD</h2>
         <p class="hint err">Not isolated: 0–3.3 V logic levels only, no protection. Condition every signal externally.</p>
-        <p class="hint err">A PWM output is only under control while the firmware runs. Switching a PWM pad to another
-          mode does not switch its load off — the input pull-up, or on RXD/TXD the UART's idle level, pulls it high:
-          set the duty cycle to 0 instead. TXD carries the boot log at every reset and while flashing, so a load on it
-          is driven then too; prefer IO1 or RXD for PWM, and give the driver input a pull-down.</p>
+        <p class="hint err">An output or PWM output is only under control while the firmware runs. Switching such a
+          pad to another mode does not switch its load off — the input pull-up, or on RXD/TXD the UART's idle level,
+          pulls it high: switch the output off (duty cycle 0) instead. TXD carries the boot log at every reset and
+          while flashing, so a load on it is driven then too; prefer IO1 or RXD, and give the driver input a
+          pull-down.</p>
+        <p class="hint">Digital input and analog input appear on the Inputs tab, digital output and PWM output on the
+          Outputs tab; a pad in its standard function appears on neither.</p>
         <table>
           <thead><tr><th>Pad</th><th>Mode</th></tr></thead>
           <tbody id="aux-table"></tbody>
         </table>
-        <p class="hint">Digital input: name and invert on the Inputs tab. PWM output: frequency and duty cycle on the Outputs tab. Applies on Save, no reboot.</p>
+        <p class="hint">Applies on Save, no reboot. A digital output starts off.</p>
       </div>
 
       <div id="network-mode" style="display:none;margin-top:1.5rem;border-top:1px solid #ccc;padding-top:1rem;font-size:.9rem;color:#555">
@@ -677,12 +680,18 @@ rule('my-rule')
     const AUX_PAD  = ['IO1', 'RXD', 'TXD'];
     /* What each pad does in its standard function, and how a mode reads. */
     const AUX_STD  = ['unused', 'UART0 RX', 'UART0 TX (console)'];
-    const AUX_MODE_LABEL = { input: 'Digital input', pwm: 'PWM output', analog: 'Analog input (0–3.1 V)' };
-    const AUX_NOTE = { standard: 'standard function', pwm: 'PWM output', analog: 'analog input' };
+    const AUX_MODE_LABEL = { input: 'Digital input', output: 'Digital output', pwm: 'PWM output',
+                             analog: 'Analog input (0–3.1 V)' };
+    const AUX_NOTE = { standard: 'standard function', input: 'digital input', output: 'digital output',
+                       pwm: 'PWM output', analog: 'analog input' };
+    const AUX_HEAD_OUT = 'Direct GPIO outputs — not isolated';
+    /* Which tab a pad belongs on in each mode; standard is on neither. */
+    const AUX_ON_INPUTS  = m => m === 'input' || m === 'analog';
+    const AUX_ON_OUTPUTS = m => m === 'output' || m === 'pwm';
     const AUX_HEAD = 'Direct GPIO inputs — not isolated';
     const AUX_TXD  = 'TXD (GPIO43) is UART0 TX: from every reset until the firmware has started, and all the time ' +
                      'while flashing, it is driven with the boot log. As an input, wire it through a series resistor ' +
-                     'of at least 1 kΩ; as a PWM output, expect the load to see that traffic.';
+                     'of at least 1 kΩ; as an output or PWM output, expect the load to see that traffic.';
     let aux = null;     /* cfg.aux from /api/config; null = firmware without the switch */
     const AUX_WARN = 'No optocoupler, no protection: 0–3.3 V logic levels only. ' +
                      'A field voltage destroys the MCU — condition these signals externally.';
@@ -713,16 +722,17 @@ rule('my-rule')
       for (let i = 0; i < diCount; i++) {
         if (i === diIsolated) {
           diTbl.insertAdjacentHTML('beforeend',
-            `<tr class="aux-sep"><td colspan="3"><strong>${AUX_HEAD}</strong>` +
+            `<tr class="aux-sep" id="aux-sep-in"><td colspan="3"><strong>${AUX_HEAD}</strong>` +
             `<div class="hint err">${AUX_WARN}</div></td></tr>`);
         }
         const pin = auxPin(i);
         const a   = i - diIsolated;
-        /* Name and invert apply while the pad is an input; what it is now is
-           chosen on the Device tab and shown here. */
+        /* A pad is listed here only while it is an input (Device tab);
+           as an analog input it has no name or invert, just a note. */
         const note = (a >= 0 && Array.isArray(aux) && aux[a])
           ? `<br><span class="hint" id="aux_${a}_note"></span>` : '';
         const tr = document.createElement('tr');
+        tr.id = `di_${i}_row`;
         tr.innerHTML =
           `<td>${diLabel(i)}${pin === undefined ? '' : ` <span class="hint">${pin}</span>`}${note}</td>` +
           `<td><input type="text" id="di_${i}_name" maxlength="20" style="width:9rem"></td>` +
@@ -742,6 +752,10 @@ rule('my-rule')
       if (!Array.isArray(aux) || !aux.length) { dev.style.display = 'none'; box.style.display = 'none'; return; }
       dev.style.display = '';
       tb.innerHTML = ''; pt.innerHTML = '';
+      doutTbl.querySelectorAll('.aux-out').forEach(e => e.remove());
+      doutTbl.insertAdjacentHTML('beforeend',
+        `<tr class="aux-sep aux-out" id="aux-sep-out"><td colspan="3"><strong>${AUX_HEAD_OUT}</strong>` +
+        `<div class="hint err">${AUX_WARN}</div></td></tr>`);
       aux.forEach((p, a) => {
         const opts = (p.modes || ['standard']).map(m =>
           `<option value="${esc(m)}">${m === 'standard'
@@ -754,9 +768,15 @@ rule('my-rule')
           `<tr id="aux_${a}_pwmrow"><td>${AUX_PAD[a] ?? a + 1} <span class="hint">GPIO${AUX_GPIO[a] ?? '?'}</span></td>` +
           `<td><input type="number" id="aux_${a}_freq" min="5" max="1000000" step="1" style="width:7rem"></td>` +
           `<td><input type="number" id="aux_${a}_duty" min="0" max="100" step="0.1" style="width:5rem"></td></tr>`);
+        doutTbl.insertAdjacentHTML('beforeend',
+          `<tr class="aux-out" id="auxo_${a}_row"><td>DO${8 + a + 1} <span class="hint">${AUX_PAD[a] ?? a + 1} \u00b7 GPIO${AUX_GPIO[a] ?? '?'}</span></td>` +
+          `<td><input type="text" id="auxo_${a}_name" maxlength="20" style="width:9rem"></td>` +
+          `<td style="text-align:center"><input type="checkbox" id="auxo_${a}_invert"></td></tr>`);
         document.getElementById(`aux_${a}_mode`).value = p.mode ?? 'standard';
         document.getElementById(`aux_${a}_freq`).value = p.pwm_freq ?? 1000;
         document.getElementById(`aux_${a}_duty`).value = p.pwm_duty ?? 0;
+        document.getElementById(`auxo_${a}_name`).value = p.out_name ?? '';
+        document.getElementById(`auxo_${a}_invert`).checked = !!p.out_invert;
       });
       auxModeChanged();
     }
@@ -783,17 +803,29 @@ rule('my-rule')
        Outputs tab and the notes on the Inputs tab show what the form says. */
     function auxModeChanged() {
       if (!Array.isArray(aux)) return;
-      let anyPwm = false;
+      let anyPwm = false, anyIn = false, anyOut = false;
+      const show = (id, on) => { const e = document.getElementById(id); if (e) e.style.display = on ? '' : 'none'; };
       aux.forEach((_, a) => {
         const m = document.getElementById(`aux_${a}_mode`)?.value ?? 'standard';
-        const row = document.getElementById(`aux_${a}_pwmrow`);
-        if (row) row.style.display = (m === 'pwm') ? '' : 'none';
-        if (m === 'pwm') anyPwm = true;
+        const i = diIsolated + a;
+        /* Inputs tab: input and analog pads; analog without name and invert. */
+        show(`di_${i}_row`, AUX_ON_INPUTS(m));
+        for (const id of [`di_${i}_name`, `di_${i}_invert`]) {
+          const e = document.getElementById(id);
+          if (e) e.style.visibility = m === 'analog' ? 'hidden' : '';
+        }
         const note = document.getElementById(`aux_${a}_note`);
-        if (note) note.textContent = m === 'input' ? ''
-          : `currently ${AUX_NOTE[m] ?? m} — set on the Device tab`;
+        if (note) note.textContent = m === 'analog' ? 'analog input — the reading is shown below' : '';
+        /* Outputs tab: output pads in the table, PWM pads in the PWM table. */
+        show(`auxo_${a}_row`, m === 'output');
+        show(`aux_${a}_pwmrow`, m === 'pwm');
+        anyIn  ||= AUX_ON_INPUTS(m);
+        anyOut ||= m === 'output';
+        anyPwm ||= m === 'pwm';
       });
-      document.getElementById('aux-pwm-box').style.display = anyPwm ? '' : 'none';
+      show('aux-sep-in', anyIn);
+      show('aux-sep-out', anyOut);
+      show('aux-pwm-box', anyPwm);
     }
     buildDiRows();
 
@@ -991,6 +1023,11 @@ rule('my-rule')
         if (Array.isArray(aux))
           cfg.aux = aux.map((_, a) => {
             const mode = document.getElementById(`aux_${a}_mode`).value;
+            if (mode === 'output') return {
+              mode,
+              out_name:   document.getElementById(`auxo_${a}_name`).value.trim(),
+              out_invert: document.getElementById(`auxo_${a}_invert`).checked,
+            };
             return mode !== 'pwm' ? { mode } : {
               mode,
               pwm_freq: Number(document.getElementById(`aux_${a}_freq`).value),
@@ -1343,7 +1380,7 @@ rule('my-rule')
       for (let i = 0; i < diCount; i++) {
         if (i === diIsolated) {
           diG.insertAdjacentHTML('beforeend',
-            `<div class="aux-head"><strong>${AUX_HEAD}</strong>` +
+            `<div class="aux-head" id="aux-head-in"><strong>${AUX_HEAD}</strong>` +
             `<div class="hint err">${AUX_WARN}</div></div>`);
         }
         const pin = auxPin(i);
@@ -1352,7 +1389,7 @@ rule('my-rule')
                 : pin === undefined ? `${n} — not isolated`
                                     : `${n} — ${pin}, not isolated`;
         diG.insertAdjacentHTML('beforeend',
-          `<div class="io-cell"><span id="di-dot-${i}" class="io-dot" title="${t}" data-t="${t}"></span>` +
+          `<div class="io-cell" id="di-cell-${i}"><span id="di-dot-${i}" class="io-dot" title="${t}" data-t="${t}"></span>` +
           `<span class="io-lbl" title="${t}">${n}<span id="aux-val-${i}" class="hint"></span></span></div>`);
       }
       for (let i = 0; i < 8; i++) {
@@ -1360,6 +1397,20 @@ rule('my-rule')
         doG.insertAdjacentHTML('beforeend',
           `<div class="io-cell"><button type="button" id="do-btn-${i}" class="io-toggle"` +
           ` title="Click to toggle ${n}" onclick="toggleOutput(${i})">${n}</button></div>`);
+      }
+      /* The pads that are outputs, after DO1-DO8, as channels 8-10. Shown
+         while the pad runs as an output; updateIoState() follows changes. */
+      if (Array.isArray(cfg.aux)) {
+        doG.insertAdjacentHTML('beforeend',
+          `<div class="aux-head" id="aux-head-out" style="display:none"><strong>${AUX_HEAD_OUT}</strong></div>`);
+        cfg.aux.forEach((p, a) => {
+          const ch = 8 + a;
+          const n = esc(p.out_name || `DO${ch + 1}`);
+          doG.insertAdjacentHTML('beforeend',
+            `<div class="io-cell" id="do-cell-${ch}" style="display:none"><button type="button" id="do-btn-${ch}"` +
+            ` class="io-toggle" title="Click to toggle ${n} — ${AUX_PAD[a] ?? a + 1}, not isolated"` +
+            ` onclick="toggleOutput(${ch})">${n}</button></div>`);
+        });
       }
     }
 
@@ -1389,20 +1440,31 @@ rule('my-rule')
         const d = await r.json();
         (d.di   || []).forEach((v, i) => {
           const el = document.getElementById(`di-dot-${i}`);
-          /* A pad that is not an input has no level to show; say what it does. */
-          const off = Array.isArray(d.di_active) && d.di_active[i] === false;
-          const p   = Array.isArray(d.aux) ? d.aux[i - diIsolated] : undefined;
+          const p  = (Array.isArray(d.aux) && i >= diIsolated) ? d.aux[i - diIsolated] : undefined;
+          /* A pad is on the Inputs tab only while it runs as an input; as an
+             analog input it shows the reading instead of a level. */
+          if (p) {
+            const cell = document.getElementById(`di-cell-${i}`);
+            if (cell) cell.style.display = AUX_ON_INPUTS(p.mode) ? '' : 'none';
+          }
           if (el) {
             el.className = 'io-dot' + (v ? ' on' : '');
-            el.style.opacity = off ? '.25' : '';
-            el.title = off ? `${el.dataset.t} — ${AUX_NOTE[p?.mode] ?? 'not used as an input'}` : el.dataset.t;
+            el.style.visibility = p?.mode === 'analog' ? 'hidden' : '';
           }
           const val = document.getElementById(`aux-val-${i}`);
-          if (val) val.textContent =
-              p?.mode === 'pwm'                         ? ` PWM ${p.pwm_duty} % @ ${p.pwm_freq} Hz`
-            : p?.mode === 'analog' && p.mv !== undefined ? ` ${p.mv} mV`
-            : '';
+          if (val) val.textContent = p?.mode === 'analog' && p.mv !== undefined ? ` ${p.mv} mV` : '';
         });
+        if (Array.isArray(d.aux)) {
+          const vis = (id, on) => { const e = document.getElementById(id); if (e) e.style.display = on ? '' : 'none'; };
+          vis('aux-head-in',  d.aux.some(q => AUX_ON_INPUTS(q.mode)));
+          vis('aux-head-out', d.aux.some(q => q.mode === 'output'));
+          d.aux.forEach((q, a) => {
+            const ch = 8 + a;
+            vis(`do-cell-${ch}`, q.mode === 'output');
+            const b = document.getElementById(`do-btn-${ch}`);
+            if (b) b.className = 'io-toggle' + (q.out ? ' on' : '');
+          });
+        }
         /* What the PWM pads run now, on the Outputs tab: Modbus, MQTT and
            rules may have changed it since the form was loaded. */
         const live = document.getElementById('aux-pwm-live');
