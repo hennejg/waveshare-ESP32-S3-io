@@ -38,3 +38,5 @@ dependencies.lock
 /test/host/test_trial.c
 /test/host/test_names
 /test/host/test_names.c
+/test/host/test_auth
+/test/host/test_auth.c

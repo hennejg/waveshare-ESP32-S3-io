@@ -9,8 +9,8 @@ CFLAGS := -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 PORT ?= 15020
 
-.PHONY: all clean client poller master dns tz resync qjscron qjsint names order di trial drain nvsread
-all: test_mb_pdu client poller master dns tz resync qjscron qjsint names order di trial drain nvsread
+.PHONY: all clean client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth
+all: test_mb_pdu client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth
 	./test_mb_pdu
 
 # The firmware's framing against a Modbus TCP server written independently of
@@ -63,6 +63,14 @@ nvsread: test_nvsread
 test_nvsread: gen_nvsread_test.py $(MAIN)/web_server.c
 	python3 gen_nvsread_test.py
 	$(CC) $(CFLAGS) test_nvsread.c -o $@
+
+# The button token flow's timeout against a new begin, cut out of auth.c.
+auth: test_auth
+	./test_auth
+
+test_auth: gen_auth_test.py ../../components/board/auth.c ../../components/board/auth.h
+	python3 gen_auth_test.py
+	$(CC) $(CFLAGS) -I../../components/board -Wno-unused-parameter -Istubs test_auth.c -lpthread -o $@
 
 names: test_names
 	./test_names
@@ -142,6 +150,6 @@ test_mb_pdu: test_mb_pdu.c $(MAIN)/mb_pdu.c $(MAIN)/mb_pdu.h $(MAIN)/mb_request.
 	$(CC) $(CFLAGS) test_mb_pdu.c $(MAIN)/mb_pdu.c -o $@
 
 clean:
-	rm -rf test_nvsread test_nvsread.c test_drain test_drain.c test_di test_di.c test_trial test_trial.c test_order test_order.c test_names test_names.c test_qjs_interrupt test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c \
+	rm -rf test_auth test_auth.c test_nvsread test_nvsread.c test_drain test_drain.c test_di test_di.c test_trial test_trial.c test_order test_order.c test_names test_names.c test_qjs_interrupt test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c \
 	       test_mb_master test_mb_master.c \
 	       test_mb_dns test_mb_dns.c test_tz test_tz.c test_resync test_resync.c test_qjs_cron qjs-obj *.dSYM
