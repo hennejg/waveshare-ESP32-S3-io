@@ -91,6 +91,8 @@ esp_err_t aux_io_analog_mv(uint8_t a, int *mv) { (void)a; (void)mv; return ESP_E
 esp_err_t aux_io_out_set(uint8_t a, bool on) { (void)a; (void)on; return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t aux_io_out_toggle(uint8_t a) { (void)a; return ESP_ERR_NOT_SUPPORTED; }
 bool aux_io_out_get(uint8_t a, bool *on) { (void)a; (void)on; return false; }
+esp_err_t aux_io_out_set_many(uint8_t m, uint8_t on) { (void)m; (void)on; return ESP_ERR_NOT_SUPPORTED; }
+esp_err_t aux_io_pwm_write(const aux_pwm_write_t w[AUX_PAD_COUNT]) { (void)w; return ESP_ERR_NOT_SUPPORTED; }
 void aux_io_on_mqtt_connected(void) {}
 void aux_io_on_mqtt_message(const char *t, size_t tl, const char *d, size_t dl) { (void)t; (void)tl; (void)d; (void)dl; }
 
@@ -291,6 +293,22 @@ esp_err_t aux_io_out_toggle(uint8_t a)
     return r;
 }
 
+esp_err_t aux_io_out_set_many(uint8_t mask, uint8_t on)
+{
+    if (!s_mux || (mask >> AUX_PAD_COUNT)) return ESP_ERR_INVALID_ARG;
+    xSemaphoreTake(s_mux, portMAX_DELAY);           /* checked and set as one */
+    esp_err_t r = ESP_OK;
+    for (uint8_t a = 0; a < AUX_PAD_COUNT; a++)
+        if (((mask >> a) & 1u) && s_mode[a] != AUX_MODE_OUTPUT) r = ESP_ERR_INVALID_STATE;
+    if (r == ESP_OK)
+        for (uint8_t a = 0; a < AUX_PAD_COUNT; a++) {
+            bool v = (on >> a) & 1u;
+            if (((mask >> a) & 1u) && s_out[a] != v) { s_out[a] = v; out_drive(a); mark_dirty(a); }
+        }
+    xSemaphoreGive(s_mux);
+    return r;
+}
+
 bool aux_io_out_get(uint8_t a, bool *on)
 {
     if (a >= AUX_PAD_COUNT || s_mode[a] != AUX_MODE_OUTPUT) return false;
@@ -465,6 +483,42 @@ esp_err_t aux_io_pwm_set(uint8_t a, uint32_t freq_hz, uint16_t duty_pm)
             r = pwm_set(a, f, d, false);
             if (r == ESP_OK) mark_dirty(a);
         }
+    }
+    xSemaphoreGive(s_mux);
+    return r;
+}
+
+esp_err_t aux_io_pwm_write(const aux_pwm_write_t w[AUX_PAD_COUNT])
+{
+    if (!s_mux) return ESP_ERR_INVALID_ARG;
+    uint32_t f[AUX_PAD_COUNT], old_f[AUX_PAD_COUNT];
+    uint16_t d[AUX_PAD_COUNT], old_d[AUX_PAD_COUNT];
+    uint8_t  todo = 0, done = 0;
+
+    xSemaphoreTake(s_mux, portMAX_DELAY);           /* checked and set as one */
+    esp_err_t r = ESP_OK;
+    for (uint8_t a = 0; a < AUX_PAD_COUNT && r == ESP_OK; a++) {
+        if (!w[a].duty_set && !w[a].hi_set && !w[a].lo_set) continue;
+        if (s_mode[a] != AUX_MODE_PWM) { r = ESP_ERR_INVALID_STATE; break; }
+        uint32_t hi = w[a].hi_set ? w[a].hi : (uint16_t)(s_freq[a] >> 16);
+        uint32_t lo = w[a].lo_set ? w[a].lo : (uint16_t)s_freq[a];
+        f[a] = (hi << 16) | lo;
+        d[a] = w[a].duty_set ? w[a].duty : s_duty[a];
+        if (f[a] < AUX_PWM_FREQ_MIN || f[a] > AUX_PWM_FREQ_MAX || d[a] > AUX_PWM_DUTY_MAX)
+            r = ESP_ERR_INVALID_ARG;
+        else if (f[a] != s_freq[a] || d[a] != s_duty[a])
+            todo |= (uint8_t)(1u << a);
+    }
+    for (uint8_t a = 0; a < AUX_PAD_COUNT && r == ESP_OK; a++) {
+        if (!((todo >> a) & 1u)) continue;
+        old_f[a] = s_freq[a]; old_d[a] = s_duty[a];
+        r = pwm_set(a, f[a], d[a], false);
+        if (r == ESP_OK) done |= (uint8_t)(1u << a);
+    }
+    for (uint8_t a = 0; a < AUX_PAD_COUNT; a++) {
+        if (!((done >> a) & 1u)) continue;
+        if (r != ESP_OK) pwm_set(a, old_f[a], old_d[a], false);   /* back as it was */
+        else             mark_dirty(a);
     }
     xSemaphoreGive(s_mux);
     return r;

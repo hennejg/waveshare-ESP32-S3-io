@@ -255,17 +255,23 @@ static uint8_t local_write_coils(uint16_t addr, uint16_t count, const uint8_t *b
         ESP_LOGW(TAG, "command queue full, refused coil write");
         return MB_EXC_DEVICE_BUSY;
     }
-    bool any_pad = false;
+    /* The pads in one call: checked again and set under the pad driver's
+       lock, so a mode changed since the check above refuses the whole
+       request rather than leaving the first pads switched. */
+    uint8_t pad_mask = 0, pad_on = 0;
     for (uint16_t i = 0; i < count; i++) {
         uint16_t ch = (uint16_t)(addr + i);
         if (ch < MB_NUM_DO) continue;
-        if (aux_io_out_set((uint8_t)(ch - MB_NUM_DO), (bits[i >> 3] >> (i & 7)) & 1u) != ESP_OK) {
+        pad_mask |= (uint8_t)(1u << (ch - MB_NUM_DO));
+        if ((bits[i >> 3] >> (i & 7)) & 1u) pad_on |= (uint8_t)(1u << (ch - MB_NUM_DO));
+    }
+    if (pad_mask) {
+        if (aux_io_out_set_many(pad_mask, pad_on) != ESP_OK) {
             CMD_UNLOCK();
             return MB_EXC_ILLEGAL_VALUE;              /* switched mode since the check */
         }
-        any_pad = true;
+        scripting_on_modbus_activity();
     }
-    if (any_pad) scripting_on_modbus_activity();
     if (!do_n) { CMD_UNLOCK(); return MB_EXC_NONE; }
 
     /* DO1-DO8 through the command task, as before. */
@@ -291,13 +297,13 @@ static uint8_t local_write_coils(uint16_t addr, uint16_t count, const uint8_t *b
 /* The PWM part of a holding write, checked as a whole before anything moves:
    every pad it touches must be a PWM output, and the values it writes must be
    in range. Only what is written changes: an unwritten duty cycle stays as it
-   runs (AUX_PWM_DUTY_KEEP), an unwritten frequency too (0). A write of only
-   one frequency word combines with the other word of the frequency as it was
-   set; FC 16 over both words changes the frequency in one step. */
-typedef struct { bool touched, has_duty, has_hi, has_lo; uint16_t duty, hi, lo; uint32_t freq; } pwm_req_t;
-
+   runs, an unwritten frequency too. A write of only one frequency word
+   combines with the other word of the frequency as it was set; FC 16 over
+   both words changes the frequency in one step. This check answers early;
+   aux_io_pwm_write() makes it again under the pad driver's lock and applies
+   the write as a whole, or nothing of it. */
 static uint8_t plan_pwm(uint16_t addr, uint16_t count, const uint8_t *regs_be,
-                        pwm_req_t req[AUX_PAD_COUNT])
+                        aux_pwm_write_t req[AUX_PAD_COUNT])
 {
     for (uint16_t i = 0; i < count; i++) {
         uint16_t reg = (uint16_t)(addr + i);
@@ -305,23 +311,20 @@ static uint8_t plan_pwm(uint16_t addr, uint16_t count, const uint8_t *regs_be,
         uint8_t  a = (uint8_t)((reg - MB_HR_BASE) / MB_HR_PER_PAD);
         uint8_t  k = (uint8_t)((reg - MB_HR_BASE) % MB_HR_PER_PAD);
         uint16_t v = mb_be16(&regs_be[i * 2]);
-        req[a].touched = true;
-        if      (k == 0) { req[a].has_duty = true; req[a].duty = v; }
-        else if (k == 1) { req[a].has_hi   = true; req[a].hi   = v; }
-        else             { req[a].has_lo   = true; req[a].lo   = v; }
+        if      (k == 0) { req[a].duty_set = true; req[a].duty = v; }
+        else if (k == 1) { req[a].hi_set   = true; req[a].hi   = v; }
+        else             { req[a].lo_set   = true; req[a].lo   = v; }
     }
     for (uint8_t a = 0; a < AUX_PAD_COUNT; a++) {
-        if (!req[a].touched) continue;
+        if (!req[a].duty_set && !req[a].hi_set && !req[a].lo_set) continue;
         uint32_t set_f;
         if (!aux_io_pwm_info(a, &set_f, NULL, NULL)) return MB_EXC_ILLEGAL_VALUE;   /* not PWM */
-        if (req[a].has_duty && req[a].duty > AUX_PWM_DUTY_MAX) return MB_EXC_ILLEGAL_VALUE;
-        req[a].freq = 0;                                               /* keep */
-        if (req[a].has_hi || req[a].has_lo) {
-            uint32_t hi = req[a].has_hi ? req[a].hi : (uint16_t)(set_f >> 16);
-            uint32_t lo = req[a].has_lo ? req[a].lo : (uint16_t)set_f;
-            req[a].freq = (hi << 16) | lo;
-            if (req[a].freq < AUX_PWM_FREQ_MIN || req[a].freq > AUX_PWM_FREQ_MAX)
-                return MB_EXC_ILLEGAL_VALUE;
+        if (req[a].duty_set && req[a].duty > AUX_PWM_DUTY_MAX) return MB_EXC_ILLEGAL_VALUE;
+        if (req[a].hi_set || req[a].lo_set) {
+            uint32_t hi = req[a].hi_set ? req[a].hi : (uint16_t)(set_f >> 16);
+            uint32_t lo = req[a].lo_set ? req[a].lo : (uint16_t)set_f;
+            uint32_t f  = (hi << 16) | lo;
+            if (f < AUX_PWM_FREQ_MIN || f > AUX_PWM_FREQ_MAX) return MB_EXC_ILLEGAL_VALUE;
         }
     }
     return MB_EXC_NONE;
@@ -332,7 +335,7 @@ static uint8_t local_write_holding(uint16_t addr, uint16_t count, const uint8_t 
     if (!s_local_ready) return MB_EXC_DEVICE_FAILURE;
     if ((uint32_t)addr + count > MB_NUM_HOLDING) return MB_EXC_ILLEGAL_ADDR;
 
-    pwm_req_t pwm[AUX_PAD_COUNT] = {0};
+    aux_pwm_write_t pwm[AUX_PAD_COUNT] = {0};
     uint8_t exc = plan_pwm(addr, count, regs_be, pwm);
     if (exc != MB_EXC_NONE) return exc;
 
@@ -351,18 +354,17 @@ static uint8_t local_write_holding(uint16_t addr, uint16_t count, const uint8_t 
         return MB_EXC_DEVICE_BUSY;
     }
     bool any = false;
-    for (uint8_t a = 0; a < AUX_PAD_COUNT; a++) {
-        if (!pwm[a].touched) continue;
-        esp_err_t r = aux_io_pwm_set(a, pwm[a].freq,
-                                     pwm[a].has_duty ? pwm[a].duty : AUX_PWM_DUTY_KEEP);
+    for (uint8_t a = 0; a < AUX_PAD_COUNT; a++)
+        any |= pwm[a].duty_set || pwm[a].hi_set || pwm[a].lo_set;
+    if (any) {
+        esp_err_t r = aux_io_pwm_write(pwm);     /* all pads, or none */
         if (r != ESP_OK) {
             CMD_UNLOCK();
             return (r == ESP_ERR_INVALID_STATE || r == ESP_ERR_INVALID_ARG)
                    ? MB_EXC_ILLEGAL_VALUE : MB_EXC_DEVICE_FAILURE;
         }
-        any = true;
+        scripting_on_modbus_activity();
     }
-    if (any) scripting_on_modbus_activity();
 
     /* LED and buzzer go through the command task as before. */
     if (base_n) {

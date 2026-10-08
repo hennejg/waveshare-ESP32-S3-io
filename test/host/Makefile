@@ -9,8 +9,8 @@ CFLAGS := -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 PORT ?= 15020
 
-.PHONY: all clean client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume
-all: test_mb_pdu client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume
+.PHONY: all clean client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite
+all: test_mb_pdu client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite
 	./test_mb_pdu
 
 # The firmware's framing against a Modbus TCP server written independently of
@@ -86,6 +86,15 @@ test_cfgnum: gen_cfgnum_test.py qjs-obj/cJSON.o $(MAIN)/web_server.c ../../compo
 qjs-obj/cJSON.o: $(CJSON)/cJSON.c
 	@mkdir -p qjs-obj
 	$(CC) -O1 -w -c $< -o $@
+
+# Modbus writes to several header pads against a configuration save, cut
+# out of mb_server.c and aux_io.c.
+auxwrite: test_auxwrite
+	./test_auxwrite
+
+test_auxwrite: gen_auxwrite_test.py $(MAIN)/mb_server.c ../../components/board/aux_io.c ../../components/board/aux_io.h
+	python3 gen_auxwrite_test.py
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-variable -I../../components/board -Istubs test_auxwrite.c -o $@
 
 names: test_names
 	./test_names
@@ -174,6 +183,6 @@ test_mb_pdu: test_mb_pdu.c $(MAIN)/mb_pdu.c $(MAIN)/mb_pdu.h $(MAIN)/mb_request.
 	$(CC) $(CFLAGS) test_mb_pdu.c $(MAIN)/mb_pdu.c -o $@
 
 clean:
-	rm -rf test_resume test_resume.c test_resume_old_dsl.js test_cfgnum test_cfgnum.c test_auth test_auth.c test_nvsread test_nvsread.c test_drain test_drain.c test_di test_di.c test_trial test_trial.c test_order test_order.c test_names test_names.c test_qjs_interrupt test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c \
+	rm -rf test_auxwrite test_auxwrite.c test_resume test_resume.c test_resume_old_dsl.js test_cfgnum test_cfgnum.c test_auth test_auth.c test_nvsread test_nvsread.c test_drain test_drain.c test_di test_di.c test_trial test_trial.c test_order test_order.c test_names test_names.c test_qjs_interrupt test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c \
 	       test_mb_master test_mb_master.c \
 	       test_mb_dns test_mb_dns.c test_tz test_tz.c test_resync test_resync.c test_qjs_cron qjs-obj *.dSYM

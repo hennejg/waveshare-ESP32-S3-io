@@ -87,6 +87,31 @@ esp_err_t   aux_io_out_set(uint8_t a, bool on);
 esp_err_t   aux_io_out_toggle(uint8_t a);
 bool        aux_io_out_get(uint8_t a, bool *on);
 
+/* Writes to several pads at once (Modbus FC 15 and 16), all or nothing:
+   every pad's mode and value is checked and the whole write applied under
+   the lock aux_io_apply() takes, so a configuration saved in between cannot
+   leave the first pads changed and the later ones refused. Pad by pad
+   through aux_io_out_set()/aux_io_pwm_set() it could.
+
+   aux_io_out_set_many(): the pads in mask (bit a = pad a) to the states in
+   on. ESP_ERR_INVALID_STATE, and nothing set, if one of them is not an
+   output.
+
+   aux_io_pwm_write(): per pad the duty cycle and either half of the
+   frequency as Modbus writes them -- an unwritten half is the frequency's
+   as it was set; a pad with none of the three is left alone.
+   ESP_ERR_INVALID_STATE if a pad written is not a PWM output,
+   ESP_ERR_INVALID_ARG for a value out of range, and nothing changed. Should
+   the LEDC driver refuse a pad, the pads already changed are put back and
+   its error returned. */
+typedef struct {
+    bool     duty_set, hi_set, lo_set;
+    uint16_t duty;                 /* 0.1 %                                  */
+    uint16_t hi, lo;               /* the frequency's upper and lower 16 bits */
+} aux_pwm_write_t;
+esp_err_t   aux_io_out_set_many(uint8_t mask, uint8_t on);
+esp_err_t   aux_io_pwm_write(const aux_pwm_write_t w[AUX_PAD_COUNT]);
+
 /* The analog input of pad a in millivolts, as last sampled (every 200 ms,
    averaged over 16 conversions). ESP_ERR_INVALID_STATE if the pad is not an
    analog input or has no reading yet. */
