@@ -106,6 +106,12 @@ The UI also provides **Save**, **Reboot**, and **Factory Reset** buttons.
 All endpoints except the auth flow require an `Authorization: Basic base64(:<password>)` header.
 Until a password has been set they answer `403 {"error":"setup_required"}`: a device that has not been
 set up yet is closed, not open, and the only way in is the button-confirmed password flow.
+That includes `/api/version` and `/api/time`.
+
+Requests a browser sends on behalf of another site are refused even with the right password
+(`Sec-Fetch-Site` other than `same-origin`/`none`, or an `Origin` that is not the device itself): once
+the browser has cached the password, any web page could otherwise post to the API. curl and scripts send
+neither header and are not affected.
 
 | Endpoint                 | Method | Auth required | Description                                      |
 |--------------------------|--------|---------------|--------------------------------------------------|

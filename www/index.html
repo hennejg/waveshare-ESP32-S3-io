@@ -859,6 +859,7 @@ rule('my-rule')
     }
 
     async function load() {
+      loadVersion();   /* behind the login like every other endpoint */
       try {
         const r = await apiFetch('/api/config');
         if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -1624,15 +1625,13 @@ rule('my-rule')
 
     async function loadVersion() {
       try {
-        const r = await fetch('/api/version');
+        const r = await fetch('/api/version', { headers: authHeaders() });
         if (!r.ok) return;
         const v = await r.json();
         document.getElementById('fw-version').textContent =
           'fw ' + v.version + ' · ' + v.idf + ' · ' + v.date;
       } catch (_) {}
     }
-    loadVersion();
-
     initAuth();
 
     /* ---- Matter pairing info ---- */

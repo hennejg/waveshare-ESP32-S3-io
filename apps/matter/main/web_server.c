@@ -95,25 +95,45 @@ static void parse_invert_array(cJSON *arr, di_config_t *out, int max)
     }
 }
 
-static bool validate_names(const di_config_t *arr, int count, const char **err_msg)
+/* A JSON number as an integer in [lo, hi], or false. The range is checked on
+   the double: casting an out-of-range double to an integer type is undefined
+   behaviour, so {"led_mode":1e10} must never reach the cast. Same as the full
+   app's. */
+static bool json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out)
 {
-    for (int i = 0; i < count; i++) {
-        if (!arr[i].name[0]) continue;
-        if (strchr(arr[i].name, '/')) {
-            *err_msg = "name must not contain '/'";
-            return false;
-        }
-        for (int j = i + 1; j < count; j++) {
-            if (arr[j].name[0] && strcmp(arr[i].name, arr[j].name) == 0) {
-                *err_msg = "names must be unique";
-                return false;
-            }
-        }
-    }
+    if (!cJSON_IsNumber(v)) return false;
+    double d = v->valuedouble;
+    if (!(d >= lo && d < (double)hi + 1.0)) return false;
+    *out = (uint32_t)d;
     return true;
 }
 
 /* ------------------------------------------------------------------ auth check */
+
+/* A request a browser sends on behalf of a page from somewhere else: a form
+   posted cross-site, a fetch() from another origin. Once the browser has the
+   password cached (its own Basic dialog, opened by our WWW-Authenticate), it
+   would attach it to those too -- switching outputs, saving rules or wiping
+   the device from any web page the user happens to open. Browsers say where
+   a request comes from in Sec-Fetch-Site (all current ones) or, failing
+   that, Origin; curl and scripts send neither and are not affected. */
+static bool cross_site(httpd_req_t *req)
+{
+    char v[24];
+    esp_err_t r = httpd_req_get_hdr_value_str(req, "Sec-Fetch-Site", v, sizeof(v));
+    if (r == ESP_OK)
+        return strcmp(v, "same-origin") != 0 && strcmp(v, "none") != 0;
+    if (r != ESP_ERR_NOT_FOUND) return true;            /* too long to be any of them */
+
+    char origin[96], host[64] = "";
+    r = httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof(origin));
+    if (r == ESP_ERR_NOT_FOUND) return false;
+    if (r != ESP_OK) return true;
+    if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK) return true;
+    const char *o = strstr(origin, "://");
+    return !o || strcmp(o + 3, host) != 0;              /* "null" has no scheme */
+}
+
 
 /* A device without a password is one that has not been set up yet, and
    until that happens nothing but the setup flow itself may be used: the
@@ -124,6 +144,10 @@ static bool validate_names(const di_config_t *arr, int count, const char **err_m
 static bool check_auth(httpd_req_t *req)
 {
     if (!auth_is_password_set()) return false;
+    if (cross_site(req)) {
+        ESP_LOGW(TAG, "cross-site request to %s refused", req->uri);
+        return false;
+    }
 
     char hdr[160] = "";
     httpd_req_get_hdr_value_str(req, "Authorization", hdr, sizeof(hdr));
@@ -351,17 +375,21 @@ static esp_err_t api_config_post(httpd_req_t *req)
     cJSON *dn = cJSON_GetObjectItem(root, "device_name");
     if (cJSON_IsString(dn)) strlcpy(cfg.device_name, dn->valuestring, sizeof(cfg.device_name));
 
-    cJSON *led_mode_v = cJSON_GetObjectItem(root, "led_mode");
-    if (cJSON_IsNumber(led_mode_v)) cfg.led_mode = (uint8_t)led_mode_v->valuedouble;
+    uint32_t n;
+    if (json_uint(cJSON_GetObjectItem(root, "led_mode"), LED_MODE_IO, LED_MODE_STATUS, &n))
+        cfg.led_mode = (uint8_t)n;
 
     parse_invert_array(cJSON_GetObjectItem(root, "di"),   cfg.di,   APP_CFG_DI_COUNT);
     parse_invert_array(cJSON_GetObjectItem(root, "dout"), cfg.dout, APP_CFG_DO_COUNT);
 
     cJSON_Delete(root);
 
+    /* The rules the loader applies at boot (io_names_normalize): checked
+       here with the same function, a name accepted now would otherwise be
+       dropped silently by the next boot -- "2" for DO1 clashes with DO2's
+       number, "set" and "read" are reserved, '+' and '#' are MQTT wildcards. */
     const char *err = NULL;
-    if (!validate_names(cfg.di,   APP_CFG_DI_COUNT, &err) ||
-        !validate_names(cfg.dout, APP_CFG_DO_COUNT, &err)) {
+    if (!app_config_io_names_ok(&cfg, &err)) {
         char msg[64];
         snprintf(msg, sizeof(msg), "{\"status\":\"error\",\"message\":\"%s\"}", err);
         httpd_resp_set_type(req, "application/json");
@@ -536,7 +564,8 @@ static esp_err_t api_io_output(httpd_req_t *req)
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
 
     cJSON *ch_j = cJSON_GetObjectItem(root, "channel");
-    if (!cJSON_IsNumber(ch_j) || (int)ch_j->valuedouble < 0 || (int)ch_j->valuedouble > 7) {
+    if (!cJSON_IsNumber(ch_j) || ch_j->valuedouble < 0 || ch_j->valuedouble > 7 ||
+        ch_j->valuedouble != (int)ch_j->valuedouble) {
         cJSON_Delete(root);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "channel 0-7 required");
         return ESP_OK;
@@ -600,9 +629,10 @@ static esp_err_t api_io_led(httpd_req_t *req)
         cJSON *rj = cJSON_GetObjectItem(root, "r");
         cJSON *gj = cJSON_GetObjectItem(root, "g");
         cJSON *bj = cJSON_GetObjectItem(root, "b");
-        if (cJSON_IsNumber(rj)) r = (uint8_t)(int)rj->valuedouble;
-        if (cJSON_IsNumber(gj)) g = (uint8_t)(int)gj->valuedouble;
-        if (cJSON_IsNumber(bj)) b = (uint8_t)(int)bj->valuedouble;
+        uint32_t u;
+        if (json_uint(rj, 0, 255, &u)) r = (uint8_t)u;
+        if (json_uint(gj, 0, 255, &u)) g = (uint8_t)u;
+        if (json_uint(bj, 0, 255, &u)) b = (uint8_t)u;
     }
     cJSON_Delete(root);
 
@@ -616,6 +646,10 @@ static esp_err_t api_io_led(httpd_req_t *req)
 
 static esp_err_t api_version(httpd_req_t *req)
 {
+    /* Firmware and IDF version, build date and the last reset reason tell an
+       attacker which known bugs apply and when the device crashed: behind the
+       password like everything else outside the setup flow. */
+    if (!check_auth(req)) return send_denied(req);
     const esp_app_desc_t *d = esp_app_get_description();
     char json[160];
     snprintf(json, sizeof(json),
@@ -648,6 +682,9 @@ static esp_err_t api_factory_reset(httpd_req_t *req)
 
 static esp_err_t api_reboot(httpd_req_t *req)
 {
+    /* Was open: anyone on the network -- or any web page the user had open,
+       by a cross-site form post -- could reboot the device, in a loop. */
+    if (!check_auth(req)) return send_denied(req);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"rebooting\"}");
 
@@ -690,6 +727,10 @@ esp_err_t web_server_start(void)
      * the esp_ptr_in_dram() check inside the SPI-flash driver before NVS writes. */
     cfg.task_caps        = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
     cfg.send_wait_timeout = 10;
+    /* HTTPD_DEFAULT_CONFIG gives 4096; api_config_post holds a whole
+       app_config_t (1.8 kB) plus cJSON's working set and goes down into NVS
+       from there. The full app raised it for the same reason. */
+    cfg.stack_size        = 6144;
 
     esp_err_t ret = httpd_start(&s_server, &cfg);
     if (ret != ESP_OK) {

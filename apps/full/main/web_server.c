@@ -168,6 +168,31 @@ static int recv_body(httpd_req_t *req, char *buf, size_t cap)
 
 /* ------------------------------------------------------------------ auth check */
 
+/* A request a browser sends on behalf of a page from somewhere else: a form
+   posted cross-site, a fetch() from another origin. Once the browser has the
+   password cached (its own Basic dialog, opened by our WWW-Authenticate), it
+   would attach it to those too -- switching outputs, saving rules or wiping
+   the device from any web page the user happens to open. Browsers say where
+   a request comes from in Sec-Fetch-Site (all current ones) or, failing
+   that, Origin; curl and scripts send neither and are not affected. */
+static bool cross_site(httpd_req_t *req)
+{
+    char v[24];
+    esp_err_t r = httpd_req_get_hdr_value_str(req, "Sec-Fetch-Site", v, sizeof(v));
+    if (r == ESP_OK)
+        return strcmp(v, "same-origin") != 0 && strcmp(v, "none") != 0;
+    if (r != ESP_ERR_NOT_FOUND) return true;            /* too long to be any of them */
+
+    char origin[96], host[64] = "";
+    r = httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof(origin));
+    if (r == ESP_ERR_NOT_FOUND) return false;
+    if (r != ESP_OK) return true;
+    if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK) return true;
+    const char *o = strstr(origin, "://");
+    return !o || strcmp(o + 3, host) != 0;              /* "null" has no scheme */
+}
+
+
 /* Returns true if the request carries a valid password (or no password is set). */
 /* A device without a password is one that has not been set up yet, and
    until that happens nothing but the setup flow itself may be used: the
@@ -178,6 +203,10 @@ static int recv_body(httpd_req_t *req, char *buf, size_t cap)
 static bool check_auth(httpd_req_t *req)
 {
     if (!auth_is_password_set()) return false;
+    if (cross_site(req)) {
+        ESP_LOGW(TAG, "cross-site request to %s refused", req->uri);
+        return false;
+    }
 
     char hdr[160] = "";
     httpd_req_get_hdr_value_str(req, "Authorization", hdr, sizeof(hdr));
@@ -862,6 +891,7 @@ static void iso8601_utc(time_t t, char *buf, size_t len)
  * stop (i.e. it lost power and its time is meaningless). */
 static esp_err_t api_time_get(httpd_req_t *req)
 {
+    if (!check_auth(req)) return send_denied(req);
     time_t now = time(NULL);
 
     struct tm rtc_tm;
@@ -1605,6 +1635,10 @@ static esp_err_t api_rules_post(httpd_req_t *req)
 
 static esp_err_t api_version(httpd_req_t *req)
 {
+    /* Firmware and IDF version, build date and the last reset reason tell an
+       attacker which known bugs apply and when the device crashed: behind the
+       password like everything else outside the setup flow. */
+    if (!check_auth(req)) return send_denied(req);
     const esp_app_desc_t *d = esp_app_get_description();
     /* Why the board last started: a watchdog or a panic otherwise leaves no
        trace unless something happened to be reading the console. */
