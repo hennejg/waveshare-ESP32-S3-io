@@ -41,7 +41,8 @@ if os.environ.get("OLD") == "1":
 cuts  = sc.defines("JS_HEAP_LIMIT", "MAX_TIMERS", "RULES_TOPIC")
 if "scripting_io_of" in pv.text:
     cuts += pv.func("static inline const scripting_io_t *scripting_io_of(JSContext *ctx)")
-cuts += sc.func("static void drain_jobs(JSRuntime *rt)")
+cuts += sc.func("static bool drain_jobs(JSRuntime *rt)" if "static bool drain_jobs(JSRuntime *rt)" in sc.text
+                else "static void drain_jobs(JSRuntime *rt)")
 cuts += sc.func("static bool eval_check(JSContext *ctx, const char *src, const char *name,")
 if "#define DRY_OUTPUTS" not in sc.text:
     # Before the dry outputs and timer table (dd92b51~1).
@@ -91,6 +92,7 @@ static const scripting_io_t s_hw = { .dout_set = hw_set_counted, .dout_get = hw_
 /* What trial_load() calls around the cut code. */
 #define TAG "t"
 #define ESP_LOGE(tag, ...) do { (void)(tag); } while (0)
+#define ESP_LOGW ESP_LOGE
 #define JS_STACK_LIMIT 0          /* a 64-bit host's frames are larger: no limit */
 static int s_psram_alloc;
 #define JS_NewRuntime2(alloc, op) ((void)(alloc), (void)(op), JS_NewRuntime())
