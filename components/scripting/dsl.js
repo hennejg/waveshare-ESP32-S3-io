@@ -74,7 +74,9 @@ function _schedule(ms, fn) {
         var k = _pending.indexOf(id);
         if (k >= 0) _pending.splice(k, 1);
         _resetCascade();   // a timer firing is a fresh trigger → fresh cascade budget
-        fn();
+        // Its own re-arm first (an every() takes its slot straight back),
+        // then whatever the full table refused gets what is left.
+        try { fn(); } finally { _retry_arms(); }
     };
     if (typeof _set_timer === 'function')      id = _set_timer(ms, wrapped);
     else if (typeof setTimeout === 'function') id = setTimeout(wrapped, ms);
@@ -92,6 +94,39 @@ function _unschedule(id) {
     var k = _pending.indexOf(id); if (k >= 0) _pending.splice(k, 1);
     if (typeof _clear_timer === 'function')      _clear_timer(id);
     else if (typeof clearTimeout === 'function') clearTimeout(id);
+    _retry_arms();
+}
+
+// Timers the full table refused. heldFor() tries again on its next matching
+// event, but every(), cron(), a watchdog and the later steps of .after() have
+// no next event of their own: refused once, an every() never ticked again, a
+// watchdog fed while the table was full never expired -- the case it exists
+// for -- and an .after() that switches an output off was dropped. They wait
+// here and are tried again each time a slot frees (a timer fires or is
+// cleared), late rather than never. Each entry re-registers itself if it is
+// refused again.
+var _retryArms = [];
+var RETRY_CAP = 256;         // every/cron/watchdog queue once each; .after() steps
+var _retryWarned = false;    // pile up under sustained overload -- not without bound
+// first: an every(), cron() or watchdog -- one entry each, and what keeps a
+// rule set running -- goes ahead of the .after() steps that may pile up.
+function _arm_later(fn, first) {
+    if (first) { _retryArms.unshift(fn); return; }
+    if (_retryArms.length >= RETRY_CAP) {
+        if (!_retryWarned) { _retryWarned = true; print('[rules] timer table full and ' + RETRY_CAP + ' timers waiting: further ones dropped'); }
+        return;
+    }
+    _retryArms.push(fn);
+}
+function _retry_arms() {
+    if (!_retryArms.length) return;
+    var list = _retryArms;
+    _retryArms = [];
+    _retryWarned = false;
+    for (var i = 0; i < list.length; i++) list[i]();
+}
+function _schedule_retrying(ms, fn) {
+    if (_schedule(ms, fn) == null) _arm_later(function() { _schedule_retrying(ms, fn); });
 }
 function _cancel_all_timers() { while (_pending.length) _unschedule(_pending[0]); }
 
@@ -143,6 +178,7 @@ function _reset_rules() {
     _watchOutputs = false;
     _passes = [];              // a cut-short pass of the old rules has nothing left to visit
     _heldCheck = null;
+    _retryArms = [];           // refused arms of the old rules
     _resetCascade();
 }
 
@@ -409,6 +445,10 @@ IntervalCondition.prototype._arm = function() {
         self._armed = false;
         self._arm();                          // re-arm for the next period
     });
+    if (self._timer == null && !self._retrying) {   // table full: when a slot frees
+        self._retrying = true;
+        _arm_later(function() { self._retrying = false; self._arm(); }, true);
+    }
 };
 
 // ── Cron: cron("min hour dom month dow") — standard 5-field, local time ──
@@ -530,6 +570,10 @@ CronCondition.prototype._arm = function() {
         self._armed = false;
         self._arm();                       // schedule the following occurrence
     });
+    if (self._timer == null && !self._retrying) {   // table full: when a slot frees
+        self._retrying = true;
+        _arm_later(function() { self._retrying = false; self._arm(); }, true);
+    }
 };
 
 // Called by the host (EVT_TIME_SYNC) when SNTP (re)syncs the clock. esp_timer delays are
@@ -603,6 +647,10 @@ Watchdog.prototype._rearm = function() {
         self._timer = null;
         if (self._alive) { self._alive = false; _emit(self._factKey); }   // timed out → expired
     });
+    if (this._timer == null && !this._retrying) {   // table full: when a slot frees
+        this._retrying = true;
+        _arm_later(function() { self._retrying = false; if (self._timer == null) self._rearm(); }, true);
+    }
 };
 Watchdog.prototype._arm = function() {           // at rule registration; idempotent
     if (this._started) return;
@@ -652,6 +700,7 @@ function _activitySource(key, ms) {
 // Host-called when an upstream command arrives on `key` — keep its watchdogs alive
 // (feed() emits only on a quiet→active recovery, so gating rules re-evaluate on edges).
 function _on_activity(key) {
+    _retry_arms();
     var list = _activityWatchdogs[key];
     if (!list) return;
     _resetCascade();                       // root event → fresh cascade budget
@@ -793,13 +842,14 @@ function _run_steps(r, idx) {
         try { step.fn(); } catch (e) { print('[rule:' + r.name + '] error: ' + e); }
         _run_steps(r, idx + 1);
     };
-    if (step.delay > 0) _schedule(step.delay, go);
+    if (step.delay > 0) _schedule_retrying(step.delay, go);
     else go();
 }
 
 // ── Internal event handlers — called from C ──────────────────────────────────
 
 function _on_mqtt(topic, payload) {
+    _retry_arms();                   // slots may have freed since (a reload, a clear)
     _resetCascade();                 // root event — fresh cascade budget (stale feeds may emit)
     var armed = [], feed = [];
     for (var i = 0; i < _rules.length; i++) {
@@ -823,6 +873,7 @@ function _on_mqtt(topic, payload) {
 }
 
 function _on_input(channel, state) {
+    _retry_arms();
     _di_seen[channel] = !!state;
     _fire_matching('input:' + channel);
 }
@@ -995,6 +1046,7 @@ function _pass(p) {
 // mv null: the pad has stopped being an analog input -- its last reading is
 // forgotten, and band conditions on it no longer match.
 function _on_analog(pad, mv) {
+    _retry_arms();
     if (mv === null || mv === undefined) delete _an_seen[pad];
     else _an_seen[pad] = mv;
     _resetCascade();

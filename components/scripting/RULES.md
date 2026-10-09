@@ -809,6 +809,13 @@ print(…)                  // log to the console (args joined by space)
   `after` fires regardless. Don't swap them.
 - **Edges can be missed.** A `.once()` edge fires only if the rule's other conditions
   are met at the instant the message arrives; it is not queued.
+- **48 timers at a time.** Every pending `.after()` step, `.heldFor()`, `every()`, `cron()`
+  and watchdog holds one of 48 slots on the device. When they are all taken, a timer that
+  is refused waits and is armed as soon as a slot frees -- late, not never: an `every()`
+  skips ticks, an `.after()` step runs later than asked. `every()`, `cron()` and watchdogs
+  go ahead of waiting `.after()` steps; at most 256 steps wait, further ones are dropped
+  with a log line. A rule that fires faster than its `.after()` delay can fill the table
+  on its own.
 - **Reload resets everything.** Reloading the rule set (device `EVT_RELOAD`, simulator
   "Apply Rules") clears all rules and cancels any pending `.after()` / `.heldFor()`
   timers.

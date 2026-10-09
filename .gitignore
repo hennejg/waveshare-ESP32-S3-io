@@ -57,3 +57,5 @@ dependencies.lock
 /test/host/test_authguard.c
 /test/host/test_mqttlog
 /test/host/test_mqttlog.c
+/test/host/test_timerid
+/test/host/test_timerid.c

@@ -249,14 +249,30 @@ static JSValue js_set_timer(JSContext *ctx, JSValue this_val, int argc, JSValue 
 
     int slot = -1;
     for (int i = 0; i < MAX_TIMERS; i++) if (!s_timers[i].used) { slot = i; break; }
+    /* Logged once per spell of a full table: dsl.js tries refused timers
+       again on every event and every freed slot, and a line per refusal on
+       the console held the engine up for seconds under load. */
+    static bool full_logged;
     if (slot < 0) {
         s_timer_full_count++;
-        ESP_LOGW(TAG, "rule timer table full (%d) — timer dropped", MAX_TIMERS);
+        if (!full_logged) {
+            full_logged = true;
+            ESP_LOGW(TAG, "rule timer table full (%d) — timers wait for a free slot", MAX_TIMERS);
+        }
         return JS_NewInt32(ctx, -1);
     }
+    full_logged = false;
 
-    uint32_t id = s_next_timer_id++;
-    if (s_next_timer_id == 0) s_next_timer_id = 1;   // never hand out id 0
+    /* The id reaches JS as an int32, and dsl.js reads a negative one as
+       "refused": from 2^31 on, every timer was armed in C but recorded as
+       never scheduled, so nothing could cancel it -- a watchdog fed on time
+       expired from its first feed, a heldFor() fired after the input had
+       let go. Ids stay in 1..INT32_MAX and skip one still in use. */
+    uint32_t id;
+    do {
+        id = s_next_timer_id;
+        s_next_timer_id = s_next_timer_id >= INT32_MAX ? 1 : s_next_timer_id + 1;
+    } while (timer_find(id));
 
     esp_timer_create_args_t args = {
         .callback        = timer_fired_cb,
@@ -770,7 +786,7 @@ static JSValue js_dry_set_timer(JSContext *ctx, JSValue this_val, int argc, JSVa
         return JS_ThrowTypeError(ctx, "_set_timer: second argument must be a function");
     for (int i = 0; i < MAX_TIMERS; i++) {
         if (s_dry_timers[i].used) continue;
-        if (++next <= 0) next = 1;
+        next = next >= INT32_MAX || next < 1 ? 1 : next + 1;   /* no signed overflow */
         s_dry_timers[i].used = true;
         s_dry_timers[i].id   = next;
         s_dry_timers[i].fn   = JS_DupValue(ctx, argv[1]);
