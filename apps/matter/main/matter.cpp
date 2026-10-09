@@ -191,13 +191,20 @@ static bool passcode_is_forbidden(uint32_t code)
  */
 static esp_err_t matter_provision_if_needed(void)
 {
-    /* Already provisioned? */
+    /* Already provisioned? All four keys, not only pin-code: the provider
+       falls back to the public test values for any key that is absent, so a
+       set left half written by a failed first boot must be written again,
+       not taken as done. pin-code is also written last, as the marker. */
     {
         nvs_handle_t h;
         bool done = false;
         if (nvs_open_from_partition("nvs", "chip-factory", NVS_READONLY, &h) == ESP_OK) {
             uint32_t v;
-            done = (nvs_get_u32(h, "pin-code", &v) == ESP_OK);
+            size_t len = 0;
+            done = nvs_get_u32(h, "pin-code", &v) == ESP_OK &&
+                   nvs_get_u32(h, "discriminator", &v) == ESP_OK &&
+                   nvs_get_str(h, "salt", NULL, &len) == ESP_OK &&
+                   nvs_get_str(h, "verifier", NULL, &len) == ESP_OK;
             nvs_close(h);
         }
         if (done) {
@@ -255,15 +262,18 @@ static esp_err_t matter_provision_if_needed(void)
         return err;
     }
 
-    if ((err = nvs_set_u32(h, "pin-code",     passcode))      != ESP_OK ||
-        (err = nvs_set_u32(h, "discriminator", discriminator)) != ESP_OK ||
+    if ((err = nvs_set_u32(h, "discriminator", discriminator)) != ESP_OK ||
         (err = nvs_set_str(h, "salt",          salt_b64))      != ESP_OK ||
         (err = nvs_set_str(h, "verifier",      ver_b64))       != ESP_OK ||
+        (err = nvs_set_u32(h, "pin-code",     passcode))      != ESP_OK ||   /* last: the marker */
         (err = nvs_commit(h))                                   != ESP_OK) {
         ESP_LOGE(TAG, "Failed to write Matter credentials: %s", esp_err_to_name(err));
     } else {
-        ESP_LOGI(TAG, "Matter: generated passcode=%" PRIu32 " discriminator=0x%03" PRIx32,
-                 passcode, discriminator);
+        /* The passcode is the commissioning secret: not on the console at
+           INFO. It is shown behind the password on /api/matter/pairing. */
+        ESP_LOGI(TAG, "Matter: commissioning credentials generated, discriminator=0x%03" PRIx32,
+                 discriminator);
+        ESP_LOGD(TAG, "Matter: passcode=%" PRIu32, passcode);
     }
 
     nvs_close(h);
@@ -273,8 +283,13 @@ static esp_err_t matter_provision_if_needed(void)
 esp_err_t matter_init(void)
 {
     /* Provision unique credentials on first boot before starting the stack */
+    /* Fail closed. Started anyway, the stack would come up with the public
+       test passcode (20202021), and anyone in range could commission the
+       device. Without Matter the board still runs; the next boot tries the
+       provisioning again. */
     if (matter_provision_if_needed() != ESP_OK) {
-        ESP_LOGW(TAG, "Provisioning failed — falling back to default test credentials");
+        ESP_LOGE(TAG, "Provisioning failed — Matter not started (no fallback to the public test credentials)");
+        return ESP_FAIL;
     }
 
     const app_config_t *cfg = app_config_get();
