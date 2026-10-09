@@ -65,3 +65,6 @@ dependencies.lock
 /test/host/test_gwerr.c
 /test/host/test_n2khb
 /test/host/test_n2khb.c
+/test/host/test_pwhash
+/test/host/test_pwhash.c
+/test/host/mbt-obj/

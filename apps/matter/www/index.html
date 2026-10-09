@@ -284,6 +284,14 @@
       document.getElementById('auth-begin-btn').disabled = true;
       try {
         const r = await fetch('/api/auth/begin', { method: 'POST' });
+        /* One setup can be pending at a time, and whoever started it gets
+           the token when BOOT is pressed. A 409 here means someone else's
+           is pending -- possibly another machine on the network waiting for
+           exactly that press. */
+        if (r.status === 409)
+          throw new Error('Another setup request is already pending on the device, not started from this page. ' +
+                          'Do NOT press BOOT now: the password would be set by whoever started it. ' +
+                          'Wait 30 s and try again; if this keeps happening, someone on the network is trying to take over the device.');
         if (!r.ok) throw new Error('Failed (' + r.status + ')');
         const d = await r.json();
         startPolling(d.session);

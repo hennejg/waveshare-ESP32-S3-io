@@ -78,6 +78,15 @@ the tab is closed).
 **Password reset** (forgotten password): click **"Forgot password?"** on the login screen and repeat the BOOT button
 flow — no prior authentication required, physical access is sufficient.
 
+**Only press BOOT for a request you started yourself.** The device cannot tell who asked: the token goes to whichever
+client started the pending request, and anyone on the network can start one. If the page reports that another
+request is already pending, do not press the button. Known limitation; a confirmation code shown on both sides would
+close it.
+
+**Storage:** the password is kept as PBKDF2-HMAC-SHA256 (2000 iterations, random salt). A wrong password costs about
+a quarter second on the device, which also slows down guessing over the network. Hashes stored by older firmware
+(one SHA-256 round) are replaced at the next login.
+
 **Transport security — plain HTTP only.** The web server speaks HTTP, not HTTPS, and the password travels with every
 request as HTTP Basic authentication, i.e. Base64 — readable to anyone who can see the traffic. The same holds for the
 setup token, the configuration (including MQTT credentials) and the rules. Run the device only on a network you trust

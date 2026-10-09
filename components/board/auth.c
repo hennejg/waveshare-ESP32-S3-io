@@ -10,6 +10,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "mbedtls/md.h"
+#include "mbedtls/pkcs5.h"
 #include <nvs.h>
 
 #define TAG    "auth"
@@ -21,16 +22,52 @@
    be torn by a failure or a power cut in between -- and a new salt beside
    an old hash matches no password at all, which locks the device for good
    because the factory reset sits behind the login. One blob is one write. */
+/* What the first firmware stored: SHA-256(salt || password). One hash
+   round: anyone with a dump of the flash (no flash encryption) tries
+   passwords at GPU speed. Still read, and replaced by the format below at
+   the first login that matches it. */
 typedef struct {
     uint8_t salt[16];
     uint8_t hash[32];
+} auth_cred_v1_t;
+
+/* PBKDF2-HMAC-SHA256. The iteration count is stored with the hash, so it
+   can be raised later without locking anyone out. */
+#define CRED_V2         2
+#ifndef AUTH_PBKDF2_ITER
+/* Measured on the board (software SHA-256, the hardware SHA is off): 10000
+   iterations took 1.2 s, and the web server handles one request at a time,
+   so every wrong password held up every other request that long. 2000 is
+   about a quarter second -- still 2000 times the work of the single SHA-256
+   it replaces for anyone trying passwords against a flash dump. */
+#define AUTH_PBKDF2_ITER 2000
+#endif
+#define PBKDF2_ITER     AUTH_PBKDF2_ITER
+typedef struct {
+    uint8_t  version;          /* CRED_V2 */
+    uint8_t  reserved[3];
+    uint32_t iterations;
+    uint8_t  salt[16];
+    uint8_t  hash[32];
 } auth_cred_t;
 
 /* ---------------------------------------------------------------- password */
 
-static bool    s_pw_set  = false;
-static uint8_t s_pw_salt[16];
-static uint8_t s_pw_hash[32];   /* SHA-256(salt || password) */
+static bool     s_pw_set  = false;
+static bool     s_pw_v1   = false;   /* stored as auth_cred_v1_t, upgrade at login */
+static uint32_t s_pw_iter;
+static uint8_t  s_pw_salt[16];
+static uint8_t  s_pw_hash[32];
+
+/* Every API request carries the password (HTTP Basic), and a PBKDF2 run per
+   request would make the device slow to use. After a login that matched the
+   stored hash, the password is also kept as a single SHA-256 with a salt of
+   its own -- in RAM only, gone at reboot or the next password change -- and
+   checked against that first. A password that is wrong always costs the
+   full PBKDF2, which is what slows down guessing. */
+static bool     s_fast_ok;
+static uint8_t  s_fast_salt[16];
+static uint8_t  s_fast_hash[32];
 
 static void to_hex(const uint8_t *b, size_t n, char *out)
 {
@@ -57,6 +94,29 @@ static void compute_hash(const uint8_t *salt, const char *pw, uint8_t out[32])
     mbedtls_md_free(&ctx);
 }
 
+static void derive(const uint8_t *salt, uint32_t iter, const char *pw, uint8_t out[32])
+{
+    if (mbedtls_pkcs5_pbkdf2_hmac_ext(MBEDTLS_MD_SHA256, (const unsigned char *)pw, strlen(pw),
+                                      salt, 16, iter, 32, out) != 0)
+        esp_fill_random(out, 32);      /* matches nothing rather than something */
+}
+
+/* Compares in time that does not depend on where the first difference is. */
+static bool same(const uint8_t *a, const uint8_t *b, size_t n)
+{
+    uint8_t d = 0;
+    for (size_t i = 0; i < n; i++) d |= a[i] ^ b[i];
+    return d == 0;
+}
+
+static void remember_fast(const char *pw)
+{
+    esp_fill_random(s_fast_salt, sizeof(s_fast_salt));
+    compute_hash(s_fast_salt, pw, s_fast_hash);
+    s_fast_ok = true;
+}
+
+static esp_err_t store_password(const char *pw);
 static esp_err_t token_init(void);
 
 esp_err_t auth_init(void)
@@ -72,13 +132,23 @@ esp_err_t auth_init(void)
 
     /* Only the blob is read. A device written by firmware that stored the
        pair as two keys comes up without a password and is set up again;
-       there is no migration, by decision. */
+       there is no migration, by decision. The single-SHA blob is migrated:
+       at the next login that matches it. */
     auth_cred_t c;
     size_t sz = sizeof(c);
-    if (nvs_get_blob(h, K_CRED, &c, &sz) == ESP_OK && sz == sizeof(c)) {
-        memcpy(s_pw_salt, c.salt, sizeof(s_pw_salt));
-        memcpy(s_pw_hash, c.hash, sizeof(s_pw_hash));
-        s_pw_set = true;
+    if (nvs_get_blob(h, K_CRED, &c, &sz) == ESP_OK) {
+        if (sz == sizeof(c) && c.version == CRED_V2 && c.iterations > 0) {
+            memcpy(s_pw_salt, c.salt, sizeof(s_pw_salt));
+            memcpy(s_pw_hash, c.hash, sizeof(s_pw_hash));
+            s_pw_iter = c.iterations;
+            s_pw_set  = true;
+        } else if (sz == sizeof(auth_cred_v1_t)) {
+            const auth_cred_v1_t *v1 = (const auth_cred_v1_t *)&c;
+            memcpy(s_pw_salt, v1->salt, sizeof(s_pw_salt));
+            memcpy(s_pw_hash, v1->hash, sizeof(s_pw_hash));
+            s_pw_v1  = true;
+            s_pw_set = true;
+        }
     }
     nvs_close(h);
     ESP_LOGI(TAG, "Password %s", s_pw_set ? "loaded" : "not set");
@@ -87,23 +157,49 @@ esp_err_t auth_init(void)
 
 bool auth_is_password_set(void) { return s_pw_set; }
 
+/* Called from the web server's handlers, which run one at a time on its
+   task -- the only caller, as is auth_set_password(). */
 bool auth_check_password(const char *pw)
 {
     if (!s_pw_set) return false;      /* nothing to match against -- see auth.h */
     uint8_t test[32];
-    compute_hash(s_pw_salt, pw, test);
-    return (memcmp(test, s_pw_hash, 32) == 0);
+    if (s_fast_ok) {
+        compute_hash(s_fast_salt, pw, test);
+        if (same(test, s_fast_hash, 32)) return true;
+    }
+    bool ok;
+    if (s_pw_v1) {
+        compute_hash(s_pw_salt, pw, test);
+        ok = same(test, s_pw_hash, 32);
+        /* Stored the old way: replace it now that the password is known. A
+           failed write keeps the old blob, which still works. */
+        if (ok && store_password(pw) == ESP_OK) ESP_LOGI(TAG, "Password hash upgraded to PBKDF2");
+    } else {
+        derive(s_pw_salt, s_pw_iter, pw, test);
+        ok = same(test, s_pw_hash, 32);
+        /* Stored with another iteration count: brought to the current one. */
+        if (ok && s_pw_iter != PBKDF2_ITER) store_password(pw);
+    }
+    if (ok) remember_fast(pw);
+    return ok;
 }
 
 esp_err_t auth_set_password(const char *pw)
+{
+    esp_err_t r = store_password(pw);
+    if (r == ESP_OK) ESP_LOGI(TAG, "Password updated");
+    return r;
+}
+
+static esp_err_t store_password(const char *pw)
 {
     /* Into locals first, and into the live state only once the flash has
        taken it: a write that fails must leave memory and flash agreeing on
        the old password, or the device answers to one password until the
        next reboot and to another after it, while the caller was told ok. */
-    auth_cred_t c;
+    auth_cred_t c = { .version = CRED_V2, .iterations = PBKDF2_ITER };
     esp_fill_random(c.salt, sizeof(c.salt));
-    compute_hash(c.salt, pw, c.hash);
+    derive(c.salt, c.iterations, pw, c.hash);
 
     nvs_handle_t h;
     esp_err_t r = nvs_open(NVS_NS, NVS_READWRITE, &h);
@@ -117,8 +213,10 @@ esp_err_t auth_set_password(const char *pw)
     }
     memcpy(s_pw_salt, c.salt, sizeof(s_pw_salt));
     memcpy(s_pw_hash, c.hash, sizeof(s_pw_hash));
-    s_pw_set = true;
-    ESP_LOGI(TAG, "Password updated");
+    s_pw_iter = c.iterations;
+    s_pw_v1   = false;
+    s_pw_set  = true;
+    remember_fast(pw);                /* the old password's verifier goes with it */
     return ESP_OK;
 }
 
