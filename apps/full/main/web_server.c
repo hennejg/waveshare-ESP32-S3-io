@@ -1163,12 +1163,23 @@ static esp_err_t api_eth_only(httpd_req_t *req)
     bool want_eth_only = cJSON_IsTrue(enabled);
     cJSON_Delete(root);
 
+    /* Rebooted only once the flash has it: answering "rebooting" over a
+       failed write came back up in the old mode while the page said the
+       new one. */
     nvs_handle_t nvs_h;
-    if (nvs_open(NVS_ETH_NS, NVS_READWRITE, &nvs_h) == ESP_OK) {
-        if (want_eth_only) nvs_set_u8(nvs_h, NVS_ETH_KEY, 1);
-        else               nvs_erase_key(nvs_h, NVS_ETH_KEY);
-        nvs_commit(nvs_h);
+    esp_err_t err = nvs_open(NVS_ETH_NS, NVS_READWRITE, &nvs_h);
+    if (err == ESP_OK) {
+        if (want_eth_only) err = nvs_set_u8(nvs_h, NVS_ETH_KEY, 1);
+        else {
+            err = nvs_erase_key(nvs_h, NVS_ETH_KEY);
+            if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;
+        }
+        if (err == ESP_OK) err = nvs_commit(nvs_h);
         nvs_close(nvs_h);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "eth-only: not stored: %s", esp_err_to_name(err));
+        return send_json(req, "500 Internal Server Error", "{\"error\":\"setting could not be stored, not rebooting\"}");
     }
 
     httpd_resp_set_type(req, "application/json");
@@ -1189,12 +1200,18 @@ static void do_restart(void *arg) { esp_restart(); }
 static esp_err_t api_factory_reset(httpd_req_t *req)
 {
     if (!check_auth(req)) return send_denied(req);
+
+    /* Erase the entire NVS default partition, then reboot. This clears WiFi
+       credentials, all config, and IO names. Erased first, answered after:
+       "resetting" over a failed erase rebooted into the old configuration
+       and password. */
+    esp_err_t err = nvs_flash_erase();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "factory reset: erase failed: %s", esp_err_to_name(err));
+        return send_json(req, "500 Internal Server Error", "{\"error\":\"erase failed, nothing reset\"}");
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"resetting\"}");
-
-    /* Erase the entire NVS default partition, then reboot.
-       This clears WiFi credentials, all config, and IO names. */
-    nvs_flash_erase();
 
     esp_timer_handle_t t;
     esp_timer_create(&(esp_timer_create_args_t){

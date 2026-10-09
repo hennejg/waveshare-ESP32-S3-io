@@ -70,3 +70,5 @@ dependencies.lock
 /test/host/mbt-obj/
 /test/host/test_chan
 /test/host/test_chan.c
+/test/host/test_reseterr
+/test/host/test_reseterr.c

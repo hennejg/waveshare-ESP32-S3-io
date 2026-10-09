@@ -291,6 +291,7 @@ void app_main(void)
     /* Before anything that can bring a network interface up. */
     s_net_ready_mux = xSemaphoreCreateMutex();
     if (!s_net_ready_mux) ESP_LOGE(TAG, "network start mutex: out of memory");
+    sntp_sync_init();
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -464,7 +465,12 @@ void app_main(void)
        poller's network rows only fail until a link comes up, and
        on_network_ready()'s start is then a no-op. */
     if (mb_tcp_master_has_rtu()) {
+        /* Under the same lock as on_network_ready(): eth_init() above has
+           started the link, and a quick DHCP can bring Got-IP -- and its
+           start of the same poller -- in between. */
+        if (s_net_ready_mux) xSemaphoreTake(s_net_ready_mux, portMAX_DELAY);
         esp_err_t mbm_ret = mb_tcp_master_start();
+        if (s_net_ready_mux) xSemaphoreGive(s_net_ready_mux);
         if (mbm_ret != ESP_OK)
             ESP_LOGE(TAG, "Modbus master start failed: %s", esp_err_to_name(mbm_ret));
     }

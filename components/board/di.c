@@ -271,7 +271,9 @@ esp_err_t di_init(void)
         input_config(s_gpios[i]);
         s_state[i] = read_pin(i);
     }
-    xTaskCreate(di_task, "di", 4096, NULL, 5, &s_task);
+    /* Checked: gpio_isr() notifies s_task, and a NULL handle there would
+       take the board down at the first input edge. */
+    if (xTaskCreate(di_task, "di", 4096, NULL, 5, &s_task) != pdPASS) return ESP_ERR_NO_MEM;
 
     /* Install ISR service (ignore ESP_ERR_INVALID_STATE if already done). */
     esp_err_t ret = gpio_install_isr_service(0);

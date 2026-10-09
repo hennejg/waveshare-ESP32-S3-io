@@ -7,12 +7,25 @@ void scripting_on_time_sync(void);
 
 #include "esp_netif_sntp.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include <time.h>
 #include <sys/time.h>
 
 #define TAG "sntp"
 
 static bool s_started = false;
+/* sntp_sync_apply() tears SNTP down and starts it again, and is called from
+   the network-up path and from a configuration save on the web server's task:
+   unguarded, the two could init twice or deinit under a running init. */
+static SemaphoreHandle_t s_lock;
+
+void sntp_sync_init(void)
+{
+    if (!s_lock) s_lock = xSemaphoreCreateMutex();
+}
+
+static void apply_locked(void);
 
 /* Called after each successful SNTP sync. The SNTP client has already stepped the
  * system clock (so NTP takes precedence over the RTC seed); mirror it to the
@@ -34,6 +47,13 @@ static void on_time_synced(struct timeval *tv)
 }
 
 void sntp_sync_apply(void)
+{
+    if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY);
+    apply_locked();
+    if (s_lock) xSemaphoreGive(s_lock);
+}
+
+static void apply_locked(void)
 {
     const app_config_t *cfg = app_config_get();
 

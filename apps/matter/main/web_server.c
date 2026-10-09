@@ -667,10 +667,15 @@ static void do_restart(void *arg) { esp_restart(); }
 static esp_err_t api_factory_reset(httpd_req_t *req)
 {
     if (!check_auth(req)) return send_denied(req);
+    /* Erased first, answered after: "resetting" over a failed erase rebooted
+       into the old configuration and password. */
+    esp_err_t err = nvs_flash_erase();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "factory reset: erase failed: %s", esp_err_to_name(err));
+        return send_json(req, "500 Internal Server Error", "{\"error\":\"erase failed, nothing reset\"}");
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"resetting\"}");
-
-    nvs_flash_erase();
 
     esp_timer_handle_t t;
     esp_timer_create(&(esp_timer_create_args_t){
