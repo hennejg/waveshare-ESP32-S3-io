@@ -17,21 +17,31 @@ static int di_count(JSContext *ctx)
     return (io && io->di_count) ? io->di_count : 8;
 }
 
+/* A channel number, checked as the double it arrives as: JS_ToInt32 wraps
+   modulo 2^32, so output(4294967296) drove DO1. Like pad_arg() below. */
+static int chan_arg(JSContext *ctx, JSValue v, int count, const char *what, int32_t *ch)
+{
+    double d;
+    if (JS_ToFloat64(ctx, &d, v) < 0) return -1;
+    if (!(d >= 0 && d < count) || d != (double)(int32_t)d) {
+        JS_ThrowRangeError(ctx, "%s channel must be 0-%d", what, count - 1);
+        return -1;
+    }
+    *ch = (int32_t)d;
+    return 0;
+}
+
 static JSValue js_di_get(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
 {
     int32_t ch;
-    if (JS_ToInt32(ctx, &ch, argv[0]) < 0) return JS_EXCEPTION;
-    if (ch < 0 || ch >= di_count(ctx))
-        return JS_ThrowRangeError(ctx, "input channel must be 0-%d", di_count(ctx) - 1);
+    if (chan_arg(ctx, argv[0], di_count(ctx), "input", &ch) < 0) return JS_EXCEPTION;
     return JS_NewBool(ctx, scripting_io_of(ctx)->di_get((uint8_t)ch));
 }
 
 static JSValue js_dout_set(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
 {
     int32_t ch;
-    if (JS_ToInt32(ctx, &ch, argv[0]) < 0) return JS_EXCEPTION;
-    if (ch < 0 || ch >= do_count(ctx))
-        return JS_ThrowRangeError(ctx, "output channel must be 0-%d", do_count(ctx) - 1);
+    if (chan_arg(ctx, argv[0], do_count(ctx), "output", &ch) < 0) return JS_EXCEPTION;
     bool state = JS_ToBool(ctx, argv[1]);
     esp_err_t err = scripting_io_of(ctx)->dout_set((uint8_t)ch, state);
     if (err == ESP_ERR_INVALID_STATE)
@@ -44,9 +54,7 @@ static JSValue js_dout_set(JSContext *ctx, JSValue this_val, int argc, JSValue *
 static JSValue js_dout_toggle(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
 {
     int32_t ch;
-    if (JS_ToInt32(ctx, &ch, argv[0]) < 0) return JS_EXCEPTION;
-    if (ch < 0 || ch >= do_count(ctx))
-        return JS_ThrowRangeError(ctx, "output channel must be 0-%d", do_count(ctx) - 1);
+    if (chan_arg(ctx, argv[0], do_count(ctx), "output", &ch) < 0) return JS_EXCEPTION;
     esp_err_t err = scripting_io_of(ctx)->dout_toggle((uint8_t)ch);
     if (err == ESP_ERR_INVALID_STATE)
         return JS_ThrowInternalError(ctx, "output %d is a header pad that is not set to output", (int)ch);
@@ -58,9 +66,7 @@ static JSValue js_dout_toggle(JSContext *ctx, JSValue this_val, int argc, JSValu
 static JSValue js_dout_get(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
 {
     int32_t ch;
-    if (JS_ToInt32(ctx, &ch, argv[0]) < 0) return JS_EXCEPTION;
-    if (ch < 0 || ch >= do_count(ctx))
-        return JS_ThrowRangeError(ctx, "output channel must be 0-%d", do_count(ctx) - 1);
+    if (chan_arg(ctx, argv[0], do_count(ctx), "output", &ch) < 0) return JS_EXCEPTION;
     return JS_NewBool(ctx, scripting_io_of(ctx)->dout_get((uint8_t)ch));
 }
 

@@ -6,6 +6,7 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -62,6 +63,10 @@ static void publish_health(void)
     static const char *const k_publishers[] = {
         "di", "dout_pub", "aux", "scripting", "mb_cmd", "can", "mqtt_health", "httpd",
     };
+    /* Internal RAM, now and the least since boot: task stacks, DMA and the
+       network buffers come out of it, and it is what runs out first. */
+    cJSON_AddNumberToObject(o, "heap_internal_free", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    cJSON_AddNumberToObject(o, "heap_internal_min",  heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
     cJSON *sf = cJSON_AddObjectToObject(o, "stack_free");
     for (size_t i = 0; sf && i < sizeof(k_publishers) / sizeof(k_publishers[0]); i++) {
         TaskHandle_t h = xTaskGetHandle(k_publishers[i]);

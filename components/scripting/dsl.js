@@ -236,7 +236,22 @@ function _channel(ch, what) {
     var n = Number(ch);
     if (!isFinite(n) || Math.floor(n) !== n)
         throw new RangeError(what + ' channel must be a whole number, got ' + ch);
+    // The device takes 0-10; anything this far out is a mistake, and the host
+    // truncated to 32 bits, so 4294967296 drove channel 0.
+    if ((what === 'input' || what === 'output') && (n < 0 || n > 255))
+        throw new RangeError(what + ' channel out of range: ' + ch);   // pads: pad_arg() in C
     return n;
+}
+
+// A rule's error, logged without throwing again: '' + e throws for a Symbol
+// and for an object whose toString() throws, and an exception escaping the
+// catch block left the pass on _passes and the rule's _firing set -- every
+// later event pushed another stale pass, and a noLoop rule never ran again.
+function _log_rule_error(r, what, e) {
+    var name, msg;
+    try { name = String(r.name); } catch (_) { name = '?'; }
+    try { msg = String(e); } catch (_) { msg = '(error that cannot be printed)'; }
+    try { print('[rule:' + name + '] ' + what + ': ' + msg); } catch (_) {}
 }
 
 function InputCondition(ch) {
@@ -839,7 +854,7 @@ function _run_steps(r, idx) {
     if (idx >= r.steps.length) return;
     var step = r.steps[idx];
     var go = function() {
-        try { step.fn(); } catch (e) { print('[rule:' + r.name + '] error: ' + e); }
+        try { step.fn(); } catch (e) { _log_rule_error(r, 'error', e); }
         _run_steps(r, idx + 1);
     };
     if (step.delay > 0) _schedule_retrying(step.delay, go);
@@ -893,7 +908,7 @@ function _rule_matches(r) {
         try {
             ok = (cond && typeof cond._check === 'function') ? cond._check() : !!cond;
         } catch (e) {
-            print('[rule:' + r.name + '] condition error: ' + e);
+            _log_rule_error(r, 'condition error', e);
             ok = false;   // a throwing condition blocks rather than crashing the engine
         }
         if (!ok) return false;
@@ -907,8 +922,8 @@ function _rule_matches(r) {
 function _run_action(r) {
     if (r.noLoop && r._firing) return;   // its own consequence reached it again — skip
     r._firing = true;
-    try { r.action(); } catch (e) { print('[rule:' + r.name + '] error: ' + e); }
-    r._firing = false;
+    try { r.action(); } catch (e) { _log_rule_error(r, 'error', e); }
+    finally { r._firing = false; }     // the budget's interrupt skips this: _after_interrupt
 }
 
 // Called by the host after the time budget interrupted a call. QuickJS's
@@ -1029,15 +1044,18 @@ function _fire_matching(factKey, _isCascade) {
 var _passes = [];
 function _pass(p) {
     _passes.push(p);
-    while (p.next < _rules.length) {
-        var r = _rules[p.next++];
-        if (p.key != null && !r._wildcard && !r._facts[p.key]) continue;
-        p.rule = r;
-        var m = _rule_matches(r);
-        if (p.analog && m && r._analogIn && !(r.heldFor > 0) && _analogEdge(r)) continue;   // edge taken
-        _apply_match(r, m);
+    try {
+        while (p.next < _rules.length) {
+            var r = _rules[p.next++];
+            if (p.key != null && !r._wildcard && !r._facts[p.key]) continue;
+            p.rule = r;
+            var m = _rule_matches(r);
+            if (p.analog && m && r._analogIn && !(r.heldFor > 0) && _analogEdge(r)) continue;   // edge taken
+            _apply_match(r, m);
+        }
+    } finally {
+        _passes.pop();                 // the budget's interrupt skips this: _after_interrupt
     }
-    _passes.pop();
 }
 
 // A new analog reading. Edge-triggered per rule: a rule fires when its

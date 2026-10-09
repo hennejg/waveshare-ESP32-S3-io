@@ -18,8 +18,16 @@ extern const char dsl_js_start[] asm("_binary_dsl_js_start");
 
 #define TAG              "scripting"
 
-// Stack > SPIRAM_MALLOC_ALWAYSINTERNAL (4 KiB) → auto-allocated in PSRAM.
-#define TASK_STACK_BYTES (48 * 1024)
+/* In PSRAM, explicitly: xTaskCreate() takes a stack from internal RAM
+   whatever its size (the comment here used to say otherwise), and internal
+   RAM is what the board runs short of -- about 34 KB free with this task's
+   48 KB taken from it. QuickJS interprets a JS call by recursing in C, and
+   on this core one output-to-rule-to-output step of a cascade costs about
+   7 KB of stack: the old 16 KB JS limit overflowed at the second step,
+   long before CASCADE_CAP (16). A task with its stack in PSRAM must not
+   touch the flash itself (the cache is off meanwhile), so storing the rules
+   goes through store_task below. */
+#define TASK_STACK_BYTES (160 * 1024)
 #define TASK_PRIORITY    3
 #define QUEUE_DEPTH      16
 
@@ -33,7 +41,9 @@ extern const char dsl_js_start[] asm("_binary_dsl_js_start");
    and because the script is persisted before it runs, for every boot after
    that too. See components/scripting/Kconfig. */
 #define TIME_BUDGET_US   ((int64_t)CONFIG_SCRIPTING_TIME_BUDGET_MS * 1000)
-#define JS_STACK_LIMIT   (16 * 1024)
+/* What QuickJS may use of the task's stack; the rest is for the C below
+   the deepest JS frame -- a binding publishing over MQTT/TLS, a log line. */
+#define JS_STACK_LIMIT   (TASK_STACK_BYTES - 16 * 1024)
 
 // Max topic / payload through the event queue; larger messages are truncated.
 #define MAX_TOPIC_LEN    128
@@ -884,12 +894,42 @@ static bool trial_load(const char *script, char *err, size_t errlen)
     return ok;
 }
 
+/* ── Flash writes off the PSRAM stack ───────────────────────────────────── */
+
+/* NVS writes turn the flash cache off, and with it the PSRAM this task's
+   stack lives in: the engine hands the store to a small task with its stack
+   in internal RAM and waits for the result. */
+static TaskHandle_t         s_engine_task, s_store_task;
+static scripting_store_fn_t s_store_fn;
+static const char          *s_store_arg;
+static esp_err_t            s_store_ret;
+
+static void store_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        s_store_ret = s_store_fn(s_store_arg);
+        xTaskNotifyGive(s_engine_task);
+    }
+}
+
+static esp_err_t store_off_psram(scripting_store_fn_t fn, const char *arg)
+{
+    if (!s_store_task) return ESP_ERR_INVALID_STATE;
+    s_store_fn = fn; s_store_arg = arg;
+    xTaskNotifyGive(s_store_task);
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    return s_store_ret;
+}
+
 /* ── Scripting task ──────────────────────────────────────────────────────── */
 
 static void scripting_task(void *arg)
 {
     JSRuntime *rt = JS_NewRuntime2(&s_psram_alloc, NULL);
     JS_SetMemoryLimit(rt, JS_HEAP_LIMIT);
+    size_t heap_limit = JS_HEAP_LIMIT;   /* in force; a reload may raise it */
     JS_SetMaxStackSize(rt, JS_STACK_LIMIT);
     JS_SetGCThreshold(rt, 256 * 1024);
     JS_SetInterruptHandler(rt, js_interrupt, NULL);
@@ -986,11 +1026,11 @@ static void scripting_task(void *arg)
                    Lift the ceiling for the duration of the handover. The
                    steady-state budget is unchanged: it is restored as soon as
                    one of the two contexts is gone. */
-                JS_SetMemoryLimit(rt, JS_HEAP_LIMIT * 2);
+                JS_SetMemoryLimit(rt, heap_limit + JS_HEAP_LIMIT);
 
                 JSContext *nctx = JS_NewContext(rt);
                 if (!nctx) {
-                    JS_SetMemoryLimit(rt, JS_HEAP_LIMIT);
+                    JS_SetMemoryLimit(rt, heap_limit);
                     ESP_LOGE(TAG, "reload: out of memory, rules unchanged");
                     free(ev.reload.script);
                     free(ev.reload.store);
@@ -1037,7 +1077,10 @@ static void scripting_task(void *arg)
                         theirs[i] = !was_used[i] && s_timers[i].used;
                     clear_timers(nctx, theirs);
                     JS_FreeContext(nctx);
-                    JS_SetMemoryLimit(rt, JS_HEAP_LIMIT);   /* new one is gone again */
+                    /* New one gone again: back to what was in force -- a
+                       limit an earlier reload raised included, or the
+                       running rules would find every allocation refused. */
+                    JS_SetMemoryLimit(rt, heap_limit);
                     ESP_LOGE(TAG, "rules not applied, previous rules still running");
                     free(ev.reload.store);
                     publish_reload_result(ev.reload.ticket, false, err, false, ESP_OK);
@@ -1069,6 +1112,7 @@ static void scripting_task(void *arg)
                              (unsigned)(in_use / 1024), (unsigned)(limit / 1024));
                 }
                 JS_SetMemoryLimit(rt, limit);
+                heap_limit = limit;
 
                 ctx = nctx;
                 bind_handlers(ctx, &on_mqtt, &on_input, &on_time_sync, &on_activity);
@@ -1078,7 +1122,7 @@ static void scripting_task(void *arg)
                 bool      tried = ev.reload.store && ev.reload.store_fn;
                 esp_err_t serr  = ESP_OK;
                 if (tried) {
-                    serr = ev.reload.store_fn(ev.reload.store);
+                    serr = store_off_psram(ev.reload.store_fn, ev.reload.store);
                     if (serr != ESP_OK)
                         ESP_LOGE(TAG, "rules running but not stored: %s", esp_err_to_name(serr));
                 }
@@ -1132,9 +1176,15 @@ esp_err_t scripting_init(const char *user_script, const scripting_io_t *io)
         return ESP_ERR_NO_MEM;
     }
 
-    BaseType_t ok = xTaskCreate(scripting_task, "scripting",
-                                TASK_STACK_BYTES / sizeof(StackType_t),
-                                NULL, TASK_PRIORITY, NULL);
+    if (xTaskCreate(store_task, "rules_store", 4096, NULL, TASK_PRIORITY, &s_store_task) != pdPASS) {
+        vQueueDelete(s_queue);
+        ESP_LOGE(TAG, "Failed to create rules store task");
+        return ESP_ERR_NO_MEM;
+    }
+    BaseType_t ok = xTaskCreateWithCaps(scripting_task, "scripting",
+                                        TASK_STACK_BYTES / sizeof(StackType_t),
+                                        NULL, TASK_PRIORITY, &s_engine_task,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ok != pdPASS) {
         vQueueDelete(s_queue);
         ESP_LOGE(TAG, "Failed to create scripting task");

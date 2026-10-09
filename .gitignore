@@ -68,3 +68,5 @@ dependencies.lock
 /test/host/test_pwhash
 /test/host/test_pwhash.c
 /test/host/mbt-obj/
+/test/host/test_chan
+/test/host/test_chan.c

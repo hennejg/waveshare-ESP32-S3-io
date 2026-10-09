@@ -23,7 +23,8 @@ setting for a custom CA yet. Before this check was configured, `mqtts://` never 
 A changed broker URL takes effect after a reboot.
 
 The retained message on the prefix itself (`<prefix>`) is the device's health, refreshed every 60 s:
-`{"online":true,"device":"…","uptime_s":…,"stack_free":{"di":…,"dout_pub":…,…}}`. `stack_free` is
+`{"online":true,"device":"…","uptime_s":…,"heap_internal_free":…,"heap_internal_min":…,"stack_free":{"di":…,…}}`.
+`heap_internal_free`/`_min` are the internal RAM free now and the least since boot -- what runs out first. `stack_free` is
 the least stack each task that publishes has had left since boot, in bytes -- with `mqtts://` the
 publish runs the TLS record write on that task's stack. The last will sets it to `{"online":false}`.
 
