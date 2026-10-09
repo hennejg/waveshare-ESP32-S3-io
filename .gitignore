@@ -51,3 +51,5 @@ dependencies.lock
 /test/host/test_auxlock.c
 /test/host/test_wifimon
 /test/host/test_wifimon.c
+/test/host/test_jobs
+/test/host/test_jobs.c

@@ -22,8 +22,12 @@ menu "Rule engine"
             the same event, each try with a fresh budget -- up to three more
             rules that run over per event, after which the rest of that event
             is dropped. A heldFor() check cut short is tried again after
-            another held period. One event can therefore hold the engine for
-            up to five budgets.
+            another held period. Promise jobs the event queued (.then(),
+            async functions) run afterwards under one more budget of their
+            own; what is still queued when it is spent runs after the next
+            event. One event can therefore hold the engine for up to six
+            budgets. A script whose promise jobs alone run over while it is
+            loaded is refused.
 
             2000 ms is generous for I/O automation, where a rule body is
             normally a handful of operations. Raise it if you do heavy work in

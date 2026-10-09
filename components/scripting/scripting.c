@@ -371,11 +371,6 @@ static const JSMallocFunctions s_psram_alloc = {
 
 /* ── JS helpers ──────────────────────────────────────────────────────────── */
 
-static void drain_jobs(JSRuntime *rt)
-{
-    JSContext *ctx2;
-    while (JS_ExecutePendingJob(rt, &ctx2) > 0) {}
-}
 
 /* Same as eval_or_log(), but says whether it worked and hands back the error
    so the caller can report it rather than only logging it. */
@@ -453,6 +448,45 @@ static int js_interrupt(JSRuntime *rt, void *opaque)
 static inline void budget_start(void)
 {
     s_deadline_us = TIME_BUDGET_US ? esp_timer_get_time() + TIME_BUDGET_US : 0;
+}
+
+/* Runs the promise jobs the last entry into JS queued, under a budget of
+   their own. QuickJS turns the budget's interrupt inside a job into an
+   ordinary rejection (promise_reaction_job, js_async_function_resume), so
+   the job "succeeds" and a .catch() can queue the next one: draining until
+   the queue was empty never ended, and with the watchdog only reporting, the
+   engine hung until a reboot. Stops once the budget is spent and leaves what
+   is queued for the next pass, which brings a budget of its own; the
+   interrupt stays flagged for recover_interrupt() at the top of the loop.
+   Says whether it ran over. */
+static bool drain_jobs(JSRuntime *rt)
+{
+    bool before = s_interrupted;
+    s_interrupted = false;
+    budget_start();
+    JSContext *jctx;
+    for (;;) {
+        /* The interrupt is polled per so many operations; a chain of short
+           jobs may never reach a poll inside one, so check between them. */
+        if (s_interrupted || js_interrupt(rt, NULL)) break;
+        int r = JS_ExecutePendingJob(rt, &jctx);
+        if (r == 0) break;
+        if (r < 0) {
+            /* A job that failed outright leaves its exception pending on the
+               runtime, where the next call would trip over it. */
+            JSValue exc = JS_GetException(jctx);
+            if (!s_interrupted) {
+                const char *msg = JS_ToCString(jctx, exc);
+                ESP_LOGE(TAG, "promise job: %s", msg ? msg : "(unknown)");
+                JS_FreeCString(jctx, msg);
+            }
+            JS_FreeValue(jctx, exc);
+        }
+    }
+    bool over = s_interrupted;
+    if (over) ESP_LOGW(TAG, "promise jobs ran over the time budget: the rest runs on the next pass");
+    s_interrupted = before || over;
+    return over;
 }
 
 /* After the budget interrupted a call: the interrupt is uncatchable and skips
@@ -813,7 +847,12 @@ static bool trial_load(const char *script, char *err, size_t errlen)
             budget_start();
             ok = eval_check(tctx, script, "<user>", err, errlen);
         }
-        if (ok) drain_jobs(trt);
+        /* A script whose promise jobs alone run over the budget would hold
+           the engine on every boot; refuse it like one whose top level does. */
+        if (ok && drain_jobs(trt)) {
+            snprintf(err, errlen, "promise jobs ran over the time budget");
+            ok = false;
+        }
         dry_timers_free(tctx);
         JS_FreeContext(tctx);
     }
