@@ -20,11 +20,13 @@
    for longer than any Modbus client waits. Against the compile-time ceiling
    this came to 40 s, which no client would still be listening for.
 
-   Derived rather than written out: the workers are the only thing that can
-   queue here, so raising MB_TCP_WORKERS without this following would make the
-   wait too short and hand out "busy" for requests that would have been
-   served, with nothing to say so. */
-#define GW_QUEUE_AHEAD (MB_TCP_WORKERS - 1)
+   Derived rather than written out: the other connection workers and the
+   Modbus master's poll task (mb_gateway_read_regs) are what can queue here,
+   so raising MB_TCP_WORKERS without this following would make the wait too
+   short and hand out "busy" for requests that would have been served, with
+   nothing to say so. The poll task was left out of the count before: four
+   silent devices ahead came to 5 s against a 4.25 s wait. */
+#define GW_QUEUE_AHEAD MB_TCP_WORKERS
 static uint32_t s_bus_wait_ms = 4000;
 
 static void             *s_master = NULL;
@@ -136,8 +138,13 @@ esp_err_t mb_gateway_start(uart_port_t uart, uint32_t baudrate,
  *   - the device answered with an exception: that code goes back unchanged. A
  *     client that asked for a register the device does not have must be told
  *     "illegal data address", not something about the gateway.
- *   - the device said nothing: 0x0B, gateway target device failed to respond.
+ *   - the device said nothing, or nothing that made sense (bad CRC, wrong
+ *     address, wrong length -- ESP_ERR_INVALID_RESPONSE): 0x0B, gateway
+ *     target device failed to respond. The path is fine; 0x0A made clients
+ *     and operators look for a routing fault and stop retrying.
  *   - the gateway could not even try: 0x0A, gateway path unavailable.
+ *   - the segment never came free: MB_GW_BUS_BUSY, which only the poll
+ *     table sees; mb_gateway_handle() puts 0x06 on the wire for it.
  */
 static uint8_t transact(uint8_t uid, uint8_t fc, uint16_t addr,
                         uint16_t count, void *data)
@@ -147,7 +154,7 @@ static uint8_t transact(uint8_t uid, uint8_t fc, uint16_t addr,
     if (xSemaphoreTake(s_bus, pdMS_TO_TICKS(s_bus_wait_ms)) != pdTRUE) {
         ESP_LOGW(TAG, "uid %u fc %u: segment busy for %"PRIu32" ms, turned away",
                  uid, fc, s_bus_wait_ms);
-        return MB_EXC_DEVICE_BUSY;
+        return MB_GW_BUS_BUSY;
     }
 
     mb_param_request_t req = {
@@ -163,7 +170,7 @@ static uint8_t transact(uint8_t uid, uint8_t fc, uint16_t addr,
         uint8_t ex = 0;
         if (mbc_master_get_last_exception(s_master, &ex) == ESP_OK && ex != 0) {
             exc = ex;
-        } else if (err == ESP_ERR_TIMEOUT) {
+        } else if (err == ESP_ERR_TIMEOUT || err == ESP_ERR_INVALID_RESPONSE) {
             exc = MB_EXC_GW_TARGET;
         } else {
             exc = MB_EXC_GW_PATH;
@@ -197,8 +204,8 @@ uint8_t mb_gateway_read_regs(uint8_t uid, uint8_t fc, uint16_t addr,
     return transact(uid, fc, addr, count, regs);
 }
 
-uint8_t mb_gateway_handle(uint8_t uid, const mb_request_t *req,
-                          uint8_t *resp, uint16_t *resp_len)
+static uint8_t handle(uint8_t uid, const mb_request_t *req,
+                      uint8_t *resp, uint16_t *resp_len)
 {
     *resp_len = 0;
 
@@ -268,4 +275,11 @@ uint8_t mb_gateway_handle(uint8_t uid, const mb_request_t *req,
         ESP_LOGD(TAG, "uid %u: function code %u cannot be relayed", uid, req->fc);
         return MB_EXC_ILLEGAL_FUNC;
     }
+}
+
+uint8_t mb_gateway_handle(uint8_t uid, const mb_request_t *req,
+                          uint8_t *resp, uint16_t *resp_len)
+{
+    uint8_t exc = handle(uid, req, resp, resp_len);
+    return exc == MB_GW_BUS_BUSY ? MB_EXC_DEVICE_BUSY : exc;   /* the wire's word for it */
 }

@@ -17,7 +17,8 @@ esp_err_t mb_tcp_server_start(uint16_t port, uint8_t local_uid);
    one without a packet capture. */
 typedef struct {
     uint32_t accepted;      /* connections taken                            */
-    uint32_t refused;       /* connections dropped, no slot free            */
+    uint32_t refused;       /* connections dropped, every slot active       */
+    uint32_t evicted;       /* idle connections closed for a new one        */
     uint32_t requests;      /* requests answered, exceptions included       */
     uint32_t exceptions;    /* of those, answered with an exception         */
     uint32_t forwarded;     /* of those, sent to the RS-485 segment         */

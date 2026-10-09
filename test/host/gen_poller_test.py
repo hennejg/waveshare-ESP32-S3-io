@@ -169,6 +169,7 @@ static void reset(void)
 
 int main(void)
 {
+    const int64_t W = (int64_t)FRAME_WAIT_MS * 1000;   /* the frame deadline, in us */
     printf("Empfangspfad des TCP-Servers\n");
 
     /* 1. Seven clients send one byte and stop; the eighth sends a whole
@@ -185,29 +186,29 @@ int main(void)
            (long long)(clock_us / 1000));
 
     /* 2. One frame, arriving in pieces either side of the deadline. The
-          header completes at 180 ms, the body would complete at 360 -- one
-          deadline of 200 ms from the first byte must end it first. */
+          header completes at 90 % of FRAME_WAIT_MS, the body would complete
+          at 180 % -- one deadline from the first byte must end it first. */
     reset();
     give[0] = 1; ready_at[0] = 0;
     pump_slot(0);                           /* first byte at t = 0 */
     CHECK(s_conn[0].want == MBAP_HDR, "nach dem ersten Byte wird kein Kopf erwartet");
 
-    clock_us = 180000; give[0] = MBAP_HDR;  /* rest of the header at 180 ms */
+    clock_us = W * 9 / 10; give[0] = MBAP_HDR;  /* rest of the header at 0.9 W */
     pump_slot(0);
     CHECK(answers == 0, "unvollstaendiger Rahmen beantwortet");
 
-    clock_us = 210000;                      /* past the deadline */
+    clock_us = W * 21 / 20;                 /* past the deadline */
     sweep_deadlines();
     CHECK(s_conn[0].state == SLOT_FREE, "Verbindung nach Fristablauf nicht geschlossen");
     CHECK(s_stats.malformed == 1, "Fristablauf nicht gezaehlt");
 
-    printf("  zerstueckelter Rahmen bei 200 ms beendet, nicht bei 360\n");
+    printf("  zerstueckelter Rahmen bei %d ms beendet, nicht bei %d\n", FRAME_WAIT_MS, FRAME_WAIT_MS * 9 / 5);
 
     /* 3. A frame that arrives in pieces but inside the deadline is served. */
     reset();
     give[0] = 1;
     pump_slot(0);
-    clock_us = 100000; give[0] = sizeof FRAME;
+    clock_us = W / 2; give[0] = sizeof FRAME;
     pump_slot(0);
     CHECK(answers == 1, "rechtzeitiger zerstueckelter Rahmen nicht beantwortet");
     CHECK(s_conn[0].want == 0, "Empfangszustand nicht zurueckgesetzt");
@@ -285,7 +286,7 @@ int main(void)
     pump_slot(1);
     CHECK(s_conn[1].got == 1, "erstes Byte von Slot 1 nicht angenommen");
 
-    clock_us = 360000;                    /* later than slot 1's deadline */
+    clock_us = W * 9 / 5;                 /* later than slot 1's deadline */
     give[1] = sizeof FRAME;               /* the rest arrives too late */
     unsigned before = answers;
     pump_slot(1);
@@ -295,7 +296,7 @@ int main(void)
 
     /* 7. The blocked connection itself is dropped once its own deadline has
           passed -- it is holding a buffer nobody is taking. */
-    clock_us = 600000;
+    clock_us = W * 9 / 5 + (int64_t)SEND_WAIT_MS * 1000;
     sweep_deadlines();
     CHECK(s_conn[0].state == SLOT_FREE, "blockierte Verbindung nicht geschlossen");
     printf("  blockierte Verbindung nach %d ms beendet\n", SEND_WAIT_MS);

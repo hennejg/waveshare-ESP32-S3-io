@@ -1680,6 +1680,7 @@ static esp_err_t api_modbus_status(httpd_req_t *req)
     cJSON *srv = cJSON_AddObjectToObject(root, "tcp_server");
     cJSON_AddNumberToObject(srv, "accepted",   st.accepted);
     cJSON_AddNumberToObject(srv, "refused",    st.refused);
+    cJSON_AddNumberToObject(srv, "evicted",    st.evicted);
     cJSON_AddNumberToObject(srv, "requests",   st.requests);
     cJSON_AddNumberToObject(srv, "exceptions", st.exceptions);
     cJSON_AddNumberToObject(srv, "forwarded",  st.forwarded);

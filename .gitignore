@@ -59,3 +59,7 @@ dependencies.lock
 /test/host/test_mqttlog.c
 /test/host/test_timerid
 /test/host/test_timerid.c
+/test/host/test_evict
+/test/host/test_evict.c
+/test/host/test_gwerr
+/test/host/test_gwerr.c

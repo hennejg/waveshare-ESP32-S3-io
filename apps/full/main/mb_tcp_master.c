@@ -438,6 +438,7 @@ static bool read_rtu(const mbm_poll_t *e, uint16_t regs, double *value,
     uint16_t r[2] = {0};
     uint8_t exc = mb_gateway_read_regs(e->unit_id, e->fc, e->reg, regs, r);
     if (exc == MB_EXC_GW_TARGET) { snprintf(err, err_len, "no answer on RS-485"); return false; }
+    if (exc == MB_GW_BUS_BUSY)   { snprintf(err, err_len, "RS-485 busy, not tried"); return false; }
     if (exc != MB_EXC_NONE)      { snprintf(err, err_len, "device says exception 0x%02X", exc); return false; }
     uint8_t wire[4];
     for (uint16_t i = 0; i < regs; i++) mb_put16(&wire[i * 2], r[i]);

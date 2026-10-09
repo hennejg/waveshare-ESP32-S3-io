@@ -65,16 +65,18 @@
 #define FRAME_MAX             (MB_MBAP_LEN + MB_PDU_MAX)
 
 /* How long a whole frame may take once its first bytes have arrived. On a
-   local segment a 260-byte frame is one or two packets; a client that cannot
-   finish one in this time is broken, and waiting longer would hold up every
-   other connection, since this runs on the polling task.
+   local segment a 260-byte frame is one or two packets. 200 ms was too
+   tight: a client that writes the MBAP header and the PDU separately with
+   Nagle on holds the second write until the first is ACKed, and lwIP's
+   delayed ACK alone can take 250 ms. Every recv() here is non-blocking, so a
+   longer deadline costs the slot that is waiting and nothing else.
 
    The socket's own timeout is much shorter so that no single recv() can
    overrun the deadline by more than a little: the deadline is checked between
    calls, so without this the last recv() could add a further whole
    FRAME_WAIT_MS, and with every connection doing it the poll loop would stall
    for a multiple of it. */
-#define FRAME_WAIT_MS         200
+#define FRAME_WAIT_MS        1000
 
 /* How often the poll loop looks at the clock while some connection holds a
    partly received frame. Only reached in that case; an idle server waits on
@@ -101,6 +103,15 @@
    that time is not going to. The connection is then ended -- there is no way
    to resync a half-written response anyway. */
 #define SEND_WAIT_MS         500
+
+/* With every slot taken, a new connection takes the place of the one that
+   has been quiet longest -- what the Modbus TCP implementation guide asks of
+   a server at its limit. Refusing the newcomer instead let any host on the
+   network lock out every SCADA client by opening eight connections and
+   sending nothing; keepalive cannot help, the host is alive. A connection is
+   only taken over once it has been idle this long, never one with a frame
+   half received or an answer still going out. */
+#define EVICT_IDLE_MS       2000
 
 
 enum { SLOT_FREE = 0, SLOT_IDLE, SLOT_BUSY };
@@ -129,6 +140,7 @@ typedef struct {
     int64_t          out_deadline_us;
 
     uint32_t         local_ip;     /* our address on this connection, network order */
+    int64_t          last_use_us;  /* accepted, or its last whole frame   */
 } conn_t;
 
 /* The slot, not the frame. A worker owns its connection outright for the
@@ -261,7 +273,12 @@ static void worker_task(void *arg)
         conn_t *c = &s_conn[job.slot];
         arm_out(job.slot, process(c->frame, job.len, c->out, c->local_ip));
 
-        c->state = SLOT_IDLE;                 /* after the answer is armed */
+        /* After the answer is armed, and seen in that order: a release
+           store, paired with the poller's acquire loads. As a plain volatile
+           store the compiler was free to sink the stores of out_len and
+           out_deadline_us below it, and a poller woken by something else
+           could send a stale length or close on a past deadline. */
+        __atomic_store_n(&c->state, SLOT_IDLE, __ATOMIC_RELEASE);
 
         uint64_t one = 1;                     /* the connection can be polled again */
         (void)write(s_wake_fd, &one, sizeof(one));
@@ -341,6 +358,20 @@ static uint16_t build_busy(const uint8_t *frame, uint8_t *out)
    wire a reset, then a repeated SYN-ACK, then the answer, and the client saw
    only the reset. 0.2 % of connections, with nothing else running. The
    receive path already reads until EAGAIN for the same reason. */
+/* The slot that has been quiet longest and may be taken over, or -1. Only
+   the poller's own slots: one a worker holds is busy by definition. */
+static int oldest_idle(int64_t now)
+{
+    int best = -1;
+    for (int i = 0; i < MB_TCP_MAX_CONN; i++) {
+        const conn_t *c = &s_conn[i];
+        if (c->state != SLOT_IDLE || c->got || c->out_len) continue;
+        if (now - c->last_use_us < (int64_t)EVICT_IDLE_MS * 1000) continue;
+        if (best < 0 || c->last_use_us < s_conn[best].last_use_us) best = i;
+    }
+    return best;
+}
+
 static bool accept_one(void)
 {
     struct sockaddr_in peer;
@@ -352,9 +383,21 @@ static bool accept_one(void)
     for (int i = 0; i < MB_TCP_MAX_CONN; i++)
         if (s_conn[i].state == SLOT_FREE) { slot = i; break; }
 
+    int64_t now = esp_timer_get_time();
+    if (slot < 0 && (slot = oldest_idle(now)) >= 0) {
+        s_stats.evicted++;
+        ESP_LOGD(TAG, "all slots in use: slot %d idle longest, closed for the new one", slot);
+        close_slot(slot);
+    }
     if (slot < 0) {
         s_stats.refused++;
-        ESP_LOGW(TAG, "no free slot, dropped a connection (%d in use)", MB_TCP_MAX_CONN);
+        /* Once per second at most: a connect flood must not turn into a
+           flood on the console from the task that serves every connection. */
+        static int64_t last_log;
+        if (now - last_log > 1000000) {
+            last_log = now;
+            ESP_LOGW(TAG, "no free slot, dropped a connection (%d in use, all active)", MB_TCP_MAX_CONN);
+        }
         close(fd);
         return true;              /* the queue may still hold others */
     }
@@ -377,8 +420,9 @@ static bool accept_one(void)
     s_conn[slot].local_ip = getsockname(fd, (struct sockaddr *)&local, &llen) == 0
                             ? local.sin_addr.s_addr : 0;
 
-    s_conn[slot].fd    = fd;
-    s_conn[slot].state = SLOT_IDLE;
+    s_conn[slot].fd          = fd;
+    s_conn[slot].last_use_us = now;
+    s_conn[slot].state       = SLOT_IDLE;
     s_stats.accepted++;
     ESP_LOGD(TAG, "connection on slot %d", slot);
     return true;
@@ -443,6 +487,7 @@ static void pump_slot(int i)
     uint16_t len = c->want;
     c->want = 0;                              /* ready for the next frame */
     c->got  = 0;
+    c->last_use_us = esp_timer_get_time();
 
     /* A request this board answers itself reads cached state and queues any
        write -- about a millisecond, with nothing in it that can block for
@@ -481,7 +526,7 @@ static void sweep_deadlines(void)
 {
     int64_t now = esp_timer_get_time();
     for (int i = 0; i < MB_TCP_MAX_CONN; i++) {
-        if (s_conn[i].state != SLOT_IDLE) continue;
+        if (__atomic_load_n(&s_conn[i].state, __ATOMIC_ACQUIRE) != SLOT_IDLE) continue;
 
         if (s_conn[i].out_len && now > s_conn[i].out_deadline_us) {
             ESP_LOGW(TAG, "slot %d: answer not taken within %d ms — closing",
@@ -508,7 +553,7 @@ static void poller_task(void *arg)
         bool partial = false;
 
         for (int i = 0; i < MB_TCP_MAX_CONN; i++) {
-            if (s_conn[i].state != SLOT_IDLE) continue;
+            if (__atomic_load_n(&s_conn[i].state, __ATOMIC_ACQUIRE) != SLOT_IDLE) continue;
 
             if (s_conn[i].fd > maxfd) maxfd = s_conn[i].fd;
 
@@ -556,12 +601,12 @@ static void poller_task(void *arg)
         /* Outgoing first: a connection waiting to be written to is holding a
            buffer and a deadline, and finishing it frees both. */
         for (int i = 0; i < MB_TCP_MAX_CONN; i++)
-            if (s_conn[i].state == SLOT_IDLE && s_conn[i].out_len &&
+            if (__atomic_load_n(&s_conn[i].state, __ATOMIC_ACQUIRE) == SLOT_IDLE && s_conn[i].out_len &&
                 FD_ISSET(s_conn[i].fd, &wr) && !flush_out(i))
                 close_slot(i);
 
         for (int i = 0; i < MB_TCP_MAX_CONN; i++)
-            if (s_conn[i].state == SLOT_IDLE && !s_conn[i].out_len &&
+            if (__atomic_load_n(&s_conn[i].state, __ATOMIC_ACQUIRE) == SLOT_IDLE && !s_conn[i].out_len &&
                 FD_ISSET(s_conn[i].fd, &rd))
                 pump_slot(i);
 

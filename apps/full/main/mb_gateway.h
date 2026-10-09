@@ -28,10 +28,17 @@ bool mb_gateway_is_running(void);
 void mb_gateway_set_forwarding(bool on);
 bool mb_gateway_forwarding(void);
 
+/* Not a Modbus exception and never put on the wire: the segment stayed
+   taken by other transactions for longer than a request waits for it.
+   Only mb_gateway_read_regs() returns it, so the poll table can say "RS-485
+   busy" instead of blaming the device; a forwarded request gets 0x06. */
+#define MB_GW_BUS_BUSY 0xFF
+
 /* Reads count holding (fc 3) or input (fc 4) registers from uid on the
    segment for the poll table, into host-order regs. Serialised with the
    forwarded requests. Returns 0 or the exception code: the device's own,
-   0x0B when it stayed silent, 0x0A when the master is not running. */
+   0x0B when it stayed silent or answered garbled, 0x0A when the master is not
+   running, MB_GW_BUS_BUSY when the segment never came free. */
 uint8_t mb_gateway_read_regs(uint8_t uid, uint8_t fc, uint16_t addr,
                              uint16_t count, uint16_t *regs);
 

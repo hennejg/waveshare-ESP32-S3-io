@@ -9,8 +9,8 @@ CFLAGS := -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 PORT ?= 15020
 
-.PHONY: all clean client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid
-all: test_mb_pdu client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid
+.PHONY: all clean client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr
+all: test_mb_pdu client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr
 	./test_mb_pdu
 
 # The firmware's framing against a Modbus TCP server written independently of
@@ -23,6 +23,24 @@ client: test_mb_client modbus_tcp_server.py
 	 ./test_mb_client $(PORT); RC=$$?; \
 	 kill $$SRV 2>/dev/null; \
 	 exit $$RC
+
+# What the RS-485 gateway reports for a failed transaction, cut out of
+# mb_gateway.c.
+gwerr: test_gwerr
+	./test_gwerr
+
+test_gwerr: gen_gwerr_test.py $(MAIN)/mb_gateway.c $(MAIN)/mb_gateway.h
+	python3 gen_gwerr_test.py
+	$(CC) $(CFLAGS) -Istubs -Wno-unused-function -Wno-unused-parameter test_gwerr.c $(MAIN)/mb_pdu.c -o $@
+
+# The Modbus TCP server at its connection limit: accept_one() and the
+# eviction of the slot idle longest, cut out of mb_tcp_server.c.
+evict: test_evict
+	./test_evict
+
+test_evict: gen_evict_test.py $(MAIN)/mb_tcp_server.c $(MAIN)/net_budget.h
+	python3 gen_evict_test.py
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter test_evict.c -o $@
 
 # The Modbus master's configuration handover, cut out of the real source.
 master: test_mb_master
@@ -236,6 +254,6 @@ test_mb_pdu: test_mb_pdu.c $(MAIN)/mb_pdu.c $(MAIN)/mb_pdu.h $(MAIN)/mb_request.
 	$(CC) $(CFLAGS) test_mb_pdu.c $(MAIN)/mb_pdu.c -o $@
 
 clean:
-	rm -rf test_timerid test_timerid.c test_mqttlog test_mqttlog.c test_authguard test_authguard.c test_jobs test_jobs.c test_wifimon test_wifimon.c test_auxlock test_auxlock.c test_auxwrite test_auxwrite.c test_resume test_resume.c test_resume_old_dsl.js test_cfgnum test_cfgnum.c test_auth test_auth.c test_nvsread test_nvsread.c test_drain test_drain.c test_di test_di.c test_trial test_trial.c test_order test_order.c test_names test_names.c test_qjs_interrupt test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c \
+	rm -rf test_gwerr test_gwerr.c test_evict test_evict.c test_timerid test_timerid.c test_mqttlog test_mqttlog.c test_authguard test_authguard.c test_jobs test_jobs.c test_wifimon test_wifimon.c test_auxlock test_auxlock.c test_auxwrite test_auxwrite.c test_resume test_resume.c test_resume_old_dsl.js test_cfgnum test_cfgnum.c test_auth test_auth.c test_nvsread test_nvsread.c test_drain test_drain.c test_di test_di.c test_trial test_trial.c test_order test_order.c test_names test_names.c test_qjs_interrupt test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c \
 	       test_mb_master test_mb_master.c \
 	       test_mb_dns test_mb_dns.c test_tz test_tz.c test_resync test_resync.c test_qjs_cron qjs-obj *.dSYM

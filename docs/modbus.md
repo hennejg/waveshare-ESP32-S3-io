@@ -83,15 +83,18 @@ time, so forwarded requests queue behind each other.
 
 | | |
 |---|---|
-| Connections served at once | 8; a ninth is closed immediately |
+| Connections served at once | 8; a ninth takes the place of the one idle longest (at least 2 s), or is closed if all 8 are active |
 | Requests forwarded at once | 4; beyond that the answer is `0x06`, retry |
-| Time to receive one frame  | 200 ms from its first byte, then the connection is closed |
+| Time to receive one frame  | 1 s from its first byte, then the connection is closed |
 | Time to send one response  | 500 ms, then the connection is closed |
 
 Neither limit is a limit on anybody else: receiving and sending are both done
 a step at a time, so a connection that stalls holds up only itself.
 
-A connection is kept open for as long as the client wants it. One whose peer
+A connection is kept open for as long as the client wants it, unless all eight
+slots are taken and a new client arrives: then the connection that has been
+quiet longest is closed for it, so eight idle connections cannot lock everybody
+else out. A client polling at least every 2 s is never the one closed. One whose peer
 has disappeared without closing is found by TCP keepalive after about 90 s and
 its slot released.
 
