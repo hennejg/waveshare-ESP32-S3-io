@@ -218,7 +218,17 @@ static esp_err_t pwm_set(uint8_t a, uint32_t freq, uint16_t duty, bool fresh)
             .clk_cfg         = LEDC_USE_APB_CLK,
         };
         esp_err_t r = ledc_timer_config(&t);
-        if (r != ESP_OK) return r;
+        if (r != ESP_OK) {
+            /* Back to what was running: the stop above holds the pin low,
+               while s_freq/s_duty -- and with them status, Modbus and MQTT --
+               still say it runs. */
+            if (!fresh) {
+                t.duty_resolution = (ledc_timer_bit_t)s_bits[a];
+                t.freq_hz         = s_freq[a];
+                if (ledc_timer_config(&t) == ESP_OK) pwm_put_duty(a, s_duty[a], s_bits[a]);
+            }
+            return r;
+        }
     }
     if (fresh) {
         ledc_channel_config_t c = {
@@ -664,6 +674,12 @@ static void aux_task(void *arg)
         ulTaskNotifyTake(pdTRUE, wait);
 
         uint8_t dirty = __atomic_exchange_n(&s_dirty, 0, __ATOMIC_RELAXED);
+        /* IO1 left analog: forget the last published reading. Cleared only
+           by a sampling pass that found no reading before, and with IO1 out
+           of analog that pass may never come (nothing to wait for), so after
+           analog -> other -> analog a first reading within 20 mV of the one
+           before was held back and subscribers saw none. */
+        if ((dirty & 1u) && aux_io_mode(0) != AUX_MODE_ANALOG) s_an_mqtt_has = false;
 #ifdef CONFIG_APP_MQTT_ENABLE
         for (uint8_t a = 0; a < AUX_PAD_COUNT; a++)
             if (dirty & (1u << a)) publish_pad(a);

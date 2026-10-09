@@ -9,8 +9,8 @@ CFLAGS := -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 PORT ?= 15020
 
-.PHONY: all clean client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr
-all: test_mb_pdu client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr
+.PHONY: all clean client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail
+all: test_mb_pdu client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail
 	./test_mb_pdu
 
 # The firmware's framing against a Modbus TCP server written independently of
@@ -228,6 +228,14 @@ test_drain: gen_drain_test.py ../../components/scripting/scripting.c $(QJS_OBJ) 
 	python3 gen_drain_test.py
 	$(CC) -O1 -Wall -Wextra -Wno-unused-parameter -I$(QJS) test_drain.c $(QJS_OBJ) -lm -o $@
 
+# A PWM update the LEDC timer refuses, pwm_set() cut out of aux_io.c.
+pwmfail: test_pwmfail
+	./test_pwmfail
+
+test_pwmfail: gen_pwmfail_test.py ../../components/board/aux_io.c
+	python3 gen_pwmfail_test.py
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter -Wno-unused-variable test_pwmfail.c -o $@
+
 # The handlers that reboot after an NVS write, cut out of web_server.c.
 reseterr: test_reseterr
 	./test_reseterr
@@ -295,6 +303,6 @@ test_mb_pdu: test_mb_pdu.c $(MAIN)/mb_pdu.c $(MAIN)/mb_pdu.h $(MAIN)/mb_request.
 	$(CC) $(CFLAGS) test_mb_pdu.c $(MAIN)/mb_pdu.c -o $@
 
 clean:
-	rm -rf test_reseterr test_reseterr.c test_chan test_chan.c test_pwhash test_pwhash.c mbt-obj test_n2khb test_n2khb.c test_gwerr test_gwerr.c test_evict test_evict.c test_timerid test_timerid.c test_mqttlog test_mqttlog.c test_authguard test_authguard.c test_jobs test_jobs.c test_wifimon test_wifimon.c test_auxlock test_auxlock.c test_auxwrite test_auxwrite.c test_resume test_resume.c test_resume_old_dsl.js test_cfgnum test_cfgnum.c test_auth test_auth.c test_nvsread test_nvsread.c test_drain test_drain.c test_di test_di.c test_trial test_trial.c test_order test_order.c test_names test_names.c test_qjs_interrupt test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c \
+	rm -rf test_pwmfail test_pwmfail.c test_reseterr test_reseterr.c test_chan test_chan.c test_pwhash test_pwhash.c mbt-obj test_n2khb test_n2khb.c test_gwerr test_gwerr.c test_evict test_evict.c test_timerid test_timerid.c test_mqttlog test_mqttlog.c test_authguard test_authguard.c test_jobs test_jobs.c test_wifimon test_wifimon.c test_auxlock test_auxlock.c test_auxwrite test_auxwrite.c test_resume test_resume.c test_resume_old_dsl.js test_cfgnum test_cfgnum.c test_auth test_auth.c test_nvsread test_nvsread.c test_drain test_drain.c test_di test_di.c test_trial test_trial.c test_order test_order.c test_names test_names.c test_qjs_interrupt test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c \
 	       test_mb_master test_mb_master.c \
 	       test_mb_dns test_mb_dns.c test_tz test_tz.c test_resync test_resync.c test_qjs_cron qjs-obj *.dSYM

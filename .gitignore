@@ -72,3 +72,5 @@ dependencies.lock
 /test/host/test_chan.c
 /test/host/test_reseterr
 /test/host/test_reseterr.c
+/test/host/test_pwmfail
+/test/host/test_pwmfail.c

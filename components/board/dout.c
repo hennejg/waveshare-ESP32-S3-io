@@ -284,11 +284,19 @@ esp_err_t dout_toggle(uint8_t n)
 
 esp_err_t dout_publish_all(void)
 {
-    dout_lock();
-    esp_err_t ret = write_outputs();   /* re-apply — picks up invert changes */
-    dout_unlock();
+    /* Re-apply -- picks up invert changes. A transient I2C error used to
+       leave the relays on the old invert until some unrelated output change
+       happened to write the byte again, flipping channels nobody touched. */
+    esp_err_t ret = ESP_FAIL;
+    for (int i = 0; i < 3 && ret != ESP_OK; i++) {
+        if (i) vTaskDelay(pdMS_TO_TICKS(20));
+        dout_lock();
+        ret = write_outputs();
+        dout_unlock();
+    }
     if (ret != ESP_OK)
-        ESP_LOGW(TAG, "outputs: re-apply failed (%s)", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "outputs: re-apply failed three times (%s) -- relays still on the old invert setting",
+                 esp_err_to_name(ret));
 #ifdef CONFIG_APP_MQTT_ENABLE
     mark_publish(0xFFu);
 #endif
