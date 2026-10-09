@@ -9,8 +9,8 @@ CFLAGS := -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 PORT ?= 15020
 
-.PHONY: all clean client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock
-all: test_mb_pdu client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock
+.PHONY: all clean client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon
+all: test_mb_pdu client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon
 	./test_mb_pdu
 
 # The firmware's framing against a Modbus TCP server written independently of
@@ -105,6 +105,15 @@ test_auxlock: gen_auxlock_test.py ../../components/board/aux_io.c ../../componen
 	python3 gen_auxlock_test.py
 	$(CC) -std=c11 -Wall -Wextra -Werror -Wno-unused-function -Wno-unused-variable -O1 -g -fsanitize=thread -I../../components/board -Istubs test_auxlock.c -lpthread -o $@
 
+# The WiFi bootstrap's link monitor and portal routing, cut out of wifi_config.c
+# and compiled with the definitions its CMakeLists.txt sets.
+wifimon: test_wifimon
+	./test_wifimon
+
+test_wifimon: gen_wifimon_test.py ../../components/esp32-wifi-bootstrap/src/wifi_config.c ../../components/esp32-wifi-bootstrap/CMakeLists.txt
+	python3 gen_wifimon_test.py
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter test_wifimon.c -o $@
+
 names: test_names
 	./test_names
 
@@ -192,6 +201,6 @@ test_mb_pdu: test_mb_pdu.c $(MAIN)/mb_pdu.c $(MAIN)/mb_pdu.h $(MAIN)/mb_request.
 	$(CC) $(CFLAGS) test_mb_pdu.c $(MAIN)/mb_pdu.c -o $@
 
 clean:
-	rm -rf test_auxlock test_auxlock.c test_auxwrite test_auxwrite.c test_resume test_resume.c test_resume_old_dsl.js test_cfgnum test_cfgnum.c test_auth test_auth.c test_nvsread test_nvsread.c test_drain test_drain.c test_di test_di.c test_trial test_trial.c test_order test_order.c test_names test_names.c test_qjs_interrupt test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c \
+	rm -rf test_wifimon test_wifimon.c test_auxlock test_auxlock.c test_auxwrite test_auxwrite.c test_resume test_resume.c test_resume_old_dsl.js test_cfgnum test_cfgnum.c test_auth test_auth.c test_nvsread test_nvsread.c test_drain test_drain.c test_di test_di.c test_trial test_trial.c test_order test_order.c test_names test_names.c test_qjs_interrupt test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c \
 	       test_mb_master test_mb_master.c \
 	       test_mb_dns test_mb_dns.c test_tz test_tz.c test_resync test_resync.c test_qjs_cron qjs-obj *.dSYM

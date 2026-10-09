@@ -448,9 +448,10 @@ static void wifi_config_server_on_settings(client_t *client) {
                         "<div style='margin-top:1.5rem;border-top:1px solid #ccc;padding-top:1rem;"
                         "font-family:sans-serif;font-size:.9rem;color:#555;text-align:center'>"
                         "<p>Ethernet is connected. You can skip WiFi entirely.</p>"
-                        "<a href='/eth-only' style='display:inline-block;padding:.4rem 1rem;"
-                        "background:#1a73e8;color:#fff;border-radius:4px;text-decoration:none'>"
-                        "ETH only &mdash; disable WiFi &rarr;</a>"
+                        "<form method='post' action='/eth-only' style='margin:0'>"
+                        "<button type='submit' style='padding:.4rem 1rem;border:0;"
+                        "background:#1a73e8;color:#fff;border-radius:4px;font-size:1rem'>"
+                        "ETH only &mdash; disable WiFi &rarr;</button></form>"
                         "<p style='margin-top:.8rem;color:#999;font-size:.8rem'>"
                         "To return to WiFi setup: hold the BOOT button for &ge;&nbsp;5&nbsp;s.</p>"
                         "</div>";
@@ -520,12 +521,14 @@ static int wifi_config_server_on_url(http_parser *parser, const char *data, size
                         client->endpoint = ENDPOINT_SETTINGS;
                 } else if (!strncmp(data, "/", length)) {
                         client->endpoint = ENDPOINT_INDEX;
-                } else if (!strncmp(data, "/eth-only", length)) {
-                        client->endpoint = ENDPOINT_ETH_ONLY;
                 }
         } else if (parser->method == HTTP_POST) {
+                /* Switching WiFi off is a POST, so a plain link or an <img>
+                 * on some other page cannot do it; GET only ever shows pages. */
                 if (!strncmp(data, "/settings", length)) {
                         client->endpoint = ENDPOINT_SETTINGS_UPDATE;
+                } else if (!strncmp(data, "/eth-only", length)) {
+                        client->endpoint = ENDPOINT_ETH_ONLY;
                 }
         }
 
@@ -653,22 +656,6 @@ static bool handle_get_request(client_t *client, const char *data, int len) {
         if (strcmp(url, "/settings") == 0) {
                 INFO("GET /settings");
                 wifi_config_server_on_settings(client);
-        } else if (strcmp(url, "/eth-only") == 0) {
-                static const char html[] =
-                        "HTTP/1.1 200 \r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
-                        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-                        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                        "<title>Ethernet-only mode</title></head>"
-                        "<body style='font-family:sans-serif;text-align:center;padding:2rem'>"
-                        "<h2>Switching to Ethernet-only mode</h2>"
-                        "<p>Rebooting now &mdash; connect via Ethernet cable.</p>"
-                        "<p style='color:#888;font-size:.85rem'>"
-                        "To return to WiFi setup: hold the BOOT button for &ge;&nbsp;5&nbsp;s.</p>"
-                        "</body></html>";
-                write(client->fd, html, sizeof(html) - 1);
-                if (s_eth_only_cb) s_eth_only_cb();
-                vTaskDelay(pdMS_TO_TICKS(400));
-                esp_restart();
         } else if (strcmp(url, "/captive-portal") == 0) {
                 /* RFC 8910 Captive Portal API endpoint — advertised via DHCP option 114.
                  * RFC 8910 clients probe this with Accept: application/captive+json.
@@ -1031,10 +1018,17 @@ static void wifi_config_softap_stop() {
 }
 
 
+/* Set when the monitor has seen the station lose its link. With credentials
+ * stored the setup AP stays off during an outage, so the mode is still plain
+ * STATION when the link comes back -- this, not the mode, is what says the
+ * application must be told again (it stopped its services on the loss). */
+static bool s_link_lost;
+
 static void wifi_config_monitor_callback(TimerHandle_t xTimer) {
         if (sdk_wifi_station_get_connect_status() == STATION_GOT_IP) {
-                if (sdk_wifi_get_opmode() == STATION_MODE && !context->first_time)
+                if (sdk_wifi_get_opmode() == STATION_MODE && !context->first_time && !s_link_lost)
                         return;
+                s_link_lost = false;
 
                 // Connected to station, all is dandy
                 INFO("Connected to WiFi network");
@@ -1061,6 +1055,8 @@ static void wifi_config_monitor_callback(TimerHandle_t xTimer) {
                         return;
 
                 INFO("Disconnected from WiFi network");
+                if (!context->first_time)
+                        s_link_lost = true;
 
                 if (!context->first_time && context->on_event)
                         context->on_event(WIFI_CONFIG_DISCONNECTED);
@@ -1070,7 +1066,13 @@ static void wifi_config_monitor_callback(TimerHandle_t xTimer) {
                         context->network_monitor_timer,
                         pdMS_TO_TICKS(WIFI_CONFIG_DISCONNECTED_MONITOR_INTERVAL), 0);
 
-                if (!s_ap_disabled)
+                /* The open setup AP only while there is nothing to connect
+                 * to. With credentials stored, a lost link is an outage, not
+                 * a setup: keep retrying the station and leave the AP off, so
+                 * jamming the real network cannot bring up an open AP that
+                 * takes new credentials from anyone in range. A long press of
+                 * BOOT clears the credentials and brings the AP back. */
+                if (!s_ap_disabled && !wifi_config_has_configuration())
                         wifi_config_softap_start();
         }
 }

@@ -49,6 +49,10 @@ board hardware abstraction layer (`components/board/`):
 
 - **WiFi provisioning** — on first boot the device opens a `Waveshare-Setup` access point. Connect to it on any device;
   a captive portal appears automatically to enter WiFi credentials. The LED blinks 30% blue while the portal is active.
+  The access point is open (no WiFi password), so it only comes up while **no credentials are stored**. Once the device
+  has credentials, a lost WiFi link is retried every 10 s and nothing else happens: no reboot (outputs, Modbus, CAN
+  and rules keep running, Ethernet stays up) and no open access point that someone in radio range could use to point
+  the device at a network of their own. If the stored network is gone for good, hold BOOT for ≥ 5 s (see below).
 - **ETH-only mode** — if you have an Ethernet cable, tap **"Use Ethernet only →"** on the provisioning portal to skip
   WiFi entirely. The preference is stored and survives reboots.
 - **Ethernet** — W5500 SPI Ethernet always runs in parallel (or alone in ETH-only mode); whichever interface gets an IP
