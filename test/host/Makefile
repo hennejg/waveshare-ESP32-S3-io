@@ -9,8 +9,8 @@ CFLAGS := -std=c11 -Wall -Wextra -Werror -O1 -g \
 
 PORT ?= 15020
 
-.PHONY: all clean client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr
-all: test_mb_pdu client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr
+.PHONY: all clean client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb
+all: test_mb_pdu client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb
 	./test_mb_pdu
 
 # The firmware's framing against a Modbus TCP server written independently of
@@ -23,6 +23,14 @@ client: test_mb_client modbus_tcp_server.py
 	 ./test_mb_client $(PORT); RC=$$?; \
 	 kill $$SRV 2>/dev/null; \
 	 exit $$RC
+
+# The NMEA 2000 heartbeat as it goes on the bus, cut out of can_server.c.
+n2khb: test_n2khb
+	./test_n2khb
+
+test_n2khb: gen_n2khb_test.py $(MAIN)/can_server.c
+	python3 gen_n2khb_test.py
+	$(CC) $(CFLAGS) -Wno-unused-function test_n2khb.c -o $@
 
 # What the RS-485 gateway reports for a failed transaction, cut out of
 # mb_gateway.c.
@@ -254,6 +262,6 @@ test_mb_pdu: test_mb_pdu.c $(MAIN)/mb_pdu.c $(MAIN)/mb_pdu.h $(MAIN)/mb_request.
 	$(CC) $(CFLAGS) test_mb_pdu.c $(MAIN)/mb_pdu.c -o $@
 
 clean:
-	rm -rf test_gwerr test_gwerr.c test_evict test_evict.c test_timerid test_timerid.c test_mqttlog test_mqttlog.c test_authguard test_authguard.c test_jobs test_jobs.c test_wifimon test_wifimon.c test_auxlock test_auxlock.c test_auxwrite test_auxwrite.c test_resume test_resume.c test_resume_old_dsl.js test_cfgnum test_cfgnum.c test_auth test_auth.c test_nvsread test_nvsread.c test_drain test_drain.c test_di test_di.c test_trial test_trial.c test_order test_order.c test_names test_names.c test_qjs_interrupt test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c \
+	rm -rf test_n2khb test_n2khb.c test_gwerr test_gwerr.c test_evict test_evict.c test_timerid test_timerid.c test_mqttlog test_mqttlog.c test_authguard test_authguard.c test_jobs test_jobs.c test_wifimon test_wifimon.c test_auxlock test_auxlock.c test_auxwrite test_auxwrite.c test_resume test_resume.c test_resume_old_dsl.js test_cfgnum test_cfgnum.c test_auth test_auth.c test_nvsread test_nvsread.c test_drain test_drain.c test_di test_di.c test_trial test_trial.c test_order test_order.c test_names test_names.c test_qjs_interrupt test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c \
 	       test_mb_master test_mb_master.c \
 	       test_mb_dns test_mb_dns.c test_tz test_tz.c test_resync test_resync.c test_qjs_cron qjs-obj *.dSYM

@@ -63,3 +63,5 @@ dependencies.lock
 /test/host/test_evict.c
 /test/host/test_gwerr
 /test/host/test_gwerr.c
+/test/host/test_n2khb
+/test/host/test_n2khb.c

@@ -215,7 +215,7 @@ static void basic_handle_rx(const rx_msg_t *m)
 /* ---- PGN constants ---- */
 #define N2K_PGN_ADDRESS_CLAIM  60928UL  /* 0x0EE00 — PDU1 */
 #define N2K_PGN_ISO_REQUEST    59904UL  /* 0x0EA00 — PDU1 */
-#define N2K_PGN_HEARTBEAT     126993UL  /* 0x1F011 — PDU2, fast-packet */
+#define N2K_PGN_HEARTBEAT     126993UL  /* 0x1F011 — PDU2, single-frame */
 #define N2K_PGN_SW_STATUS     127501UL  /* 0x1F20D — PDU2, single-frame */
 #define N2K_PGN_SW_CONTROL    127502UL  /* 0x1F20E — PDU2, single-frame */
 #define N2K_PGN_PROPRIETARY   126720UL  /* 0x1EF00 — PDU1 broadcast, fast-packet */
@@ -339,15 +339,20 @@ static void n2k_send_address_claim(uint8_t addr)
     n2k_send_frame(id, s_name, 8);
 }
 
+/* PGN 126993 is a single 8-byte frame (canboat: PACKET_SINGLE; the NMEA 2000
+   heartbeat corrigendum): transmit interval in ms, sequence counter, then
+   controller/equipment state bits and reserved. It went out as a 9-byte
+   fast-packet with the interval in 0.01 s, so receivers read the fast-packet
+   header as the interval -- and even unpacked, 100 meant 100 ms, not 1 s. */
 static void n2k_tx_heartbeat(void)
 {
-    uint8_t payload[9];
-    uint16_t rate_cs = 100;           /* 1.00 s in 0.01 s units */
-    payload[0] = rate_cs & 0xFF;
-    payload[1] = (rate_cs >> 8) & 0xFF;
+    uint8_t payload[8];
+    uint16_t interval_ms = HB_PERIOD_MS;
+    payload[0] = interval_ms & 0xFF;
+    payload[1] = (interval_ms >> 8) & 0xFF;
     payload[2] = s_hb_seq++;
-    memset(payload + 3, 0xFF, 6);     /* reserved / not available */
-    n2k_send_fp(N2K_PGN_HEARTBEAT, 7, N2K_ADDR_GLOBAL, payload, sizeof(payload));
+    memset(payload + 3, 0xFF, 5);     /* controller/equipment state n/a, reserved */
+    n2k_send_frame(n2k_make_id(N2K_PGN_HEARTBEAT, 7, s_addr, N2K_ADDR_GLOBAL), payload, sizeof(payload));
 }
 
 /* Encode 8 switch states (bitmask) into PGN 127501/127502 data. */
