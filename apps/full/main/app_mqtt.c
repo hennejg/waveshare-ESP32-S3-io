@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "mqtt_client.h"
+#include "esp_crt_bundle.h"
 #include "cJSON.h"
 
 #define TAG                  "app_mqtt"
@@ -54,6 +55,18 @@ static void publish_health(void)
     cJSON_AddBoolToObject(o, "online", true);
     cJSON_AddStringToObject(o, "device", cfg->device_name);
     cJSON_AddNumberToObject(o, "uptime_s", (double)(esp_timer_get_time() / 1000000LL));
+    /* The least stack each task that publishes has had left so far, in
+       bytes: a publish runs the transport write on the caller's stack, and
+       with mqtts:// that is an mbedtls record write. Watched here because a
+       stack that runs out does so only under TLS, on a broker few test with. */
+    static const char *const k_publishers[] = {
+        "di", "dout_pub", "aux", "scripting", "mb_cmd", "can", "mqtt_health", "httpd",
+    };
+    cJSON *sf = cJSON_AddObjectToObject(o, "stack_free");
+    for (size_t i = 0; sf && i < sizeof(k_publishers) / sizeof(k_publishers[0]); i++) {
+        TaskHandle_t h = xTaskGetHandle(k_publishers[i]);
+        if (h) cJSON_AddNumberToObject(sf, k_publishers[i], uxTaskGetStackHighWaterMark(h));
+    }
     char *payload = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
     if (!payload) return;
@@ -183,6 +196,25 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
     }
 }
 
+/* The broker URL without the user:password@ it may carry: the log goes to
+   the console and to anyone reading it. */
+static const char *url_for_log(const char *url, char *out, size_t cap)
+{
+    const char *sep  = strstr(url, "://");
+    const char *auth = sep ? sep + 3 : url;          /* scheme:// kept */
+    /* The user info ends at the last '@' before the path: a password may
+       contain '@' itself. */
+    const char *end  = strchr(auth, '/');
+    if (!end) end = auth + strlen(auth);
+    const char *host = auth;
+    for (const char *c = auth; c < end; c++) if (*c == '@') host = c + 1;
+    size_t pre = (size_t)(auth - url);
+    if (pre >= cap) pre = cap - 1;
+    memcpy(out, url, pre);
+    strlcpy(out + pre, host, cap - pre);
+    return out;
+}
+
 /* ------------------------------------------------------------------ public */
 
 esp_err_t app_mqtt_start(void)
@@ -198,6 +230,14 @@ esp_err_t app_mqtt_start(void)
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = cfg->mqtt_url,
     };
+#ifndef CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY
+    /* mqtts:// and wss:// need something to check the broker's certificate
+       against; with nothing set, esp-tls refuses the handshake ("No server
+       verification option set") and TLS never connected at all. The CA
+       bundle that is built in anyway: brokers with a certificate from a
+       public CA. Plain mqtt:// does not look at it. */
+    mqtt_cfg.broker.verification.crt_bundle_attach = esp_crt_bundle_attach;
+#endif
 
     if (cfg->mqtt_user[0]) {
         mqtt_cfg.credentials.username = cfg->mqtt_user;
@@ -256,7 +296,8 @@ esp_err_t app_mqtt_start(void)
         return ret;
     }
 
-    ESP_LOGI(TAG, "Connecting to %s", cfg->mqtt_url);
+    char shown[sizeof(cfg->mqtt_url)];
+    ESP_LOGI(TAG, "Connecting to %s", url_for_log(cfg->mqtt_url, shown, sizeof(shown)));
     return ESP_OK;
 }
 

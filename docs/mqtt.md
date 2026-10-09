@@ -15,6 +15,18 @@ All MQTT settings are configured via the web UI (port 80) or the REST API (`POST
 
 Supported URI schemes: `mqtt://` (plain TCP), `mqtts://` (TLS).
 
+With `mqtts://` the broker's certificate is checked against ESP-IDF's built-in bundle of public root CAs, so
+a broker with a certificate from a public CA (Let's Encrypt and the like) connects. A broker with a
+self-signed certificate or one from a private CA is refused (TLS alert "bad certificate"); there is no
+setting for a custom CA yet. Before this check was configured, `mqtts://` never connected at all.
+
+A changed broker URL takes effect after a reboot.
+
+The retained message on the prefix itself (`<prefix>`) is the device's health, refreshed every 60 s:
+`{"online":true,"device":"…","uptime_s":…,"stack_free":{"di":…,"dout_pub":…,…}}`. `stack_free` is
+the least stack each task that publishes has had left since boot, in bytes -- with `mqtts://` the
+publish runs the TLS record write on that task's stack. The last will sets it to `{"online":false}`.
+
 If no broker URL is configured, MQTT is silently disabled at boot.
 
 ## Topic Structure

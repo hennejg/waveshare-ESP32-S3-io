@@ -216,7 +216,11 @@ esp_err_t dout_init(void)
     ESP_RETURN_ON_ERROR(i2c_transmit_safe(cfg_cmd, sizeof(cfg_cmd)), TAG, "TCA9554 config");
 
 #ifdef CONFIG_APP_MQTT_ENABLE
-    if (!s_pub_task && xTaskCreate(publish_task, "dout_pub", 3072, NULL, 4, &s_pub_task) != pdPASS)
+    /* The publish runs the MQTT transport write on this stack. Measured on
+       the board with an mqtts:// broker under load: about 2 kB used, 1 kB of
+       3072 left -- 4096 leaves room for the error paths' logging too. The
+       broker's "stack_free" in the health message shows it. */
+    if (!s_pub_task && xTaskCreate(publish_task, "dout_pub", 4096, NULL, 4, &s_pub_task) != pdPASS)
         ESP_LOGE(TAG, "publish task: out of memory -- output states are not published");
 #endif
     ESP_LOGI(TAG, "Initialized %d outputs via TCA9554 (I2C addr 0x%02X)", NUM_DO, TCA9554_ADDR);

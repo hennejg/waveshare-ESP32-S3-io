@@ -711,7 +711,9 @@ esp_err_t aux_io_init(void)
 {
     s_mux = xSemaphoreCreateMutex();
     if (!s_mux) return ESP_ERR_NO_MEM;
-    if (xTaskCreate(aux_task, "aux", 3584, NULL, 4, &s_task) != pdPASS) return ESP_ERR_NO_MEM;
+    /* Publishes over MQTT from this stack (see dout_pub): with mqtts:// under
+       load 1.4 kB of 3584 were left, so 4096. */
+    if (xTaskCreate(aux_task, "aux", 4096, NULL, 4, &s_task) != pdPASS) return ESP_ERR_NO_MEM;
     return aux_io_apply();
 }
 
