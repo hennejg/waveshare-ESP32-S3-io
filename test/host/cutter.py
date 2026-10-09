@@ -7,7 +7,19 @@ module, because the thing that goes wrong is always the same: something is
 retyped by hand, the firmware changes, and the test keeps asserting the old
 shape while still compiling. Anything not found stops the build.
 """
-import pathlib, re
+import os, pathlib, re, subprocess
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+
+def show(rel):
+    """A repository file as text: the working tree, or with OLD=1 as it was at
+    OLDREV (default HEAD) -- the convention every generator's OLD run uses."""
+    if os.environ.get("OLD") == "1":
+        rev = os.environ.get("OLDREV", "HEAD")
+        return subprocess.run(["git", "show", "%s:%s" % (rev, rel)], cwd=ROOT,
+                              check=True, capture_output=True, text=True).stdout
+    return (ROOT / rel).read_text()
 
 
 class Source:
@@ -16,6 +28,14 @@ class Source:
     def __init__(self, path: pathlib.Path):
         self.path = path
         self.text = path.read_text()
+
+    @classmethod
+    def at(cls, rel):
+        """The file at rel (from the repository root), honouring OLD/OLDREV."""
+        s = cls.__new__(cls)
+        s.path = ROOT / rel
+        s.text = show(rel)
+        return s
 
     def _fail(self, what):
         raise SystemExit("%s: %s not found in %s" % (__name__, what, self.path.name))

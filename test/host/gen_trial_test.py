@@ -60,6 +60,8 @@ cuts += sc.func("static bool trial_load(const char *script, char *err, size_t er
 cuts += sc.func("void scripting_on_mqtt_connected(void)")
 cuts += bd.func("static int do_count(")
 if "static int chan_arg(" in bd.text:
+    if "static int int_arg(" in bd.text:
+        cuts += bd.func("static int int_arg(JSContext *ctx, JSValue v, int32_t lo, int32_t hi, const char *msg, int32_t *out)")
     cuts += bd.func("static int chan_arg(JSContext *ctx, JSValue v, int count, const char *what, int32_t *ch)")
 cuts += bd.func("static JSValue js_dout_set(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)")
 cuts += bd.func("static JSValue js_dout_toggle(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)")

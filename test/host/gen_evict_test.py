@@ -16,21 +16,19 @@ OLD=1 cuts mb_tcp_server.c from git (OLDREV, default HEAD).
 
   make -C test/host evict
 """
-import os, pathlib, subprocess
+import pathlib
 from cutter import Source
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-src  = Source(ROOT / "apps/full/main/mb_tcp_server.c")
-bud  = Source(ROOT / "apps/full/main/net_budget.h")
-if os.environ.get("OLD") == "1":
-    src.text = subprocess.run(["git", "show", os.environ.get("OLDREV", "HEAD") + ":apps/full/main/mb_tcp_server.c"],
-                              cwd=ROOT, capture_output=True, text=True, check=True).stdout
+src  = Source.at("apps/full/main/mb_tcp_server.c")
+bud  = Source.at("apps/full/main/net_budget.h")
 new = "static int oldest_idle(int64_t now)" in src.text
 
 defines = bud.defines("NET_SOCK_MB_CONN") + src.defines("MBAP_HDR", "FRAME_MAX", "MB_TCP_MAX_CONN", "KEEPALIVE_IDLE_S", "KEEPALIVE_INTVL_S", "KEEPALIVE_COUNT") + \
           (src.defines("EVICT_IDLE_MS") if new else "#define EVICT_IDLE_MS 2000\n")
 types = src.type("SLOT_BUSY };") + src.type("} conn_t;")
-cuts  = src.func("static void close_slot(int i)")
+cuts  = (src.func("static inline uint8_t slot_state(int i)") if "slot_state(int i)" in src.text else "")
+cuts += src.func("static void close_slot(int i)")
 if new: cuts += src.func("static int oldest_idle(int64_t now)")
 cuts += src.func("static bool accept_one(void)")
 

@@ -25,8 +25,6 @@ void sntp_sync_init(void)
     if (!s_lock) s_lock = xSemaphoreCreateMutex();
 }
 
-static void apply_locked(void);
-
 /* Called after each successful SNTP sync. The SNTP client has already stepped the
  * system clock (so NTP takes precedence over the RTC seed); mirror it to the
  * battery-backed RTC so the time persists across power loss / offline periods. */
@@ -44,13 +42,6 @@ static void on_time_synced(struct timeval *tv)
 #ifdef CONFIG_APP_SCRIPTING_ENABLE
     scripting_on_time_sync();
 #endif
-}
-
-void sntp_sync_apply(void)
-{
-    if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY);
-    apply_locked();
-    if (s_lock) xSemaphoreGive(s_lock);
 }
 
 static void apply_locked(void)
@@ -78,4 +69,11 @@ static void apply_locked(void)
     } else {
         ESP_LOGE(TAG, "SNTP init failed: %s", esp_err_to_name(ret));
     }
+}
+
+void sntp_sync_apply(void)
+{
+    if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY);
+    apply_locked();
+    if (s_lock) xSemaphoreGive(s_lock);
 }

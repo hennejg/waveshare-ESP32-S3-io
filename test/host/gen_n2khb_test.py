@@ -13,14 +13,11 @@ OLD=1 cuts can_server.c from git (OLDREV, default HEAD).
 
   make -C test/host n2khb
 """
-import os, pathlib, subprocess
+import pathlib
 from cutter import Source
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-src  = Source(ROOT / "apps/full/main/can_server.c")
-if os.environ.get("OLD") == "1":
-    src.text = subprocess.run(["git", "show", os.environ.get("OLDREV", "HEAD") + ":apps/full/main/can_server.c"],
-                              cwd=ROOT, capture_output=True, text=True, check=True).stdout
+src  = Source.at("apps/full/main/can_server.c")
 cuts  = src.defines("HB_PERIOD_MS", "N2K_PGN_HEARTBEAT", "N2K_ADDR_GLOBAL")
 cuts += src.func("static uint32_t n2k_make_id(uint32_t pgn, uint8_t pri, uint8_t src, uint8_t dst)")
 cuts += src.func("static void n2k_tx_heartbeat(void)")

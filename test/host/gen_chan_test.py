@@ -13,16 +13,15 @@ OLD=1 cuts bindings.c from git (OLDREV, default HEAD).
 
   make -C test/host chan
 """
-import os, pathlib, subprocess
+import pathlib
 from cutter import Source
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-src  = Source(ROOT / "components/scripting/bindings.c")
-if os.environ.get("OLD") == "1":
-    src.text = subprocess.run(["git", "show", os.environ.get("OLDREV", "HEAD") + ":components/scripting/bindings.c"],
-                              cwd=ROOT, capture_output=True, text=True, check=True).stdout
+src  = Source.at("components/scripting/bindings.c")
 cuts  = src.func("static int do_count(JSContext *ctx)") + src.func("static int di_count(JSContext *ctx)")
 if "static int chan_arg(" in src.text:
+    if "static int int_arg(" in src.text:
+        cuts += src.func("static int int_arg(JSContext *ctx, JSValue v, int32_t lo, int32_t hi, const char *msg, int32_t *out)")
     cuts += src.func("static int chan_arg(JSContext *ctx, JSValue v, int count, const char *what, int32_t *ch)")
 for f in ("js_di_get", "js_dout_set", "js_dout_toggle", "js_dout_get"):
     cuts += src.func("static JSValue %s(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)" % f)

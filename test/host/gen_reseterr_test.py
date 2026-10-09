@@ -11,14 +11,11 @@ OLD=1 cuts web_server.c from git (OLDREV, default HEAD).
 
   make -C test/host reseterr
 """
-import os, pathlib, subprocess
+import pathlib
 from cutter import Source
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-src  = Source(ROOT / "apps/full/main/web_server.c")
-if os.environ.get("OLD") == "1":
-    src.text = subprocess.run(["git", "show", os.environ.get("OLDREV", "HEAD") + ":apps/full/main/web_server.c"],
-                              cwd=ROOT, capture_output=True, text=True, check=True).stdout
+src  = Source.at("apps/full/main/web_server.c")
 cuts  = src.defines("NVS_ETH_NS", "NVS_ETH_KEY")
 cuts += "static void do_restart(void *arg) { (void)arg; restarts++; }\n"
 cuts += src.func("static esp_err_t api_eth_only(httpd_req_t *req)")

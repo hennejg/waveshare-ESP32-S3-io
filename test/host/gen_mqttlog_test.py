@@ -8,14 +8,11 @@ OLD=1 has no url_for_log(); the test then says so.
 
   make -C test/host mqttlog
 """
-import os, pathlib, subprocess
+import pathlib
 from cutter import Source
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-src  = Source(ROOT / "apps/full/main/app_mqtt.c")
-if os.environ.get("OLD") == "1":
-    src.text = subprocess.run(["git", "show", os.environ.get("OLDREV", "HEAD") + ":apps/full/main/app_mqtt.c"],
-                              cwd=ROOT, capture_output=True, text=True, check=True).stdout
+src  = Source.at("apps/full/main/app_mqtt.c")
 have = "static const char *url_for_log(" in src.text
 cut  = src.func("static const char *url_for_log(const char *url, char *out, size_t cap)") if have else \
        "static const char *url_for_log(const char *url, char *out, size_t cap) { snprintf(out, cap, \"%s\", url); return out; }\n"

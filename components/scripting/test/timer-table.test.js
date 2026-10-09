@@ -108,3 +108,15 @@ test('every() gets a freed slot ahead of waiting .after() steps', () => {
   e.advance(60000);
   assert.equal(e.T.off, 20, 'and every step still runs');
 });
+
+test('a retry pass stops at the first refusal instead of trying the whole queue', () => {
+  const e = createEngine({ maxTimers: 0 });
+  e.load(`rule('p').when(input(0).isOn()).then(function(){}).after(100).then(function(){ T.n = (T.n || 0) + 1; });`);
+  for (let i = 0; i < 50; i++) { e.input(0, true); e.input(0, false); }
+  const calls = e.evalIn('(function(){ var n = 0, s = _set_timer; _set_timer = function(a, b){ n++; return s(a, b); }; _retry_arms(); _set_timer = s; return n; })()');
+  assert.equal(calls, 1, 'one refused attempt, not one per waiting step');
+  e.setMaxTimers(Infinity);
+  e.input(1, true);
+  e.advance(1000);
+  assert.equal(e.T.n, 50, 'all waiting steps ran once the table had room');
+});

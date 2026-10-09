@@ -18,14 +18,11 @@ returns, which a 5 s alarm reports.
 
   make -C test/host jobs
 """
-import os, pathlib, subprocess
+import pathlib
 from cutter import Source
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-src  = Source(ROOT / "components/scripting/scripting.c")
-if os.environ.get("OLD") == "1":
-    src.text = subprocess.run(["git", "show", os.environ.get("OLDREV", "HEAD") + ":components/scripting/scripting.c"],
-                              cwd=ROOT, capture_output=True, text=True, check=True).stdout
+src  = Source.at("components/scripting/scripting.c")
 
 new  = "static bool drain_jobs(JSRuntime *rt)" in src.text
 cuts  = src.span("static int64_t s_deadline_us;", "static int64_t s_deadline_us;")

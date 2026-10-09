@@ -2,6 +2,7 @@
 #include "quickjs.h"
 #include <esp_log.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #define TAG "js"
 
@@ -17,18 +18,26 @@ static int di_count(JSContext *ctx)
     return (io && io->di_count) ? io->di_count : 8;
 }
 
-/* A channel number, checked as the double it arrives as: JS_ToInt32 wraps
-   modulo 2^32, so output(4294967296) drove DO1. Like pad_arg() below. */
-static int chan_arg(JSContext *ctx, JSValue v, int count, const char *what, int32_t *ch)
+/* A whole number in [lo, hi], checked as the double it arrives as: JS_ToInt32
+   wraps modulo 2^32, so output(4294967296) drove DO1 and 7.9 was DO8.
+   Throws RangeError(msg) otherwise. */
+static int int_arg(JSContext *ctx, JSValue v, int32_t lo, int32_t hi, const char *msg, int32_t *out)
 {
     double d;
     if (JS_ToFloat64(ctx, &d, v) < 0) return -1;
-    if (!(d >= 0 && d < count) || d != (double)(int32_t)d) {
-        JS_ThrowRangeError(ctx, "%s channel must be 0-%d", what, count - 1);
+    if (!(d >= lo && d <= hi) || d != (double)(int32_t)d) {
+        JS_ThrowRangeError(ctx, "%s", msg);
         return -1;
     }
-    *ch = (int32_t)d;
+    *out = (int32_t)d;
     return 0;
+}
+
+static int chan_arg(JSContext *ctx, JSValue v, int count, const char *what, int32_t *ch)
+{
+    char msg[40];
+    snprintf(msg, sizeof(msg), "%s channel must be 0-%d", what, count - 1);
+    return int_arg(ctx, v, 0, count - 1, msg, ch);
 }
 
 static JSValue js_di_get(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
@@ -146,20 +155,6 @@ static JSValue js_mqtt_publish(JSContext *ctx, JSValue this_val, int argc, JSVal
     return JS_NewInt32(ctx, msg_id);
 }
 
-/* A pad number 1..3, checked as the number it is: JS_ToInt32 wraps modulo
-   2^32, so pwm(4294967297) would otherwise reach pad 1. */
-static int pad_arg(JSContext *ctx, JSValue v, int32_t *pad)
-{
-    double d;
-    if (JS_ToFloat64(ctx, &d, v) < 0) return -1;
-    if (!(d >= 1 && d <= 3) || d != (double)(int32_t)d) {
-        JS_ThrowRangeError(ctx, "pad must be 1, 2 or 3");
-        return -1;
-    }
-    *pad = (int32_t)d;
-    return 0;
-}
-
 /* _aux_pwm_set(pad, duty%, freq) -- pad 1..3; freq undefined or 0 keeps it.
    The ranges are aux_io.h's AUX_PWM_*; this component cannot include it. */
 static JSValue js_aux_pwm_set(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
@@ -167,7 +162,7 @@ static JSValue js_aux_pwm_set(JSContext *ctx, JSValue this_val, int argc, JSValu
     if (!scripting_io_of(ctx)->aux_pwm_set) return JS_ThrowInternalError(ctx, "no PWM pads on this board");
     int32_t pad;
     double duty, freq = 0;
-    if (pad_arg(ctx, argv[0], &pad) < 0) return JS_EXCEPTION;
+    if (int_arg(ctx, argv[0], 1, 3, "pad must be 1, 2 or 3", &pad) < 0) return JS_EXCEPTION;
     if (JS_ToFloat64(ctx, &duty, argv[1]) < 0) return JS_EXCEPTION;
     if (argc > 2 && !JS_IsUndefined(argv[2]) && JS_ToFloat64(ctx, &freq, argv[2]) < 0) return JS_EXCEPTION;
     if (!(duty >= 0.0 && duty <= 100.0)) return JS_ThrowRangeError(ctx, "pwm duty must be 0-100 (%%)");
@@ -184,7 +179,7 @@ static JSValue js_aux_pwm_set(JSContext *ctx, JSValue this_val, int argc, JSValu
 static JSValue js_aux_pwm_get(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
 {
     int32_t pad;
-    if (pad_arg(ctx, argv[0], &pad) < 0) return JS_EXCEPTION;
+    if (int_arg(ctx, argv[0], 1, 3, "pad must be 1, 2 or 3", &pad) < 0) return JS_EXCEPTION;
     uint32_t f; uint16_t d;
     if (!scripting_io_of(ctx)->aux_pwm_get || !scripting_io_of(ctx)->aux_pwm_get((uint8_t)pad, &f, &d)) return JS_NULL;
     JSValue o = JS_NewObject(ctx);
@@ -197,7 +192,7 @@ static JSValue js_aux_pwm_get(JSContext *ctx, JSValue this_val, int argc, JSValu
 static JSValue js_aux_analog_get(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
 {
     int32_t pad;
-    if (pad_arg(ctx, argv[0], &pad) < 0) return JS_EXCEPTION;
+    if (int_arg(ctx, argv[0], 1, 3, "pad must be 1, 2 or 3", &pad) < 0) return JS_EXCEPTION;
     int mv;
     if (!scripting_io_of(ctx)->aux_analog_get || scripting_io_of(ctx)->aux_analog_get((uint8_t)pad, &mv) != ESP_OK)
         return JS_NULL;

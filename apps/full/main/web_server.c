@@ -192,7 +192,6 @@ static bool cross_site(httpd_req_t *req)
     return !o || strcmp(o + 3, host) != 0;              /* "null" has no scheme */
 }
 
-
 /* Returns true if the request carries a valid password (or no password is set). */
 /* A device without a password is one that has not been set up yet, and
    until that happens nothing but the setup flow itself may be used: the

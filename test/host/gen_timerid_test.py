@@ -13,14 +13,11 @@ is fed ten times. OLD=1 cuts scripting.c from git (OLDREV, default HEAD).
 
   make -C test/host timerid
 """
-import os, pathlib, subprocess
+import pathlib
 from cutter import Source
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-src  = Source(ROOT / "components/scripting/scripting.c")
-if os.environ.get("OLD") == "1":
-    src.text = subprocess.run(["git", "show", os.environ.get("OLDREV", "HEAD") + ":components/scripting/scripting.c"],
-                              cwd=ROOT, capture_output=True, text=True, check=True).stdout
+src  = Source.at("components/scripting/scripting.c")
 
 cuts  = src.span("#define MAX_TIMERS", "static uint32_t     s_next_timer_id = 1;")
 cuts += "static uint32_t s_timer_full_count;\n"

@@ -85,7 +85,7 @@ function _schedule(ms, fn) {
     // result in _timer and guard on `!= null`, and -1 != null is true in JS —
     // so returning it would mark the rule as armed forever and stop it from
     // ever trying again. Report "not scheduled" instead.
-    if (id == null || id < 0) return null;
+    if (id == null || id < 0) { _refused = true; return null; }
     _pending.push(id);
     return id;
 }
@@ -102,10 +102,13 @@ function _unschedule(id) {
 // no next event of their own: refused once, an every() never ticked again, a
 // watchdog fed while the table was full never expired -- the case it exists
 // for -- and an .after() that switches an output off was dropped. They wait
-// here and are tried again each time a slot frees (a timer fires or is
-// cleared), late rather than never. Each entry re-registers itself if it is
-// refused again.
+// here, in order, and are tried again when a slot may have freed (a timer
+// fires or is cleared, an event comes in): late rather than never. An entry
+// answers whether the table took it; the first one refused ends the pass,
+// since the table is full again -- trying the rest would only be refused too.
 var _retryArms = [];
+var _refused = false;        // set by _schedule() when the table said no
+var _retrying = false;       // a pass is running (a clear inside it must not start another)
 var RETRY_CAP = 256;         // every/cron/watchdog queue once each; .after() steps
 var _retryWarned = false;    // pile up under sustained overload -- not without bound
 // first: an every(), cron() or watchdog -- one entry each, and what keeps a
@@ -119,14 +122,30 @@ function _arm_later(fn, first) {
     _retryArms.push(fn);
 }
 function _retry_arms() {
-    if (!_retryArms.length) return;
-    var list = _retryArms;
-    _retryArms = [];
-    _retryWarned = false;
-    for (var i = 0; i < list.length; i++) list[i]();
+    if (_retrying || !_retryArms.length) return;
+    _retrying = true;
+    try {
+        while (_retryArms.length && _retryArms[0]()) _retryArms.shift();
+    } finally { _retrying = false; }
+    if (_retryArms.length < RETRY_CAP) _retryWarned = false;
 }
 function _schedule_retrying(ms, fn) {
-    if (_schedule(ms, fn) == null) _arm_later(function() { _schedule_retrying(ms, fn); });
+    if (_schedule(ms, fn) == null)
+        _arm_later(function() { return _schedule(ms, fn) != null; });
+}
+// For an every(), cron() or watchdog whose own arm the table refused: queued
+// once (o._waiting), and taken off the queue once rearm() got past the table
+// -- armed, or nothing to arm (cron without a valid clock).
+function _rearm_when_free(o, rearm) {
+    if (o._timer != null || o._waiting) return;
+    o._waiting = true;
+    _arm_later(function() {
+        _refused = false;
+        if (o._timer == null) rearm.call(o);   // a refusal in there finds o._waiting set
+        if (_refused) return false;
+        o._waiting = false;
+        return true;
+    }, true);
 }
 function _cancel_all_timers() { while (_pending.length) _unschedule(_pending[0]); }
 
@@ -171,6 +190,7 @@ function _drive_output(ch, v) {
 // Called on rule reload (EVT_RELOAD / simulator "Apply") — drop the rule set and
 // any in-flight timers so stale callbacks can't fire against the old rules.
 function _reset_rules() {
+    _retryArms = [];           // refused arms of the old rules -- before the clears below retry them
     _cancel_all_timers();
     _rules = [];
     _cronTriggers = [];        // timers already cancelled above; drop the old trigger registry
@@ -178,7 +198,6 @@ function _reset_rules() {
     _watchOutputs = false;
     _passes = [];              // a cut-short pass of the old rules has nothing left to visit
     _heldCheck = null;
-    _retryArms = [];           // refused arms of the old rules
     _resetCascade();
 }
 
@@ -236,8 +255,8 @@ function _channel(ch, what) {
     var n = Number(ch);
     if (!isFinite(n) || Math.floor(n) !== n)
         throw new RangeError(what + ' channel must be a whole number, got ' + ch);
-    // The device takes 0-10; anything this far out is a mistake, and the host
-    // truncated to 32 bits, so 4294967296 drove channel 0.
+    // Refused when the rule is built, before a fact key like 'input:4294967296'
+    // exists that no event ever matches; the bindings check the real range.
     if ((what === 'input' || what === 'output') && (n < 0 || n > 255))
         throw new RangeError(what + ' channel out of range: ' + ch);   // pads: pad_arg() in C
     return n;
@@ -460,10 +479,7 @@ IntervalCondition.prototype._arm = function() {
         self._armed = false;
         self._arm();                          // re-arm for the next period
     });
-    if (self._timer == null && !self._retrying) {   // table full: when a slot frees
-        self._retrying = true;
-        _arm_later(function() { self._retrying = false; self._arm(); }, true);
-    }
+    if (self._timer == null) _rearm_when_free(self, self._arm);   // table full: when a slot frees
 };
 
 // ── Cron: cron("min hour dom month dow") — standard 5-field, local time ──
@@ -585,10 +601,7 @@ CronCondition.prototype._arm = function() {
         self._armed = false;
         self._arm();                       // schedule the following occurrence
     });
-    if (self._timer == null && !self._retrying) {   // table full: when a slot frees
-        self._retrying = true;
-        _arm_later(function() { self._retrying = false; self._arm(); }, true);
-    }
+    if (self._timer == null) _rearm_when_free(self, self._arm);   // table full: when a slot frees
 };
 
 // Called by the host (EVT_TIME_SYNC) when SNTP (re)syncs the clock. esp_timer delays are
@@ -662,10 +675,7 @@ Watchdog.prototype._rearm = function() {
         self._timer = null;
         if (self._alive) { self._alive = false; _emit(self._factKey); }   // timed out → expired
     });
-    if (this._timer == null && !this._retrying) {   // table full: when a slot frees
-        this._retrying = true;
-        _arm_later(function() { self._retrying = false; if (self._timer == null) self._rearm(); }, true);
-    }
+    if (this._timer == null) _rearm_when_free(this, this._rearm);   // table full: when a slot frees
 };
 Watchdog.prototype._arm = function() {           // at rule registration; idempotent
     if (this._started) return;
@@ -942,6 +952,7 @@ function _run_action(r) {
 // A heldFor check cut short is set again for another held period.
 function _after_interrupt(resume) {
     _resetCascade();
+    _retrying = false;          // a retry pass the interrupt cut short (its finally skipped)
     for (var f = 0; f < _rules.length; f++) _rules[f]._firing = false;
     var h = _heldCheck;
     _heldCheck = null;

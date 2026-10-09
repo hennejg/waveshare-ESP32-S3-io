@@ -14,15 +14,12 @@ OLD=1 cuts aux_io.c from git (OLDREV, default HEAD).
 
   make -C test/host pwmfail
 """
-import os, pathlib, subprocess
+import pathlib
 from cutter import Source
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-src  = Source(ROOT / "components/board/aux_io.c")
-hdr  = Source(ROOT / "components/board/aux_io.h")
-if os.environ.get("OLD") == "1":
-    src.text = subprocess.run(["git", "show", os.environ.get("OLDREV", "HEAD") + ":components/board/aux_io.c"],
-                              cwd=ROOT, capture_output=True, text=True, check=True).stdout
+src  = Source.at("components/board/aux_io.c")
+hdr  = Source.at("components/board/aux_io.h")
 cuts  = hdr.defines("AUX_PWM_DUTY_MAX") + src.defines("PWM_MODE", "PWM_TIMER", "PWM_CHAN", "PWM_SRC_HZ", "PWM_BITS_MAX")
 cuts += src.func("static uint32_t duty_ticks(uint16_t duty_pm, uint8_t bits)")
 cuts += src.func("static void pwm_put_duty(uint8_t a, uint16_t duty, uint8_t bits)")

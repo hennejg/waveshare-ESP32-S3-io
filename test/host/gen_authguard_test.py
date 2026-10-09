@@ -16,7 +16,7 @@ OLD=1 takes both files from git (OLDREV, default HEAD).
 
   make -C test/host authguard
 """
-import os, pathlib, re, subprocess
+import pathlib, re
 from cutter import Source
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -26,10 +26,7 @@ GUARD = "if (!check_auth(req)) return send_denied(req);"
 
 findings, cuts, calls = [], "", ""
 for app, rel in APPS.items():
-    s = Source(ROOT / rel)
-    if os.environ.get("OLD") == "1":
-        s.text = subprocess.run(["git", "show", "%s:%s" % (os.environ.get("OLDREV", "HEAD"), rel)],
-                                cwd=ROOT, check=True, capture_output=True, text=True).stdout
+    s = Source.at(rel)
     table = s.span("static const httpd_uri_t s_handlers[] = {", "};")
     rows = re.findall(r'\.uri\s*=\s*"([^"]+)",\s*\.method\s*=\s*(\w+),\s*\.handler\s*=\s*(\w+)', table)
     if len(rows) < 10: raise SystemExit("%s: handler table not understood" % rel)

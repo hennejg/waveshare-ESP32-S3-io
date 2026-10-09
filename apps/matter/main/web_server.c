@@ -134,7 +134,6 @@ static bool cross_site(httpd_req_t *req)
     return !o || strcmp(o + 3, host) != 0;              /* "null" has no scheme */
 }
 
-
 /* A device without a password is one that has not been set up yet, and
    until that happens nothing but the setup flow itself may be used: the
    outputs, the rules (which run as code on the device) and the factory

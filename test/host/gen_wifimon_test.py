@@ -18,19 +18,13 @@ OLD=1 cuts wifi_config.c and CMakeLists.txt from git (OLDREV, default HEAD).
 
   make -C test/host wifimon
 """
-import os, pathlib, re, subprocess
-from cutter import Source
+import pathlib, re
+from cutter import Source, show
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 COMP = "components/esp32-wifi-bootstrap"
-src  = Source(ROOT / COMP / "src/wifi_config.c")
-cmk  = (ROOT / COMP / "CMakeLists.txt").read_text()
-if os.environ.get("OLD") == "1":
-    rev = os.environ.get("OLDREV", "HEAD")
-    show = lambda p: subprocess.run(["git", "show", "%s:%s/%s" % (rev, COMP, p)], cwd=ROOT,
-                                    check=True, capture_output=True, text=True).stdout
-    src.text = show("src/wifi_config.c")
-    cmk = show("CMakeLists.txt")
+src  = Source.at(COMP + "/src/wifi_config.c")
+cmk  = show(COMP + "/CMakeLists.txt")
 
 defs = ""
 for m in re.finditer(r"target_compile_definitions\([^)]*?PRIVATE\s+([^)]*)\)", cmk):

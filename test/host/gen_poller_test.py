@@ -384,7 +384,8 @@ types = "".join(src.type(e) for e in (
     "} conn_t;",
     "} job_t;",
 ))
-cuts = "".join(src.func(sig) for sig in (          # C declaration order
+cuts = (src.func("static inline uint8_t slot_state(int i)") if "slot_state(int i)" in src.text else "")
+cuts += "".join(src.func(sig) for sig in (          # C declaration order
     "static void arm_out(int i, uint16_t len)",
     "static bool is_local(uint8_t uid)",
     "static bool flush_out(int i)",

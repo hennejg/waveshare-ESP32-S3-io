@@ -176,6 +176,13 @@ static mb_tcp_stats_t s_stats;
 
 void mb_tcp_server_get_stats(mb_tcp_stats_t *out) { *out = s_stats; }
 
+/* A slot's state as the poller reads it: an acquire load, paired with the
+   worker's release store when it hands the slot back (see worker_task). */
+static inline uint8_t slot_state(int i)
+{
+    return __atomic_load_n(&s_conn[i].state, __ATOMIC_ACQUIRE);
+}
+
 /* ------------------------------------------------------------------ workers */
 
 /* Says that the answer already written into the connection's out buffer is
@@ -349,6 +356,20 @@ static uint16_t build_busy(const uint8_t *frame, uint8_t *out)
     return mb_mbap_write(out, frame, frame[6], pdu);
 }
 
+/* The slot that has been quiet longest and may be taken over, or -1. Only
+   the poller's own slots: one a worker holds is busy by definition. */
+static int oldest_idle(int64_t now)
+{
+    int best = -1;
+    for (int i = 0; i < MB_TCP_MAX_CONN; i++) {
+        const conn_t *c = &s_conn[i];
+        if (slot_state(i) != SLOT_IDLE || c->got || c->out_len) continue;
+        if (now - c->last_use_us < (int64_t)EVICT_IDLE_MS * 1000) continue;
+        if (best < 0 || c->last_use_us < s_conn[best].last_use_us) best = i;
+    }
+    return best;
+}
+
 /* Takes one waiting connection and says whether there may be another, so
    the caller can drain the queue in one visit.
 
@@ -358,20 +379,6 @@ static uint16_t build_busy(const uint8_t *frame, uint8_t *out)
    wire a reset, then a repeated SYN-ACK, then the answer, and the client saw
    only the reset. 0.2 % of connections, with nothing else running. The
    receive path already reads until EAGAIN for the same reason. */
-/* The slot that has been quiet longest and may be taken over, or -1. Only
-   the poller's own slots: one a worker holds is busy by definition. */
-static int oldest_idle(int64_t now)
-{
-    int best = -1;
-    for (int i = 0; i < MB_TCP_MAX_CONN; i++) {
-        const conn_t *c = &s_conn[i];
-        if (c->state != SLOT_IDLE || c->got || c->out_len) continue;
-        if (now - c->last_use_us < (int64_t)EVICT_IDLE_MS * 1000) continue;
-        if (best < 0 || c->last_use_us < s_conn[best].last_use_us) best = i;
-    }
-    return best;
-}
-
 static bool accept_one(void)
 {
     struct sockaddr_in peer;
@@ -526,7 +533,7 @@ static void sweep_deadlines(void)
 {
     int64_t now = esp_timer_get_time();
     for (int i = 0; i < MB_TCP_MAX_CONN; i++) {
-        if (__atomic_load_n(&s_conn[i].state, __ATOMIC_ACQUIRE) != SLOT_IDLE) continue;
+        if (slot_state(i) != SLOT_IDLE) continue;
 
         if (s_conn[i].out_len && now > s_conn[i].out_deadline_us) {
             ESP_LOGW(TAG, "slot %d: answer not taken within %d ms — closing",
@@ -553,7 +560,7 @@ static void poller_task(void *arg)
         bool partial = false;
 
         for (int i = 0; i < MB_TCP_MAX_CONN; i++) {
-            if (__atomic_load_n(&s_conn[i].state, __ATOMIC_ACQUIRE) != SLOT_IDLE) continue;
+            if (slot_state(i) != SLOT_IDLE) continue;
 
             if (s_conn[i].fd > maxfd) maxfd = s_conn[i].fd;
 
@@ -601,12 +608,12 @@ static void poller_task(void *arg)
         /* Outgoing first: a connection waiting to be written to is holding a
            buffer and a deadline, and finishing it frees both. */
         for (int i = 0; i < MB_TCP_MAX_CONN; i++)
-            if (__atomic_load_n(&s_conn[i].state, __ATOMIC_ACQUIRE) == SLOT_IDLE && s_conn[i].out_len &&
+            if (slot_state(i) == SLOT_IDLE && s_conn[i].out_len &&
                 FD_ISSET(s_conn[i].fd, &wr) && !flush_out(i))
                 close_slot(i);
 
         for (int i = 0; i < MB_TCP_MAX_CONN; i++)
-            if (__atomic_load_n(&s_conn[i].state, __ATOMIC_ACQUIRE) == SLOT_IDLE && !s_conn[i].out_len &&
+            if (slot_state(i) == SLOT_IDLE && !s_conn[i].out_len &&
                 FD_ISSET(s_conn[i].fd, &rd))
                 pump_slot(i);
 

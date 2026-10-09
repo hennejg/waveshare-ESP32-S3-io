@@ -18,15 +18,10 @@ extern const char dsl_js_start[] asm("_binary_dsl_js_start");
 
 #define TAG              "scripting"
 
-/* In PSRAM, explicitly: xTaskCreate() takes a stack from internal RAM
-   whatever its size (the comment here used to say otherwise), and internal
-   RAM is what the board runs short of -- about 34 KB free with this task's
-   48 KB taken from it. QuickJS interprets a JS call by recursing in C, and
-   on this core one output-to-rule-to-output step of a cascade costs about
-   7 KB of stack: the old 16 KB JS limit overflowed at the second step,
-   long before CASCADE_CAP (16). A task with its stack in PSRAM must not
-   touch the flash itself (the cache is off meanwhile), so storing the rules
-   goes through store_task below. */
+/* In PSRAM (xTaskCreateWithCaps): internal RAM is what the board runs short
+   of. QuickJS recurses in C per JS call, about 7 KB per step of an output
+   cascade, so this holds CASCADE_CAP (16) steps. NVS writes cannot run on a
+   PSRAM stack: storing the rules goes through store_task. */
 #define TASK_STACK_BYTES (160 * 1024)
 #define TASK_PRIORITY    3
 #define QUEUE_DEPTH      16
@@ -397,7 +392,6 @@ static const JSMallocFunctions s_psram_alloc = {
 
 /* ── JS helpers ──────────────────────────────────────────────────────────── */
 
-
 /* Same as eval_or_log(), but says whether it worked and hands back the error
    so the caller can report it rather than only logging it. */
 static bool eval_check(JSContext *ctx, const char *src, const char *name,
@@ -487,6 +481,7 @@ static inline void budget_start(void)
    Says whether it ran over. */
 static bool drain_jobs(JSRuntime *rt)
 {
+    if (!JS_IsJobPending(rt)) return false;      /* the usual case: nothing queued */
     bool before = s_interrupted;
     s_interrupted = false;
     budget_start();

@@ -13,14 +13,11 @@ OLD=1 cuts auth.c from git (OLDREV, default HEAD).
 
   make -C test/host pwhash
 """
-import os, pathlib, subprocess
+import pathlib
 from cutter import Source
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-src  = Source(ROOT / "components/board/auth.c")
-if os.environ.get("OLD") == "1":
-    src.text = subprocess.run(["git", "show", os.environ.get("OLDREV", "HEAD") + ":components/board/auth.c"],
-                              cwd=ROOT, capture_output=True, text=True, check=True).stdout
+src  = Source.at("components/board/auth.c")
 new = "static esp_err_t store_password(const char *pw)" in src.text
 a = src.text.index("typedef struct {")
 b = src.text.index("/* ---------------------------------------------------------------- token */")
@@ -35,6 +32,7 @@ HARNESS = r"""
 #include <string.h>
 #include "mbedtls/md.h"
 #include "mbedtls/pkcs5.h"
+#include "mbedtls/constant_time.h"
 
 typedef int esp_err_t;
 #define ESP_OK 0

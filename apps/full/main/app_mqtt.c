@@ -56,6 +56,10 @@ static void publish_health(void)
     cJSON_AddBoolToObject(o, "online", true);
     cJSON_AddStringToObject(o, "device", cfg->device_name);
     cJSON_AddNumberToObject(o, "uptime_s", (double)(esp_timer_get_time() / 1000000LL));
+    /* Internal RAM, now and the least since boot: task stacks, DMA and the
+       network buffers come out of it, and it is what runs out first. */
+    cJSON_AddNumberToObject(o, "heap_internal_free", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    cJSON_AddNumberToObject(o, "heap_internal_min",  heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
     /* The least stack each task that publishes has had left so far, in
        bytes: a publish runs the transport write on the caller's stack, and
        with mqtts:// that is an mbedtls record write. Watched here because a
@@ -63,10 +67,6 @@ static void publish_health(void)
     static const char *const k_publishers[] = {
         "di", "dout_pub", "aux", "scripting", "mb_cmd", "can", "mqtt_health", "httpd",
     };
-    /* Internal RAM, now and the least since boot: task stacks, DMA and the
-       network buffers come out of it, and it is what runs out first. */
-    cJSON_AddNumberToObject(o, "heap_internal_free", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-    cJSON_AddNumberToObject(o, "heap_internal_min",  heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
     cJSON *sf = cJSON_AddObjectToObject(o, "stack_free");
     for (size_t i = 0; sf && i < sizeof(k_publishers) / sizeof(k_publishers[0]); i++) {
         TaskHandle_t h = xTaskGetHandle(k_publishers[i]);

@@ -282,8 +282,8 @@ static esp_err_t matter_provision_if_needed(void)
 
 esp_err_t matter_init(void)
 {
-    /* Provision unique credentials on first boot before starting the stack */
-    /* Fail closed. Started anyway, the stack would come up with the public
+    /* Provision unique credentials on first boot, before the stack starts.
+       Fail closed. Started anyway, the stack would come up with the public
        test passcode (20202021), and anyone in range could commission the
        device. Without Matter the board still runs; the next boot tries the
        provisioning again. */
