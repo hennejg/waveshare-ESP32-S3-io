@@ -388,7 +388,10 @@ esp_err_t matter_init(void)
         s_manual_code[man_span.size()] = '\0';
     }
 
-    PrintOnboardingCodes(rvFlags);
+    /* Not PrintOnboardingCodes(): both codes carry the setup passcode, and
+       that would put them on the console of every boot. They are shown in
+       the web UI, behind its password. */
+    ESP_LOGI(TAG, "Pairing codes: web UI, Matter tab");
 
     return ESP_OK;
 }

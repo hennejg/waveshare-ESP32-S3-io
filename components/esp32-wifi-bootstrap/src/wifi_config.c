@@ -111,26 +111,32 @@ static void sdk_wifi_station_set_auto_connect(bool en) {
         safe_set_auto_connect(en);
 }
 
-static void sysparam_init(void) {
+/* Retried on the next use when the namespace could not be opened, rather
+   than going on with a handle that every read and write then fails on. */
+static esp_err_t sysparam_init(void) {
         static bool initialized = false;
         if (!initialized) {
                 nvs_flash_init();
-                nvs_open("wifi_cfg", NVS_READWRITE, &wifi_cfg_handle);
+                esp_err_t r = nvs_open("wifi_cfg", NVS_READWRITE, &wifi_cfg_handle);
+                if (r != ESP_OK) return r;
                 initialized = true;
         }
+        return ESP_OK;
 }
 
-static void sysparam_set_string(const char *key, const char *value) {
-        sysparam_init();
+static esp_err_t sysparam_set_string(const char *key, const char *value) {
+        esp_err_t r = sysparam_init();
+        if (r != ESP_OK) return r;
         if (!value) value = "";
-        nvs_set_str(wifi_cfg_handle, key, value);
-        nvs_commit(wifi_cfg_handle);
+        r = nvs_set_str(wifi_cfg_handle, key, value);
+        if (r == ESP_OK) r = nvs_commit(wifi_cfg_handle);
+        return r;
 }
 
 static void sysparam_get_string(const char *key, char **value) {
-        sysparam_init();
         size_t required = 0;
-        if (nvs_get_str(wifi_cfg_handle, key, NULL, &required) == ESP_OK && required > 0) {
+        if (sysparam_init() == ESP_OK &&
+            nvs_get_str(wifi_cfg_handle, key, NULL, &required) == ESP_OK && required > 0) {
                 *value = malloc(required);
                 nvs_get_str(wifi_cfg_handle, key, *value, &required);
         } else {
@@ -402,6 +408,35 @@ static void wifi_scan_task(void *arg)
 
 #include "index.html.h"
 
+/* Writes the first max_in bytes of in to out as HTML text. SSIDs come from
+   whatever access point is in range and are put into the setup page: as
+   they are, a 21-character SSID like <svg/onload=...> is markup, and runs
+   script on the page the WiFi password is typed into. out is always
+   terminated; what does not fit whole is left off. */
+static void html_escape(char *out, size_t cap, const char *in, size_t max_in) {
+        size_t o = 0;
+        for (size_t i = 0; i < max_in && in[i]; i++) {
+                const char *e;
+                char one[2] = { in[i], 0 };
+                switch (in[i]) {
+                case '&':  e = "&amp;";  break;
+                case '<':  e = "&lt;";   break;
+                case '>':  e = "&gt;";   break;
+                case '"':  e = "&quot;"; break;
+                case '\'': e = "&#39;";  break;
+                default:   e = one;      break;
+                }
+                size_t n = strlen(e);
+                if (o + n >= cap) break;
+                memcpy(out + o, e, n);
+                o += n;
+        }
+        out[o] = 0;
+}
+
+/* An SSID is at most 32 bytes, each at most 6 once escaped. */
+#define SSID_HTML_MAX (32 * 6 + 1)
+
 static void wifi_config_server_on_settings(client_t *client) {
         static const char http_prologue[] =
                 "HTTP/1.1 200 \r\n"
@@ -425,13 +460,15 @@ static void wifi_config_server_on_settings(client_t *client) {
         client_send_chunk(client, html_settings_body);
 
         if (xSemaphoreTake(wifi_networks_mutex, 5000 / portTICK_PERIOD_MS)) {
-                char buffer[64];
+                char ssid[SSID_HTML_MAX];
+                char buffer[SSID_HTML_MAX + 64];
                 wifi_network_info_t *net = wifi_networks;
                 while (net) {
+                        html_escape(ssid, sizeof(ssid), net->ssid, sizeof(net->ssid));
                         snprintf(
                                 buffer, sizeof(buffer),
                                 html_network_item,
-                                net->secure ? "secure" : "unsecure", net->ssid
+                                net->secure ? "secure" : "unsecure", ssid
                                 );
                         client_send_chunk(client, buffer);
 
@@ -462,8 +499,23 @@ static void wifi_config_server_on_settings(client_t *client) {
 }
 
 
+/* Two NVS keys cannot be written as one. The SSID is cleared first and set
+   last, so a write that fails part way leaves no SSID -- which brings the
+   setup AP back -- instead of the new password next to the old network. */
+static esp_err_t store_credentials(const char *ssid, const char *password) {
+        esp_err_t r = sysparam_set_string("wifi_ssid", "");
+        if (r == ESP_OK) r = sysparam_set_string("wifi_password", password);
+        if (r == ESP_OK) r = sysparam_set_string("wifi_ssid", ssid);
+        if (r != ESP_OK) ERROR("Storing the WiFi credentials failed: %s", esp_err_to_name(r));
+        return r;
+}
+
 static void wifi_config_server_on_settings_update(client_t *client) {
-        DEBUG("Update settings, body = %s", client->body);
+        /* A POST without a body (Content-Length: 0) never allocates one. */
+        if (!client->body) {
+                client_send_redirect(client, 302, "/settings");
+                return;
+        }
 
         form_param_t *form = form_params_parse((char *)client->body);
         if (!form) {
@@ -481,16 +533,31 @@ static void wifi_config_server_on_settings_update(client_t *client) {
                 return;
         }
 
-        DEBUG("Setting wifi_ssid param = %s", ssid_param->value);
-        DEBUG("Setting wifi_password param = %s", password_param ? password_param->value : "(none)");
+        char ssid[SSID_HTML_MAX];
+        html_escape(ssid, sizeof(ssid), ssid_param->value ? ssid_param->value : "", 32);
+        esp_err_t stored = store_credentials(ssid_param->value, password_param ? password_param->value : "");
+        form_params_free(form);
 
-        sysparam_set_string("wifi_ssid", ssid_param->value);
-        sysparam_set_string("wifi_password", password_param ? password_param->value : "");
+        if (stored != ESP_OK) {
+                /* No reboot: nothing new to boot into, and the page stays
+                   where the user can try again. */
+                static const char failed[] =
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
+                        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                        "<title>Not saved</title></head>"
+                        "<body style='font-family:sans-serif;text-align:center;padding:2rem'>"
+                        "<h2>Credentials could not be saved</h2>"
+                        "<p><a href='/settings'>Try again</a></p>"
+                        "</body></html>";
+                write(client->fd, failed, sizeof(failed) - 1);
+                return;
+        }
 
         /* Send a confirmation page before rebooting so the user sees feedback.
          * Reboot is cleaner than a live APSTA→STA transition: avoids mode-change
          * errors and ensures WiFi starts fresh in STA-only mode. */
-        char html[768];
+        char html[768 + SSID_HTML_MAX];
         snprintf(html, sizeof(html),
                  "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
                  "<!DOCTYPE html><html><head>"
@@ -499,12 +566,11 @@ static void wifi_config_server_on_settings_update(client_t *client) {
                  "<title>Connecting</title></head>"
                  "<body style='font-family:sans-serif;text-align:center;padding:2rem'>"
                  "<h2>Credentials saved</h2>"
-                 "<p>Rebooting &mdash; will connect to <strong>%.32s</strong>.</p>"
+                 "<p>Rebooting &mdash; will connect to <strong>%s</strong>.</p>"
                  "<p style='color:#888;font-size:.85rem'>"
                  "To change WiFi: hold the BOOT button for &ge;&nbsp;5&nbsp;s.</p>"
                  "</body></html>",
-                 ssid_param->value);
-        form_params_free(form);
+                 ssid);
 
         write(client->fd, html, strlen(html));
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -777,7 +843,8 @@ static void http_task(void *arg) {
                         int len = lwip_read(fd, data, sizeof(data) - 1);
                         if (len > 0) {
                                 data[len] = '\0';
-                                INFO("HTTP rx fd=%d len=%d [%.*s]", fd, len, len, data);
+                                /* Only the length: the data is the setup form, WiFi password included. */
+                                INFO("HTTP rx fd=%d len=%d", fd, len);
                                 if (!client->disconnected) {
                                         if (!handle_get_request(client, data, len)) {
                                                 /* Not a complete GET — run http_parser (handles POST body) */
@@ -1216,9 +1283,10 @@ void wifi_config_init2(const char *ssid_prefix, const char *password,
 }
 
 
-void wifi_config_reset() {
-        sysparam_set_string("wifi_ssid", "");
-        sysparam_set_string("wifi_password", "");
+esp_err_t wifi_config_reset() {
+        esp_err_t r = sysparam_set_string("wifi_ssid", "");     /* the one that counts */
+        esp_err_t p = sysparam_set_string("wifi_password", "");
+        return r != ESP_OK ? r : p;
 }
 
 
@@ -1231,9 +1299,8 @@ void wifi_config_get(char **ssid, char **password) {
 }
 
 
-void wifi_config_set(const char *ssid, const char *password) {
-        sysparam_set_string("wifi_ssid", ssid);
-        sysparam_set_string("wifi_password", password);
+esp_err_t wifi_config_set(const char *ssid, const char *password) {
+        return store_credentials(ssid, password);
 }
 
 void wifi_config_set_custom_html(char *html) {

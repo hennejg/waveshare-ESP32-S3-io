@@ -9,6 +9,7 @@ void scripting_on_time_sync(void);
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include <string.h>
 #include <time.h>
 #include <sys/time.h>
 
@@ -44,10 +45,19 @@ static void on_time_synced(struct timeval *tv)
 #endif
 }
 
+/* The server SNTP runs with while s_started. Every configuration save calls
+   sntp_sync_apply(), renaming an input included; a restart then drops a
+   sync that is under way and sends a fresh request to the server for
+   nothing. */
+static char s_server[APP_CFG_SNTP_SERVER_LEN];
+
 static void apply_locked(void)
 {
     const app_config_t *cfg = app_config_get();
+    const char *server = cfg->sntp.server[0] ? cfg->sntp.server : "pool.ntp.org";
 
+    if (s_started && cfg->sntp.enable && !strcmp(server, s_server))
+        return;               /* running as configured */
     if (s_started) {          /* tear down so a server/enable change applies cleanly */
         esp_netif_sntp_deinit();
         s_started = false;
@@ -57,7 +67,6 @@ static void apply_locked(void)
         return;
     }
 
-    const char *server = cfg->sntp.server[0] ? cfg->sntp.server : "pool.ntp.org";
     esp_sntp_config_t scfg = ESP_NETIF_SNTP_DEFAULT_CONFIG(server);
     scfg.start   = true;
     scfg.sync_cb = on_time_synced;
@@ -65,6 +74,7 @@ static void apply_locked(void)
     esp_err_t ret = esp_netif_sntp_init(&scfg);
     if (ret == ESP_OK) {
         s_started = true;
+        strlcpy(s_server, server, sizeof(s_server));
         ESP_LOGI(TAG, "SNTP started (server=%s)", server);
     } else {
         ESP_LOGE(TAG, "SNTP init failed: %s", esp_err_to_name(ret));

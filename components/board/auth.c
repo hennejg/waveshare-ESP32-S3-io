@@ -94,11 +94,12 @@ static void compute_hash(const uint8_t *salt, const char *pw, uint8_t out[32])
     mbedtls_md_free(&ctx);
 }
 
-static void derive(const uint8_t *salt, uint32_t iter, const char *pw, uint8_t out[32])
+/* False when mbedTLS failed (out of memory): out is then no hash of
+   anything, and must be neither stored nor compared. */
+static bool derive(const uint8_t *salt, uint32_t iter, const char *pw, uint8_t out[32])
 {
-    if (mbedtls_pkcs5_pbkdf2_hmac_ext(MBEDTLS_MD_SHA256, (const unsigned char *)pw, strlen(pw),
-                                      salt, 16, iter, 32, out) != 0)
-        esp_fill_random(out, 32);      /* matches nothing rather than something */
+    return mbedtls_pkcs5_pbkdf2_hmac_ext(MBEDTLS_MD_SHA256, (const unsigned char *)pw, strlen(pw),
+                                         salt, 16, iter, 32, out) == 0;
 }
 
 /* Compares in time that does not depend on where the first difference is. */
@@ -162,7 +163,10 @@ static esp_err_t store_password(const char *pw)
        next reboot and to another after it, while the caller was told ok. */
     auth_cred_t c = { .version = CRED_V2, .iterations = AUTH_PBKDF2_ITER };
     esp_fill_random(c.salt, sizeof(c.salt));
-    derive(c.salt, c.iterations, pw, c.hash);
+    if (!derive(c.salt, c.iterations, pw, c.hash)) {
+        ESP_LOGE(TAG, "deriving the password hash failed");
+        return ESP_FAIL;
+    }
 
     nvs_handle_t h;
     esp_err_t r = nvs_open(NVS_NS, NVS_READWRITE, &h);
@@ -205,8 +209,7 @@ bool auth_check_password(const char *pw)
             return true;
         }
     } else {
-        derive(s_pw_salt, s_pw_iter, pw, test);
-        ok = same(test, s_pw_hash, 32);
+        ok = derive(s_pw_salt, s_pw_iter, pw, test) && same(test, s_pw_hash, 32);
         /* Stored with another iteration count: brought to the current one. */
         if (ok && s_pw_iter != AUTH_PBKDF2_ITER && store_password(pw) == ESP_OK) return true;
     }

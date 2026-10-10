@@ -80,6 +80,7 @@ char *url_unescape(const char *buffer, size_t size) {
 
 form_param_t *form_params_parse(const char *s) {
         form_param_t *params = NULL;
+        if (!s) return NULL;
 
         int i = 0;
         while (s[i]) {

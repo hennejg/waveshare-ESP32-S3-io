@@ -56,6 +56,16 @@ static esp_err_t nvs_set_blob(nvs_handle_t h, const char *k, const void *v, size
 static esp_err_t nvs_commit(nvs_handle_t h) { (void)h; return ESP_OK; }
 static void nvs_close(nvs_handle_t h) { (void)h; }
 
+/* mbedTLS running out of memory, on demand. */
+static int pbkdf2_fail;
+static int pbkdf2_maybe_fail(mbedtls_md_type_t t, const unsigned char *p, size_t pl, const unsigned char *s,
+                             size_t sl, unsigned int it, uint32_t kl, unsigned char *out)
+{
+    if (pbkdf2_fail) return MBEDTLS_ERR_MD_ALLOC_FAILED;
+    return mbedtls_pkcs5_pbkdf2_hmac_ext(t, p, pl, s, sl, it, kl, out);
+}
+#define mbedtls_pkcs5_pbkdf2_hmac_ext pbkdf2_maybe_fail
+
 __CUT__
 
 static esp_err_t token_init(void) { return ESP_OK; }
@@ -107,6 +117,18 @@ int main(void)
     REBOOT();
     CHECK(auth_check_password("NeuesPasswort!") && !auth_check_password("geheim123"), "neues Passwort nach Neustart nicht gueltig oder altes noch gueltig");
     if (failures == f0) printf("  neues Passwort: PBKDF2-HMAC-SHA256, %u Iterationen, gilt nach Neustart\n", iter);
+
+    /* The derivation fails while a new password is set. */
+    f0 = failures;
+    pbkdf2_fail = 1;
+    int r = auth_set_password("Kaputt#1");
+    pbkdf2_fail = 0;
+    CHECK(r != ESP_OK, "fehlgeschlagene Ableitung als Erfolg gemeldet");
+    CHECK(!auth_check_password("Kaputt#1"), "nicht gespeichertes Passwort gilt (RAM-Cache)");
+    REBOOT();
+    CHECK(auth_check_password("NeuesPasswort!"), "nach fehlgeschlagener Ableitung und Neustart: bisheriges Passwort abgelehnt");
+    CHECK(!auth_check_password("Kaputt#1"), "nach Neustart: nicht gespeichertes Passwort gilt");
+    if (failures == f0) printf("  fehlgeschlagene Ableitung: Aenderung abgelehnt, altes Passwort gilt weiter\n");
 
     printf("%s\n", failures ? "FEHLER" : "alles in Ordnung");
     return failures ? 1 : 0;

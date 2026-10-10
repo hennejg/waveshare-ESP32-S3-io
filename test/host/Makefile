@@ -11,8 +11,8 @@ PORT ?= 15020
 
 # Every target below; GEN are the ones a gen_<name>_test.py writes as
 # test_<name>.c and builds into test_<name>.
-TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail
-GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail
+TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply
+GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply
 
 .PHONY: all clean $(TESTS)
 all: test_mb_pdu $(TESTS)
@@ -172,6 +172,24 @@ test_authguard: gen_authguard_test.py $(MAIN)/web_server.c ../../apps/matter/mai
 
 # The WiFi bootstrap's link monitor and portal routing, cut out of wifi_config.c
 # and compiled with the definitions its CMakeLists.txt sets.
+# The WiFi setup portal's settings page and POST, cut out of wifi_config.c,
+# with form_urlencoded.c and the page templates as they are.
+WIFI := ../../components/esp32-wifi-bootstrap
+wifiportal: test_wifiportal
+	./test_wifiportal
+
+test_wifiportal: gen_wifiportal_test.py $(WIFI)/src/wifi_config.c $(WIFI)/src/form_urlencoded.c $(WIFI)/content/index.html.h
+	python3 gen_wifiportal_test.py
+	$(CC) $(CFLAGS) -I$(WIFI)/src -I$(WIFI)/content -Wno-unused-function -Wno-unused-parameter -Wno-unused-variable test_wifiportal.c -o $@
+
+# When a configuration save restarts SNTP, cut out of sntp_sync.c.
+sntpapply: test_sntpapply
+	./test_sntpapply
+
+test_sntpapply: gen_sntpapply_test.py ../../components/board/sntp_sync.c
+	python3 gen_sntpapply_test.py
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter test_sntpapply.c -o $@
+
 wifimon: test_wifimon
 	./test_wifimon
 

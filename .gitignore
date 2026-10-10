@@ -74,3 +74,7 @@ dependencies.lock
 /test/host/test_reseterr.c
 /test/host/test_pwmfail
 /test/host/test_pwmfail.c
+/test/host/test_wifiportal
+/test/host/test_wifiportal.c
+/test/host/test_sntpapply
+/test/host/test_sntpapply.c
