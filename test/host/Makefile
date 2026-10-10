@@ -11,8 +11,8 @@ PORT ?= 15020
 
 # Every target below; GEN are the ones a gen_<name>_test.py writes as
 # test_<name>.c and builds into test_<name>.
-TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic cfgpost portalconn cantx
-GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic cfgpost portalconn cantx
+TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic cfgpost portalconn cantx mqttstate
+GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic cfgpost portalconn cantx mqttstate
 
 .PHONY: all clean $(TESTS)
 all: test_mb_pdu $(TESTS)
@@ -48,6 +48,14 @@ test_pwhash: gen_pwhash_test.py ../../components/board/auth.c $(MBT_OBJ)
 
 # The NMEA 2000 heartbeat as it goes on the bus, cut out of can_server.c.
 # What the CAN server sends on its own, cut out of can_server.c.
+# How the rule engine learns the broker state, cut out of scripting.c.
+mqttstate: test_mqttstate
+	./test_mqttstate
+
+test_mqttstate: gen_mqttstate_test.py ../../components/scripting/scripting.c
+	python3 gen_mqttstate_test.py
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter test_mqttstate.c -o $@
+
 cantx: test_cantx
 	./test_cantx
 

@@ -91,3 +91,5 @@ dependencies.lock
 /test/host/test_portalconn.c
 /test/host/test_cantx
 /test/host/test_cantx.c
+/test/host/test_mqttstate
+/test/host/test_mqttstate.c

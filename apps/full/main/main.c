@@ -133,11 +133,12 @@ static void set_eth_only(bool on)
 /* --------------------------------------------------------- MQTT callbacks */
 
 /* Feed the rule engine the broker connection state as an internal '$sys/mqtt'
- * message ("up"/"down"), so rules can gate on mqttConnected()/mqttDown(). Injected
- * locally via the normal message path — never published to or read from the broker. */
+ * message ("up"/"down"), so rules can gate on mqttConnected()/mqttDown(). Local
+ * only -- never published to or read from the broker -- and kept as state by the
+ * engine, so a full event queue cannot lose it. */
 static void scripting_feed_mqtt_state(const char *state)
 {
-    scripting_on_mqtt_message("$sys/mqtt", 9, state, strlen(state));
+    scripting_on_mqtt_state(!strcmp(state, "up"));
 }
 
 static void on_mqtt_connected(void)

@@ -245,7 +245,8 @@ rule('DO1 follows DO0')
 
 > **Feedback loops are bounded.** Because outputs are written *by* rules, output→output
 > chains can feed back on themselves. The engine caps the cascade at **16 hops per
-> triggering event**; if exceeded it logs a warning and stops, so a runaway loop can't
+> triggering event** (and, against wide fan-out, 256 changes in all); if exceeded it
+> logs a warning and stops, so a runaway loop can't
 > wedge the engine (or trip the device watchdog). Writing an output to the value it
 > already holds is a no-op and emits no event.
 
@@ -601,6 +602,10 @@ Place it **before** `.then()`. The action fires only if the `when()` conditions 
 true continuously for `ms` milliseconds. If they break first, the timer is cancelled.
 It fires **once per sustained period** (it re-arms after the conditions drop and rise
 again).
+
+`heldFor()` needs conditions that *stay* true. An edge — `mqtt(topic).once()`,
+`every()`, `cron()` — is true only for the instant it fires, never when the held period
+ends, so combining them throws an error when the rule is built.
 
 ```js
 // DO5 turns on only after DI5 has been high continuously for 5 seconds.

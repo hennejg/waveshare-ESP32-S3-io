@@ -156,23 +156,34 @@ function _cancel_all_timers() { while (_pending.length) _unschedule(_pending[0])
 // firing resets it). When the budget is exhausted the cascade stops with a logged
 // warning instead of looping forever — important on-device, where an unbounded loop
 // would block the scripting task and trip the watchdog.
+//
+// CASCADE_CAP is the depth -- how many hops one change may chain through, as
+// documented. It used to count every change of the event instead: one action
+// setting 20 watched facts fired only 16 rules, and the 17th top-level
+// fact.set() of a script was dropped while it loaded. The total cap is the
+// backstop for wide fan-out, which depth alone does not bound.
 var CASCADE_CAP = 16;
-var _cascade = 0;
+var CASCADE_TOTAL_CAP = 256;
+var _cascade = 0;            // current depth
+var _cascadeTotal = 0;       // changes emitted for this triggering event
 var _cascadeWarned = false;
 var _watchOutputs = false;   // does any rule reference an output fact / is wildcard?
 
-function _resetCascade() { _cascade = 0; _cascadeWarned = false; }
+function _resetCascade() { _cascade = 0; _cascadeTotal = 0; _cascadeWarned = false; }
 
 function _emit(factKey) {
-    if (_cascade >= CASCADE_CAP) {
+    if (_cascade >= CASCADE_CAP || _cascadeTotal >= CASCADE_TOTAL_CAP) {
         if (!_cascadeWarned) {
             _cascadeWarned = true;
-            print('[rules] cascade limit (' + CASCADE_CAP + ') reached — stopping (output feedback loop?)');
+            print('[rules] cascade limit (' + (_cascade >= CASCADE_CAP ? CASCADE_CAP + ' hops'
+                  : CASCADE_TOTAL_CAP + ' changes') + ') reached — stopping (output feedback loop?)');
         }
         return;
     }
     _cascade++;
-    _fire_matching(factKey, true);   // cascade pass — does NOT reset the budget
+    _cascadeTotal++;
+    try { _fire_matching(factKey, true); }   // cascade pass — does NOT reset the budget
+    finally { _cascade--; }                  // skipped by the budget's interrupt; the next event resets
 }
 
 // Drive an output through the host binding; emit only on an actual change, and only
@@ -806,8 +817,22 @@ RuleBuilder.prototype.when = function() {
 RuleBuilder.prototype.heldFor = function(ms) {
     this._heldFor = ms;
     if (this._rule) this._rule.heldFor = ms;
+    _check_held_edges(this);
     return this;
 };
+
+// An edge -- mqtt().once(), every(), cron() -- is true only during the pass
+// it triggers, never when the held period runs out: such a rule never fired,
+// and nothing said why. Refused when the rule is built, in either order.
+function _check_held_edges(b) {
+    if (!(b._heldFor > 0)) return;
+    for (var i = 0; i < b._conditions.length; i++) {
+        var c = b._conditions[i];
+        if ((c instanceof MqttCondition && c._once) || c instanceof IntervalCondition || c instanceof CronCondition)
+            throw new Error('rule "' + b.name + '": heldFor() cannot be combined with once(), every() or cron() -- ' +
+                            'an edge is never still true when the held period ends');
+    }
+}
 // No-loop (Drools-style): the rule will not be re-fired by changes its OWN action
 // causes — directly or through the cascade it triggers. Other rules still react to
 // its writes, and it still fires on later, independent events. Order-independent.
@@ -823,6 +848,7 @@ RuleBuilder.prototype.after = function(ms) {
     return this;
 };
 RuleBuilder.prototype.then = function(fn) {
+    _check_held_edges(this);
     this._steps.push({ delay: this._nextDelay, fn: fn });
     this._nextDelay = 0;
     if (!this._rule) {
@@ -864,8 +890,21 @@ function _run_steps(r, idx) {
     if (idx >= r.steps.length) return;
     var step = r.steps[idx];
     var go = function() {
+        // A delayed next step is armed before this one runs. The budget's
+        // interrupt cannot be caught here: when it landed in step.fn the rest
+        // of the timeline went with it -- an output switched on by step 0
+        // stayed on, its "off" never armed.
+        var next = r.steps[idx + 1];
+        var armedNext = !!next && next.delay > 0;
+        if (armedNext) _run_steps(r, idx + 1);
+        // A delayed step runs from its timer, outside _run_action and its
+        // no-loop guard: a .noLoop() rule's own .after() step re-fired it
+        // (on, off, on, ... for good). The guard is taken here for it.
+        var guard = r.noLoop && !r._firing;
+        if (guard) r._firing = true;
         try { step.fn(); } catch (e) { _log_rule_error(r, 'error', e); }
-        _run_steps(r, idx + 1);
+        finally { if (guard) r._firing = false; }
+        if (!armedNext) _run_steps(r, idx + 1);
     };
     if (step.delay > 0) _schedule_retrying(step.delay, go);
     else go();

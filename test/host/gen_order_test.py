@@ -29,8 +29,15 @@ src  = Source(ROOT / "components/scripting/scripting.c")
 cuts  = src.span("static SemaphoreHandle_t s_send_lock;", "    return seq <= s_input_mark[ch & 31];\n}")
 cuts += src.span("#define TIMER_OVERFLOW_SLOTS", "static volatile uint8_t  s_of_head, s_of_tail;")
 cuts += src.func("static void timer_fired_cb(void *arg)")
-cuts += src.span("static volatile uint8_t s_pending;", "#define PENDING_TZ_CHANGE  0x02u")
-cuts += src.func("static void deliver_pending(JSContext *ctx, JSValue on_time_sync)")
+if "JSValue on_time_sync, JSValue on_mqtt)" in src.text:
+    # Since the broker state is latched as well: deliver_pending() also takes on_mqtt.
+    cuts += src.span("static volatile uint8_t s_pending;", "static volatile bool s_mqtt_known;      /* a state was ever reported */")
+    cuts += src.func("static void deliver_pending(JSContext *ctx, JSValue on_time_sync, JSValue on_mqtt)")
+    deliver = "(void)s_mqtt_known; deliver_pending(NULL, 0, 0);"
+else:
+    cuts += src.span("static volatile uint8_t s_pending;", "#define PENDING_TZ_CHANGE  0x02u")
+    cuts += src.func("static void deliver_pending(JSContext *ctx, JSValue on_time_sync)")
+    deliver = "deliver_pending(NULL, 0);"
 cuts += src.func("static void drain_overflow(JSContext *ctx)")
 cuts += src.func("void scripting_on_time_sync(void)")
 
@@ -94,6 +101,8 @@ static BaseType_t xQueueSend(QueueHandle_t q, const scripting_evt_t *e, int t)
     Q.e[(Q.h + Q.n++) % QCAP] = *e; return pdTRUE;
 }
 static void budget_start(void) {}
+static JSValue JS_NewString(JSContext *c, const char *t) { (void)c; (void)t; return 0; }
+static void call2(JSContext *c, JSValue f, JSValue a, JSValue b) { (void)c; (void)f; (void)a; (void)b; }
 static void recover_interrupt(JSContext *ctx) { (void)ctx; }   /* no budget in this model */
 
 /* The engine: one input and a heldFor() rule on it, armed while HIGH. */
@@ -116,7 +125,7 @@ static void handle(const scripting_evt_t *e)
 /* One pass of scripting_task() around the cut functions. */
 static void pass(void)
 {
-    deliver_pending(NULL, 0);
+    __DELIVER__
     if (old_loop) {   /* before: the whole ring first, no matter what is queued */
         while (s_of_tail != s_of_head) {
             uint32_t id = s_overflow[s_of_tail];
@@ -191,4 +200,4 @@ int main(void)
 }
 """
 out = pathlib.Path(__file__).with_name("test_order.c")
-out.write_text(HARNESS.replace("__CUT__", cuts))
+out.write_text(HARNESS.replace("__CUT__", cuts).replace("__DELIVER__", deliver))

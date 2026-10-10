@@ -587,12 +587,25 @@ static void handle_time_sync(JSContext *ctx, JSValue on_time_sync, bool sync)
 static volatile uint8_t s_pending;      /* PENDING_* bits */
 #define PENDING_TIME_SYNC  0x01u
 #define PENDING_TZ_CHANGE  0x02u
+#define PENDING_MQTT_STATE 0x04u
 
-static void deliver_pending(JSContext *ctx, JSValue on_time_sync)
+/* The broker connection state is state as well, and goes only this way, not
+   through the queue: dropped when the queue was full, mqttDown() never
+   matched and the local fallback stayed off until the next transition; and
+   a latch next to a queued older state could be overtaken by it. What is
+   delivered is the latest state. */
+static volatile bool s_mqtt_up;
+static volatile bool s_mqtt_known;      /* a state was ever reported */
+
+static void deliver_pending(JSContext *ctx, JSValue on_time_sync, JSValue on_mqtt)
 {
-    uint8_t p = __atomic_exchange_n(&s_pending, 0u, __ATOMIC_RELAXED);
+    uint8_t p = __atomic_exchange_n(&s_pending, 0u, __ATOMIC_ACQUIRE);
     if (p & PENDING_TIME_SYNC)      handle_time_sync(ctx, on_time_sync, true);
     else if (p & PENDING_TZ_CHANGE) handle_time_sync(ctx, on_time_sync, false);  /* a sync re-arms too */
+    if (p & PENDING_MQTT_STATE) {
+        budget_start();
+        call2(ctx, on_mqtt, JS_NewString(ctx, "$sys/mqtt"), JS_NewString(ctx, s_mqtt_up ? "up" : "down"));
+    }
 }
 
 /* Runs one elapsed timer. Reached from the event queue and, when that was
@@ -949,7 +962,7 @@ static void scripting_task(void *arg)
     scripting_evt_t ev;
     for (;;) {
         recover_interrupt(ctx);   /* the event of the previous pass */
-        deliver_pending(ctx, on_time_sync);
+        deliver_pending(ctx, on_time_sync, on_mqtt);
         recover_interrupt(ctx);
         /* Resync before the deferred timers: a dropped input change has no
            place in the order, and the live level is never older than a
@@ -957,6 +970,12 @@ static void scripting_task(void *arg)
         resync_lost_inputs(ctx);
         recover_interrupt(ctx);
         drain_overflow(ctx);   /* timers the event queue could not take, in order */
+        recover_interrupt(ctx);
+        /* Promise jobs left by a drain that ran over, or queued by any of the
+           calls above, which do not drain: they used to wait for the next
+           queued event, on a quiet device indefinitely. Nothing to do and
+           no cost when none is pending. */
+        drain_jobs(rt);
         recover_interrupt(ctx);
 
         if (xQueueReceive(s_queue, &ev, pdMS_TO_TICKS(200)) == pdTRUE) {
@@ -1083,6 +1102,10 @@ static void scripting_task(void *arg)
                 }
 
                 drain_jobs(rt);
+                /* The new rules have not seen the broker state yet:
+                   mqttDown() would not match until the next transition. */
+                if (s_mqtt_known)
+                    __atomic_fetch_or(&s_pending, PENDING_MQTT_STATE, __ATOMIC_RELEASE);
                 clear_timers(ctx, was_used);          /* old context's timers */
                 JS_FreeValue(ctx, on_mqtt);
                 JS_FreeValue(ctx, on_input);
@@ -1192,6 +1215,13 @@ void scripting_on_mqtt_connected(void)
 {
     if (g_scripting_io && g_scripting_io->mqtt_subscribe)
         g_scripting_io->mqtt_subscribe(RULES_TOPIC, 0);
+}
+
+void scripting_on_mqtt_state(bool up)
+{
+    s_mqtt_up = up;
+    s_mqtt_known = true;
+    __atomic_fetch_or(&s_pending, PENDING_MQTT_STATE, __ATOMIC_RELEASE);
 }
 
 void scripting_on_mqtt_message(const char *topic, size_t tlen,

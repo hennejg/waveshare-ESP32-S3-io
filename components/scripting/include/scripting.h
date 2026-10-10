@@ -49,6 +49,11 @@ void scripting_on_mqtt_connected(void);
 void scripting_on_mqtt_message(const char *topic, size_t topic_len,
                                 const char *data,  size_t data_len);
 
+// The broker connection went up or down: rules see it as the internal
+// '$sys/mqtt' message "up"/"down" (mqttConnected()/mqttDown()). Kept as
+// state, never dropped when the event queue is full; safe from any task.
+void scripting_on_mqtt_state(bool up);
+
 // Notify the rule engine that a digital input changed state.
 // Safe to call from any task.
 void scripting_on_input_change(uint8_t channel, bool state);
