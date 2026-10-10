@@ -16,6 +16,7 @@ extern "C" {
 #include "di.h"
 #include "app_config.h"
 #include "eth.h"
+#include "wifi_config.h"
 #include "led.h"
 #include <esp_timer.h>
 }
@@ -149,6 +150,7 @@ static void event_cb(const ChipDeviceEvent *event, intptr_t arg)
     case chip::DeviceLayer::DeviceEventType::kCommissioningComplete:
         ESP_LOGI(TAG, "Matter commissioning complete");
         s_commissioned = chip::Server::GetInstance().GetFabricTable().FabricCount() > 0;
+        if (s_commissioned) wifi_config_disable_ap();   /* no open setup AP from here on */
         break;
     case chip::DeviceLayer::DeviceEventType::kFabricRemoved:
         s_commissioned = chip::Server::GetInstance().GetFabricTable().FabricCount() > 0;

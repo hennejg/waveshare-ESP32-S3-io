@@ -12,7 +12,9 @@ What it pins down:
     not open the setup AP (jamming the network must not produce an open AP
     that accepts new credentials);
   - without credentials the setup AP still comes up;
-  - the switch to Ethernet-only is reachable by POST only.
+  - the switch to Ethernet-only is reachable by POST only;
+  - an AP that is up when wifi_config_disable_ap() is called (Matter, once
+    commissioned) is taken down by the monitor, not left open.
 
 OLD=1 cuts wifi_config.c and CMakeLists.txt from git (OLDREV, default HEAD).
 
@@ -135,6 +137,14 @@ int main(void)
     CHECK(route(HTTP_POST, "/settings") == ENDPOINT_SETTINGS_UPDATE, "POST /settings nicht erkannt");
     CHECK(route(HTTP_GET,  "/settings") == ENDPOINT_SETTINGS, "GET /settings nicht erkannt");
     printf("  /eth-only nur per POST\n");
+
+    /* 6. AP up (not commissioned yet), then disabled: the monitor stops it. */
+    configured = 0; link_up = 0; opmode = 3; s_ap_disabled = 0; ap_starts = 0;
+    s_ap_disabled = 1;
+    wifi_config_monitor_callback(NULL);
+    wifi_config_monitor_callback(NULL);
+    CHECK(opmode == STATION_MODE && ap_starts == 0, "AP nach wifi_config_disable_ap() weiter offen (opmode %d, %d Starts)", opmode, ap_starts);
+    printf("  spaet abgeschalteter AP: vom Monitor beendet\n");
 
     printf("%s\n", failures ? "FEHLER" : "alles in Ordnung");
     return failures ? 1 : 0;

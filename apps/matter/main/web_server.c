@@ -286,7 +286,7 @@ static esp_err_t api_auth_set_password(httpd_req_t *req)
     if (strlen(pw_j->valuestring) > APP_CFG_PASSWORD_MAX) {
         cJSON_Delete(root);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                            "password too long (max 113 characters)");
+                            "password too long (max 113 bytes as UTF-8)");
         return ESP_OK;
     }
     if (strlen(pw_j->valuestring) < 8) {

@@ -235,9 +235,19 @@
     let pollTimer    = null;
     let countdown    = 30;
 
+    /* HTTP Basic carries bytes; the device stores the password as UTF-8.
+       btoa() alone takes Latin-1: "ä" went out as one byte that matched
+       nothing, and "€" made it throw -- either way no login. */
+    function basicAuth(pw) {
+      const bytes = new TextEncoder().encode(':' + pw);
+      let bin = '';
+      for (const b of bytes) bin += String.fromCharCode(b);
+      return 'Basic ' + btoa(bin);
+    }
+
     function authHeaders() {
       if (!authPassword) return {};
-      return { 'Authorization': 'Basic ' + btoa(':' + authPassword) };
+      return { 'Authorization': basicAuth(authPassword) };
     }
 
     async function apiFetch(url, opts = {}) {
@@ -368,7 +378,7 @@
       const err = document.getElementById('auth-login-err');
       err.textContent = '';
       const r = await fetch('/api/config', {
-        headers: { 'Authorization': 'Basic ' + btoa(':' + pw) }
+        headers: { 'Authorization': basicAuth(pw) }
       });
       if (r.ok) {
         authPassword = pw;

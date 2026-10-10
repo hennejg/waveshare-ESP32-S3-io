@@ -11,8 +11,8 @@ PORT ?= 15020
 
 # Every target below; GEN are the ones a gen_<name>_test.py writes as
 # test_<name>.c and builds into test_<name>.
-TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply
-GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply
+TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic
+GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic
 
 .PHONY: all clean $(TESTS)
 all: test_mb_pdu $(TESTS)
@@ -190,6 +190,19 @@ test_sntpapply: gen_sntpapply_test.py ../../components/board/sntp_sync.c
 	python3 gen_sntpapply_test.py
 	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter test_sntpapply.c -o $@
 
+# The setup AP's DNS reply builder, cut out of wifi_config.c.
+capdns: test_capdns
+	./test_capdns
+
+test_capdns: gen_capdns_test.py ../../components/esp32-wifi-bootstrap/src/wifi_config.c
+	python3 gen_capdns_test.py
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter test_capdns.c -o $@
+
+# The Basic auth header both web UIs build, run in node.
+uiauth: gen_uiauth_test.py ../../www/index.html ../../apps/matter/www/index.html
+	python3 gen_uiauth_test.py
+	node test_uiauth.js
+
 wifimon: test_wifimon
 	./test_wifimon
 
@@ -260,6 +273,14 @@ test_pwmfail: gen_pwmfail_test.py ../../components/board/aux_io.c
 	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter -Wno-unused-variable test_pwmfail.c -o $@
 
 # The handlers that reboot after an NVS write, cut out of web_server.c.
+# Setting the clock from the web UI, cut out of web_server.c.
+timeset: test_timeset
+	./test_timeset
+
+test_timeset: gen_timeset_test.py qjs-obj/cJSON.o $(MAIN)/web_server.c
+	python3 gen_timeset_test.py
+	$(CC) $(CFLAGS) -I$(CJSON) -Wno-unused-function test_timeset.c qjs-obj/cJSON.o -o $@
+
 reseterr: test_reseterr
 	./test_reseterr
 
@@ -268,6 +289,15 @@ test_reseterr: gen_reseterr_test.py qjs-obj/cJSON.o $(MAIN)/web_server.c
 	$(CC) $(CFLAGS) -I$(CJSON) -Wno-unused-function -Wno-unused-parameter test_reseterr.c qjs-obj/cJSON.o -o $@
 
 # Channel numbers handed to the I/O bindings, cut out of bindings.c, real QuickJS.
+# Topics refused before they reach the broker, cut out of app_mqtt.c and
+# bindings.c. Real QuickJS.
+mqtttopic: test_mqtttopic
+	./test_mqtttopic
+
+test_mqtttopic: gen_mqtttopic_test.py $(MAIN)/app_mqtt.c ../../components/scripting/bindings.c $(QJS_OBJ)
+	python3 gen_mqtttopic_test.py
+	$(CC) -O1 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -I$(QJS) test_mqtttopic.c $(QJS_OBJ) -lm -o $@
+
 chan: test_chan
 	./test_chan
 
@@ -326,4 +356,4 @@ test_mb_pdu: test_mb_pdu.c $(MAIN)/mb_pdu.c $(MAIN)/mb_pdu.h $(MAIN)/mb_request.
 	$(CC) $(CFLAGS) test_mb_pdu.c $(MAIN)/mb_pdu.c -o $@
 
 clean:
-	rm -rf $(GEN:%=test_%) $(GEN:%=test_%.c) test_resume_old_dsl.js test_qjs_interrupt test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c test_mb_master test_mb_master.c test_mb_dns test_mb_dns.c test_qjs_cron qjs-obj mbt-obj *.dSYM
+	rm -rf $(GEN:%=test_%) $(GEN:%=test_%.c) test_resume_old_dsl.js test_uiauth.js test_qjs_interrupt test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c test_mb_master test_mb_master.c test_mb_dns test_mb_dns.c test_qjs_cron qjs-obj mbt-obj *.dSYM

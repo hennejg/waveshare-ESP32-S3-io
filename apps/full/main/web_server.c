@@ -351,7 +351,7 @@ static esp_err_t api_auth_set_password(httpd_req_t *req)
     if (strlen(pw_j->valuestring) > APP_CFG_PASSWORD_MAX) {
         cJSON_Delete(root);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                            "password too long (max 113 characters)");
+                            "password too long (max 113 bytes as UTF-8)");
         return ESP_OK;
     }
     if (strlen(pw_j->valuestring) < 8) {
@@ -971,6 +971,11 @@ static esp_err_t api_time_post(httpd_req_t *req)
 
     struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
     settimeofday(&tv, NULL);
+    /* As after an SNTP sync: the clock is valid now, and cron is armed
+       again from it. Without this, a board without SNTP and with no valid
+       RTC -- where setting the time by hand is the only way -- never armed
+       a cron rule until the next reboot. */
+    scripting_on_time_sync();
 
     struct tm utc;
     gmtime_r(&t, &utc);

@@ -157,7 +157,8 @@ static int sdk_wifi_station_get_connect_status(void) {
         return sta_got_ip ? STATION_GOT_IP : 0;
 }
 
-static bool s_ap_disabled = false;
+/* Set from another task (Matter, once commissioned); the monitor reads it. */
+static volatile bool s_ap_disabled = false;
 void wifi_config_disable_ap(void) { s_ap_disabled = true; }
 
 static void wifi_config_init_wifi(void) {
@@ -526,7 +527,12 @@ static void wifi_config_server_on_settings_update(client_t *client) {
 
         form_param_t *ssid_param     = form_params_find(form, "ssid");
         form_param_t *password_param = form_params_find(form, "password");
-        if (!ssid_param) {
+        /* What the station can take: an SSID of 1..32 bytes, a passphrase
+           of up to 64. Anything else was stored and confirmed before, and
+           then never connected -- with the AP off for good, as credentials
+           were stored. */
+        if (!ssid_param || !ssid_param->value || strlen(ssid_param->value) > 32 ||
+            (password_param && password_param->value && strlen(password_param->value) > 64)) {
                 DEBUG("Invalid form data, redirecting to /settings");
                 form_params_free(form);
                 client_send_redirect(client, 302, "/settings");
@@ -534,7 +540,7 @@ static void wifi_config_server_on_settings_update(client_t *client) {
         }
 
         char ssid[SSID_HTML_MAX];
-        html_escape(ssid, sizeof(ssid), ssid_param->value ? ssid_param->value : "", 32);
+        html_escape(ssid, sizeof(ssid), ssid_param->value, 32);
         esp_err_t stored = store_credentials(ssid_param->value, password_param ? password_param->value : "");
         form_params_free(form);
 
@@ -887,12 +893,73 @@ static void http_stop() {
 }
 
 
+/* Turns the query in buf (len bytes received, cap the buffer size) into the
+   reply in place: every A or ANY question is answered with ip, anything else
+   with an empty NOERROR. Returns the reply's length, or 0 for a datagram
+   that is dropped.
+
+   Everything is read within len. The QNAME used to be measured with strlen()
+   on a buffer that is not terminated and still holds an earlier, longer
+   datagram: anyone on the open setup AP could send 512 non-zero bytes and
+   then a short query, and the reply was written and sent from past the end
+   of the stack buffer. */
+static size_t dns_build_reply(uint8_t *buf, size_t len, size_t cap, const uint8_t ip[4]) {
+        if (len < 12 || (buf[2] & 0x80))               /* header; a response, not a query */
+                return 0;
+        if (buf[4] != 0 || buf[5] != 1)                /* exactly one question */
+                return 0;
+
+        size_t i = 12;
+        while (i < len && buf[i]) {
+                if (buf[i] > 63)                       /* compression or extended label */
+                        return 0;
+                i += 1 + buf[i];
+        }
+        if (i >= len || i - 12 + 1 > 255)              /* no terminator, or name too long */
+                return 0;
+        size_t qname_len = i - 12 + 1;
+        if (12 + qname_len + 4 > len)                  /* QTYPE and QCLASS */
+                return 0;
+
+        uint8_t qtype_hi = buf[12 + qname_len];
+        uint8_t qtype_lo = buf[12 + qname_len + 1];
+        /* Answer with an A record for A (0x0001) and ANY (0x00FF) queries */
+        int send_a = (qtype_hi == 0x00 && (qtype_lo == 0x01 || qtype_lo == 0xFF));
+        size_t reply_len = 12 + qname_len + 4 + (send_a ? 16 : 0);
+        if (reply_len > cap)
+                return 0;
+
+        /* QR=1, copy RD from query, AA/TC=0; RA=1, RCODE=0 */
+        buf[2] = (uint8_t)(0x80 | (buf[2] & 0x01));
+        buf[3] = 0x80;
+        buf[6] = 0x00; buf[7] = send_a ? 0x01 : 0x00;  /* ANCOUNT */
+        buf[8] = buf[9] = buf[10] = buf[11] = 0x00;    /* NSCOUNT, ARCOUNT */
+        /* The question stays as it came, QCLASS set to IN. */
+        uint8_t *head = buf + 12 + qname_len + 2;
+        *head++ = 0x00;
+        *head++ = 0x01;
+
+        if (send_a) {
+                static const uint8_t answer[12] = {
+                        0xC0, 0x0C,                    /* name = pointer to offset 12 */
+                        0x00, 0x01,                    /* TYPE A */
+                        0x00, 0x01,                    /* CLASS IN */
+                        0x00, 0x00, 0x00, 0x78,        /* TTL = 120 s */
+                        0x00, 0x04,                    /* RDLENGTH = 4 */
+                };
+                memcpy(head, answer, sizeof(answer));
+                memcpy(head + sizeof(answer), ip, 4);
+        }
+        DEBUG("DNS query type=0x%02X -> %s", qtype_lo, send_a ? "A 192.168.4.1" : "NOERROR/empty");
+        return reply_len;
+}
+
+
 static void dns_task(void *arg)
 {
         INFO("Starting DNS server");
 
-        ip4_addr_t server_addr;
-        IP4_ADDR(&server_addr, 192, 168, 4, 1);
+        static const uint8_t ip[4] = { 192, 168, 4, 1 };
 
         struct sockaddr_in serv_addr;
         int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -918,76 +985,15 @@ static void dns_task(void *arg)
 
         for (;;) {
                 /* 512 bytes: enough for EDNS queries (OPT record appended by Android 8+) */
-                char buffer[512];
+                uint8_t buffer[512];
                 struct sockaddr src_addr;
                 socklen_t src_addr_len = sizeof(src_addr);
-                size_t count = recvfrom(fd, buffer, sizeof(buffer), 0, (struct sockaddr*)&src_addr, &src_addr_len);
+                int recvd = recvfrom(fd, buffer, sizeof(buffer), 0, (struct sockaddr*)&src_addr, &src_addr_len);
 
-                /* Drop messages that are too small or too large to build a valid response */
-                if (count > 12 && count <= sizeof(buffer) - 16 && src_addr.sa_family == AF_INET) {
-                        size_t qname_len = strlen(buffer + 12) + 1;
-
-                        /* Read QTYPE before overwriting the buffer */
-                        uint8_t qtype_hi = (uint8_t)buffer[12 + qname_len];
-                        uint8_t qtype_lo = (uint8_t)buffer[12 + qname_len + 1];
-                        /* Answer with an A record for A (0x0001) and ANY (0x00FF) queries */
-                        int send_a = (qtype_hi == 0x00 && (qtype_lo == 0x01 || qtype_lo == 0xFF));
-
-                        char *head = buffer + 2;
-                        /* QR=1, copy RD from query, AA/TC=0 */
-                        *head++ = (char)(0x80 | (buffer[2] & 0x01));
-                        /* RA=1, RCODE=0 */
-                        *head++ = (char)0x80;
-                        *head++ = 0x00; /* QDCOUNT = 1 */
-                        *head++ = 0x01;
-                        *head++ = 0x00; /* ANCOUNT */
-                        *head++ = send_a ? 0x01 : 0x00;
-                        *head++ = 0x00; /* NSCOUNT = 0 */
-                        *head++ = 0x00;
-                        *head++ = 0x00; /* ARCOUNT = 0 */
-                        *head++ = 0x00;
-                        head += qname_len; /* skip QNAME (kept verbatim) */
-                        /* Echo original QTYPE and QCLASS in the question section */
-                        *head++ = qtype_hi;
-                        *head++ = qtype_lo;
-                        *head++ = 0x00; /* QCLASS IN */
-                        *head++ = 0x01;
-
-                        uint32_t reply_len = 2 + 10 + qname_len + 4;
-
-                        if (send_a) {
-                                *head++ = 0xC0; /* name = pointer to offset 12 */
-                                *head++ = 0x0C;
-                                *head++ = 0x00; /* TYPE A */
-                                *head++ = 0x01;
-                                *head++ = 0x00; /* CLASS IN */
-                                *head++ = 0x01;
-                                *head++ = 0x00; /* TTL = 120 s */
-                                *head++ = 0x00;
-                                *head++ = 0x00;
-                                *head++ = 0x78;
-                                *head++ = 0x00; /* RDLENGTH = 4 */
-                                *head++ = 0x04;
-                                *head++ = ip4_addr1(&server_addr);
-                                *head++ = ip4_addr2(&server_addr);
-                                *head++ = ip4_addr3(&server_addr);
-                                *head++ = ip4_addr4(&server_addr);
-                                reply_len += 16;
-                        }
-
-                        /* Decode DNS label-encoded QNAME for diagnostics */
-                        char domain[128] = "";
-                        const char *p = buffer + 12;
-                        int dlen = 0;
-                        while (*p && dlen < (int)sizeof(domain) - 2) {
-                                int llen = (unsigned char)*p++;
-                                if (dlen) domain[dlen++] = '.';
-                                while (llen-- && dlen < (int)sizeof(domain) - 1)
-                                        domain[dlen++] = *p++;
-                        }
-                        domain[dlen] = '\0';
-                        INFO("DNS query: %s type=0x%02X -> %s", domain, qtype_lo, send_a ? "A 192.168.4.1" : "NOERROR/empty");
-                        sendto(fd, buffer, reply_len, 0, &src_addr, src_addr_len);
+                if (recvd > 0 && src_addr.sa_family == AF_INET) {
+                        size_t reply_len = dns_build_reply(buffer, (size_t)recvd, sizeof(buffer), ip);
+                        if (reply_len)
+                                sendto(fd, buffer, reply_len, 0, &src_addr, src_addr_len);
                 }
 
                 uint32_t task_value = 0;
@@ -1092,6 +1098,11 @@ static void wifi_config_softap_stop() {
 static bool s_link_lost;
 
 static void wifi_config_monitor_callback(TimerHandle_t xTimer) {
+        /* Disabled while it was up: taken down here, on the task that
+           starts and stops it. */
+        if (s_ap_disabled && sdk_wifi_get_opmode() != STATION_MODE)
+                wifi_config_softap_stop();
+
         if (sdk_wifi_station_get_connect_status() == STATION_GOT_IP) {
                 if (sdk_wifi_get_opmode() == STATION_MODE && !context->first_time && !s_link_lost)
                         return;
@@ -1179,8 +1190,9 @@ static int wifi_config_station_connect() {
 
         wifi_config_t sta_config;
         memset(&sta_config, 0, sizeof(sta_config));
+        /* Both fields are fixed-length, not strings: a 32-byte SSID and a
+           64-digit hex key fill them with no terminator. */
         strncpy((char *)sta_config.sta.ssid, wifi_ssid, sizeof(sta_config.sta.ssid));
-        sta_config.sta.ssid[sizeof(sta_config.sta.ssid)-1] = 0;
         if (wifi_password)
                 strncpy((char *)sta_config.sta.password, wifi_password, sizeof(sta_config.sta.password));
 

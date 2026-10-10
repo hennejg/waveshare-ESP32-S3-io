@@ -3,6 +3,7 @@
 #include <esp_log.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #define TAG "js"
 
@@ -128,6 +129,12 @@ static JSValue js_mqtt_publish(JSContext *ctx, JSValue this_val, int argc, JSVal
 
     const char *topic = JS_ToCString(ctx, argv[0]);
     if (!topic) return JS_EXCEPTION;
+    /* Said to the script, not just a -1: the broker would drop the
+       connection over it (MQTT 3.1.1, 3.3.2.1). */
+    if (!topic[0] || strpbrk(topic, "+#")) {
+        JS_FreeCString(ctx, topic);
+        return JS_ThrowRangeError(ctx, "publish topic must not be empty or contain + or #");
+    }
 
     /* ToCStringLen, not strlen: a payload containing a NUL would otherwise be
        cut off there. */

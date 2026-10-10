@@ -29,15 +29,18 @@ static void                   (*s_on_publish_cb)(void)   = NULL;
 /* ------------------------------------------------------------------ helpers */
 
 /* Fill buf with "<prefix>/<topic>" or just "<topic>" if prefix is empty
-   or the topic is absolute (starts with '/'). */
-static void make_topic(const char *topic, char *buf, size_t buf_len)
+   or the topic is absolute (starts with '/'). False when it does not fit:
+   cut short, it would be another topic. */
+static bool make_topic(const char *topic, char *buf, size_t buf_len)
 {
     const char *prefix = app_config_get()->mqtt_topic_prefix;
+    size_t n;
     if (prefix[0] && topic[0] != '/') {
-        snprintf(buf, buf_len, "%s/%s", prefix, topic);
+        n = (size_t)snprintf(buf, buf_len, "%s/%s", prefix, topic);
     } else {
-        strlcpy(buf, topic, buf_len);
+        n = strlcpy(buf, topic, buf_len);
     }
+    return n < buf_len;
 }
 
 /* ------------------------------------------------------------------ health */
@@ -334,8 +337,13 @@ int app_mqtt_publish(const char *topic, const char *payload, int len,
                      int qos, bool retain)
 {
     if (!s_client) return -1;
+    /* A PUBLISH to a topic with a wildcard, or to none, is a protocol
+       violation the broker answers by closing the connection; at QoS 1/2
+       the message stays in the outbox and does it again after every
+       reconnect. */
+    if (!topic[0] || strpbrk(topic, "+#")) return -1;
     char full[TOPIC_MAXLEN];
-    make_topic(topic, full, sizeof(full));
+    if (!make_topic(topic, full, sizeof(full))) return -1;
     int id = esp_mqtt_client_publish(s_client, full, payload, len, qos, retain);
     if (id >= 0 && s_on_publish_cb) s_on_publish_cb();
     return id;
@@ -345,7 +353,7 @@ int app_mqtt_subscribe(const char *topic, int qos)
 {
     if (!s_client) return -1;
     char full[TOPIC_MAXLEN];
-    make_topic(topic, full, sizeof(full));
+    if (!make_topic(topic, full, sizeof(full))) return -1;
     return esp_mqtt_client_subscribe(s_client, full, qos);
 }
 
@@ -353,7 +361,7 @@ int app_mqtt_unsubscribe(const char *topic)
 {
     if (!s_client) return -1;
     char full[TOPIC_MAXLEN];
-    make_topic(topic, full, sizeof(full));
+    if (!make_topic(topic, full, sizeof(full))) return -1;
     return esp_mqtt_client_unsubscribe(s_client, full);
 }
 

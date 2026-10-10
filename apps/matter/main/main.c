@@ -22,7 +22,6 @@
 
 static bool s_eth_connected  = false;
 static bool s_wifi_connected = false;
-static bool is_eth_connected(void) { return s_eth_connected; }
 
 static void on_network_ready(void)
 {
@@ -130,20 +129,20 @@ void app_main(void)
              heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 
     esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START, on_wifi_ap, NULL);
-    wifi_config_set_eth_available_fn(is_eth_connected);
+    /* No wifi_config_set_eth_available_fn(): its "ETH only" button needs an
+       eth-only mode this firmware does not have, and only rebooted back
+       into the same AP. */
 
     /* Always init WiFi — creates a SoftAP in uncommissioned state so the web UI
      * (QR code / status) is reachable before Matter commissioning completes.
-     * In commissioned state: suppress the AP if credentials are already stored
-     * so the device connects STA-only without advertising a provisioning AP. */
-    {
-        char *ssid = NULL;
-        wifi_config_get(&ssid, NULL);
-        if (matter_is_commissioned() && ssid && ssid[0])
-            wifi_config_disable_ap();
-        free(ssid);
-        wifi_config_init("Waveshare Matter (192.168.4.1)", NULL, NULL);
-    }
+     * Once commissioned, never the open AP: a device paired over Ethernet, or
+     * over Matter WiFi (whose credentials are not in wifi_cfg), counted as
+     * unconfigured, and the AP -- open, taking an SSID from anyone in range --
+     * came up for good or on every WiFi outage. matter.cpp also turns it off
+     * when commissioning completes. */
+    if (matter_is_commissioned())
+        wifi_config_disable_ap();
+    wifi_config_init("Waveshare Matter (192.168.4.1)", NULL, NULL);
 
     esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (sta) esp_netif_set_hostname(sta, app_config_get()->device_name);

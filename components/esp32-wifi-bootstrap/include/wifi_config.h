@@ -1,6 +1,11 @@
 #pragma once
 
+#include <stdbool.h>
 #include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 typedef enum {
         WIFI_CONFIG_CONNECTED = 1,
@@ -30,8 +35,13 @@ void wifi_config_set_eth_available_fn(bool (*fn)(void));
 
 esp_err_t safe_set_auto_connect(bool enable);
 
-/** Disable SoftAP mode entirely.  Must be called BEFORE wifi_config_init().
- *  Use when an out-of-band commissioning mechanism (e.g. Matter CHIPoBLE)
+/** Disable SoftAP mode entirely.  Called before wifi_config_init(), the AP
+ *  is never created; called later, a running AP is taken down by the network
+ *  monitor at its next check and not started again.  Use when an out-of-band commissioning mechanism (e.g. Matter CHIPoBLE)
  *  handles WiFi credential delivery, so the captive-portal AP is unneeded and
  *  would consume DMA that BLE and the WiFi driver both need. */
 void wifi_config_disable_ap(void);
+
+#ifdef __cplusplus
+}
+#endif

@@ -373,7 +373,10 @@ In `then()` bodies, `mqtt(topic)` can also **send** a message to the broker:
 | `mqtt(topic).publish(payload, {qos: n, retain: bool})` | explicit QoS and retained |
 
 `payload` is coerced to a string. Returns the broker message-id (`>= 0`) on success,
-or `-1` if the broker is not connected. The configured topic prefix is prepended
+or `-1` if the broker is not connected or prefix and topic together exceed 255
+bytes. A topic that is empty or contains `+` or `#` throws a `RangeError`:
+wildcards are for subscribing, and a broker closes the connection of a client
+that publishes to one. The configured topic prefix is prepended
 automatically (a topic starting with `/` bypasses the prefix, same as all other MQTT
 operations).
 

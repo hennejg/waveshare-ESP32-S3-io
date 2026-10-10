@@ -78,3 +78,10 @@ dependencies.lock
 /test/host/test_wifiportal.c
 /test/host/test_sntpapply
 /test/host/test_sntpapply.c
+/test/host/test_capdns
+/test/host/test_capdns.c
+/test/host/test_uiauth.js
+/test/host/test_timeset
+/test/host/test_timeset.c
+/test/host/test_mqtttopic
+/test/host/test_mqtttopic.c
