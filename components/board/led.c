@@ -66,21 +66,30 @@ static bool parse_step(cJSON *obj, led_step_t *s)
     cJSON *col = cJSON_GetObjectItem(obj, "color");
     cJSON *dur = cJSON_GetObjectItem(obj, "duration");
     if (!cJSON_IsString(col) || !cJSON_IsNumber(dur)) return false;
-    uint32_t d = (uint32_t)dur->valuedouble;
-    if (d == 0 || d > DUR_MAX_MS) return false;
+    /* Checked as the double: a negative or huge one converted to uint32_t
+       is undefined behaviour, not a refused step. */
+    if (!(dur->valuedouble >= 1 && dur->valuedouble <= DUR_MAX_MS)) return false;
     if (!parse_hex(col->valuestring, &s->r, &s->g, &s->b)) return false;
-    s->duration_ms = d;
+    s->duration_ms = (uint32_t)dur->valuedouble;
     return true;
 }
 #endif
 
-static void hw_apply(uint8_t r, uint8_t g, uint8_t b)
+static void hw_write(uint8_t r, uint8_t g, uint8_t b)
 {
-    s_r = r; s_g = g; s_b = b;
     if (!s_strip) return;               /* before led_init(): nothing to drive yet */
     /* WS2812 wire order is GRB — swap red and green at the call site. */
     led_strip_set_pixel(s_strip, 0, g, r, b);
     led_strip_refresh(s_strip);
+}
+
+/* The colour the LED should show, as its owner set it. A forced colour
+   (led_force_set) goes to the hardware only, so led_force_release() has
+   something to go back to. */
+static void hw_apply(uint8_t r, uint8_t g, uint8_t b)
+{
+    s_r = r; s_g = g; s_b = b;
+    hw_write(r, g, b);
 }
 
 #ifdef CONFIG_APP_MQTT_ENABLE
@@ -138,7 +147,7 @@ typedef struct { uint8_t r, g, b; } flash_t;
 
 static uint8_t            s_bg_r, s_bg_g, s_bg_b;
 static uint8_t            s_net_level;
-static int                s_net_count;
+static bool               s_net_up;
 static QueueHandle_t      s_flash_q;
 static bool               s_ap_mode      = false;
 static bool               s_ap_blink_on  = false;
@@ -198,29 +207,24 @@ void led_status_set_ap_mode(bool up)
     }
 }
 
+/* up: some interface has an address; false only once none has (main.c
+   decides that). A level, not a count: the callers report "up" once per
+   address an interface gets -- twice for two interfaces, again on a DHCP
+   renewal -- but "down" once when the last one is gone, so the count never
+   came back to zero and the LED stayed green with no network at all. */
 void led_status_set_network(bool up)
 {
     if (!s_status_mode) return;
 
-    bool do_ap_down = false;
+    if (up) led_status_set_ap_mode(false);   /* AP done once we have an IP */
+
     bool do_refresh = false;
+    taskENTER_CRITICAL(&s_mux);
+    s_net_up = up;
+    if (up && s_net_level < 1)  { s_net_level = 1; do_refresh = true; }
+    if (!up && s_net_level > 0) { s_net_level = 0; do_refresh = true; }
+    taskEXIT_CRITICAL(&s_mux);
 
-    if (up) {
-        led_status_set_ap_mode(false);   /* AP done once we have an IP */
-        taskENTER_CRITICAL(&s_mux);
-        s_net_count++;
-        if (s_net_level < 1) { s_net_level = 1; do_refresh = true; }
-        taskEXIT_CRITICAL(&s_mux);
-    } else {
-        taskENTER_CRITICAL(&s_mux);
-        if (--s_net_count <= 0) {
-            s_net_count = 0;
-            if (s_net_level > 0) { s_net_level = 0; do_refresh = true; }
-        }
-        taskEXIT_CRITICAL(&s_mux);
-    }
-
-    (void)do_ap_down;
     if (do_refresh) refresh_status();
 }
 
@@ -232,7 +236,7 @@ void led_status_set_mqtt(bool up)
     if (up) {
         s_net_level = 2;
     } else {
-        s_net_level = (s_net_count > 0) ? 1 : 0;
+        s_net_level = s_net_up ? 1 : 0;
     }
     taskEXIT_CRITICAL(&s_mux);
 
@@ -260,7 +264,21 @@ esp_err_t led_set_rgb(uint8_t r, uint8_t g, uint8_t b)
 
 void led_force_set(uint8_t r, uint8_t g, uint8_t b)
 {
-    hw_apply(r, g, b);   /* always applies, regardless of mode */
+    hw_write(r, g, b);   /* always applies, regardless of mode */
+}
+
+void led_force_release(void)
+{
+    if (s_status_mode) {
+        bool ap;
+        taskENTER_CRITICAL(&s_mux);
+        ap = s_ap_mode;
+        taskEXIT_CRITICAL(&s_mux);
+        if (ap) return;                  /* the AP blink takes over on its next tick */
+        hw_write(s_bg_r, s_bg_g, s_bg_b);
+    } else {
+        hw_write(s_r, s_g, s_b);
+    }
 }
 
 esp_err_t led_init(void)

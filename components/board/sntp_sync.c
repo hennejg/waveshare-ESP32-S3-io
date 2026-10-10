@@ -7,6 +7,7 @@ void scripting_on_time_sync(void);
 
 #include "esp_netif_sntp.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include <string.h>
@@ -21,28 +22,50 @@ static bool s_started = false;
    unguarded, the two could init twice or deinit under a running init. */
 static SemaphoreHandle_t s_lock;
 
-void sntp_sync_init(void)
-{
-    if (!s_lock) s_lock = xSemaphoreCreateMutex();
-}
+/* Mirrors the system clock, which SNTP has just stepped (so NTP takes
+ * precedence over the RTC seed), to the battery-backed RTC so the time
+ * persists across power loss / offline periods. Runs on the esp_timer task:
+ * the SNTP callback itself runs on lwIP's task, and an I2C transfer there --
+ * up to 50 ms, longer while the output expander holds the bus for a
+ * recovery -- stalled every socket on the board meanwhile. */
+static esp_timer_handle_t s_rtc_timer;
 
-/* Called after each successful SNTP sync. The SNTP client has already stepped the
- * system clock (so NTP takes precedence over the RTC seed); mirror it to the
- * battery-backed RTC so the time persists across power loss / offline periods. */
-static void on_time_synced(struct timeval *tv)
+static void write_rtc(void *arg)
 {
-    time_t now = tv ? tv->tv_sec : time(NULL);
+    (void)arg;
+    time_t now = time(NULL);
     struct tm utc;
     gmtime_r(&now, &utc);
     if (rtc_dev_set(&utc) == ESP_OK)
         ESP_LOGI(TAG, "SNTP synced; RTC updated");
     else
         ESP_LOGW(TAG, "SNTP synced; RTC update failed");
+}
+
+/* Called after each successful SNTP sync, on lwIP's task: nothing here may
+   block. */
+static void on_time_synced(struct timeval *tv)
+{
+    (void)tv;
+    /* INVALID_STATE: a write is already on its way, and it reads the clock
+       when it runs. */
+    esp_err_t r = s_rtc_timer ? esp_timer_start_once(s_rtc_timer, 0) : ESP_ERR_INVALID_STATE;
+    if (r != ESP_OK && !(s_rtc_timer && r == ESP_ERR_INVALID_STATE))
+        ESP_LOGW(TAG, "SNTP synced; RTC update not scheduled");
 
     /* Clock is now real: let the rule engine arm/re-arm cron from the corrected time. */
 #ifdef CONFIG_APP_SCRIPTING_ENABLE
     scripting_on_time_sync();
 #endif
+}
+
+void sntp_sync_init(void)
+{
+    if (!s_lock) s_lock = xSemaphoreCreateMutex();
+    if (!s_rtc_timer) {
+        const esp_timer_create_args_t a = { .callback = write_rtc, .name = "sntp_rtc" };
+        if (esp_timer_create(&a, &s_rtc_timer) != ESP_OK) s_rtc_timer = NULL;
+    }
 }
 
 /* The server SNTP runs with while s_started. Every configuration save calls

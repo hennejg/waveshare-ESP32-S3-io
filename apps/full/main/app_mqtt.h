@@ -15,7 +15,6 @@ typedef void (*app_mqtt_msg_cb_t)(const char *topic, size_t topic_len,
                                    const char *data,  size_t data_len);
 
 esp_err_t app_mqtt_start(void);
-void      app_mqtt_stop(void);
 bool      app_mqtt_is_connected(void);
 
 /* Publish / subscribe — the configured topic prefix is prepended automatically.

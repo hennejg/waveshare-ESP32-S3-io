@@ -266,7 +266,7 @@ static void stop_blink(void)
 {
     esp_timer_stop(s_blink_timer);
     s_blink_on = false;
-    led_force_set(0, 0, 0);
+    led_force_release();   /* back to what the LED showed before the blinking */
 }
 
 static void stop_timers(void)

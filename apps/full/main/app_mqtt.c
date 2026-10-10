@@ -90,18 +90,13 @@ static void publish_health(void)
    held up rule timers, the auth timeout and every other timer with it. */
 static TaskHandle_t s_health_task;
 
-/* Held by health_task around its publish and by app_mqtt_stop() around the
-   destroy, so the task can never run esp_mqtt_client_publish() on a client
-   that stop() has freed between the NULL check and the call. */
-static SemaphoreHandle_t s_client_lock;
-
+/* The client, once started, lives until the next reboot: nothing destroys
+   it, so the task needs no lock against a client freed under it. */
 static void health_task(void *arg)
 {
     for (;;) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        xSemaphoreTake(s_client_lock, portMAX_DELAY);
         publish_health();
-        xSemaphoreGive(s_client_lock);
     }
 }
 
@@ -261,13 +256,8 @@ esp_err_t app_mqtt_start(void)
         mqtt_cfg.session.last_will.retain  = 1;
     }
 
-    /* The lock and the task outlive the client: stop() leaves them, start()
-       reuses them. The timer is created once too and deleted by stop(). */
-    if (!s_client_lock) s_client_lock = xSemaphoreCreateMutex();
-    if (!s_client_lock) {
-        ESP_LOGE(TAG, "Failed to create client lock");
-        return ESP_ERR_NO_MEM;
-    }
+    /* The task and the timer are created once; a start that fails after
+       them leaves them for the next try. */
     /* The publish runs the transport write on this stack; with an mqtts://
        or wss:// URL that is an mbedtls record write. */
     if (!s_health_task &&
@@ -307,25 +297,6 @@ esp_err_t app_mqtt_start(void)
     char shown[sizeof(cfg->mqtt_url)];
     ESP_LOGI(TAG, "Connecting to %s", url_for_log(cfg->mqtt_url, shown, sizeof(shown)));
     return ESP_OK;
-}
-
-void app_mqtt_stop(void)
-{
-    if (!s_client) return;
-    if (s_health_timer) {
-        esp_timer_stop(s_health_timer);
-        esp_timer_delete(s_health_timer);
-        s_health_timer = NULL;
-    }
-    /* Stop first, outside the lock: the mqtt task may be inside the inline
-       publish_health() of MQTT_EVENT_CONNECTED, and stop() waits for it to
-       exit. Once it has, only health_task can still reach s_client. */
-    esp_mqtt_client_stop(s_client);
-    xSemaphoreTake(s_client_lock, portMAX_DELAY);
-    esp_mqtt_client_destroy(s_client);
-    s_client    = NULL;
-    s_connected = false;
-    xSemaphoreGive(s_client_lock);
 }
 
 bool app_mqtt_is_connected(void)

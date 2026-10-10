@@ -36,12 +36,18 @@ static esp_err_t reg_write(uint8_t reg, const uint8_t *data, size_t len)
     if (len + 1 > sizeof(buf)) return ESP_ERR_INVALID_SIZE;
     buf[0] = reg;
     memcpy(buf + 1, data, len);
-    return i2c_master_transmit(s_dev, buf, len + 1, I2C_TIMEOUT_MS);
+    i2c_bus_lock();           /* see i2c_bus.h: no output-expander bus reset mid-transfer */
+    esp_err_t ret = i2c_master_transmit(s_dev, buf, len + 1, I2C_TIMEOUT_MS);
+    i2c_bus_unlock();
+    return ret;
 }
 
 static esp_err_t reg_read(uint8_t reg, uint8_t *data, size_t len)
 {
-    return i2c_master_transmit_receive(s_dev, &reg, 1, data, len, I2C_TIMEOUT_MS);
+    i2c_bus_lock();
+    esp_err_t ret = i2c_master_transmit_receive(s_dev, &reg, 1, data, len, I2C_TIMEOUT_MS);
+    i2c_bus_unlock();
+    return ret;
 }
 
 esp_err_t rtc_dev_init(void)

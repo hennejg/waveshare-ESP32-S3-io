@@ -238,7 +238,6 @@ void wifi_config_set_eth_available_fn(bool (*fn)(void)) { s_eth_available_fn = f
 typedef struct {
         char *ssid_prefix;
         char *password;
-        char *custom_html;
         void (*on_wifi_ready)(); // deprecated
         void (*on_event)(wifi_config_event_t);
 
@@ -291,27 +290,6 @@ static void client_free(client_t *client) {
 static void client_send(client_t *client, const char *payload, size_t payload_size) {
         lwip_write(client->fd, payload, payload_size);
 }
-static void client_send_index(client_t *client) {
-        ESP_LOGI("wifi_config", "Serving captive portal response");
-        extern const uint8_t index_html_start[] asm ("_binary_index_html_start");
-        extern const uint8_t index_html_end[] asm ("_binary_index_html_end");
-
-        const char *header =
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: text/html\r\n"
-                "Cache-Control: no-cache\r\n"
-                "Connection: close\r\n"
-                "\r\n";
-
-        client_send(client, header, strlen(header));
-        client_send(client, (const char *)index_html_start, index_html_end - index_html_start);
-}
-
-
-
-
-
-
 static void client_send_chunk(client_t *client, const char *payload) {
         int len = strlen(payload);
         char buffer[10];
@@ -450,14 +428,6 @@ static void wifi_config_server_on_settings(client_t *client) {
         client_send(client, http_prologue, sizeof(http_prologue)-1);
         client_send_chunk(client, html_settings_header);
 
-        if (context->custom_html != NULL && context->custom_html[0] > 0) {
-                uint8_t buffer_size = strlen(html_settings_custom_html) + strlen(context->custom_html);
-                char* buffer = (char*) calloc(buffer_size, sizeof(char)); //fill up the buffer with zeros
-                snprintf(buffer, buffer_size, html_settings_custom_html, context->custom_html); //fill in template with the custom_html content
-                client_send_chunk(client, buffer);
-                free(buffer);
-        }
-
         client_send_chunk(client, html_settings_body);
 
         if (xSemaphoreTake(wifi_networks_mutex, 5000 / portTICK_PERIOD_MS)) {
@@ -584,22 +554,29 @@ static void wifi_config_server_on_settings_update(client_t *client) {
 }
 
 
+/* The whole URL, not a prefix of it: strncmp() bounded by the request's
+   length matched any start of the path -- "POST /" was a settings update and
+   "POST /e" switched WiFi off. */
+static bool url_is(const char *data, size_t length, const char *path) {
+        return length == strlen(path) && !memcmp(data, path, length);
+}
+
 static int wifi_config_server_on_url(http_parser *parser, const char *data, size_t length) {
         client_t *client = (client_t*) parser->data;
 
         client->endpoint = ENDPOINT_UNKNOWN;
         if (parser->method == HTTP_GET) {
-                if (!strncmp(data, "/settings", length)) {
+                if (url_is(data, length, "/settings")) {
                         client->endpoint = ENDPOINT_SETTINGS;
-                } else if (!strncmp(data, "/", length)) {
+                } else if (url_is(data, length, "/")) {
                         client->endpoint = ENDPOINT_INDEX;
                 }
         } else if (parser->method == HTTP_POST) {
                 /* Switching WiFi off is a POST, so a plain link or an <img>
                  * on some other page cannot do it; GET only ever shows pages. */
-                if (!strncmp(data, "/settings", length)) {
+                if (url_is(data, length, "/settings")) {
                         client->endpoint = ENDPOINT_SETTINGS_UPDATE;
-                } else if (!strncmp(data, "/eth-only", length)) {
+                } else if (url_is(data, length, "/eth-only")) {
                         client->endpoint = ENDPOINT_ETH_ONLY;
                 }
         }
@@ -981,7 +958,11 @@ static void dns_task(void *arg)
 
         memset(&serv_addr, 0, sizeof(serv_addr));
         serv_addr.sin_family = AF_INET;
-        serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        /* The AP address only, as the HTTP server does: bound to every
+         * interface, it answered DNS queries arriving over Ethernet or the
+         * station link too, with 192.168.4.1 for every name -- to any host
+         * on the network that asked it. */
+        memcpy(&serv_addr.sin_addr.s_addr, ip, 4);
         serv_addr.sin_port = htons(53);
         if (bind(fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
                 ERROR("DNS bind() failed — port 53 in use?");
@@ -1335,14 +1316,3 @@ esp_err_t wifi_config_set(const char *ssid, const char *password) {
         return store_credentials(ssid, password);
 }
 
-void wifi_config_set_custom_html(char *html) {
-        if (context == NULL) {
-                ERROR("Cannot set custom html content, WiFi configuration not initialised yet");
-                return;
-        }
-
-        context->custom_html = html;
-}
-
-
-__attribute__((used)) static void *linker_keep_client_send_index = (void *)&client_send_index;

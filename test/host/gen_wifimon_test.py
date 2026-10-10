@@ -42,6 +42,8 @@ cuts = (src.type("} wifi_config_context_t;")
         + (src.span("/* Set when the monitor has seen", "static bool s_link_lost;") if "s_link_lost" in src.text else "")
         + src.func("static void wifi_config_monitor_callback(TimerHandle_t xTimer) {")
         + src.func("void wifi_config_legacy_support_on_event(wifi_config_event_t event) {")
+        + (src.func("static bool url_is(const char *data, size_t length, const char *path) {")
+           if "static bool url_is(" in src.text else "")
         + src.func("static int wifi_config_server_on_url(http_parser *parser, const char *data, size_t length) {"))
 
 HARNESS = r"""

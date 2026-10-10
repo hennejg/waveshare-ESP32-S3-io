@@ -11,8 +11,8 @@ PORT ?= 15020
 
 # Every target below; GEN are the ones a gen_<name>_test.py writes as
 # test_<name>.c and builds into test_<name>.
-TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic cfgpost portalconn cantx mqttstate
-GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic cfgpost portalconn cantx mqttstate
+TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl
+GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl
 
 .PHONY: all clean $(TESTS)
 all: test_mb_pdu $(TESTS)
@@ -386,6 +386,81 @@ test_mb_client: test_mb_client.c $(MAIN)/mb_pdu.c $(MAIN)/mb_pdu.h $(MAIN)/mb_re
 
 test_mb_pdu: test_mb_pdu.c $(MAIN)/mb_pdu.c $(MAIN)/mb_pdu.h $(MAIN)/mb_request.h
 	$(CC) $(CFLAGS) test_mb_pdu.c $(MAIN)/mb_pdu.c -o $@
+
+# The status LED after network loss and after a forced colour, cut out of
+# led.c and auth.c.
+ledstatus: test_ledstatus
+	./test_ledstatus
+
+test_ledstatus: gen_ledstatus_test.py ../../components/board/led.c ../../components/board/auth.c
+	python3 gen_ledstatus_test.py
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter -Wno-unused-variable test_ledstatus.c -o $@
+
+# The shared I2C bus lock around transfers and the bus reset, cut out of
+# dout.c and rtc.c.
+i2clock: test_i2clock
+	./test_i2clock
+
+test_i2clock: gen_i2clock_test.py ../../components/board/dout.c ../../components/board/rtc.c
+	python3 gen_i2clock_test.py
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter test_i2clock.c -o $@
+
+# The RTC written off lwIP's task after an SNTP sync, cut out of sntp_sync.c.
+sntprtc: test_sntprtc
+	./test_sntprtc
+
+test_sntprtc: gen_sntprtc_test.py ../../components/board/sntp_sync.c
+	python3 gen_sntprtc_test.py
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter test_sntprtc.c -o $@
+
+# Numbers from MQTT LED and buzzer commands, cut out of led.c and buzzer.c;
+# ESP-IDF's cJSON, UBSan as a hard error.
+jsoncast: test_jsoncast
+	./test_jsoncast
+
+test_jsoncast: gen_jsoncast_test.py qjs-obj/cJSON.o ../../components/board/led.c ../../components/board/buzzer.c
+	python3 gen_jsoncast_test.py
+	$(CC) $(CFLAGS) -fno-sanitize-recover=all -I$(CJSON) -Wno-unused-function -Wno-unused-parameter test_jsoncast.c qjs-obj/cJSON.o -lm -o $@
+
+# A failed RTU slave start, cut out of mb_server.c.
+rtuunwind: test_rtuunwind
+	./test_rtuunwind
+
+test_rtuunwind: gen_rtuunwind_test.py $(MAIN)/mb_server.c
+	python3 gen_rtuunwind_test.py
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter test_rtuunwind.c -o $@
+
+# A failed CAN start, cut out of can_server.c.
+caninit: test_caninit
+	./test_caninit
+
+test_caninit: gen_caninit_test.py $(MAIN)/can_server.c
+	python3 gen_caninit_test.py
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter -Wno-unused-variable test_caninit.c -o $@
+
+# The poll table's error text for an RS-485 read, cut out of mb_tcp_master.c.
+rtuerr: test_rtuerr
+	./test_rtuerr
+
+test_rtuerr: gen_rtuerr_test.py $(MAIN)/mb_tcp_master.c $(MAIN)/mb_request.h $(MAIN)/mb_gateway.h
+	python3 gen_rtuerr_test.py
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter test_rtuerr.c -o $@
+
+# MQTT messages too long for the rule engine, cut out of scripting.c.
+mqttdrop: test_mqttdrop
+	./test_mqttdrop
+
+test_mqttdrop: gen_mqttdrop_test.py ../../components/scripting/scripting.c
+	python3 gen_mqttdrop_test.py
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter test_mqttdrop.c -o $@
+
+# Request routing in the setup portal, cut out of wifi_config.c.
+portalurl: test_portalurl
+	./test_portalurl
+
+test_portalurl: gen_portalurl_test.py ../../components/esp32-wifi-bootstrap/src/wifi_config.c
+	python3 gen_portalurl_test.py
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter test_portalurl.c -o $@
 
 clean:
 	rm -rf $(GEN:%=test_%) $(GEN:%=test_%.c) test_resume_old_dsl.js test_uiauth.js test_qjs_interrupt test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c test_mb_master test_mb_master.c test_mb_dns test_mb_dns.c test_qjs_cron qjs-obj mbt-obj *.dSYM

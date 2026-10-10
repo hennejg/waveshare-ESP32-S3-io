@@ -114,15 +114,19 @@ static void apply_json_item(cJSON *item, uint8_t n,
 
 /* i2c_master_transmit wrapper: on ESP_ERR_INVALID_STATE (bus stuck) clocks
  * 9 SCL pulses to release SDA and retries once.  Handles both a mid-reset
- * stuck bus and the TCA9554 power-on edge case on a never-flashed device. */
+ * stuck bus and the TCA9554 power-on edge case on a never-flashed device.
+ * Under the bus lock: the reset is not serialised by the driver and would
+ * cut into an RTC transfer under way on another task. */
 static esp_err_t i2c_transmit_safe(const uint8_t *buf, size_t len)
 {
+    i2c_bus_lock();
     esp_err_t ret = i2c_master_transmit(s_dev, buf, len, 10);
     if (ret == ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG, "I2C bus stuck — recovering");
         i2c_master_bus_reset(s_bus);
         ret = i2c_master_transmit(s_dev, buf, len, 10);
     }
+    i2c_bus_unlock();
     return ret;
 }
 

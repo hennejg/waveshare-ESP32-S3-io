@@ -40,7 +40,8 @@ extern const char dsl_js_start[] asm("_binary_dsl_js_start");
    the deepest JS frame -- a binding publishing over MQTT/TLS, a log line. */
 #define JS_STACK_LIMIT   (TASK_STACK_BYTES - 16 * 1024)
 
-// Max topic / payload through the event queue; larger messages are truncated.
+// Max topic / payload through the event queue, terminator included; larger
+// messages are dropped (see scripting_on_mqtt_message()).
 #define MAX_TOPIC_LEN    128
 #define MAX_PAYLOAD_LEN  256
 
@@ -1230,14 +1231,17 @@ void scripting_on_mqtt_message(const char *topic, size_t tlen,
     if (!s_queue) return;
 
     scripting_evt_t ev = { .type = EVT_MQTT };
-    size_t tl = tlen < sizeof(ev.mqtt.topic)   - 1 ? tlen : sizeof(ev.mqtt.topic)   - 1;
-    size_t dl = dlen < sizeof(ev.mqtt.payload) - 1 ? dlen : sizeof(ev.mqtt.payload) - 1;
+    /* Too long is dropped, not cut: a cut topic could equal a shorter one
+       and fire that topic's rules, and a cut payload is a different value
+       -- half a JSON object, a number missing its last digits. */
+    if (tlen >= sizeof(ev.mqtt.topic) || dlen >= sizeof(ev.mqtt.payload)) {
+        ESP_LOGW(TAG, "MQTT message dropped: topic %zu/%zu, payload %zu/%zu bytes over the limit",
+                 tlen, sizeof(ev.mqtt.topic) - 1, dlen, sizeof(ev.mqtt.payload) - 1);
+        return;
+    }
 
-    if (tlen > tl || dlen > dl)
-        ESP_LOGW(TAG, "MQTT msg truncated (%zu/%zu → %zu/%zu)", tlen, dlen, tl, dl);
-
-    memcpy(ev.mqtt.topic,   topic, tl); ev.mqtt.topic[tl]   = '\0';
-    memcpy(ev.mqtt.payload, data,  dl); ev.mqtt.payload[dl] = '\0';
+    memcpy(ev.mqtt.topic,   topic, tlen); ev.mqtt.topic[tlen]   = '\0';
+    memcpy(ev.mqtt.payload, data,  dlen); ev.mqtt.payload[dlen] = '\0';
 
     if (evt_send(&ev) != pdTRUE)
         ESP_LOGW(TAG, "Event queue full — MQTT message dropped");

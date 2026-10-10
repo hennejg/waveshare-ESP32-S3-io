@@ -659,13 +659,26 @@ esp_err_t can_server_init(void)
            sender here looks at the return value to notice. */
         .fail_retry_cnt         = -1,
     };
+    /* Before the node: the receive callback posts here from the ISR, and a
+       NULL queue would have been found by the first frame on the bus. */
+    if (!s_rx_q) s_rx_q = xQueueCreate(RX_QUEUE_DEPTH, sizeof(rx_msg_t));
+    ESP_RETURN_ON_FALSE(s_rx_q, ESP_ERR_NO_MEM, TAG, "rx queue");
     ESP_RETURN_ON_ERROR(twai_new_node_onchip(&node_cfg, &s_node), TAG, "new node");
 
-    s_rx_q = xQueueCreate(RX_QUEUE_DEPTH, sizeof(rx_msg_t));
+    /* From here on a failure deletes the node again: left behind, it held
+       the controller and its pins, and an enabled node with no worker task
+       to empty the queue answered nothing. */
+    esp_err_t err;
+    const char *step;
     twai_event_callbacks_t cbs = { .on_rx_done = rx_done_cb, .on_tx_done = tx_done_cb };
-    ESP_RETURN_ON_ERROR(twai_node_register_event_callbacks(s_node, &cbs, NULL),
-                        TAG, "register cbs");
-    ESP_RETURN_ON_ERROR(twai_node_enable(s_node), TAG, "enable");
+    if ((err = twai_node_register_event_callbacks(s_node, &cbs, NULL)) != ESP_OK) {
+        step = "register cbs";
+        goto fail;
+    }
+    if ((err = twai_node_enable(s_node)) != ESP_OK) {
+        step = "enable";
+        goto fail;
+    }
 
     if (s_mode == CAN_MODE_BASIC) {
         s_base = cfg->can.base_id;
@@ -679,6 +692,16 @@ esp_err_t can_server_init(void)
         ESP_LOGI(TAG, "N2k mode — preferred addr=0x%02x mfr=0x%03x", s_addr, N2K_MFR_CODE);
     }
 
-    xTaskCreate(can_worker_task, "can", 4096, NULL, 5, NULL);
+    if (xTaskCreate(can_worker_task, "can", 4096, NULL, 5, NULL) != pdPASS) {
+        err = ESP_ERR_NO_MEM; step = "worker task";
+        twai_node_disable(s_node);
+        goto fail;
+    }
     return ESP_OK;
+
+fail:
+    ESP_LOGE(TAG, "%s: %s", step, esp_err_to_name(err));
+    twai_node_delete(s_node);
+    s_node = NULL;
+    return err;
 }

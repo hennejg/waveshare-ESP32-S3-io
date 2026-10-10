@@ -26,8 +26,6 @@ bool wifi_config_reset_requested(void);
 void wifi_config_get(char **ssid, char **password);
 esp_err_t wifi_config_set(const char *ssid, const char *password);
 
-void wifi_config_set_custom_html(char *html);
-
 /* Register a one-shot callback invoked when the user taps "Use Ethernet only"
    in the provisioning portal. Use it to persist the preference before reboot. */
 void wifi_config_set_eth_only_callback(void (*cb)(void));

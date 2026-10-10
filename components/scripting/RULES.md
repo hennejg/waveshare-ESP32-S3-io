@@ -329,7 +329,10 @@ rule('alarm off')
 | `mqtt(topic).once()` | **edge** — matches only on each message arrival, not while held |
 | `mqtt(topic).value` | last received payload (read in `then()`) |
 
-`.is(fn)` receives the raw payload string:
+`.is(fn)` receives the raw payload string. A message reaches the rules only
+whole: one whose topic (as seen by the rules, prefix removed) is longer than
+127 bytes or whose payload is longer than 255 bytes is dropped, with a warning
+in the device log, rather than shortened.
 
 ```js
 var trig = mqtt('rules/trigger').is(function (m) { return m === 'ON'; });

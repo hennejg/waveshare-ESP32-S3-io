@@ -2,16 +2,21 @@
 
 #include "esp_check.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #define TAG          "i2c_bus"
 #define I2C_SDA_PIN  GPIO_NUM_42
 #define I2C_SCL_PIN  GPIO_NUM_41
 
 static i2c_master_bus_handle_t s_bus = NULL;
+static SemaphoreHandle_t       s_lock;
+static StaticSemaphore_t       s_lock_buf;
 
 esp_err_t i2c_bus_init(void)
 {
     if (s_bus) return ESP_OK;   // already created
+    if (!s_lock) s_lock = xSemaphoreCreateRecursiveMutexStatic(&s_lock_buf);
 
     i2c_master_bus_config_t bus_cfg = {
         .i2c_port          = -1,          /* auto-select */
@@ -29,4 +34,14 @@ esp_err_t i2c_bus_init(void)
 i2c_master_bus_handle_t i2c_bus_handle(void)
 {
     return s_bus;
+}
+
+void i2c_bus_lock(void)
+{
+    if (s_lock) xSemaphoreTakeRecursive(s_lock, portMAX_DELAY);
+}
+
+void i2c_bus_unlock(void)
+{
+    if (s_lock) xSemaphoreGiveRecursive(s_lock);
 }

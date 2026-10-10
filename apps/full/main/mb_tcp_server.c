@@ -140,7 +140,7 @@ typedef struct {
     int64_t          out_deadline_us;
 
     uint32_t         local_ip;     /* our address on this connection, network order */
-    int64_t          last_use_us;  /* accepted, or its last whole frame   */
+    int64_t          last_use_us;  /* accepted, last whole frame, or answer */
 } conn_t;
 
 /* The slot, not the frame. A worker owns its connection outright for the
@@ -279,6 +279,10 @@ static void worker_task(void *arg)
            connection hostage. */
         conn_t *c = &s_conn[job.slot];
         arm_out(job.slot, process(c->frame, job.len, c->out, c->local_ip));
+        /* Answered now: a forward that waited seconds on the segment left
+           the frame's arrival time behind, and oldest_idle() offered the
+           connection to the next newcomer the moment its answer went out. */
+        c->last_use_us = esp_timer_get_time();
 
         /* After the answer is armed, and seen in that order: a release
            store, paired with the poller's acquire loads. As a plain volatile

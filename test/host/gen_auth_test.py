@@ -102,6 +102,8 @@ static void button_on_short_press(void (*cb)(void))
 }
 static int led_r;
 static void led_force_set(uint8_t r, uint8_t g, uint8_t b) { (void)g; (void)b; led_r = r; }
+/* Back to the LED's own colour: no blinking yellow left. */
+static void led_force_release(void) { led_r = 0; }
 
 __CUT__
 

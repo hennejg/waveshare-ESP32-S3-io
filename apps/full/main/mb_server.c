@@ -644,6 +644,24 @@ static esp_err_t start_command_task(void)
     return ESP_OK;
 }
 
+/* Takes back a half-finished start, as gateway_unwind() does for the master:
+   the controller installs the UART driver at create time, and a start that
+   failed after it left the port claimed for the rest of the boot. */
+static void rtu_slave_unwind(void)
+{
+    if (s_handle) { (void)mbc_slave_delete(s_handle); s_handle = NULL; }
+}
+
+#define RTU_START_CHECK(expr, what)                                  \
+    do {                                                             \
+        esp_err_t _e = (expr);                                       \
+        if (_e != ESP_OK) {                                          \
+            ESP_LOGE(TAG, "%s: %s", (what), esp_err_to_name(_e));    \
+            rtu_slave_unwind();                                      \
+            return _e;                                               \
+        }                                                            \
+    } while (0)
+
 /* The board on the RS-485 segment: either answering as a slave, or driving it
    as a master on behalf of TCP clients. One UART and one master per segment,
    so it is one or the other. */
@@ -659,46 +677,40 @@ static esp_err_t start_rtu_slave(const app_config_t *cfg)
         .ser_opts.stop_bits = UART_STOP_BITS_1,
     };
 
-    ESP_RETURN_ON_ERROR(mbc_slave_create_serial(&comm, &s_handle),
-                        TAG, "create serial slave");
+    RTU_START_CHECK(mbc_slave_create_serial(&comm, &s_handle), "create serial slave");
 
     /* GPIO assignment and RS-485 half-duplex mode must be set after
        create but before start — the controller installs the UART driver
        internally; uart_set_pin/mode patch it afterwards. */
-    ESP_RETURN_ON_ERROR(
-        uart_set_pin(MB_UART, MB_TX_GPIO, MB_RX_GPIO,
-                     MB_RTS_GPIO, UART_PIN_NO_CHANGE),
-        TAG, "uart_set_pin");
-    ESP_RETURN_ON_ERROR(
-        uart_set_mode(MB_UART, UART_MODE_RS485_HALF_DUPLEX),
-        TAG, "uart_set_mode");
+    RTU_START_CHECK(uart_set_pin(MB_UART, MB_TX_GPIO, MB_RX_GPIO,
+                                 MB_RTS_GPIO, UART_PIN_NO_CHANGE), "uart_set_pin");
+    RTU_START_CHECK(uart_set_mode(MB_UART, UART_MODE_RS485_HALF_DUPLEX), "uart_set_mode");
 
     mb_register_area_descriptor_t area = {0};
 
     area.type = MB_PARAM_COIL;      area.start_offset = 0;
     area.address = &s_coils_unused; area.size = sizeof(s_coils_unused);
     area.access  = MB_ACCESS_RW;
-    ESP_RETURN_ON_ERROR(mbc_slave_set_descriptor(s_handle, area), TAG, "coil desc");
+    RTU_START_CHECK(mbc_slave_set_descriptor(s_handle, area), "coil desc");
 
     area.type = MB_PARAM_DISCRETE;  area.start_offset = 0;
     area.address = &s_di_unused;    area.size = sizeof(s_di_unused);
     area.access  = MB_ACCESS_RO;
-    ESP_RETURN_ON_ERROR(mbc_slave_set_descriptor(s_handle, area), TAG, "di desc");
+    RTU_START_CHECK(mbc_slave_set_descriptor(s_handle, area), "di desc");
 
     area.type = MB_PARAM_HOLDING;   area.start_offset = 0;
     area.address = &s_hr_unused;    area.size = sizeof(s_hr_unused);
     area.access  = MB_ACCESS_RW;
-    ESP_RETURN_ON_ERROR(mbc_slave_set_descriptor(s_handle, area), TAG, "hr desc");
+    RTU_START_CHECK(mbc_slave_set_descriptor(s_handle, area), "hr desc");
 
     area.type = MB_PARAM_INPUT;     area.start_offset = 0;
     area.address = &s_ir_unused;    area.size = sizeof(s_ir_unused);
     area.access  = MB_ACCESS_RO;
-    ESP_RETURN_ON_ERROR(mbc_slave_set_descriptor(s_handle, area), TAG, "ir desc");
+    RTU_START_CHECK(mbc_slave_set_descriptor(s_handle, area), "ir desc");
 
-    ESP_RETURN_ON_ERROR(mbc_set_handler(s_handle, MB_FC_DEVICE_ID, rtu_device_id_handler),
-                        TAG, "fc43 handler");
+    RTU_START_CHECK(mbc_set_handler(s_handle, MB_FC_DEVICE_ID, rtu_device_id_handler), "fc43 handler");
 
-    ESP_RETURN_ON_ERROR(mbc_slave_start(s_handle), TAG, "start");
+    RTU_START_CHECK(mbc_slave_start(s_handle), "start");
 
     ESP_LOGI(TAG, "RS-485: RTU slave, address %u, %"PRIu32" baud",
              cfg->modbus.address, cfg->modbus.baudrate);

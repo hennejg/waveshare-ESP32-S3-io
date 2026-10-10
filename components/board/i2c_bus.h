@@ -11,3 +11,10 @@ esp_err_t i2c_bus_init(void);
 
 // The shared bus handle, or NULL if i2c_bus_init() hasn't succeeded yet.
 i2c_master_bus_handle_t i2c_bus_handle(void);
+
+// Held around every transfer on the bus, and around a bus reset with the
+// transfer it repeats. The driver serialises transfers itself, but not
+// i2c_master_bus_reset(): a reset by one device's code cut into the other
+// device's transfer under way. Recursive.
+void i2c_bus_lock(void);
+void i2c_bus_unlock(void);

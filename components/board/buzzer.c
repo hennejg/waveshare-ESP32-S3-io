@@ -50,16 +50,16 @@ static bool parse_bstep(cJSON *obj, bstep_t *s)
     cJSON *dur = cJSON_GetObjectItem(obj, "duration");
     if (!cJSON_IsNumber(dur)) return false;
 
-    uint32_t d = (uint32_t)dur->valuedouble;
-    if (d < DUR_MIN_MS) d = DUR_MIN_MS;
-    if (d > DUR_MAX_MS) d = DUR_MAX_MS;
+    /* Clamped as doubles, before the conversion: a negative or huge value
+       converted to uint32_t is undefined behaviour. NaN fails every test
+       and ends up at the low end. */
+    double dd = dur->valuedouble;
+    uint32_t d = dd >= DUR_MAX_MS ? DUR_MAX_MS : dd > DUR_MIN_MS ? (uint32_t)dd : DUR_MIN_MS;
 
     cJSON *freq = cJSON_GetObjectItem(obj, "freq");
-    uint32_t f = cJSON_IsNumber(freq) ? (uint32_t)freq->valuedouble : 0;
-    if (f > 0) {
-        if (f < FREQ_MIN) f = FREQ_MIN;
-        if (f > FREQ_MAX) f = FREQ_MAX;
-    }
+    double fd = cJSON_IsNumber(freq) ? freq->valuedouble : 0;
+    uint32_t f = 0;                                  /* below 1 Hz: silence */
+    if (fd >= 1) f = fd >= FREQ_MAX ? FREQ_MAX : fd > FREQ_MIN ? (uint32_t)fd : FREQ_MIN;
 
     s->freq_hz = f;
     s->dur_ms  = d;

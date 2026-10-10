@@ -134,7 +134,7 @@ static esp_err_t identification_cb(identification::callback_type_t type,
         esp_timer_start_periodic(s_identify_timer, 500 * 1000);
     } else {
         if (s_identify_timer) esp_timer_stop(s_identify_timer);
-        led_force_set(0, 0, 0);
+        led_force_release();
     }
     ESP_LOGI(TAG, "Identify %s on endpoint %u",
              type == identification::callback_type_t::START ? "start" : "stop", endpoint_id);
