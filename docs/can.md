@@ -19,7 +19,7 @@ Three modes are available, selected in the web UI (CAN Bus section). Changes tak
 
 | Field       | Applies to | Description                                    | Default |
 |-------------|------------|------------------------------------------------|---------|
-| TX interval | Both       | Periodic DI transmit in ms; 0 = on-change only | 1000 ms |
+| TX interval | Both       | Periodic DI/DO transmit in ms; 0 = on-change only | 1000 ms |
 
 ---
 
@@ -48,7 +48,9 @@ interval, and on read request. Invert flags applied.
 
 **base+2 — Digital outputs (RX + TX):**
 
-Two bytes: `[opcode][bitmask]` on receive; `[0x00][state]` echo on transmit.
+Two bytes: `[opcode][bitmask]` on receive; `[0x00][state]` echo on transmit. The state is sent after each command,
+whenever an output changes for any other reason (Modbus, MQTT, a rule, the web page), periodically at TX interval, and
+on read request.
 
 | Opcode     | Operation        | Effect                                    |
 |------------|------------------|-------------------------------------------|
@@ -96,7 +98,8 @@ On startup the device transmits an ISO Address Claim for its preferred source ad
 with no challenge, the address is considered claimed.
 
 If another node claims the same address with a numerically lower NAME, the device automatically tries the next address,
-repeating until it succeeds (up to address 251).
+repeating until it succeeds (up to address 251). If no address is left, it sends one "cannot claim" (an address claim
+from the null address 254), answers address-claim requests the same way, and sends nothing else.
 
 ### PGN Summary
 

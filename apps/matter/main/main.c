@@ -139,8 +139,9 @@ void app_main(void)
      * over Matter WiFi (whose credentials are not in wifi_cfg), counted as
      * unconfigured, and the AP -- open, taking an SSID from anyone in range --
      * came up for good or on every WiFi outage. matter.cpp also turns it off
-     * when commissioning completes. */
-    if (matter_is_commissioned())
+     * when commissioning completes. The exception is the BOOT long press:
+     * someone at the device asked for the setup AP. */
+    if (matter_is_commissioned() && !wifi_config_reset_requested())
         wifi_config_disable_ap();
     wifi_config_init("Waveshare Matter (192.168.4.1)", NULL, NULL);
 

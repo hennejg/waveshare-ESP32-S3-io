@@ -245,6 +245,14 @@
       return 'Basic ' + btoa(bin);
     }
 
+    /* What a refused request says: JSON or plain text, depending on the
+       handler. r.json() alone threw on plain text and lost the reason. */
+    async function responseError(r) {
+      const t = await r.text();
+      try { const d = JSON.parse(t); return d.error || d.message || d.detail || t; }
+      catch (_) { return t.replace(/<[^>]*>/g, ' ').trim() || ('HTTP ' + r.status); }
+    }
+
     function authHeaders() {
       if (!authPassword) return {};
       return { 'Authorization': basicAuth(authPassword) };
@@ -364,7 +372,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ token: authToken, password: p1 }),
         });
-        if (!r.ok) { const d = await r.json(); err.textContent = d.error || 'Error'; return; }
+        if (!r.ok) { err.textContent = await responseError(r); return; }
         authPassword = p1;
         sessionStorage.setItem('auth_pw', p1);
         authToken = '';
@@ -480,6 +488,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(cfg),
         });
+        if (!r.ok) throw new Error(await responseError(r));
         const res = await r.json();
         if (res.status === 'ok') {
           status.className = 'ok';
@@ -545,19 +554,25 @@
     let ioPollTimer  = null;
     let ioPollActive = false;
 
+    /* Names are the user's text: put into markup they must be escaped, or
+       a name like <svg onload=...> -- 20 characters -- runs script with the
+       password in sessionStorage. */
+    const esc = s => String(s).replace(/[&<>"']/g,
+      c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
     function buildIoPanel(cfg) {
       const diG = document.getElementById('di-grid');
       const doG = document.getElementById('do-grid');
       diG.innerHTML = '';
       doG.innerHTML = '';
       for (let i = 0; i < 8; i++) {
-        const n = cfg.di?.[i]?.name || `DI${i + 1}`;
+        const n = esc(cfg.di?.[i]?.name || `DI${i + 1}`);
         diG.insertAdjacentHTML('beforeend',
           `<div class="io-cell"><span id="di-dot-${i}" class="io-dot" title="${n}"></span>` +
           `<span class="io-lbl" title="${n}">${n}</span></div>`);
       }
       for (let i = 0; i < 8; i++) {
-        const n = cfg.dout?.[i]?.name || `DO${i + 1}`;
+        const n = esc(cfg.dout?.[i]?.name || `DO${i + 1}`);
         doG.insertAdjacentHTML('beforeend',
           `<div class="io-cell"><button type="button" id="do-btn-${i}" class="io-toggle"` +
           ` title="Click to toggle ${n}" onclick="toggleOutput(${i})">${n}</button></div>`);

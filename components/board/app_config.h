@@ -210,3 +210,6 @@ esp_err_t           app_config_update(const app_config_t *cfg);
        listened on output/2/set, and the handler only ever switched DO1.
    False with a message for the first problem. */
 bool                app_config_io_names_ok(const app_config_t *cfg, const char **err_msg);
+/* Well-formed UTF-8: no stray or missing continuation bytes, no overlong
+   forms, no surrogates, nothing past U+10FFFF. */
+bool                app_config_utf8_ok(const char *s);

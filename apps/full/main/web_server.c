@@ -100,22 +100,6 @@ static const char *mime_type(const char *path)
     return "application/octet-stream";
 }
 
-/* Parse a cJSON array of {invert, name} objects into a di_config_t array. */
-static void parse_invert_array(cJSON *arr, di_config_t *out, int max)
-{
-    if (!cJSON_IsArray(arr)) return;
-    int n = cJSON_GetArraySize(arr);
-    if (n > max) n = max;
-    for (int i = 0; i < n; i++) {
-        cJSON *item = cJSON_GetArrayItem(arr, i);
-        if (!item) continue;
-        cJSON *inv  = cJSON_GetObjectItem(item, "invert");
-        cJSON *name = cJSON_GetObjectItem(item, "name");
-        if (cJSON_IsBool(inv))    out[i].invert = cJSON_IsTrue(inv);
-        if (cJSON_IsString(name)) strlcpy(out[i].name, name->valuestring, sizeof(out[i].name));
-    }
-}
-
 /* httpd_req_recv() returns what a single socket read yielded. The loop in
    httpd_recv_with_opt() only repeats for HTTPD_RECV_OPT_BLOCKING, and
    httpd_recv() passes HTTPD_RECV_OPT_NONE, so one call can return far less
@@ -138,6 +122,65 @@ static bool json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out)
     if (!(d >= lo && d < (double)hi + 1.0)) return false;
     *out = (uint32_t)d;
     return true;
+}
+
+/* api_config_post() takes a field that is sent only when it is valid, and
+   refuses the whole save otherwise. A value out of range or of the wrong
+   type used to be skipped while the page said "Saved": register 70000 made
+   the row poll register 0, unit 300 polled unit 1. A field that is missing,
+   or null -- what the page sends for an empty number box -- leaves the
+   stored value. The first bad field is kept in *bad for the 400. */
+typedef struct { char field[40]; } cfg_err_t;
+
+static void cfg_bad(cfg_err_t *bad, const char *where, const char *key)
+{
+    if (bad && !bad->field[0]) snprintf(bad->field, sizeof(bad->field), "%s%s", where, key);
+}
+
+static bool cfg_uint(const cJSON *obj, const char *where, const char *key,
+                     uint32_t lo, uint32_t hi, uint32_t *out, cfg_err_t *bad)
+{
+    const cJSON *v = cJSON_GetObjectItem(obj, key);
+    if (!v || cJSON_IsNull(v)) return false;
+    if (json_uint(v, lo, hi, out)) return true;
+    cfg_bad(bad, where, key);
+    return false;
+}
+
+/* A string is taken whole or not at all. strlcpy() cut an over-long one
+   short -- a different name, and when the cut fell inside a character, an
+   MQTT topic that is not UTF-8, over which the broker closes the
+   connection, again on every reconnect. The page's maxlength counts
+   characters; the limit here is bytes. */
+static bool cfg_str(const cJSON *obj, const char *where, const char *key,
+                    char *dst, size_t cap, cfg_err_t *bad)
+{
+    const cJSON *v = cJSON_GetObjectItem(obj, key);
+    if (!v || cJSON_IsNull(v)) return false;
+    size_t len = cJSON_IsString(v) ? strlen(v->valuestring) : 0;
+    if (!cJSON_IsString(v) || len >= cap || !app_config_utf8_ok(v->valuestring)) {
+        cfg_bad(bad, where, key);
+        return false;
+    }
+    memcpy(dst, v->valuestring, len + 1);
+    return true;
+}
+
+/* Parse a cJSON array of {invert, name} objects into a di_config_t array. */
+static void parse_invert_array(cJSON *arr, di_config_t *out, int max, const char *where, cfg_err_t *bad)
+{
+    if (!cJSON_IsArray(arr)) return;
+    int n = cJSON_GetArraySize(arr);
+    if (n > max) n = max;
+    for (int i = 0; i < n; i++) {
+        cJSON *item = cJSON_GetArrayItem(arr, i);
+        if (!item) continue;
+        cJSON *inv  = cJSON_GetObjectItem(item, "invert");
+        if (cJSON_IsBool(inv)) out[i].invert = cJSON_IsTrue(inv);
+        char w[16];
+        snprintf(w, sizeof(w), "%s%d.", where, i + 1);
+        cfg_str(item, w, "name", out[i].name, sizeof(out[i].name), bad);
+    }
 }
 
 static int recv_body(httpd_req_t *req, char *buf, size_t cap)
@@ -554,16 +597,11 @@ static esp_err_t api_config_post(httpd_req_t *req)
 
     app_config_t cfg;
     memcpy(&cfg, app_config_get(), sizeof(cfg));
+    cfg_err_t bad = { "" };
 
-    /* String fields — macro to keep it terse */
-    #define STR(key, dst) do { \
-        cJSON *_v = cJSON_GetObjectItem(root, key); \
-        if (cJSON_IsString(_v)) strlcpy(dst, _v->valuestring, sizeof(dst)); \
-    } while (0)
-
-    STR("device_name",      cfg.device_name);
-    STR("mqtt_url",         cfg.mqtt_url);
-    STR("mqtt_user",        cfg.mqtt_user);
+    cfg_str(root, "", "device_name", cfg.device_name, sizeof(cfg.device_name), &bad);
+    cfg_str(root, "", "mqtt_url",    cfg.mqtt_url,    sizeof(cfg.mqtt_url),    &bad);
+    cfg_str(root, "", "mqtt_user",   cfg.mqtt_user,   sizeof(cfg.mqtt_user),   &bad);
     /* The prefix is used verbatim as a publish topic and as the last-will
        topic. '#' and '+' are illegal there (MQTT 3.1.1 3.3.2.1 / 4.7) and a
        conforming broker closes the connection on CONNECT, after which MQTT
@@ -581,17 +619,16 @@ static esp_err_t api_config_post(httpd_req_t *req)
                                     "or start or end with '/'");
                 return ESP_OK;
             }
-            strlcpy(cfg.mqtt_topic_prefix, pfx, sizeof(cfg.mqtt_topic_prefix));
+            cfg_str(root, "", "mqtt_topic_prefix", cfg.mqtt_topic_prefix, sizeof(cfg.mqtt_topic_prefix), &bad);
         }
     }
-    #undef STR
 
     /* Password: only update when a non-empty value is sent */
     cJSON *pass = cJSON_GetObjectItem(root, "mqtt_password");
     if (cJSON_IsString(pass) && pass->valuestring[0])
-        strlcpy(cfg.mqtt_password, pass->valuestring, sizeof(cfg.mqtt_password));
+        cfg_str(root, "", "mqtt_password", cfg.mqtt_password, sizeof(cfg.mqtt_password), &bad);
 
-    parse_invert_array(cJSON_GetObjectItem(root, "di"),   cfg.di,   APP_CFG_DI_COUNT);
+    parse_invert_array(cJSON_GetObjectItem(root, "di"), cfg.di, APP_CFG_DI_COUNT, "di.", &bad);
 #if APP_CFG_DI_AUX_COUNT
     /* Only what is sent changes: a request without "aux", a shorter array, or
        an entry without a field leaves the rest as it is. A value outside its
@@ -625,8 +662,9 @@ static esp_err_t api_config_post(httpd_req_t *req)
                     aux_err = "pwm_duty must be a percentage from 0 to 100";
             }
             if (!aux_err && (v = cJSON_GetObjectItem(o, "out_name"))) {
-                if (!cJSON_IsString(v) || strlen(v->valuestring) > APP_CFG_IO_NAME_MAX)
-                    aux_err = "out_name must be a string of at most 20 characters";
+                if (!cJSON_IsString(v) || strlen(v->valuestring) > APP_CFG_IO_NAME_MAX ||
+                    !app_config_utf8_ok(v->valuestring))
+                    aux_err = "out_name must be text of at most 20 bytes (UTF-8)";
                 else
                     strlcpy(cfg.aux_out[a].name, v->valuestring, sizeof(cfg.aux_out[a].name));
             }
@@ -644,27 +682,27 @@ static esp_err_t api_config_post(httpd_req_t *req)
         return ESP_OK;
     }
 #endif
-    parse_invert_array(cJSON_GetObjectItem(root, "dout"), cfg.dout, APP_CFG_DO_COUNT);
+    parse_invert_array(cJSON_GetObjectItem(root, "dout"), cfg.dout, APP_CFG_DO_COUNT, "dout.", &bad);
 
     uint32_t n;
-    if (json_uint(cJSON_GetObjectItem(root, "led_mode"), LED_MODE_IO, LED_MODE_STATUS, &n))
+    if (cfg_uint(root, "", "led_mode", LED_MODE_IO, LED_MODE_STATUS, &n, &bad))
         cfg.led_mode = (uint8_t)n;
 
     cJSON *can_j = cJSON_GetObjectItem(root, "can");
     if (cJSON_IsObject(can_j)) {
-        if (json_uint(cJSON_GetObjectItem(can_j, "mode"), 0, 2, &n))
+        if (cfg_uint(can_j, "can.", "mode", 0, 2, &n, &bad))
             cfg.can.mode = (uint8_t)n;
-        if (json_uint(cJSON_GetObjectItem(can_j, "n2k_addr"), 1, 251, &n))
+        if (cfg_uint(can_j, "can.", "n2k_addr", 1, 251, &n, &bad))
             cfg.can.n2k_addr = (uint8_t)n;
         /* base_id .. base_id + 5 are used for TX and RX matching, so the
            whole block has to fit in the 11-bit standard range. */
-        if (json_uint(cJSON_GetObjectItem(can_j, "base_id"), 0, APP_CFG_CAN_BASE_ID_MAX, &n))
+        if (cfg_uint(can_j, "can.", "base_id", 0, APP_CFG_CAN_BASE_ID_MAX, &n, &bad))
             cfg.can.base_id = (uint16_t)n;
         /* Outside this range twai_new_node_onchip() refuses the value and
            can_server_init() fails — see the boot-order note in main.c. */
-        if (json_uint(cJSON_GetObjectItem(can_j, "bitrate"), 10000, 1000000, &n))
+        if (cfg_uint(can_j, "can.", "bitrate", 10000, 1000000, &n, &bad))
             cfg.can.bitrate = n;
-        if (json_uint(cJSON_GetObjectItem(can_j, "tx_interval_ms"), 0, UINT16_MAX, &n))
+        if (cfg_uint(can_j, "can.", "tx_interval_ms", 0, UINT16_MAX, &n, &bad))
             cfg.can.tx_interval_ms = (uint16_t)n;
     }
 
@@ -673,9 +711,9 @@ static esp_err_t api_config_post(httpd_req_t *req)
         cJSON *v;
         if ((v = cJSON_GetObjectItem(mb, "enable"))   && cJSON_IsBool(v))
             cfg.modbus.enable = cJSON_IsTrue(v) ? 1 : 0;
-        if (json_uint(cJSON_GetObjectItem(mb, "address"), 1, 247, &n))
+        if (cfg_uint(mb, "modbus.", "address", 1, 247, &n, &bad))
             cfg.modbus.address = (uint8_t)n;
-        if (json_uint(cJSON_GetObjectItem(mb, "baudrate"), 1200, 921600, &n))
+        if (cfg_uint(mb, "modbus.", "baudrate", 1200, 921600, &n, &bad))
             cfg.modbus.baudrate = n;
         if ((v = cJSON_GetObjectItem(mb, "rs485_role")) && cJSON_IsString(v)) {
             if      (!strcmp(v->valuestring, "slave"))  cfg.modbus.rs485_role = MB_ROLE_SLAVE;
@@ -685,9 +723,9 @@ static esp_err_t api_config_post(httpd_req_t *req)
             cfg.modbus.tcp_server = cJSON_IsTrue(v) ? 1 : 0;
         if ((v = cJSON_GetObjectItem(mb, "gateway")) && cJSON_IsBool(v))
             cfg.modbus.gateway = cJSON_IsTrue(v) ? 1 : 0;
-        if (json_uint(cJSON_GetObjectItem(mb, "tcp_uid"), 1, 247, &n))
+        if (cfg_uint(mb, "modbus.", "tcp_uid", 1, 247, &n, &bad))
             cfg.modbus.tcp_uid = (uint8_t)n;
-        if (json_uint(cJSON_GetObjectItem(mb, "rs485_tout_ms"), MB_RS485_TOUT_MIN_MS, MB_RS485_TOUT_MAX_MS, &n))
+        if (cfg_uint(mb, "modbus.", "rs485_tout_ms", MB_RS485_TOUT_MIN_MS, MB_RS485_TOUT_MAX_MS, &n, &bad))
             cfg.modbus.rs485_tout_ms = (uint16_t)n;
 
         /* Two combinations are worth refusing rather than quietly accepting.
@@ -731,6 +769,8 @@ static esp_err_t api_config_post(httpd_req_t *req)
             mbm_poll_t *e = &cfg.mbm[i];
             cJSON *v;
             uint32_t u;
+            char w[12];
+            snprintf(w, sizeof(w), "mbm.%d.", i + 1);
 
             e->port = MBM_PORT_DEFAULT; e->unit_id = MBM_UNIT_ID_DEFAULT;
             e->fc = MBM_FC_DEFAULT; e->scale = 1.0f; e->interval_ms = MBM_INTERVAL_DEFAULT_MS;
@@ -741,17 +781,18 @@ static esp_err_t api_config_post(httpd_req_t *req)
                 if (cJSON_IsBool(v))        e->enable = cJSON_IsTrue(v) ? 1 : 0;
                 else if (cJSON_IsNumber(v)) e->enable = v->valuedouble != 0 ? 1 : 0;
             }
-            if ((v = cJSON_GetObjectItem(o, "name")) && cJSON_IsString(v))
-                strlcpy(e->name, v->valuestring, sizeof(e->name));
-            if ((v = cJSON_GetObjectItem(o, "host")) && cJSON_IsString(v))
-                strlcpy(e->host, v->valuestring, sizeof(e->host));
-            if (json_uint(cJSON_GetObjectItem(o, "port"), 1, 65535, &u))
+            /* Only a row that is polled is held to its ranges: what a
+               disabled row's hidden boxes hold must not block the save. */
+            cfg_err_t *rb = e->enable ? &bad : NULL;
+            cfg_str(o, w, "name", e->name, sizeof(e->name), rb);
+            cfg_str(o, w, "host", e->host, sizeof(e->host), rb);
+            if (cfg_uint(o, w, "port", 1, 65535, &u, rb))
                 e->port = (uint16_t)u;
-            if (json_uint(cJSON_GetObjectItem(o, "unit_id"), 1, 247, &u))
+            if (cfg_uint(o, w, "unit_id", 1, 247, &u, rb))
                 e->unit_id = (uint8_t)u;
             if ((v = cJSON_GetObjectItem(o, "fc")) && cJSON_IsString(v))
                 e->fc = strcmp(v->valuestring, "input") == 0 ? 4 : 3;
-            if (json_uint(cJSON_GetObjectItem(o, "reg"), 0, 65535, &u))
+            if (cfg_uint(o, w, "reg", 0, 65535, &u, rb))
                 e->reg = (uint16_t)u;
             if ((v = cJSON_GetObjectItem(o, "type")) && cJSON_IsString(v))
                 mbm_type_value(v->valuestring, &e->type);
@@ -779,7 +820,7 @@ static esp_err_t api_config_post(httpd_req_t *req)
                        the row as it stands would then be refused. */
                     e->scale = 1.0f;
             }
-            if (json_uint(cJSON_GetObjectItem(o, "interval_ms"), MBM_INTERVAL_MIN_MS, MBM_INTERVAL_MAX_MS, &u))
+            if (cfg_uint(o, w, "interval_ms", MBM_INTERVAL_MIN_MS, MBM_INTERVAL_MAX_MS, &u, rb))
                 e->interval_ms = u;
 
             /* A name that is empty or carries MQTT syntax would make a topic
@@ -816,25 +857,30 @@ static esp_err_t api_config_post(httpd_req_t *req)
         cJSON *v;
         if ((v = cJSON_GetObjectItem(sntp_j, "enable")) && cJSON_IsBool(v))
             cfg.sntp.enable = cJSON_IsTrue(v) ? 1 : 0;
-        if ((v = cJSON_GetObjectItem(sntp_j, "server")) && cJSON_IsString(v))
-            strlcpy(cfg.sntp.server, v->valuestring, sizeof(cfg.sntp.server));
+        cfg_str(sntp_j, "sntp.", "server", cfg.sntp.server, sizeof(cfg.sntp.server), &bad);
     }
 
-    cJSON *tz_j = cJSON_GetObjectItem(root, "tz");
-    if (cJSON_IsString(tz_j))
-        strlcpy(cfg.tz, tz_j->valuestring, sizeof(cfg.tz));
+    cfg_str(root, "", "tz", cfg.tz, sizeof(cfg.tz), &bad);
 
     cJSON_Delete(root);
 
-    /* Validate names before saving */
-    const char *err = NULL;
-    if (!app_config_io_names_ok(&cfg, &err)) {
+    if (bad.field[0]) {
         char msg[128];
-        snprintf(msg, sizeof(msg), "{\"status\":\"error\",\"message\":\"%s\"}", err);
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, msg);
+        snprintf(msg, sizeof(msg), "invalid value for %s (wrong type, out of range or too long)", bad.field);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
         return ESP_OK;
     }
+
+    /* Validate names before saving -- a 400 in plain text, like every other
+       refusal here (it was a 200 with a JSON error). */
+    const char *err = NULL;
+    if (!app_config_io_names_ok(&cfg, &err)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, err);
+        return ESP_OK;
+    }
+
+    /* The page always sends the table; whether it changed is what counts. */
+    bool mbm_changed = mbm_present && memcmp(cfg.mbm, app_config_get()->mbm, sizeof(cfg.mbm)) != 0;
 
     esp_err_t upd = app_config_update(&cfg);
     if (upd != ESP_OK) {
@@ -843,26 +889,37 @@ static esp_err_t api_config_post(httpd_req_t *req)
         return send_json(req, "500 Internal Server Error", "{\"error\":\"configuration could not be stored\"}");
     }
 
-    /* Only when this request actually carried the table. Reloading clears the
-       master's counters and drops its connections to every meter, so doing it
-       for a request that merely renamed an input or changed the NTP server
-       would throw away readings nobody asked to lose.
+    /* Only when the table changed. Reloading clears the master's counters and
+       drops its connections to every meter, so doing it for a request that
+       merely renamed an input or changed the NTP server would throw away
+       readings nobody asked to lose. The page sends the table with every
+       save, so "the request carried it" was every time.
 
        The master re-reads the table on its own, but the task only exists once
        something is enabled, and what it knew about the old entries no longer
        describes the new ones. Everything else on this page needs a reboot,
        which is what the form says; this one does not have to. */
-    if (mbm_present) mb_tcp_master_reload();
+    if (mbm_changed) mb_tcp_master_reload();
     /* Before di_publish_all() below. A pad that cannot take its mode is left
        in its standard function; the save itself has happened. */
     esp_err_t aux_ret = aux_io_apply();
     app_time_apply_tz();  /* timezone first, so a sync that follows computes in it */
     sntp_sync_apply();    /* apply any SNTP server / enable change immediately */
     di_publish_all();
+    /* The relays take a changed invert here, with or without MQTT: before,
+       only dout_on_mqtt_connected() re-applied them, and it is empty in a
+       build without MQTT -- the save said ok and the next unrelated output
+       write flipped them. */
+    esp_err_t dout_ret = dout_publish_all();
     /* Re-subscribe with potentially new names, then publish all DO states. */
     dout_on_mqtt_connected();
     if (app_mqtt_is_connected()) aux_io_on_mqtt_connected();
 
+    if (dout_ret != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+            "Saved, but the outputs could not be re-applied and may still use the old invert setting (see the device log)");
+        return ESP_OK;
+    }
     if (aux_ret != ESP_OK) {
         /* Stored, but not in effect: say so, rather than "ok" next to a mode
            the Device tab shows and the pad does not have. */
@@ -1340,8 +1397,12 @@ static esp_err_t api_io_output(httpd_req_t *req)
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "this pad is not set to output");
             return ESP_OK;
         }
+        if (r != ESP_OK) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "output write failed");
+            return ESP_OK;
+        }
         httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, r == ESP_OK ? "{\"status\":\"ok\"}" : "{\"status\":\"error\"}");
+        httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
         return ESP_OK;
     }
 

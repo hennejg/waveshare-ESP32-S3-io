@@ -11,8 +11,8 @@ PORT ?= 15020
 
 # Every target below; GEN are the ones a gen_<name>_test.py writes as
 # test_<name>.c and builds into test_<name>.
-TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic
-GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic
+TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic cfgpost portalconn cantx
+GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic cfgpost portalconn cantx
 
 .PHONY: all clean $(TESTS)
 all: test_mb_pdu $(TESTS)
@@ -47,6 +47,14 @@ test_pwhash: gen_pwhash_test.py ../../components/board/auth.c $(MBT_OBJ)
 	$(CC) $(CFLAGS) $(MBT_INC) -Wno-unused-function -Wno-unused-parameter test_pwhash.c $(MBT_OBJ) -o $@
 
 # The NMEA 2000 heartbeat as it goes on the bus, cut out of can_server.c.
+# What the CAN server sends on its own, cut out of can_server.c.
+cantx: test_cantx
+	./test_cantx
+
+test_cantx: gen_cantx_test.py $(MAIN)/can_server.c
+	python3 gen_cantx_test.py
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter -Wno-unused-variable test_cantx.c -o $@
+
 n2khb: test_n2khb
 	./test_n2khb
 
@@ -203,6 +211,14 @@ uiauth: gen_uiauth_test.py ../../www/index.html ../../apps/matter/www/index.html
 	python3 gen_uiauth_test.py
 	node test_uiauth.js
 
+# How long one client can hold the setup portal, cut out of wifi_config.c.
+portalconn: test_portalconn
+	./test_portalconn
+
+test_portalconn: gen_portalconn_test.py ../../components/esp32-wifi-bootstrap/src/wifi_config.c
+	python3 gen_portalconn_test.py
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter test_portalconn.c -o $@
+
 wifimon: test_wifimon
 	./test_wifimon
 
@@ -280,6 +296,14 @@ timeset: test_timeset
 test_timeset: gen_timeset_test.py qjs-obj/cJSON.o $(MAIN)/web_server.c
 	python3 gen_timeset_test.py
 	$(CC) $(CFLAGS) -I$(CJSON) -Wno-unused-function test_timeset.c qjs-obj/cJSON.o -o $@
+
+# Saving the configuration, the whole handler cut out of web_server.c.
+cfgpost: test_cfgpost
+	./test_cfgpost
+
+test_cfgpost: gen_cfgpost_test.py qjs-obj/cJSON.o $(MAIN)/web_server.c ../../components/board/app_config.h
+	python3 gen_cfgpost_test.py
+	$(CC) $(CFLAGS) -I$(CJSON) -I../../components/board -Istubs -Wno-unused-function test_cfgpost.c qjs-obj/cJSON.o -lm -o $@
 
 reseterr: test_reseterr
 	./test_reseterr

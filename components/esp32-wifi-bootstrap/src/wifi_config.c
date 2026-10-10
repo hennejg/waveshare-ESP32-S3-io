@@ -785,6 +785,50 @@ static http_parser_settings wifi_config_http_parser_settings = {
 };
 
 
+/* One connection, start to close. The server takes one client at a time,
+   so a client must not be able to keep it: SO_RCVTIMEO only bounds each
+   read, and a client sending a byte every few seconds -- or anything the
+   parser cannot read, such as a TLS hello on port 80, which left the loop
+   reading on -- kept the setup page from everyone else for as long as it
+   liked. Now the whole connection has a deadline, and a parse error ends it. */
+#define WIFI_CONFIG_CLIENT_DEADLINE_MS 10000
+
+static void serve_client(int fd) {
+        const struct timeval client_to = { 5, 0 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &client_to, sizeof(client_to));
+
+        client_t *client = client_new();
+        client->fd = fd;
+        char data[256];
+        const TickType_t start = xTaskGetTickCount();
+
+        while (xTaskGetTickCount() - start < pdMS_TO_TICKS(WIFI_CONFIG_CLIENT_DEADLINE_MS)) {
+                int len = lwip_read(fd, data, sizeof(data) - 1);
+                if (len <= 0) {
+                        /* len==0: client closed (ACKed our response); len<0: timeout/error */
+                        INFO("HTTP rx fd=%d close len=%d errno=%d", fd, len, errno);
+                        break;
+                }
+                data[len] = '\0';
+                /* Only the length: the data is the setup form, WiFi password included. */
+                INFO("HTTP rx fd=%d len=%d", fd, len);
+                if (!handle_get_request(client, data, len)) {
+                        /* Not a complete GET — run http_parser (handles POST body) */
+                        size_t nparsed = http_parser_execute(&client->parser, &wifi_config_http_parser_settings, data, len);
+                        if ((int)nparsed != len || HTTP_PARSER_ERRNO(&client->parser) != HPE_OK) {
+                                INFO("HTTP parser: consumed %d/%d errno=%s", (int)nparsed, len,
+                                     http_errno_name(HTTP_PARSER_ERRNO(&client->parser)));
+                                break;
+                        }
+                }
+                if (client->disconnected)
+                        break;
+        }
+
+        lwip_close(fd);
+        client_free(client);
+}
+
 static void http_task(void *arg) {
         INFO("Starting HTTP server");
 
@@ -826,8 +870,6 @@ static void http_task(void *arg) {
                 return;
         }
 
-        char data[256];
-
         while (true) {
                 uint32_t task_value = 0;
                 if (xTaskNotifyWait(0, 1, &task_value, 0) == pdTRUE && task_value)
@@ -838,39 +880,7 @@ static void http_task(void *arg) {
                         continue;   /* timeout (EAGAIN) or error — recheck stop notification */
 
                 INFO("HTTP: client connected, fd=%d", fd);
-
-                const struct timeval client_to = { 5, 0 };
-                setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &client_to, sizeof(client_to));
-
-                client_t *client = client_new();
-                client->fd = fd;
-
-                while (true) {
-                        int len = lwip_read(fd, data, sizeof(data) - 1);
-                        if (len > 0) {
-                                data[len] = '\0';
-                                /* Only the length: the data is the setup form, WiFi password included. */
-                                INFO("HTTP rx fd=%d len=%d", fd, len);
-                                if (!client->disconnected) {
-                                        if (!handle_get_request(client, data, len)) {
-                                                /* Not a complete GET — run http_parser (handles POST body) */
-                                                size_t nparsed = http_parser_execute(&client->parser, &wifi_config_http_parser_settings, data, len);
-                                                if ((int)nparsed != len || HTTP_PARSER_ERRNO(&client->parser) != HPE_OK)
-                                                        INFO("HTTP parser: consumed %d/%d errno=%s", (int)nparsed, len,
-                                                             http_errno_name(HTTP_PARSER_ERRNO(&client->parser)));
-                                        }
-                                }
-                                if (client->disconnected)
-                                        break;
-                        } else {
-                                /* len==0: client closed (ACKed our response); len<0: timeout/error */
-                                INFO("HTTP rx fd=%d close len=%d errno=%d", fd, len, errno);
-                                break;
-                        }
-                }
-
-                lwip_close(fd);
-                client_free(client);
+                serve_client(fd);
         }
 
         INFO("Stopping HTTP server");
@@ -1292,6 +1302,16 @@ void wifi_config_init2(const char *ssid_prefix, const char *password,
         context->on_event = on_event;
 
         wifi_config_start();
+}
+
+
+bool wifi_config_reset_requested(void) {
+        /* wifi_config_reset() leaves the key, empty; a device that never had
+           credentials through this component has no key at all. */
+        size_t required = 0;
+        return sysparam_init() == ESP_OK &&
+               nvs_get_str(wifi_cfg_handle, "wifi_ssid", NULL, &required) == ESP_OK &&
+               required <= 1;
 }
 
 

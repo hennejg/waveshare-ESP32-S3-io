@@ -547,6 +547,15 @@ rule('my-rule')
       return 'Basic ' + btoa(bin);
     }
 
+    /* What a refused request says. The device answers in JSON or in plain
+       text depending on the handler; r.json() alone threw on the plain-text
+       ones ("password too long", "Invalid JSON") and the reason was lost. */
+    async function responseError(r) {
+      const t = await r.text();
+      try { const d = JSON.parse(t); return d.error || d.message || d.detail || t; }
+      catch (_) { return t.replace(/<[^>]*>/g, ' ').trim() || ('HTTP ' + r.status); }
+    }
+
     function authHeaders() {
       if (!authPassword) return {};
       return { 'Authorization': basicAuth(authPassword) };
@@ -668,7 +677,7 @@ rule('my-rule')
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ token: authToken, password: p1 }),
         });
-        if (!r.ok) { const d = await r.json(); err.textContent = d.error || 'Error'; return; }
+        if (!r.ok) { err.textContent = await responseError(r); return; }
         authPassword = p1;
         sessionStorage.setItem('auth_pw', p1);
         authToken = '';
@@ -1396,7 +1405,16 @@ rule('my-rule')
         '  • IO names and invert flags\n' +
         '  • Modbus configuration\n\n' +
         'Continue?')) return;
-      try { await apiFetch('/api/factory-reset', { method: 'POST' }); } catch (_) {}
+      /* No answer is fine -- the device may already be going down. A refusal
+         is not: "erase failed, nothing reset" used to be followed by
+         "Resetting…" and "Back online", as if it had worked. */
+      let r = null;
+      try { r = await apiFetch('/api/factory-reset', { method: 'POST' }); } catch (_) {}
+      if (r && !r.ok) {
+        status.className = 'err';
+        status.textContent = 'Factory reset failed: ' + await responseError(r);
+        return;
+      }
       waitForReboot('Resetting to factory defaults…', true);
     });
 
@@ -1607,12 +1625,24 @@ rule('my-rule')
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ script }),
         });
+        if (!r.ok && r.status !== 202) {
+          st.className = 'err';
+          st.textContent = 'Error: ' + await responseError(r);
+          return;
+        }
         const d = await r.json();
         if (d.status === 'ok') {
           st.className = 'ok';
           st.textContent = successMsg;
           rulesLoaded = false;
           await loadRules();
+        } else if (d.status === 'accepted') {
+          /* 202: the engine has the script and has not ruled on it yet; it
+             stores it once it does. Not an error -- it was shown as one, and
+             invited saving a script that was already on its way in. */
+          st.className = '';
+          st.textContent = 'Accepted — the engine is still checking it. Reload in a moment to see the result.';
+          rulesLoaded = false;
         } else {
           st.className = 'err';
           st.textContent = 'Error: ' + JSON.stringify(d);

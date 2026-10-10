@@ -80,7 +80,7 @@ static const char *mime_type(const char *path)
     return "application/octet-stream";
 }
 
-static void parse_invert_array(cJSON *arr, di_config_t *out, int max)
+static void parse_invert_array(cJSON *arr, di_config_t *out, int max, bool *too_long)
 {
     if (!cJSON_IsArray(arr)) return;
     int n = cJSON_GetArraySize(arr);
@@ -91,7 +91,12 @@ static void parse_invert_array(cJSON *arr, di_config_t *out, int max)
         cJSON *inv  = cJSON_GetObjectItem(item, "invert");
         cJSON *name = cJSON_GetObjectItem(item, "name");
         if (cJSON_IsBool(inv))    out[i].invert = cJSON_IsTrue(inv);
-        if (cJSON_IsString(name)) strlcpy(out[i].name, name->valuestring, sizeof(out[i].name));
+        /* Whole or not at all: cut at 20 bytes, a name could end inside a
+           character, and Matter labels must be UTF-8. */
+        if (cJSON_IsString(name)) {
+            if (strlen(name->valuestring) >= sizeof(out[i].name)) { *too_long = true; continue; }
+            strlcpy(out[i].name, name->valuestring, sizeof(out[i].name));
+        }
     }
 }
 
@@ -371,17 +376,26 @@ static esp_err_t api_config_post(httpd_req_t *req)
     app_config_t cfg;
     memcpy(&cfg, app_config_get(), sizeof(cfg));
 
+    bool too_long = false;
     cJSON *dn = cJSON_GetObjectItem(root, "device_name");
-    if (cJSON_IsString(dn)) strlcpy(cfg.device_name, dn->valuestring, sizeof(cfg.device_name));
+    if (cJSON_IsString(dn)) {
+        if (strlen(dn->valuestring) >= sizeof(cfg.device_name)) too_long = true;
+        else strlcpy(cfg.device_name, dn->valuestring, sizeof(cfg.device_name));
+    }
 
     uint32_t n;
     if (json_uint(cJSON_GetObjectItem(root, "led_mode"), LED_MODE_IO, LED_MODE_STATUS, &n))
         cfg.led_mode = (uint8_t)n;
 
-    parse_invert_array(cJSON_GetObjectItem(root, "di"),   cfg.di,   APP_CFG_DI_COUNT);
-    parse_invert_array(cJSON_GetObjectItem(root, "dout"), cfg.dout, APP_CFG_DO_COUNT);
+    parse_invert_array(cJSON_GetObjectItem(root, "di"),   cfg.di,   APP_CFG_DI_COUNT, &too_long);
+    parse_invert_array(cJSON_GetObjectItem(root, "dout"), cfg.dout, APP_CFG_DO_COUNT, &too_long);
 
     cJSON_Delete(root);
+
+    if (too_long) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "a name is too long (at most 20 bytes as UTF-8)");
+        return ESP_OK;
+    }
 
     /* The rules the loader applies at boot (io_names_normalize): checked
        here with the same function, a name accepted now would otherwise be
@@ -389,10 +403,7 @@ static esp_err_t api_config_post(httpd_req_t *req)
        number, "set" and "read" are reserved, '+' and '#' are MQTT wildcards. */
     const char *err = NULL;
     if (!app_config_io_names_ok(&cfg, &err)) {
-        char msg[64];
-        snprintf(msg, sizeof(msg), "{\"status\":\"error\",\"message\":\"%s\"}", err);
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, msg);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, err);
         return ESP_OK;
     }
 

@@ -9,6 +9,9 @@ found by an outside review:
   - DO1 called "2" next to an unnamed DO2: both subscribed output/2/set and
     the handler only ever switched DO1.
 And a stored configuration from before the check is cleaned up on load.
+Later review: a name cut at 20 bytes inside a UTF-8 character was stored,
+and made a topic the broker closes the connection over -- names must be
+UTF-8 (refused on save, dropped on load).
 
   make -C test/host names
 """
@@ -16,7 +19,7 @@ import pathlib
 from cutter import Source
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-src  = Source(ROOT / "components/board/app_config.c")
+src  = Source.at("components/board/app_config.c")
 cuts = src.span("#define IO_SPACE_MAX", "    io_space_normalize(&out);\n}")
 
 HARNESS = r"""
@@ -70,6 +73,9 @@ int main(void)
     FRESH(); strcpy(c.dout[0].name, "a+b");          expect("DO1 'a+b'", &c, false);
     FRESH(); strcpy(c.dout[0].name, "#");            expect("DO1 '#'", &c, false);
     FRESH(); strcpy(c.dout[0].name, "a/b");          expect("DO1 'a/b'", &c, false);
+    FRESH(); strcpy(c.di[0].name, "Gr\xc3\xb6\xc3\x9f" "e"); expect("DI1 mit Umlaut (UTF-8)", &c, true);
+    FRESH(); strcpy(c.di[0].name, "Wohnzimmer\xc3");  expect("DI1 endet mitten im Zeichen", &c, false);
+    FRESH(); strcpy(c.di[0].name, "\xc0\xaf");       expect("DI1 ueberlange Kodierung", &c, false);
 
     printf("  Bereinigung beim Laden:\n");
     FRESH(); strcpy(c.dout[0].name, "set"); strcpy(c.dout[1].name, "1"); strcpy(c.dout[4].name, "pump");
@@ -80,6 +86,9 @@ int main(void)
     FRESH(); strcpy(c.dout[0].name, "2");
     io_names_normalize(&c);
     expect("DO1 '2' -> bereinigt", &c, true);
+    FRESH(); strcpy(c.dout[3].name, "ab\xc3");
+    io_names_normalize(&c);
+    expect("DO4 kaputtes UTF-8 -> bereinigt", &c, true);
 
     printf(failures ? "names: %d FEHLER\n" : "names: alles OK\n", failures);
     return failures ? 1 : 0;

@@ -18,6 +18,11 @@ void wifi_config_init2(const char *ssid_prefix, const char *password, void (*on_
 /* Both return what NVS said; on an error the stored credentials may be the
    old ones, or none (wifi_config_set clears the SSID first). */
 esp_err_t wifi_config_reset();
+/* True when the credentials were cleared by wifi_config_reset() (the BOOT
+   long press) and nothing has been stored since -- the one time a device
+   that is otherwise set up (e.g. Matter-commissioned) should open the
+   setup AP again. False when no credentials were ever stored here. */
+bool wifi_config_reset_requested(void);
 void wifi_config_get(char **ssid, char **password);
 esp_err_t wifi_config_set(const char *ssid, const char *password);
 

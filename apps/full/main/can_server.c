@@ -65,6 +65,12 @@ static IRAM_ATTR bool rx_done_cb(twai_node_handle_t node,
 
 static uint16_t s_base;
 
+/* The output state last sent, in either mode. The senders set it, so a
+   change the worker has not seen yet -- an output switched over Modbus,
+   MQTT, a rule or the web page -- is told apart from one a CAN command
+   already answered. */
+static uint8_t s_last_do = 0xFF;
+
 /* The driver does not copy a frame: it keeps a pointer to the twai_frame_t and
    to its buffer in p_curr_tx and in tx_mount_queue until the transmission
    finishes. Frames therefore live here rather than on the sender's stack, and
@@ -166,7 +172,7 @@ static void basic_tx_di(uint8_t bits) { basic_send(s_base + 1, &bits, 1); }
 static void basic_tx_do(void)
 {
     uint8_t f[2] = {0, 0};
-    f[1] = dout_get_all();
+    f[1] = s_last_do = dout_get_all();
     basic_send(s_base + 2, f, 2);
 }
 
@@ -350,7 +356,8 @@ static void n2k_tx_heartbeat(void)
     uint16_t interval_ms = HB_PERIOD_MS;
     payload[0] = interval_ms & 0xFF;
     payload[1] = (interval_ms >> 8) & 0xFF;
-    payload[2] = s_hb_seq++;
+    payload[2] = s_hb_seq;
+    s_hb_seq = s_hb_seq >= 252 ? 0 : s_hb_seq + 1;   /* 253..255: reserved, error, n/a */
     memset(payload + 3, 0xFF, 5);     /* controller/equipment state n/a, reserved */
     n2k_send_frame(n2k_make_id(N2K_PGN_HEARTBEAT, 7, s_addr, N2K_ADDR_GLOBAL), payload, sizeof(payload));
 }
@@ -380,8 +387,7 @@ static void n2k_tx_di_bank(void)
 
 static void n2k_tx_do_bank(void)
 {
-    uint8_t bitmask = 0;
-    bitmask = dout_get_all();
+    uint8_t bitmask = s_last_do = dout_get_all();
     uint8_t data[8];
     encode_switch_bank(data, N2K_DO_INSTANCE, bitmask);
     n2k_send_frame(n2k_make_id(N2K_PGN_SW_STATUS, 3, s_addr, N2K_ADDR_GLOBAL), data, 8);
@@ -429,8 +435,14 @@ static void n2k_handle_rx(const rx_msg_t *m)
         if (our_name >= their_name) {
             s_addr++;
             if (s_addr > 251) {
+                /* ISO 11783-5: a node that cannot claim says so once, as an
+                   address claim from the null address, and from then on
+                   sends nothing else. It used to stay on 252 and answer
+                   requests from there. */
+                s_addr     = N2K_ADDR_NULL;
                 s_ac_state = AC_FAILED;
                 ESP_LOGW(TAG, "N2k: no free address left, giving up");
+                n2k_send_address_claim(N2K_ADDR_NULL);
                 return;
             }
             s_ac_state   = AC_CLAIMING;
@@ -455,9 +467,12 @@ static void n2k_handle_rx(const rx_msg_t *m)
         uint32_t requested = (uint32_t)m->data[0]
                            | ((uint32_t)m->data[1] << 8)
                            | ((uint32_t)m->data[2] << 16);
+        /* A claim is answered in any state: from 254 once claiming failed
+           ("cannot claim"). Data only with an address of our own -- not
+           while the claim is still open, and not after it failed. */
         if (requested == N2K_PGN_ADDRESS_CLAIM)
             n2k_send_address_claim(s_addr);
-        else if (requested == N2K_PGN_SW_STATUS) {
+        else if (requested == N2K_PGN_SW_STATUS && s_ac_state == AC_ACTIVE) {
             n2k_tx_di_bank();
             n2k_tx_do_bank();
         }
@@ -501,7 +516,9 @@ static void n2k_handle_rx(const rx_msg_t *m)
         if (fp_frame != 0) return;   /* only first frame */
         /* data[1]=total len, data[2]=mfr_lo, data[3]=mfr_hi, data[4]=sub_fn ... */
         uint16_t mfr = (uint16_t)m->data[2] | ((uint16_t)m->data[3] << 8);
-        if (mfr != N2K_MFR_CODE) return;
+        /* manufacturer code (11 bits), reserved (2), industry group (3):
+           a standard stack sends the reserved bits set and industry 4. */
+        if ((mfr & 0x7FF) != N2K_MFR_CODE) return;
         uint8_t sub_fn = m->data[4];
         if (sub_fn == 0x01 && m->data[1] >= 6) {          /* LED */
             led_set_rgb(m->data[5], m->data[6], m->data[7]);
@@ -550,13 +567,61 @@ static void can_check_bus_off(void)
     if (twai_node_recover(s_node) == ESP_OK) recovering = true;
 }
 
+/* The periodic part of the worker: heartbeat, address-claim timeout, and
+   inputs and outputs sent on change and every tx_interval_ms. Outputs used
+   to go out only after a CAN command or a request: one switched over
+   Modbus, MQTT, a rule or the web page stayed at its old state on the bus. */
+static void can_tick(TickType_t now)
+{
+    static uint8_t    last_di  = 0xFF;
+    static TickType_t last_hb  = 0;
+    static TickType_t last_per = 0;
+    /* At least one tick: at 100 Hz, 1..9 ms is 0 ticks, and every pass of
+       the loop -- one per received frame -- sent the inputs again. */
+    const uint16_t   interval = app_config_get()->can.tx_interval_ms;
+    const TickType_t period   = interval == 0 ? 0
+                              : (pdMS_TO_TICKS(interval) ? pdMS_TO_TICKS(interval) : 1);
+
+    uint8_t di = 0;
+    for (int i = 0; i < 8; i++) if (di_get(i)) di |= (uint8_t)(1u << i);
+    bool due = period && (now - last_per) >= period;
+
+    /* ---- Basic mode ---- */
+    if (s_mode == CAN_MODE_BASIC) {
+        if ((now - last_hb) >= pdMS_TO_TICKS(HB_PERIOD_MS)) {
+            basic_tx_heartbeat(); last_hb = now;
+        }
+        if (di != last_di || due) { basic_tx_di(di); last_di = di; }
+        if (dout_get_all() != s_last_do || due) basic_tx_do();
+        if (due) last_per = now;
+    }
+
+    /* ---- NMEA2000 mode ---- */
+    if (s_mode == CAN_MODE_N2K) {
+        /* Address claiming */
+        if (s_ac_state == AC_CLAIMING &&
+            (now - s_claim_tick) >= pdMS_TO_TICKS(250)) {
+            s_ac_state = AC_ACTIVE;
+            ESP_LOGI(TAG, "N2k address %u claimed", s_addr);
+            n2k_tx_heartbeat(); n2k_tx_di_bank(); n2k_tx_do_bank();
+            last_di = di;
+            last_hb = last_per = now;
+            due = false;
+        }
+
+        if (s_ac_state == AC_ACTIVE) {
+            if ((now - last_hb) >= pdMS_TO_TICKS(HB_PERIOD_MS)) {
+                n2k_tx_heartbeat(); last_hb = now;
+            }
+            if (di != last_di || due) { n2k_tx_di_bank(); last_di = di; }
+            if (dout_get_all() != s_last_do || due) n2k_tx_do_bank();
+            if (due) last_per = now;
+        }
+    }
+}
+
 static void can_worker_task(void *arg)
 {
-    uint8_t    last_di  = 0xFF;
-    TickType_t last_hb  = 0;
-    TickType_t last_per = 0;
-    uint16_t   interval = app_config_get()->can.tx_interval_ms;
-
     for (;;) {
         rx_msg_t m;
         if (xQueueReceive(s_rx_q, &m, pdMS_TO_TICKS(TX_POLL_MS)) == pdTRUE) {
@@ -565,45 +630,7 @@ static void can_worker_task(void *arg)
         }
 
         can_check_bus_off();
-
-        TickType_t now = xTaskGetTickCount();
-
-        /* ---- Basic mode ---- */
-        if (s_mode == CAN_MODE_BASIC) {
-            if ((now - last_hb) >= pdMS_TO_TICKS(HB_PERIOD_MS)) {
-                basic_tx_heartbeat(); last_hb = now;
-            }
-            uint8_t di = 0;
-            for (int i = 0; i < 8; i++) if (di_get(i)) di |= (uint8_t)(1u << i);
-            if (di != last_di) { basic_tx_di(di); last_di = di; }
-            if (interval > 0 && (now - last_per) >= pdMS_TO_TICKS(interval)) {
-                basic_tx_di(di); last_per = now;
-            }
-        }
-
-        /* ---- NMEA2000 mode ---- */
-        if (s_mode == CAN_MODE_N2K) {
-            /* Address claiming */
-            if (s_ac_state == AC_CLAIMING &&
-                (now - s_claim_tick) >= pdMS_TO_TICKS(250)) {
-                s_ac_state = AC_ACTIVE;
-                ESP_LOGI(TAG, "N2k address %u claimed", s_addr);
-                n2k_tx_heartbeat(); n2k_tx_di_bank(); n2k_tx_do_bank();
-                last_hb = last_per = now;
-            }
-
-            if (s_ac_state == AC_ACTIVE) {
-                if ((now - last_hb) >= pdMS_TO_TICKS(HB_PERIOD_MS)) {
-                    n2k_tx_heartbeat(); last_hb = now;
-                }
-                uint8_t di = 0;
-                for (int i = 0; i < 8; i++) if (di_get(i)) di |= (uint8_t)(1u << i);
-                if (di != last_di) { n2k_tx_di_bank(); last_di = di; }
-                if (interval > 0 && (now - last_per) >= pdMS_TO_TICKS(interval)) {
-                    n2k_tx_di_bank(); last_per = now;
-                }
-            }
-        }
+        can_tick(xTaskGetTickCount());
     }
 }
 

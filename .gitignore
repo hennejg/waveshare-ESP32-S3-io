@@ -85,3 +85,9 @@ dependencies.lock
 /test/host/test_timeset.c
 /test/host/test_mqtttopic
 /test/host/test_mqtttopic.c
+/test/host/test_cfgpost
+/test/host/test_cfgpost.c
+/test/host/test_portalconn
+/test/host/test_portalconn.c
+/test/host/test_cantx
+/test/host/test_cantx.c

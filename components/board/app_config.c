@@ -110,12 +110,36 @@ static void io_fragment(const io_space_t *s, int i, char *buf, size_t len)
     else snprintf(buf, len, "%d", i + 1);
 }
 
+bool app_config_utf8_ok(const char *s)
+{
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) {
+        unsigned c = *p++;
+        int n; unsigned min;
+        if (c < 0x80) continue;
+        else if ((c & 0xE0) == 0xC0) { n = 1; min = 0x80;    c &= 0x1F; }
+        else if ((c & 0xF0) == 0xE0) { n = 2; min = 0x800;   c &= 0x0F; }
+        else if ((c & 0xF8) == 0xF0) { n = 3; min = 0x10000; c &= 0x07; }
+        else return false;
+        while (n--) {
+            if ((*p & 0xC0) != 0x80) return false;
+            c = (c << 6) | (*p++ & 0x3F);
+        }
+        if (c < min || c > 0x10FFFF || (c >= 0xD800 && c <= 0xDFFF)) return false;
+    }
+    return true;
+}
+
 /* The problem with channel i's own name, if any. */
 static const char *io_name_problem(const io_space_t *s, int i)
 {
     const char *n = s->name[i];
     if (!n[0]) return NULL;
     if (strpbrk(n, "/+#")) return "names must not contain '/', '+' or '#'";
+    /* The name is an MQTT topic level and a Matter label, both UTF-8 by
+       specification: a broker closes the connection over one that is not.
+       A name cut at 20 bytes inside a character was stored that way. */
+    if (!app_config_utf8_ok(n)) return "names must be valid UTF-8";
     for (int r = 0; s->reserved[r]; r++)
         if (!strcmp(n, s->reserved[r]))
             return s->reserved == OUTPUT_RESERVED ? "'set' and 'read' are reserved output names"

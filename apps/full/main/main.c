@@ -405,32 +405,34 @@ void app_main(void)
      * is intentionally NOT pre-created: CHIPoBLE handles commissioning, so the
      * captive-portal AP is unnecessary and its beacon buffer (752 B DMA) would
      * crash after BLE has consumed the main free block. */
-    if (!eth_only) {
-        esp_netif_init();
-        esp_event_loop_create_default();
+    /* The IP stack and Ethernet in either case: in ETH-only mode this path
+       used to skip them along with WiFi and Matter, and the board came up
+       with no network at all. */
+    esp_netif_init();
+    esp_event_loop_create_default();
+    if (!eth_only)
         esp_netif_create_default_wifi_sta();
-    }
 
 #ifdef CONFIG_BT_ENABLED
     /* Release classic-BT memory (only relevant when BT stack is compiled in). */
     esp_bt_mem_release(ESP_BT_MODE_CLASSIC_BT);
 #endif
 
-    if (!eth_only) {
-        /* Ethernet init first — lets matter_init() detect the link state. */
-        esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, on_ip_lost, NULL);
-        esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_LOST_IP, on_ip_lost, NULL);
-        esp_err_t eth_ret = eth_init(on_eth_ready);
-        if (eth_ret != ESP_OK)
-            ESP_LOGW(TAG, "Ethernet init failed: %s", esp_err_to_name(eth_ret));
-        else {
-            /* Wait up to 500 ms for physical link detection (W5500 auto-neg). */
-            for (int i = 0; i < 10 && !eth_link_is_up(); i++)
-                vTaskDelay(pdMS_TO_TICKS(50));
-            ESP_LOGI(TAG, "ETH link %s before matter_init",
-                     eth_link_is_up() ? "UP" : "down");
-        }
+    /* Ethernet init first — lets matter_init() detect the link state. */
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, on_ip_lost, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_LOST_IP, on_ip_lost, NULL);
+    esp_err_t eth_ret = eth_init(on_eth_ready);
+    if (eth_ret != ESP_OK)
+        ESP_LOGW(TAG, "Ethernet init failed: %s", esp_err_to_name(eth_ret));
+    else {
+        /* Wait up to 500 ms for physical link detection (W5500 auto-neg). */
+        for (int i = 0; i < 10 && !eth_link_is_up(); i++)
+            vTaskDelay(pdMS_TO_TICKS(50));
+        ESP_LOGI(TAG, "ETH link %s before matter_init",
+                 eth_link_is_up() ? "UP" : "down");
+    }
 
+    if (!eth_only) {
         esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
 
         ESP_LOGI(TAG, "heap before matter_init: free=%u DMA_free=%u DMA_largest=%u",
@@ -492,16 +494,15 @@ void app_main(void)
             esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START, on_wifi_ap, NULL);
             wifi_config_set_eth_only_callback(on_eth_only_requested);
             wifi_config_set_eth_available_fn(is_eth_connected);
-            /* If credentials are already stored, suppress the captive portal entirely.
-             * Without this, wifi_config's monitor fires on any brief disconnect and
-             * calls wifi_config_softap_start() → esp_wifi_scan_start(NULL, true) — a
-             * blocking all-channel scan that holds the radio for several seconds every
-             * 10 s, starving STA traffic of ACKs and causing send() EAGAIN on the httpd. */
-            char *ssid = NULL;
-            wifi_config_get(&ssid, NULL);
-            if (ssid && ssid[0])
+            /* Commissioned: no captive portal, unless the BOOT long press
+             * asked for it. Suppressing it only when wifi_cfg held an SSID
+             * left it open on a board commissioned over Ethernet or Matter
+             * WiFi (whose credentials are not in wifi_cfg) -- an open AP
+             * taking an SSID from anyone in range. It also costs: the
+             * monitor's AP start runs a blocking all-channel scan every
+             * 10 s that starves STA traffic. */
+            if (!wifi_config_reset_requested())
                 wifi_config_disable_ap();
-            free(ssid);
             wifi_config_init("Waveshare (192.168.4.1)", NULL, NULL);
         }
 #else

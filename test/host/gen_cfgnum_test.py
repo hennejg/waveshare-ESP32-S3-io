@@ -36,10 +36,22 @@ if old:
     body = web.span("    cJSON *led_mode_v = cJSON_GetObjectItem(root, \"led_mode\");",
                     "            cfg.can.tx_interval_ms = (uint16_t)v->valuedouble;\n    }\n")
     norm = "static void can_normalize(app_config_t *c) { (void)c; }\n"
-else:
+elif "static bool cfg_uint(" not in web.text:
     cuts = web.func("static bool json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out)")
     body = web.span("    uint32_t n;\n    if (json_uint(cJSON_GetObjectItem(root, \"led_mode\")",
                     "            cfg.can.tx_interval_ms = (uint16_t)n;\n    }\n")
+    norm = cfg.func("static void can_normalize(app_config_t *c)")
+else:
+    # Since the fields are taken through cfg_uint(), which also names a bad
+    # one for the 400; what is stored is what this test looks at.
+    cuts = (web.func("static bool json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out)")
+            + web.span("typedef struct { char field[40]; } cfg_err_t;", "typedef struct { char field[40]; } cfg_err_t;")
+            + web.func("static void cfg_bad(cfg_err_t *bad, const char *where, const char *key)")
+            + web.func("static bool cfg_uint(const cJSON *obj, const char *where, const char *key,"))
+    body = ("    cfg_err_t bad = { \"\" };\n"
+            + web.span("    uint32_t n;\n    if (cfg_uint(root, \"\", \"led_mode\"",
+                       "            cfg.can.tx_interval_ms = (uint16_t)n;\n    }\n")
+            + "    (void)bad;\n")
     norm = cfg.func("static void can_normalize(app_config_t *c)")
 
 HARNESS = r"""
