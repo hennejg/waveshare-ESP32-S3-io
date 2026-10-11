@@ -11,8 +11,8 @@ PORT ?= 15020
 
 # Every target below; GEN are the ones a gen_<name>_test.py writes as
 # test_<name>.c and builds into test_<name>.
-TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload
-GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload
+TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag
+GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag
 
 .PHONY: all clean $(TESTS)
 all: test_mb_pdu $(TESTS)
@@ -472,3 +472,11 @@ payload: test_payload
 test_payload: gen_payload_test.py qjs-obj/cJSON.o ../../components/board/led.c ../../components/board/buzzer.c
 	python3 gen_payload_test.py
 	$(CC) $(CFLAGS) -I$(CJSON) -Wno-unused-function -Wno-unused-parameter test_payload.c qjs-obj/cJSON.o -lm -o $@
+
+# MQTT messages larger than the client's buffer, cut out of app_mqtt.c.
+mqttfrag: test_mqttfrag
+	./test_mqttfrag
+
+test_mqttfrag: gen_mqttfrag_test.py $(MAIN)/app_mqtt.c
+	python3 gen_mqttfrag_test.py
+	$(CC) $(CFLAGS) -Wno-unused-function test_mqttfrag.c -o $@

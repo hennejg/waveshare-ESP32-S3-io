@@ -107,6 +107,24 @@ static void health_timer_cb(void *arg)
 
 /* ------------------------------------------------------------------ events */
 
+/* A payload larger than CONFIG_MQTT_BUFFER_SIZE arrives as several
+   MQTT_EVENT_DATA events. Only the first carries the topic; without
+   CONFIG_MQTT_TOPIC_PRESENT_ALL_DATA_EVENTS there is nothing to reassemble
+   the rest under, so such a message is dropped whole, with one warning.
+   Forwarding the continuations made the rule engine run a pass with an
+   empty topic over mid-payload bytes; forwarding the first piece passed it
+   off as complete -- 1100 bytes of "#aaaa..." on led/set set the LED to
+   #aaaaaa, and no handler's own length limit ever saw the real length. */
+static bool data_whole(const esp_mqtt_event_t *e)
+{
+    if (e->data_len >= e->total_data_len) return true;
+    if (e->current_data_offset == 0)
+        ESP_LOGW(TAG, "dropping a %d-byte payload on %.*s"
+                      " — raise CONFIG_MQTT_BUFFER_SIZE to receive it whole",
+                 e->total_data_len, e->topic_len, e->topic ? e->topic : "");
+    return false;
+}
+
 static void mqtt_event_handler(void *arg, esp_event_base_t base,
                                 int32_t event_id, void *event_data)
 {
@@ -145,20 +163,8 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
         break;
 
     case MQTT_EVENT_DATA:
-        /* A payload larger than CONFIG_MQTT_BUFFER_SIZE arrives as several
-           events. Only the first carries the topic; the continuations have
-           msg_topic == NULL and topic_len == 0, and forwarding those made the
-           rule engine run a pass with an empty topic over mid-payload bytes,
-           re-evaluating every wildcard rule. Without
-           CONFIG_MQTT_TOPIC_PRESENT_ALL_DATA_EVENTS there is no topic to
-           reassemble them under, so drop the continuations and say so once. */
-        if (event->topic_len == 0 || event->topic == NULL) {
-            if (event->current_data_offset == 0) break;   /* not a continuation */
-            ESP_LOGW(TAG, "dropping continuation of a %d-byte payload at offset %d"
-                          " — raise CONFIG_MQTT_BUFFER_SIZE to receive it whole",
-                     event->total_data_len, event->current_data_offset);
-            break;
-        }
+        if (!data_whole(event)) break;
+        if (event->topic_len == 0 || event->topic == NULL) break;   /* nothing to route by */
         if (s_on_msg) {
             /* Hand the handlers the topic the way they subscribed to it:
                relative, without the configured prefix. Each handler used to
