@@ -8,6 +8,7 @@ idf_component_register(
     REQUIRES esp32-wifi-bootstrap nvs_flash spiffs esp_http_server
              esp_netif esp_wifi esp_coex board modbus lwip mbedtls esp_app_format
     PRIV_REQUIRES esp_matter
+    LDFRAGMENTS linker.lf
 )
 
 set(_WWW  ${CMAKE_SOURCE_DIR}/../../www)

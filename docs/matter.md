@@ -157,6 +157,25 @@ board (Ethernet up, setup AP on, BLE advertising, not commissioned):
 Commissioning was done on-network over Ethernet with chip-tool and succeeded in every case; afterwards the
 setup AP and BLE are off and 56–73 KB are free. Commissioning over BLE with a phone was not measured.
 
+These figures predate the two changes below, which together free about 78 KB of internal RAM:
+
+- `main/linker.lf` places the static data (`.bss`) of `libCHIP.a` and `libesp_matter.a` in PSRAM -- 59.6 KB,
+  as documented in esp-matter's FAQ ("Moving BSS Segments to PSRAM"). Needs
+  `CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY`. None of this data is touched from an ISR, and atomics on PSRAM
+  are covered by `CONFIG_STDATOMIC_S32C1I_SPIRAM_WORKAROUND`.
+- `CONFIG_ESP_WIFI_IRAM_OPT` and `CONFIG_ESP_WIFI_RX_IRAM_OPT` off -- 18.1 KB of Wi-Fi code goes from IRAM to
+  flash, at the cost of Wi-Fi throughput the setup portal and Matter control traffic do not need.
+
+Measured after both changes (all pads standard, Modbus enabled):
+
+| Phase                                                   | internal free | lowest   | DMA-capable lowest |
+|---------------------------------------------------------|---------------|----------|--------------------|
+| not commissioned, Modbus waiting                        | 84.0 KB       | 76.8 KB  | 76.2 KB            |
+| through commissioning                                   | --            | 74.0 KB  | 66.2 KB            |
+| commissioned, Modbus running                            | 109.4 KB      | 72.8 KB  | --                 |
+| 4 Modbus TCP clients, 656 requests in 15 s              | --            | 110.5 KB | 102.8 KB           |
+| second fabric commissioned with Modbus running          | --            | 121.5 KB | 113.6 KB           |
+
 ### Modbus
 
 Modbus (RTU slave on RS-485, Modbus TCP server with 4 clients) is in this firmware but starts only once the device
@@ -166,7 +185,8 @@ commissioning, well within the 50–70 KB free afterwards. Its tasks run on PSRA
 lives in PSRAM, and `CONFIG_RINGBUF_PLACE_FUNCTIONS_INTO_FLASH` keeps the UART driver's ring buffer code out of
 IRAM.
 
-Measured with Modbus in the build (all pads standard, Modbus enabled):
+Measured with Modbus in the build (all pads standard, Modbus enabled), before the Matter stack's static data
+moved to PSRAM (see above for the figures after):
 
 | Phase                                                   | internal free (lowest) |
 |---------------------------------------------------------|------------------------|
