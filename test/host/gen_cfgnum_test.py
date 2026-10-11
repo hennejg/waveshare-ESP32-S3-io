@@ -28,6 +28,12 @@ def source(rel):
                                 cwd=ROOT, capture_output=True, text=True, check=True).stdout
     return s
 web = source("apps/full/main/web_server.c")
+# json_uint() moved to components/board/web_common.c as web_json_uint().
+def json_uint_cut():
+    if "web_json_uint(" not in web.text:
+        return web.func("static bool json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out)")
+    return source("components/board/web_common.c").func(
+        "bool web_json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out)")
 cfg = source("components/board/app_config.c")
 hdr = Source(ROOT / "components/board/app_config.h")
 
@@ -37,14 +43,14 @@ if old:
                     "            cfg.can.tx_interval_ms = (uint16_t)v->valuedouble;\n    }\n")
     norm = "static void can_normalize(app_config_t *c) { (void)c; }\n"
 elif "static bool cfg_uint(" not in web.text:
-    cuts = web.func("static bool json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out)")
+    cuts = json_uint_cut()
     body = web.span("    uint32_t n;\n    if (json_uint(cJSON_GetObjectItem(root, \"led_mode\")",
                     "            cfg.can.tx_interval_ms = (uint16_t)n;\n    }\n")
     norm = cfg.func("static void can_normalize(app_config_t *c)")
 else:
     # Since the fields are taken through cfg_uint(), which also names a bad
     # one for the 400; what is stored is what this test looks at.
-    cuts = (web.func("static bool json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out)")
+    cuts = (json_uint_cut()
             + web.span("typedef struct { char field[40]; } cfg_err_t;", "typedef struct { char field[40]; } cfg_err_t;")
             + web.func("static void cfg_bad(cfg_err_t *bad, const char *where, const char *key)")
             + web.func("static bool cfg_uint(const cJSON *obj, const char *where, const char *key,"))

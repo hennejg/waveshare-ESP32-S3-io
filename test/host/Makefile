@@ -142,7 +142,7 @@ CJSON := ../../esp-idf/components/json/cJSON
 cfgnum: test_cfgnum
 	./test_cfgnum
 
-test_cfgnum: gen_cfgnum_test.py qjs-obj/cJSON.o $(MAIN)/web_server.c ../../components/board/app_config.c ../../components/board/app_config.h
+test_cfgnum: gen_cfgnum_test.py qjs-obj/cJSON.o $(MAIN)/web_server.c ../../components/board/app_config.c ../../components/board/app_config.h ../../components/board/web_common.c
 	python3 gen_cfgnum_test.py
 	$(CC) $(CFLAGS) -I$(CJSON) test_cfgnum.c qjs-obj/cJSON.o -o $@
 
@@ -182,7 +182,7 @@ test_mqttlog: gen_mqttlog_test.py $(MAIN)/app_mqtt.c
 authguard: test_authguard
 	./test_authguard
 
-test_authguard: gen_authguard_test.py $(MAIN)/web_server.c ../../apps/matter/main/web_server.c
+test_authguard: gen_authguard_test.py $(MAIN)/web_server.c ../../apps/matter/main/web_server.c ../../components/board/web_common.c
 	python3 gen_authguard_test.py
 	$(CC) $(CFLAGS) -Wno-unused-function test_authguard.c -o $@
 
@@ -309,7 +309,7 @@ test_timeset: gen_timeset_test.py qjs-obj/cJSON.o $(MAIN)/web_server.c
 cfgpost: test_cfgpost
 	./test_cfgpost
 
-test_cfgpost: gen_cfgpost_test.py qjs-obj/cJSON.o $(MAIN)/web_server.c ../../components/board/app_config.h
+test_cfgpost: gen_cfgpost_test.py qjs-obj/cJSON.o $(MAIN)/web_server.c ../../components/board/app_config.h ../../components/board/web_common.c
 	python3 gen_cfgpost_test.py
 	$(CC) $(CFLAGS) -I$(CJSON) -I../../components/board -Istubs -Wno-unused-function test_cfgpost.c qjs-obj/cJSON.o -lm -o $@
 

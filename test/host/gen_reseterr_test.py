@@ -48,6 +48,11 @@ static esp_err_t httpd_resp_set_type(httpd_req_t *r, const char *t) { (void)r; (
 static esp_err_t httpd_resp_sendstr(httpd_req_t *r, const char *s) { (void)r; if (!last_status) last_status = 200; snprintf(last_body, sizeof last_body, "%s", s); return ESP_OK; }
 static esp_err_t send_json(httpd_req_t *r, const char *status, const char *body) { (void)r; last_status = atoi(status); snprintf(last_body, sizeof last_body, "%s", body); return ESP_OK; }
 static int recv_body(httpd_req_t *r, char *buf, size_t cap) { (void)r; snprintf(buf, cap + 1, "%s", req_body); return (int)strlen(buf); }
+/* Since web_common.c the helpers carry a web_ prefix; the stubs serve both. */
+#define web_check_auth check_auth
+#define web_send_denied send_denied
+#define web_send_json send_json
+#define web_recv_body recv_body
 typedef int nvs_handle_t; enum { NVS_READWRITE = 1 };
 static esp_err_t fail_open, fail_set, fail_commit, fail_erase_all; static int stored = -1;
 static esp_err_t nvs_open(const char *ns, int m, nvs_handle_t *h) { (void)ns; (void)m; *h = 1; return fail_open; }

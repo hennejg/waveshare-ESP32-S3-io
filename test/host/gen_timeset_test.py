@@ -42,6 +42,11 @@ static esp_err_t httpd_resp_send_err(httpd_req_t *r, int code, const char *m) { 
 static esp_err_t httpd_resp_set_type(httpd_req_t *r, const char *t) { (void)r; (void)t; return ESP_OK; }
 static esp_err_t httpd_resp_sendstr(httpd_req_t *r, const char *s) { (void)r; (void)s; last_status = 200; return ESP_OK; }
 static int recv_body(httpd_req_t *r, char *buf, size_t cap) { (void)r; snprintf(buf, cap + 1, "%s", req_body); return (int)strlen(buf); }
+/* Since web_common.c the helpers carry a web_ prefix; the stubs serve both. */
+#define web_check_auth check_auth
+#define web_send_denied send_denied
+#define web_send_json send_json
+#define web_recv_body recv_body
 static time_t clock_set;
 #define settimeofday(tv, tz) (clock_set = (tv)->tv_sec, 0)
 static esp_err_t rtc_dev_set(const struct tm *t) { (void)t; return ESP_OK; }

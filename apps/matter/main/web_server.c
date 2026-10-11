@@ -1,6 +1,7 @@
 #include "web_server.h"
 #include "app_config.h"
 #include "auth.h"
+#include "web_common.h"
 #include "di.h"
 #include "dout.h"
 #include "led.h"
@@ -20,65 +21,15 @@
 #include <nvs_flash.h>
 #include <nvs.h>
 #include "cJSON.h"
-#include "mbedtls/base64.h"
 
 #define TAG        "web_server"
 #define WWW_BASE   "/www"
 #define CHUNK_SIZE  4096
 #define BODY_MAX    2048
 
-/* Longest password whose HTTP Basic header still fits check_auth()'s 160-byte
-   buffer: "Basic " + base64(":" + password) must stay within 159 characters,
-   which 113 does at 158 and 114 exceeds at 162. Same figure as in apps/full. */
-#define APP_CFG_PASSWORD_MAX 113
-
-/* Total time a request body may take to arrive. */
-#define BODY_RECV_TIMEOUT_MS 5000
-
 static httpd_handle_t s_server = NULL;
 
 /* ------------------------------------------------------------------ helpers */
-
-/* Reads the whole body, as many socket reads as that takes. httpd_req_recv()
-   returns what one read delivered, which is less than content_len whenever
-   the body arrives in more than one segment -- and parsing that as JSON
-   failed valid configuration and password requests at random. Same helper
-   as in apps/full, with the same absolute deadline: a client that dribbles
-   one byte at a time must not hold the server's single handler task open. */
-static int recv_body(httpd_req_t *req, char *buf, size_t cap)
-{
-    size_t want = req->content_len;
-    if (want > cap) return -1;
-
-    const int64_t deadline = esp_timer_get_time() + (int64_t)BODY_RECV_TIMEOUT_MS * 1000;
-    size_t got = 0;
-    while (got < want) {
-        int r = httpd_req_recv(req, buf + got, want - got);
-        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
-            if (esp_timer_get_time() >= deadline) return -1;
-            continue;
-        }
-        if (r <= 0) return -1;
-        got += (size_t)r;
-        if (esp_timer_get_time() >= deadline && got < want) return -1;
-    }
-    buf[got] = '\0';
-    return (int)got;
-}
-
-static const char *mime_type(const char *path)
-{
-    const char *ext = strrchr(path, '.');
-    if (!ext) return "application/octet-stream";
-    if (!strcmp(ext, ".html")) return "text/html";
-    if (!strcmp(ext, ".js"))   return "application/javascript";
-    if (!strcmp(ext, ".css"))  return "text/css";
-    if (!strcmp(ext, ".json")) return "application/json";
-    if (!strcmp(ext, ".ico"))  return "image/x-icon";
-    if (!strcmp(ext, ".png"))  return "image/png";
-    if (!strcmp(ext, ".svg"))  return "image/svg+xml";
-    return "application/octet-stream";
-}
 
 static void parse_invert_array(cJSON *arr, di_config_t *out, int max, bool *too_long)
 {
@@ -100,227 +51,11 @@ static void parse_invert_array(cJSON *arr, di_config_t *out, int max, bool *too_
     }
 }
 
-/* A JSON number as an integer in [lo, hi], or false. The range is checked on
-   the double: casting an out-of-range double to an integer type is undefined
-   behaviour, so {"led_mode":1e10} must never reach the cast. Same as the full
-   app's. */
-static bool json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out)
-{
-    if (!cJSON_IsNumber(v)) return false;
-    double d = v->valuedouble;
-    if (!(d >= lo && d < (double)hi + 1.0)) return false;
-    *out = (uint32_t)d;
-    return true;
-}
-
-/* ------------------------------------------------------------------ auth check */
-
-/* A request a browser sends on behalf of a page from somewhere else: a form
-   posted cross-site, a fetch() from another origin. Once the browser has the
-   password cached (its own Basic dialog, opened by our WWW-Authenticate), it
-   would attach it to those too -- switching outputs, saving rules or wiping
-   the device from any web page the user happens to open. Browsers say where
-   a request comes from in Sec-Fetch-Site (all current ones) or, failing
-   that, Origin; curl and scripts send neither and are not affected. */
-static bool cross_site(httpd_req_t *req)
-{
-    char v[24];
-    esp_err_t r = httpd_req_get_hdr_value_str(req, "Sec-Fetch-Site", v, sizeof(v));
-    if (r == ESP_OK)
-        return strcmp(v, "same-origin") != 0 && strcmp(v, "none") != 0;
-    if (r != ESP_ERR_NOT_FOUND) return true;            /* too long to be any of them */
-
-    char origin[96], host[64] = "";
-    r = httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof(origin));
-    if (r == ESP_ERR_NOT_FOUND) return false;
-    if (r != ESP_OK) return true;
-    if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK) return true;
-    const char *o = strstr(origin, "://");
-    return !o || strcmp(o + 3, host) != 0;              /* "null" has no scheme */
-}
-
-/* A device without a password is one that has not been set up yet, and
-   until that happens nothing but the setup flow itself may be used: the
-   outputs, the rules (which run as code on the device) and the factory
-   reset must not be one unauthenticated request away just because nobody
-   has pressed the button yet. The physical confirmation guards the
-   password; this guards everything else until there is one. */
-static bool check_auth(httpd_req_t *req)
-{
-    if (!auth_is_password_set()) return false;
-    if (cross_site(req)) {
-        ESP_LOGW(TAG, "cross-site request to %s refused", req->uri);
-        return false;
-    }
-
-    char hdr[160] = "";
-    httpd_req_get_hdr_value_str(req, "Authorization", hdr, sizeof(hdr));
-    if (strncmp(hdr, "Basic ", 6) != 0) return false;
-
-    unsigned char decoded[128];
-    size_t decoded_len = 0;
-    if (mbedtls_base64_decode(decoded, sizeof(decoded) - 1, &decoded_len,
-                              (const unsigned char *)(hdr + 6),
-                              strlen(hdr + 6)) != 0) return false;
-    decoded[decoded_len] = '\0';
-
-    const char *pw = (const char *)decoded;
-    const char *colon = (const char *)memchr(decoded, ':', decoded_len);
-    if (colon) pw = colon + 1;
-
-    bool ok = auth_check_password(pw);
-    memset(decoded, 0, sizeof(decoded));
-    return ok;
-}
-
-/* One shape for every JSON answer that is not a payload: status line and
-   body, nothing else to get out of step. */
-static esp_err_t send_json(httpd_req_t *req, const char *status, const char *body)
-{
-    httpd_resp_set_status(req, status);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, body);
-    return ESP_OK;
-}
-
-/* A request that may not pass. Without a password the device is not set up,
-   and no credentials would help: that is 403, with a body a client can act
-   on, and no WWW-Authenticate for a browser to open a dialog over. With a
-   password it is the ordinary 401 challenge. */
-static esp_err_t send_denied(httpd_req_t *req)
-{
-    if (!auth_is_password_set())
-        return send_json(req, "403 Forbidden", "{\"error\":\"setup_required\"}");
-    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"Device\"");
-    return send_json(req, "401 Unauthorized", "{\"error\":\"unauthorized\"}");
-}
-
-/* ------------------------------------------------------------------ auth endpoints */
-
-static esp_err_t api_auth_status(httpd_req_t *req)
-{
-    char json[32];
-    snprintf(json, sizeof(json), "{\"password_set\":%s}",
-             auth_is_password_set() ? "true" : "false");
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, json);
-    return ESP_OK;
-}
-
-static esp_err_t api_auth_begin(httpd_req_t *req)
-{
-    char session[9];
-    esp_err_t r = auth_token_begin(session);
-    if (r == ESP_ERR_INVALID_STATE) {
-        return send_json(req, "409 Conflict", "{\"error\":\"already_pending\"}");
-    }
-    if (r != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Internal error");
-        return ESP_OK;
-    }
-    char json[48];
-    snprintf(json, sizeof(json), "{\"session\":\"%.8s\"}", session);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, json);
-    return ESP_OK;
-}
-
-static esp_err_t api_auth_token(httpd_req_t *req)
-{
-    char query[16] = "";
-    httpd_req_get_url_query_str(req, query, sizeof(query));
-    char param[9] = "";
-    httpd_query_key_value(query, "s", param, sizeof(param));
-
-    char token[33] = "";
-    auth_tok_state_t state = auth_token_status(param, token);
-    httpd_resp_set_type(req, "application/json");
-    switch (state) {
-    case AUTH_TOK_WAITING:
-        httpd_resp_sendstr(req, "{\"status\":\"waiting\"}");
-        break;
-    case AUTH_TOK_READY: {
-        char json[64];
-        snprintf(json, sizeof(json), "{\"status\":\"ready\",\"token\":\"%.32s\"}", token);
-        httpd_resp_sendstr(req, json);
-        break;
-    }
-    case AUTH_TOK_TIMEOUT:
-        httpd_resp_set_status(req, "408 Request Timeout");
-        httpd_resp_sendstr(req, "{\"status\":\"timeout\"}");
-        break;
-    default:
-        httpd_resp_set_status(req, "404 Not Found");
-        httpd_resp_sendstr(req, "{\"status\":\"idle\"}");
-        break;
-    }
-    return ESP_OK;
-}
-
-static esp_err_t api_auth_set_password(httpd_req_t *req)
-{
-    if (req->content_len > 256) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body too large");
-        return ESP_OK;
-    }
-    char *body = malloc(req->content_len + 1);
-    if (!body) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_OK; }
-    int n = recv_body(req, body, req->content_len);
-    if (n < 0) { free(body); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
-
-    cJSON *root = cJSON_Parse(body);
-    free(body);
-    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
-
-    cJSON *token_j = cJSON_GetObjectItem(root, "token");
-    cJSON *pw_j    = cJSON_GetObjectItem(root, "password");
-
-    if (!cJSON_IsString(token_j) || !cJSON_IsString(pw_j)) {
-        cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing fields");
-        return ESP_OK;
-    }
-
-    /* Check the password before spending the token. It is single use and only
-       obtainable by pressing the button on the device, so rejecting the input
-       afterwards would send the user back to the hardware for a typo.
-
-       The Basic-auth parser reads the header into a 160-byte buffer, so a
-       password that cannot fit there could be set and would then lock the user
-       out of the very API that set it -- see APP_CFG_PASSWORD_MAX. */
-    if (strlen(pw_j->valuestring) > APP_CFG_PASSWORD_MAX) {
-        cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                            "password too long (max 113 bytes as UTF-8)");
-        return ESP_OK;
-    }
-    if (strlen(pw_j->valuestring) < 8) {
-        cJSON_Delete(root);
-        return send_json(req, "400 Bad Request", "{\"error\":\"password_too_short\"}");
-    }
-
-    if (!auth_token_consume(token_j->valuestring)) {
-        cJSON_Delete(root);
-        return send_json(req, "403 Forbidden", "{\"error\":\"invalid_token\"}");
-    }
-
-    esp_err_t set_ret = auth_set_password(pw_j->valuestring);
-    cJSON_Delete(root);
-    if (set_ret != ESP_OK) {
-        /* The token is spent either way; say what happened rather than
-           reporting a protection the flash does not have. */
-        return send_json(req, "500 Internal Server Error", "{\"error\":\"password could not be stored\"}");
-    }
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
-    return ESP_OK;
-}
-
 /* ----------------------------------------------------------------- /api/config */
 
 static esp_err_t api_config_get(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_denied(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
     const app_config_t *cfg = app_config_get();
 
     cJSON *root = cJSON_CreateObject();
@@ -353,7 +88,7 @@ static esp_err_t api_config_get(httpd_req_t *req)
 
 static esp_err_t api_config_post(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_denied(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
     if (req->content_len > BODY_MAX) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body too large");
         return ESP_OK;
@@ -362,7 +97,7 @@ static esp_err_t api_config_post(httpd_req_t *req)
     char *body = malloc(req->content_len + 1);
     if (!body) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_OK; }
 
-    int received = recv_body(req, body, req->content_len);
+    int received = web_recv_body(req, body, req->content_len);
     if (received < 0) {
         free(body);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv failed");
@@ -384,7 +119,7 @@ static esp_err_t api_config_post(httpd_req_t *req)
     }
 
     uint32_t n;
-    if (json_uint(cJSON_GetObjectItem(root, "led_mode"), LED_MODE_IO, LED_MODE_STATUS, &n))
+    if (web_json_uint(cJSON_GetObjectItem(root, "led_mode"), LED_MODE_IO, LED_MODE_STATUS, &n))
         cfg.led_mode = (uint8_t)n;
 
     parse_invert_array(cJSON_GetObjectItem(root, "di"),   cfg.di,   APP_CFG_DI_COUNT, &too_long);
@@ -408,7 +143,7 @@ static esp_err_t api_config_post(httpd_req_t *req)
     }
 
     if (app_config_update(&cfg) != ESP_OK) {
-        return send_json(req, "500 Internal Server Error", "{\"error\":\"configuration could not be stored\"}");
+        return web_send_json(req, "500 Internal Server Error", "{\"error\":\"configuration could not be stored\"}");
     }
     matter_set_node_label(cfg.device_name);
 
@@ -461,7 +196,7 @@ static esp_err_t file_get(httpd_req_t *req)
         return ESP_OK;
     }
 
-    httpd_resp_set_type(req, mime_type(file));
+    httpd_resp_set_type(req, web_mime_type(file));
 
     if (strcmp(file, "/index.html") == 0)
         httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -498,14 +233,14 @@ static esp_err_t file_get(httpd_req_t *req)
 
 static esp_err_t api_matter_pairing(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_denied(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
 
     const char *qr  = matter_get_qr_code();
     const char *man = matter_get_manual_code();
     bool commissioned = matter_is_commissioned();
 
     if ((!qr || !qr[0]) && !commissioned) {
-        return send_json(req, "404 Not Found", "{\"error\":\"matter_not_active\"}");
+        return web_send_json(req, "404 Not Found", "{\"error\":\"matter_not_active\"}");
     }
 
     cJSON *root = cJSON_CreateObject();
@@ -525,10 +260,10 @@ static esp_err_t api_matter_pairing(httpd_req_t *req)
 
 static esp_err_t api_matter_decommission(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_denied(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
 
     if (!matter_is_commissioned()) {
-        return send_json(req, "409 Conflict", "{\"error\":\"not_commissioned\"}");
+        return web_send_json(req, "409 Conflict", "{\"error\":\"not_commissioned\"}");
     }
 
     httpd_resp_set_type(req, "application/json");
@@ -542,7 +277,7 @@ static esp_err_t api_matter_decommission(httpd_req_t *req)
 
 static esp_err_t api_io_state(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_denied(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
 
     cJSON *root = cJSON_CreateObject();
     cJSON *di   = cJSON_AddArrayToObject(root, "di");
@@ -561,13 +296,13 @@ static esp_err_t api_io_state(httpd_req_t *req)
 
 static esp_err_t api_io_output(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_denied(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
     if (req->content_len == 0 || req->content_len > 64) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad body");
         return ESP_OK;
     }
     char body[65];
-    int n = recv_body(req, body, sizeof(body) - 1);
+    int n = web_recv_body(req, body, sizeof(body) - 1);
     if (n < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
     cJSON *root = cJSON_Parse(body);
@@ -616,13 +351,13 @@ static esp_err_t api_io_output(httpd_req_t *req)
 
 static esp_err_t api_io_led(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_denied(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
     if (req->content_len == 0 || req->content_len > 64) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad body");
         return ESP_OK;
     }
     char body[65];
-    int n = recv_body(req, body, sizeof(body) - 1);
+    int n = web_recv_body(req, body, sizeof(body) - 1);
     if (n < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
     cJSON *root = cJSON_Parse(body);
@@ -640,9 +375,9 @@ static esp_err_t api_io_led(httpd_req_t *req)
         cJSON *gj = cJSON_GetObjectItem(root, "g");
         cJSON *bj = cJSON_GetObjectItem(root, "b");
         uint32_t u;
-        if (json_uint(rj, 0, 255, &u)) r = (uint8_t)u;
-        if (json_uint(gj, 0, 255, &u)) g = (uint8_t)u;
-        if (json_uint(bj, 0, 255, &u)) b = (uint8_t)u;
+        if (web_json_uint(rj, 0, 255, &u)) r = (uint8_t)u;
+        if (web_json_uint(gj, 0, 255, &u)) g = (uint8_t)u;
+        if (web_json_uint(bj, 0, 255, &u)) b = (uint8_t)u;
     }
     cJSON_Delete(root);
 
@@ -659,7 +394,7 @@ static esp_err_t api_version(httpd_req_t *req)
     /* Firmware and IDF version, build date and the last reset reason tell an
        attacker which known bugs apply and when the device crashed: behind the
        password like everything else outside the setup flow. */
-    if (!check_auth(req)) return send_denied(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
     const esp_app_desc_t *d = esp_app_get_description();
     char json[160];
     snprintf(json, sizeof(json),
@@ -676,13 +411,13 @@ static void do_restart(void *arg) { esp_restart(); }
 
 static esp_err_t api_factory_reset(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_denied(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
     /* Erased first, answered after: "resetting" over a failed erase rebooted
        into the old configuration and password. */
     esp_err_t err = nvs_flash_erase();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "factory reset: erase failed: %s", esp_err_to_name(err));
-        return send_json(req, "500 Internal Server Error", "{\"error\":\"erase failed, nothing reset\"}");
+        return web_send_json(req, "500 Internal Server Error", "{\"error\":\"erase failed, nothing reset\"}");
     }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"resetting\"}");
@@ -699,7 +434,7 @@ static esp_err_t api_reboot(httpd_req_t *req)
 {
     /* Was open: anyone on the network -- or any web page the user had open,
        by a cross-site form post -- could reboot the device, in a loop. */
-    if (!check_auth(req)) return send_denied(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"rebooting\"}");
 
@@ -714,10 +449,10 @@ static esp_err_t api_reboot(httpd_req_t *req)
 /* -------------------------------------------------------------- start / stop */
 
 static const httpd_uri_t s_handlers[] = {
-    { .uri = "/api/auth/status",          .method = HTTP_GET,  .handler = api_auth_status       },
-    { .uri = "/api/auth/begin",           .method = HTTP_POST, .handler = api_auth_begin        },
-    { .uri = "/api/auth/token",           .method = HTTP_GET,  .handler = api_auth_token        },
-    { .uri = "/api/auth/set-password",    .method = HTTP_POST, .handler = api_auth_set_password },
+    { .uri = "/api/auth/status",          .method = HTTP_GET,  .handler = web_api_auth_status       },
+    { .uri = "/api/auth/begin",           .method = HTTP_POST, .handler = web_api_auth_begin        },
+    { .uri = "/api/auth/token",           .method = HTTP_GET,  .handler = web_api_auth_token        },
+    { .uri = "/api/auth/set-password",    .method = HTTP_POST, .handler = web_api_auth_set_password },
     { .uri = "/api/config",               .method = HTTP_GET,  .handler = api_config_get        },
     { .uri = "/api/config",               .method = HTTP_POST, .handler = api_config_post       },
     { .uri = "/api/io/state",             .method = HTTP_GET,  .handler = api_io_state          },

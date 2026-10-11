@@ -29,7 +29,8 @@ from cutter import Source
 
 src = Source.at("apps/full/main/web_server.c")
 new = "static bool cfg_uint(" in src.text
-cuts = src.defines("BODY_MAX") + src.func("static bool json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out)")
+cuts = src.defines("BODY_MAX") + (Source.at("components/board/web_common.c").func("bool web_json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out)")
+                                          if "web_json_uint(" in src.text else src.func("static bool json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out)"))
 if new:
     cuts += (src.span("typedef struct { char field[40]; } cfg_err_t;", "typedef struct { char field[40]; } cfg_err_t;")
              + src.func("static void cfg_bad(cfg_err_t *bad, const char *where, const char *key)")
@@ -71,6 +72,11 @@ static esp_err_t httpd_resp_set_type(httpd_req_t *r, const char *t) { (void)r; (
 static esp_err_t httpd_resp_sendstr(httpd_req_t *r, const char *s) { (void)r; status = 200; snprintf(resp, sizeof resp, "%s", s); return ESP_OK; }
 static esp_err_t send_json(httpd_req_t *r, const char *st, const char *b) { (void)r; status = atoi(st); snprintf(resp, sizeof resp, "%s", b); return ESP_OK; }
 static int recv_body(httpd_req_t *r, char *buf, size_t cap) { (void)r; snprintf(buf, cap + 1, "%s", req_body); return (int)strlen(buf); }
+/* Since web_common.c the helpers carry a web_ prefix; the stubs serve both. */
+#define web_check_auth check_auth
+#define web_send_denied send_denied
+#define web_send_json send_json
+#define web_recv_body recv_body
 
 static app_config_t stored;
 static int updates, reloads, dout_applies; static esp_err_t dout_result;
