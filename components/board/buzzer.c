@@ -11,6 +11,8 @@ int app_mqtt_subscribe(const char *topic, int qos);
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
 #include "esp_check.h"
 #include "esp_log.h"
 
@@ -151,7 +153,11 @@ esp_err_t buzzer_init(void)
     ESP_RETURN_ON_ERROR(ledc_channel_config(&ch), TAG, "channel config");
 
     s_queue = xQueueCreate(1, sizeof(bseq_t));
-    xTaskCreate(buzzer_task, "buzzer", 3072, NULL, 5, NULL);
+    /* Stack in PSRAM, like the aux task: LEDC calls and delays only, nothing
+       that writes the flash. */
+    if (!s_queue || xTaskCreateWithCaps(buzzer_task, "buzzer", 3072, NULL, 5, NULL,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS)
+        return ESP_ERR_NO_MEM;
 
     ESP_LOGI(TAG, "Initialized buzzer on GPIO%d", GPIO_BUZZER);
     return ESP_OK;

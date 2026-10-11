@@ -108,10 +108,9 @@ static void notify_ext(uint8_t n, bool state)
             publish_one(n, state);
 #endif
 #ifdef CONFIG_APP_MATTER_ENABLE
-        /* The Matter app exposes exactly 8 contact sensors; the auxiliary inputs
-           have no endpoint and are reported over MQTT and the web UI only. */
-        if (di_is_isolated(n))
-            matter_di_update(n, state);
+        /* Channels 8..10 are the header pads; matter_di_update() maps them
+           to their endpoint when the pad was an input at boot. */
+        matter_di_update(n, state);
 #endif
         xSemaphoreTake(s_mux, portMAX_DELAY);
         bool active = di_is_active(n), now = s_state[n];

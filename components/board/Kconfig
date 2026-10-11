@@ -17,7 +17,6 @@ config APP_SNTP_ENABLE
 
 config APP_AUX_DI_ENABLE
     bool "Offer GPIO1, GPIO44 and GPIO43 as NON-ISOLATED inputs, PWM and analog"
-    depends on !APP_MATTER_ENABLE
     default y
     help
         Lets each of the three header pins IO1, RXD and TXD (GPIO1, GPIO44,
@@ -65,10 +64,12 @@ config APP_AUX_DI_ENABLE
         the rule engine (input(8..10), output(8..10), pwm(), analog()).  Not over CAN, which packs the
         input states into a single byte.
 
-        Not offered in a Matter build.  The Matter app exposes exactly eight
-        Contact Sensor endpoints and its own web UI builds eight input rows, so
-        the extra channels would be invisible there — better unavailable than
-        half working.
+        In the Matter firmware a pad becomes an endpoint by its mode at
+        boot: input a Contact Sensor, output an On/Off Plug-in Unit, PWM a
+        Dimmable Plug-in Unit (level = duty cycle).  An analog input has no
+        Matter device type that home apps show; it is in the web UI only.
+        A mode change there takes effect on the pad at once and on the
+        Matter endpoints after a reboot.
 
 config APP_SCRIPTING_ENABLE
     bool "Enable scripting engine callbacks"

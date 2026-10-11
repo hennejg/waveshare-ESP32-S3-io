@@ -6,6 +6,7 @@
 #include <esp_err.h>
 #include <esp_http_server.h>
 #include "cJSON.h"
+#include "app_config.h"
 
 /* Longest password whose HTTP Basic header still fits web_check_auth()'s
    160-byte buffer: "Basic " + base64(":" + password) must stay within 159
@@ -35,3 +36,24 @@ esp_err_t web_api_auth_status(httpd_req_t *req);
 esp_err_t web_api_auth_begin(httpd_req_t *req);
 esp_err_t web_api_auth_token(httpd_req_t *req);
 esp_err_t web_api_auth_set_password(httpd_req_t *req);
+
+/* GET /api/time: system clock, RTC and local time. POST /api/time
+   {"epoch": <UTC seconds>}: sets the clock by hand and writes the RTC. */
+esp_err_t web_api_time_get(httpd_req_t *req);
+esp_err_t web_api_time_post(httpd_req_t *req);
+/* POST /api/io/buzzer {"freq":440,"duration":200}: one beep. */
+esp_err_t web_api_io_buzzer(httpd_req_t *req);
+
+#if APP_CFG_DI_AUX_COUNT
+/* The header pads IO1/RXD/TXD in the web API, the same in every firmware:
+   - web_aux_config_json(): "aux" in GET /api/config;
+   - web_aux_config_parse(): "aux" of a POST /api/config into *cfg, only
+     what is sent; the first refusal as text, or NULL;
+   - web_aux_state_json(): "di_active" and "aux" in GET /api/io/state;
+   - web_aux_output(): POST /api/io/output for pad a (channel 8 + a);
+     answers the request. root stays the caller's. */
+void        web_aux_config_json(cJSON *root, const app_config_t *cfg);
+const char *web_aux_config_parse(const cJSON *root, app_config_t *cfg);
+void        web_aux_state_json(cJSON *root);
+esp_err_t   web_aux_output(httpd_req_t *req, uint8_t a, const cJSON *root);
+#endif

@@ -11,8 +11,8 @@ PORT ?= 15020
 
 # Every target below; GEN are the ones a gen_<name>_test.py writes as
 # test_<name>.c and builds into test_<name>.
-TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag
-GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag
+TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel
+GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel
 
 .PHONY: all clean $(TESTS)
 all: test_mb_pdu $(TESTS)
@@ -301,7 +301,7 @@ test_pwmfail: gen_pwmfail_test.py ../../components/board/aux_io.c
 timeset: test_timeset
 	./test_timeset
 
-test_timeset: gen_timeset_test.py qjs-obj/cJSON.o $(MAIN)/web_server.c
+test_timeset: gen_timeset_test.py qjs-obj/cJSON.o $(MAIN)/web_server.c ../../components/board/web_common.c
 	python3 gen_timeset_test.py
 	$(CC) $(CFLAGS) -I$(CJSON) -Wno-unused-function test_timeset.c qjs-obj/cJSON.o -o $@
 
@@ -480,3 +480,11 @@ mqttfrag: test_mqttfrag
 test_mqttfrag: gen_mqttfrag_test.py $(MAIN)/app_mqtt.c
 	python3 gen_mqttfrag_test.py
 	$(CC) $(CFLAGS) -Wno-unused-function test_mqttfrag.c -o $@
+
+# A PWM header pad as a Matter Dimmable Plug-in Unit, cut out of matter.cpp.
+padlevel: test_padlevel
+	./test_padlevel
+
+test_padlevel: gen_padlevel_test.py ../../apps/matter/main/matter.cpp ../../components/board/aux_io.h
+	python3 gen_padlevel_test.py
+	$(CC) $(CFLAGS) -Wno-unused-function test_padlevel.c -o $@

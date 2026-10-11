@@ -9,13 +9,17 @@
 #include <esp_spiffs.h>
 #include <wifi_config.h>
 #include "app_config.h"
+#include "app_time.h"
 #include "auth.h"
+#include "aux_io.h"
 #include "button.h"
+#include "buzzer.h"
 #include "di.h"
 #include "dout.h"
 #include "eth.h"
 #include "led.h"
 #include "matter.h"
+#include "sntp_sync.h"
 #include "web_server.h"
 
 #define TAG "main"
@@ -27,6 +31,7 @@ static void on_network_ready(void)
 {
     led_status_set_network(true);
     web_server_start();
+    sntp_sync_apply();   /* idempotent; per the configuration */
 }
 
 static void on_eth_ready(void)
@@ -67,6 +72,7 @@ static void on_wifi_ap(void *arg, esp_event_base_t base, int32_t id, void *data)
 
 void app_main(void)
 {
+    sntp_sync_init();   /* before anything can bring a network interface up */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -75,6 +81,7 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     ESP_ERROR_CHECK(app_config_init());
+    app_time_apply_tz();
     ESP_ERROR_CHECK(auth_init());
 
     esp_vfs_spiffs_conf_t spiffs = {
@@ -90,8 +97,16 @@ void app_main(void)
 
     button_init();
     ESP_ERROR_CHECK(di_init());
+    /* After di_init(), before matter_init(): a pad set to input joins the
+       input path, and matter_init() creates the pads' endpoints by their
+       mode. Not fatal -- a pad that cannot take its mode stays standard. */
+    esp_err_t aux_ret = aux_io_init();
+    if (aux_ret != ESP_OK)
+        ESP_LOGE(TAG, "IO1/RXD/TXD pads: %s", esp_err_to_name(aux_ret));
     ESP_ERROR_CHECK(dout_init());
     ESP_ERROR_CHECK(led_init());
+    ESP_ERROR_CHECK(buzzer_init());
+    app_time_seed_from_rtc();   /* SNTP corrects it once the network is up */
 
     esp_netif_init();
     esp_event_loop_create_default();

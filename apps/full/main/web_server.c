@@ -4,7 +4,6 @@
 #include "app_time.h"
 #include "auth.h"
 #include "web_common.h"
-#include "buzzer.h"
 #include "di.h"
 #include "dout.h"
 #include "aux_io.h"
@@ -14,14 +13,10 @@
 #ifdef CONFIG_APP_MATTER_ENABLE
 #include "matter.h"
 #endif
-#include "app_rtc.h"
 #include "mb_tcp_server.h"
 #include "mb_tcp_master.h"
 #include "scripting.h"
 #include "sntp_sync.h"
-
-#include <time.h>
-#include <sys/time.h>
 
 extern const char DEMO_SCRIPT[];
 
@@ -236,22 +231,7 @@ static esp_err_t api_config_get(httpd_req_t *req)
     /* Inputs from this index on are not optocoupler-isolated. */
     cJSON_AddNumberToObject(root, "di_isolated", APP_CFG_DI_ISOLATED_COUNT);
 #if APP_CFG_DI_AUX_COUNT
-    /* The IO1/RXD/TXD pads: mode, the modes this pad offers, and the PWM
-       settings (kept while the pad is in another mode). */
-    cJSON *aux = cJSON_AddArrayToObject(root, "aux");
-    for (int a = 0; a < APP_CFG_DI_AUX_COUNT; a++) {
-        cJSON *o = cJSON_CreateObject();
-        cJSON_AddStringToObject(o, "mode", aux_mode_name((aux_mode_t)cfg->aux_mode[a]));
-        cJSON *modes = cJSON_AddArrayToObject(o, "modes");
-        for (int m = 0; m < AUX_MODE_COUNT; m++)
-            if (aux_mode_allowed((uint8_t)a, (aux_mode_t)m))
-                cJSON_AddItemToArray(modes, cJSON_CreateString(aux_mode_name((aux_mode_t)m)));
-        cJSON_AddNumberToObject(o, "pwm_freq", cfg->aux_pwm[a].freq_hz);
-        cJSON_AddNumberToObject(o, "pwm_duty", cfg->aux_pwm[a].duty_pm / 10.0);
-        cJSON_AddStringToObject(o, "out_name",   cfg->aux_out[a].name);
-        cJSON_AddBoolToObject  (o, "out_invert", cfg->aux_out[a].invert);
-        cJSON_AddItemToArray(aux, o);
-    }
+    web_aux_config_json(root, cfg);
 #endif
 
     cJSON *dout = cJSON_AddArrayToObject(root, "dout");
@@ -347,50 +327,7 @@ static esp_err_t api_config_post(httpd_req_t *req)
 
     parse_invert_array(cJSON_GetObjectItem(root, "di"), cfg.di, APP_CFG_DI_COUNT, "di.", &bad);
 #if APP_CFG_DI_AUX_COUNT
-    /* Only what is sent changes: a request without "aux", a shorter array, or
-       an entry without a field leaves the rest as it is. A value outside its
-       range is refused rather than clamped -- a PWM output is driving
-       something, and quietly running it at another frequency or duty than
-       asked is not a safe guess. */
-    const char *aux_err = NULL;
-    cJSON *aux_j = cJSON_GetObjectItem(root, "aux");
-    if (cJSON_IsArray(aux_j)) {
-        int n = cJSON_GetArraySize(aux_j);
-        for (int a = 0; a < n && a < APP_CFG_DI_AUX_COUNT && !aux_err; a++) {
-            cJSON *o = cJSON_GetArrayItem(aux_j, a);
-            if (!cJSON_IsObject(o)) continue;
-            cJSON *v;
-            if ((v = cJSON_GetObjectItem(o, "mode"))) {
-                aux_mode_t m;
-                if (!cJSON_IsString(v) || !aux_mode_parse(v->valuestring, &m) ||
-                    !aux_mode_allowed((uint8_t)a, m))
-                    aux_err = "aux mode not available on this pad";
-                else
-                    cfg.aux_mode[a] = (uint8_t)m;
-            }
-            if (!aux_err && (v = cJSON_GetObjectItem(o, "pwm_freq"))) {
-                if (!cJSON_IsNumber(v) || !aux_pwm_freq_ok(v->valuedouble))
-                    aux_err = "pwm_freq must be a whole number of Hz from 5 to 1000000";
-                else
-                    cfg.aux_pwm[a].freq_hz = (uint32_t)v->valuedouble;
-            }
-            if (!aux_err && (v = cJSON_GetObjectItem(o, "pwm_duty"))) {
-                if (!cJSON_IsNumber(v) || !aux_pwm_duty_from_pct(v->valuedouble, &cfg.aux_pwm[a].duty_pm))
-                    aux_err = "pwm_duty must be a percentage from 0 to 100";
-            }
-            if (!aux_err && (v = cJSON_GetObjectItem(o, "out_name"))) {
-                if (!cJSON_IsString(v) || strlen(v->valuestring) > APP_CFG_IO_NAME_MAX ||
-                    !app_config_utf8_ok(v->valuestring))
-                    aux_err = "out_name must be text of at most 20 bytes (UTF-8)";
-                else
-                    strlcpy(cfg.aux_out[a].name, v->valuestring, sizeof(cfg.aux_out[a].name));
-            }
-            if (!aux_err && (v = cJSON_GetObjectItem(o, "out_invert"))) {
-                if (!cJSON_IsBool(v)) aux_err = "out_invert must be true or false";
-                else cfg.aux_out[a].invert = cJSON_IsTrue(v);
-            }
-        }
-    }
+    const char *aux_err = web_aux_config_parse(root, &cfg);
     if (aux_err) {
         /* Plain text, like every other refusal of this handler: the page
            shows the body as it is. */
@@ -652,126 +589,6 @@ static esp_err_t api_config_post(httpd_req_t *req)
 /* ----------------------------------------------------------------- time / RTC */
 
 /* Format a UTC epoch as ISO-8601 "YYYY-MM-DDTHH:MM:SSZ" into buf (>= 21 bytes). */
-static void iso8601_utc(time_t t, char *buf, size_t len)
-{
-    struct tm tm_utc;
-    gmtime_r(&t, &tm_utc);
-    strftime(buf, len, "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
-}
-
-/* GET /api/time — report the system clock and the battery-backed RTC.
- * All times are UTC. "rtc_valid" is false when the RTC reports an oscillator
- * stop (i.e. it lost power and its time is meaningless). */
-static esp_err_t api_time_get(httpd_req_t *req)
-{
-    if (!web_check_auth(req)) return web_send_denied(req);
-    time_t now = time(NULL);
-
-    struct tm rtc_tm;
-    bool rtc_valid = false;
-    bool rtc_ok    = (rtc_dev_read(&rtc_tm, &rtc_valid) == ESP_OK);
-
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddNumberToObject(root, "epoch", (double)now);
-    char iso[24];
-    iso8601_utc(now, iso, sizeof(iso));
-    cJSON_AddStringToObject(root, "utc", iso);
-
-    cJSON_AddBoolToObject(root, "rtc_present", rtc_ok);
-    cJSON_AddBoolToObject(root, "rtc_valid",   rtc_ok && rtc_valid);
-    if (rtc_ok && rtc_valid) {
-        /* struct tm from the RTC is UTC; turn it back into an epoch for display. */
-        char riso[24];
-        strftime(riso, sizeof(riso), "%Y-%m-%dT%H:%M:%SZ", &rtc_tm);
-        cJSON_AddStringToObject(root, "rtc_utc", riso);
-    }
-
-    /* Local time and the configured zone (TZ is applied process-wide via tzset). */
-    struct tm local_tm;
-    localtime_r(&now, &local_tm);
-    char local[32];
-    strftime(local, sizeof(local), "%Y-%m-%d %H:%M:%S", &local_tm);
-    cJSON_AddStringToObject(root, "local", local);
-    cJSON_AddStringToObject(root, "tz", app_config_get()->tz);
-
-    char *json = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, json ? json : "{}");
-    cJSON_free(json);
-    return ESP_OK;
-}
-
-/* POST /api/time {"epoch": <unix seconds, UTC>} — set the system clock and
- * mirror it to the RTC. Used to set the time manually from the browser. */
-static esp_err_t api_time_post(httpd_req_t *req)
-{
-    if (!web_check_auth(req)) return web_send_denied(req);
-    if (req->content_len > BODY_MAX) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body too large");
-        return ESP_OK;
-    }
-
-    char *body = malloc(req->content_len + 1);
-    if (!body) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
-        return ESP_OK;
-    }
-    int received = web_recv_body(req, body, req->content_len);
-    if (received < 0) {
-        free(body);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv failed");
-        return ESP_OK;
-    }
-
-    cJSON *root = cJSON_Parse(body);
-    free(body);
-    if (!root) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
-        return ESP_OK;
-    }
-
-    cJSON *epoch = cJSON_GetObjectItem(root, "epoch");
-    /* Up to 2099: the RTC counts years 2000..2099 (rtc.c), and beyond
-       time_t the cast below would be undefined. */
-    if (!cJSON_IsNumber(epoch) || !(epoch->valuedouble >= 1000000000.0 &&
-                                    epoch->valuedouble < 4102444800.0)) {
-        cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing/invalid epoch");
-        return ESP_OK;
-    }
-    time_t t = (time_t)epoch->valuedouble;
-    cJSON_Delete(root);
-
-    struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
-    settimeofday(&tv, NULL);
-    /* As after an SNTP sync: the clock is valid now, and cron is armed
-       again from it. Without this, a board without SNTP and with no valid
-       RTC -- where setting the time by hand is the only way -- never armed
-       a cron rule until the next reboot. */
-    scripting_on_time_sync();
-
-    struct tm utc;
-    gmtime_r(&t, &utc);
-    esp_err_t rtc_ret = rtc_dev_set(&utc);
-
-    char iso[24];
-    iso8601_utc(t, iso, sizeof(iso));
-    ESP_LOGI(TAG, "time set from UI: %s (RTC %s)", iso,
-             rtc_ret == ESP_OK ? "updated" : "unavailable");
-
-    cJSON *resp = cJSON_CreateObject();
-    cJSON_AddStringToObject(resp, "status", "ok");
-    cJSON_AddStringToObject(resp, "utc", iso);
-    cJSON_AddBoolToObject(resp, "rtc_updated", rtc_ret == ESP_OK);
-    char *json = cJSON_PrintUnformatted(resp);
-    cJSON_Delete(resp);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, json ? json : "{\"status\":\"ok\"}");
-    cJSON_free(json);
-    return ESP_OK;
-}
-
 /* ----------------------------------------------------------------- static files */
 
 static esp_err_t file_get(httpd_req_t *req)
@@ -1029,35 +846,7 @@ static esp_err_t api_io_state(httpd_req_t *req)
         cJSON_AddItemToArray(di,   cJSON_CreateBool(di_get((uint8_t)i)));
     }
 #if APP_CFG_DI_AUX_COUNT
-    /* Which channels are inputs right now; an auxiliary one in another mode
-       reads false above without meaning "low". */
-    cJSON *act = cJSON_AddArrayToObject(root, "di_active");
-    for (int i = 0; i < APP_CFG_DI_COUNT; i++)
-        cJSON_AddItemToArray(act, cJSON_CreateBool(di_is_active((uint8_t)i)));
-    /* The pads as they run: PWM as the timer really produces it, analog as
-       read now. */
-    cJSON *aux = cJSON_AddArrayToObject(root, "aux");
-    for (int a = 0; a < APP_CFG_DI_AUX_COUNT; a++) {
-        cJSON *o = cJSON_CreateObject();
-        aux_status_t st;                         /* the pad at one moment */
-        aux_io_status((uint8_t)a, &st);
-        cJSON_AddStringToObject(o, "mode", aux_mode_name(st.mode));
-        if (st.mode == AUX_MODE_PWM) {
-            /* As it runs, which Modbus, MQTT or a rule may have changed since
-               the configuration was saved: the values as set -- what Modbus
-               and MQTT report too -- and the frequency the timer actually
-               produces from them. */
-            cJSON_AddNumberToObject(o, "pwm_freq", st.freq_hz);
-            cJSON_AddNumberToObject(o, "pwm_freq_actual", st.actual_hz);
-            cJSON_AddNumberToObject(o, "pwm_duty", st.duty_pm / 10.0);
-            cJSON_AddNumberToObject(o, "pwm_bits", st.bits);
-        } else if (st.mode == AUX_MODE_ANALOG && st.mv_valid) {
-            cJSON_AddNumberToObject(o, "mv", st.mv);
-        } else if (st.mode == AUX_MODE_OUTPUT) {
-            cJSON_AddBoolToObject(o, "out", st.out);
-        }
-        cJSON_AddItemToArray(aux, o);
-    }
+    web_aux_state_json(root);
 #endif
     for (int i = 0; i < APP_CFG_DO_COUNT; i++) {
         cJSON_AddItemToArray(dout, cJSON_CreateBool(dout_get((uint8_t)i)));
@@ -1097,31 +886,13 @@ static esp_err_t api_io_output(httpd_req_t *req)
     }
     uint8_t ch = (uint8_t)ch_j->valuedouble;
 
+#if APP_CFG_DI_AUX_COUNT
     if (ch >= APP_CFG_DO_COUNT) {
-        uint8_t a = (uint8_t)(ch - APP_CFG_DO_COUNT);
-        cJSON *tog = cJSON_GetObjectItem(root, "toggle");
-        cJSON *val = cJSON_GetObjectItem(root, "value");
-        esp_err_t r;
-        if (cJSON_IsTrue(tog))      r = aux_io_out_toggle(a);
-        else if (cJSON_IsBool(val)) r = aux_io_out_set(a, cJSON_IsTrue(val));
-        else {
-            cJSON_Delete(root);
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "value or toggle required");
-            return ESP_OK;
-        }
+        esp_err_t r = web_aux_output(req, (uint8_t)(ch - APP_CFG_DO_COUNT), root);
         cJSON_Delete(root);
-        if (r == ESP_ERR_INVALID_STATE) {
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "this pad is not set to output");
-            return ESP_OK;
-        }
-        if (r != ESP_OK) {
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "output write failed");
-            return ESP_OK;
-        }
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
-        return ESP_OK;
+        return r;
     }
+#endif
 
     /* A toggle goes to dout_modify() as one: read and flip under the output
        lock. Reading here and setting the opposite lost one of two toggles
@@ -1189,35 +960,6 @@ static esp_err_t api_io_led(httpd_req_t *req)
     cJSON_Delete(root);
 
     led_set_rgb(r, g, b);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
-    return ESP_OK;
-}
-
-/* POST /api/io/buzzer — {"freq":440,"duration":200} */
-static esp_err_t api_io_buzzer(httpd_req_t *req)
-{
-    if (!web_check_auth(req)) return web_send_denied(req);
-    if (req->content_len == 0 || req->content_len > 64) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad body");
-        return ESP_OK;
-    }
-    char body[65];
-    int n = web_recv_body(req, body, sizeof(body) - 1);
-    if (n < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
-
-    cJSON *root = cJSON_Parse(body);
-    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
-
-    uint32_t freq = 440, dur = 200;
-    cJSON *fj = cJSON_GetObjectItem(root, "freq");
-    cJSON *dj = cJSON_GetObjectItem(root, "duration");
-    /* buzzer_beep_once() clamps both; out of uint32_t they are left. */
-    web_json_uint(fj, 0, UINT32_MAX, &freq);
-    web_json_uint(dj, 0, UINT32_MAX, &dur);
-    cJSON_Delete(root);
-
-    buzzer_beep_once(freq, dur);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
     return ESP_OK;
@@ -1524,7 +1266,7 @@ static const httpd_uri_t s_handlers[] = {
     { .uri = "/api/modbus/status",     .method = HTTP_GET,  .handler = api_modbus_status     },
     { .uri = "/api/io/output",         .method = HTTP_POST, .handler = api_io_output         },
     { .uri = "/api/io/led",            .method = HTTP_POST, .handler = api_io_led            },
-    { .uri = "/api/io/buzzer",         .method = HTTP_POST, .handler = api_io_buzzer         },
+    { .uri = "/api/io/buzzer",         .method = HTTP_POST, .handler = web_api_io_buzzer     },
 #ifdef CONFIG_APP_MATTER_ENABLE
     { .uri = "/api/matter/pairing",       .method = HTTP_GET,  .handler = api_matter_pairing      },
     { .uri = "/api/matter/decommission", .method = HTTP_POST, .handler = api_matter_decommission },
@@ -1534,8 +1276,8 @@ static const httpd_uri_t s_handlers[] = {
     { .uri = "/api/factory-reset",     .method = HTTP_POST, .handler = api_factory_reset     },
     { .uri = "/api/rules",             .method = HTTP_GET,  .handler = api_rules_get         },
     { .uri = "/api/rules",             .method = HTTP_POST, .handler = api_rules_post        },
-    { .uri = "/api/time",              .method = HTTP_GET,  .handler = api_time_get          },
-    { .uri = "/api/time",              .method = HTTP_POST, .handler = api_time_post         },
+    { .uri = "/api/time",              .method = HTTP_GET,  .handler = web_api_time_get      },
+    { .uri = "/api/time",              .method = HTTP_POST, .handler = web_api_time_post     },
     { .uri = "/api/version",           .method = HTTP_GET,  .handler = api_version           },
     { .uri = "/*",                     .method = HTTP_GET,  .handler = file_get              },
 };

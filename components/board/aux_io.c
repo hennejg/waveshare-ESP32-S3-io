@@ -12,6 +12,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
+#include <freertos/idf_additions.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
 
 #ifdef CONFIG_APP_MQTT_ENABLE
@@ -729,8 +731,12 @@ esp_err_t aux_io_init(void)
     s_mux = xSemaphoreCreateMutex();
     if (!s_mux) return ESP_ERR_NO_MEM;
     /* Publishes over MQTT from this stack (see dout_pub): with mqtts:// under
-       load 1.4 kB of 3584 were left, so 4096. */
-    if (xTaskCreate(aux_task, "aux", 4096, NULL, 4, &s_task) != pdPASS) return ESP_ERR_NO_MEM;
+       load 1.4 kB of 3584 were left, so 4096. In PSRAM: internal RAM is what
+       the Matter firmware runs short of, and this task never touches the
+       flash (NVS writes cannot run on a PSRAM stack). */
+    if (xTaskCreateWithCaps(aux_task, "aux", 4096, NULL, 4, &s_task,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS)
+        return ESP_ERR_NO_MEM;
     return aux_io_apply();
 }
 

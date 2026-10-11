@@ -21,7 +21,7 @@ board hardware abstraction layer (`components/board/`):
 | Flavor | Binary | What it includes |
 |--------|--------|-----------------|
 | **Full** (`apps/full/`) | `waveshare_esp32s3_full.bin` | [WiFi provisioning](#connectivity), [Ethernet](#connectivity), [Rule engine](#automation-rules), [MQTT](#mqtt), [CAN bus](#can-bus), [Modbus RTU](#modbus-rtu), [full web UI](#web-configuration-ui) — **no Matter** |
-| **Matter** (`apps/matter/`) | `waveshare_esp32s3_matter.bin` | [WiFi provisioning](#connectivity), [Ethernet](#connectivity), [Matter](#matter) (Apple Home / Google Home), minimal web UI — no rule engine, no MQTT |
+| **Matter** (`apps/matter/`) | `waveshare_esp32s3_matter.bin` | [WiFi provisioning](#connectivity), [Ethernet](#connectivity), [Matter](#matter) (Apple Home / Google Home), header pads, buzzer, NTP time + RTC, minimal web UI — no rule engine, no MQTT |
 
 **If you are not sure which to use, start with the full firmware** — it is what the CI builds and the releases contain.
 
@@ -135,9 +135,11 @@ neither header and are not affected.
 | `/api/rules`             | GET    | Yes           | Read the current rule script as `{"script":"…"}` |
 | `/api/rules`             | POST   | Yes           | Save + hot-reload rules from `{"script":"…"}`    |
 
-The matter firmware exposes a smaller API: `/api/auth/*`, `/api/config` (subset), `/api/reboot`,
-`/api/factory-reset`, `/api/matter/pairing` (GET — QR code + commissioning status), and
-`/api/matter/decommission` (POST — erase fabrics and reboot).
+The matter firmware exposes a smaller API: `/api/auth/*`, `/api/config` (subset, with `sntp`, `tz` and
+`aux`), `/api/io/state`, `/api/io/output` (DO1–DO8 and the header pads), `/api/io/led`, `/api/io/buzzer`,
+`/api/time`, `/api/version` (with the free internal heap), `/api/reboot`, `/api/factory-reset`,
+`/api/matter/pairing` (GET — QR code + commissioning status), and `/api/matter/decommission` (POST — erase
+fabrics and reboot).
 
 ### Automation Rules
 
@@ -209,6 +211,9 @@ Matter protocol. You give up the rule engine, MQTT, CAN bus, and Modbus RTU in e
 |-----------------------|-------------------------------------------------------------------------------------------|
 | **8 Digital Outputs** | Exposed as *On/Off Plug-in Unit* endpoints (controllable)                                 |
 | **8 Digital Inputs**  | Exposed as *Contact Sensor* endpoints (read-only state)                                   |
+| **Header pads**       | IO1/RXD/TXD by mode: input → *Contact Sensor*, output → *On/Off Plug-in Unit*, PWM → *Dimmable Plug-in Unit*; analog in the web UI only |
+| **Time**              | NTP sync and the battery-backed RTC, time zone, set by hand from the web UI               |
+| **Buzzer**            | Test beep from the web UI (`POST /api/io/buzzer`)                                         |
 | **Pairing code**      | Unique passcode + discriminator generated on first boot; survives reboot and decommission |
 | **QR code**           | Shown in the web UI; scan with your home app to pair                                      |
 | **Decommission**      | Erase all fabric data via `POST /api/matter/decommission` or the minimal web UI           |

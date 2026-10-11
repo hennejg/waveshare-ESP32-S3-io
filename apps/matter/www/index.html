@@ -130,6 +130,7 @@
     <button type="button" class="tab-btn" data-tab="device"  onclick="switchTab('device')">Device</button>
     <button type="button" class="tab-btn" data-tab="inputs"  onclick="switchTab('inputs')">Inputs</button>
     <button type="button" class="tab-btn" data-tab="outputs" onclick="switchTab('outputs')">Outputs</button>
+    <button type="button" class="tab-btn" data-tab="pads"    onclick="switchTab('pads')">Pads</button>
   </nav>
 
   <form id="form" novalidate>
@@ -178,6 +179,25 @@
         <button type="button" onclick="setLed('#000000')" style="background:#888">Off</button>
       </div>
       <p class="hint">Only effective when LED Mode is "IO device".</p>
+
+      <h2>Buzzer</h2>
+      <div class="io-row">
+        <button type="button" onclick="beep()">Beep</button>
+      </div>
+
+      <h2>Time</h2>
+      <p id="time-now" class="hint" style="font-size:.85rem;color:#333">–</p>
+      <label style="font-weight:normal"><input type="checkbox" id="sntp_enable"> Sync from an NTP server</label>
+      <label>NTP Server
+        <input type="text" id="sntp_server" maxlength="63" placeholder="pool.ntp.org">
+      </label>
+      <label>Time Zone (POSIX TZ)
+        <input type="text" id="tz" maxlength="63" placeholder="CET-1CEST,M3.5.0,M10.5.0/3">
+      </label>
+      <p class="hint">Empty = UTC. The battery-backed RTC keeps the time across power loss.</p>
+      <div class="io-row">
+        <button type="button" onclick="setTimeFromBrowser()">Set from this browser</button>
+      </div>
     </div>
 
     <!-- ── Inputs ── -->
@@ -198,6 +218,19 @@
       </table>
       <p class="hint">Name: label shown in the UI. Invert: checked = physical bit flipped relative to logical state.</p>
       <div id="do-grid" class="io-grid" style="margin-top:.6rem"></div>
+    </div>
+
+    <!-- ── Header pads ── -->
+    <div id="tab-pads" class="tab-pane">
+      <p class="hint" style="color:#b00">IO1, RXD and TXD are bare 3.3 V GPIOs: no isolation, no protection.
+        Never more than 3.3 V or less than 0 V.</p>
+      <table>
+        <thead><tr><th>Pad</th><th>Mode</th><th>Settings</th><th>Now</th></tr></thead>
+        <tbody id="pad-table"></tbody>
+      </table>
+      <p class="hint">In Matter a pad is a Contact Sensor (input), an On/Off Plug-in Unit (output)
+        or a Dimmable Plug-in Unit (PWM, level = duty cycle). Analog is shown here only.
+        A mode change switches the pad at once and its Matter endpoint after a reboot.</p>
     </div>
 
     <div class="btn-row">
@@ -441,7 +474,12 @@
           if (inv)  inv.checked = !!dout.invert;
           if (name) name.value  = dout.name ?? '';
         });
+        document.getElementById('sntp_enable').checked = !!cfg.sntp?.enable;
+        document.getElementById('sntp_server').value   = cfg.sntp?.server ?? '';
+        document.getElementById('tz').value            = cfg.tz ?? '';
+        buildPads(cfg);
         buildIoPanel(cfg);
+        loadTime();
         startIoPoll();
         loadMatterPairing();
       } catch (e) {
@@ -482,7 +520,13 @@
           led_mode:    parseInt(document.getElementById('led_mode').value, 10),
           di,
           dout,
+          sntp: {
+            enable: document.getElementById('sntp_enable').checked,
+            server: document.getElementById('sntp_server').value.trim(),
+          },
+          tz: document.getElementById('tz').value.trim(),
         };
+        if (padCount) cfg.aux = readPads();
         const r = await apiFetch('/api/config', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -492,7 +536,9 @@
         const res = await r.json();
         if (res.status === 'ok') {
           status.className = 'ok';
-          status.textContent = 'Saved.';
+          status.textContent = res.reboot_required
+            ? 'Saved. A pad changed its mode: reboot for Matter to see it.'
+            : 'Saved.';
           load();
         } else {
           status.className = 'err';
@@ -611,6 +657,19 @@
           const el = document.getElementById(`do-btn-${i}`);
           if (el) el.className = 'io-toggle' + (v ? ' on' : '');
         });
+        (d.aux || []).forEach((p, a) => {
+          const el = document.getElementById(`pad-now-${a}`);
+          if (!el) return;
+          if (p.mode === 'input')
+            el.innerHTML = `<span class="io-dot${d.di?.[8 + a] ? ' on' : ''}"></span>`;
+          else if (p.mode === 'output')
+            el.innerHTML = `<button type="button" class="io-toggle${p.out ? ' on' : ''}" onclick="toggleOutput(${8 + a})">${p.out ? 'on' : 'off'}</button>`;
+          else if (p.mode === 'pwm')
+            el.textContent = `${p.pwm_duty} % @ ${p.pwm_freq_actual ?? p.pwm_freq} Hz`;
+          else if (p.mode === 'analog')
+            el.textContent = p.mv != null ? `${p.mv} mV` : '–';
+          else el.textContent = '–';
+        });
       } catch (_) {}
     }
 
@@ -635,6 +694,91 @@
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ r, g, b }),
+        });
+      } catch (_) {}
+    }
+
+    /* ---- Header pads ---- */
+    const PAD_NAMES = ['IO1', 'RXD', 'TXD'];
+    let padCount = 0;
+
+    function buildPads(cfg) {
+      const tb = document.getElementById('pad-table');
+      tb.innerHTML = '';
+      const pads = cfg.aux ?? [];
+      padCount = pads.length;
+      document.querySelector('.tab-btn[data-tab="pads"]').style.display = padCount ? '' : 'none';
+      pads.forEach((p, a) => {
+        const opts = (p.modes ?? []).map(m =>
+          `<option value="${esc(m)}"${m === p.mode ? ' selected' : ''}>${esc(m)}</option>`).join('');
+        tb.insertAdjacentHTML('beforeend',
+          `<tr><td>${PAD_NAMES[a] ?? 'AUX' + (a + 1)}</td>` +
+          `<td><select id="pad_${a}_mode" onchange="padModeShown(${a})">${opts}</select></td>` +
+          `<td><span id="pad_${a}_pwm">` +
+            `<input type="number" id="pad_${a}_freq" min="5" max="1000000" step="1" style="width:6rem" title="Hz"> Hz ` +
+            `<input type="number" id="pad_${a}_duty" min="0" max="100" step="0.1" style="width:4.5rem" title="%"> %</span>` +
+          `<span id="pad_${a}_out"><input type="text" id="pad_${a}_name" maxlength="20" style="width:7rem" placeholder="name"> ` +
+            `<label style="display:inline;font-weight:normal"><input type="checkbox" id="pad_${a}_invert"> invert</label></span></td>` +
+          `<td id="pad-now-${a}">–</td></tr>`);
+        document.getElementById(`pad_${a}_freq`).value   = p.pwm_freq ?? 1000;
+        document.getElementById(`pad_${a}_duty`).value   = p.pwm_duty ?? 0;
+        document.getElementById(`pad_${a}_name`).value   = p.out_name ?? '';
+        document.getElementById(`pad_${a}_invert`).checked = !!p.out_invert;
+        padModeShown(a);
+      });
+    }
+
+    function padModeShown(a) {
+      const m = document.getElementById(`pad_${a}_mode`).value;
+      document.getElementById(`pad_${a}_pwm`).style.display = m === 'pwm' ? '' : 'none';
+      document.getElementById(`pad_${a}_out`).style.display = m === 'output' ? '' : 'none';
+    }
+
+    function readPads() {
+      const aux = [];
+      for (let a = 0; a < padCount; a++) {
+        aux.push({
+          mode:       document.getElementById(`pad_${a}_mode`).value,
+          pwm_freq:   Number(document.getElementById(`pad_${a}_freq`).value),
+          pwm_duty:   Number(document.getElementById(`pad_${a}_duty`).value),
+          out_name:   document.getElementById(`pad_${a}_name`).value.trim(),
+          out_invert: document.getElementById(`pad_${a}_invert`).checked,
+        });
+      }
+      return aux;
+    }
+
+    /* ---- Time and buzzer ---- */
+    async function loadTime() {
+      try {
+        const r = await apiFetch('/api/time');
+        if (!r.ok) return;
+        const t = await r.json();
+        document.getElementById('time-now').textContent =
+          `Device: ${t.local} (${t.tz || 'UTC'}) · RTC ` +
+          (t.rtc_present ? (t.rtc_valid ? 'valid' : 'not set') : 'not found');
+      } catch (_) {}
+    }
+
+    async function setTimeFromBrowser() {
+      try {
+        const r = await apiFetch('/api/time', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ epoch: Math.floor(Date.now() / 1000) }),
+        });
+        status.className = r.ok ? 'ok' : 'err';
+        status.textContent = r.ok ? 'Time set.' : 'Setting the time failed: ' + await responseError(r);
+        loadTime();
+      } catch (_) {}
+    }
+
+    async function beep() {
+      try {
+        await apiFetch('/api/io/buzzer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ freq: 2000, duration: 150 }),
         });
       } catch (_) {}
     }

@@ -115,3 +115,5 @@ dependencies.lock
 /test/host/test_payload.c
 /test/host/test_mqttfrag
 /test/host/test_mqttfrag.c
+/test/host/test_padlevel
+/test/host/test_padlevel.c

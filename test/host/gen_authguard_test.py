@@ -43,7 +43,10 @@ for app, rel in APPS.items():
     if len(rows) < 10: raise SystemExit("%s: handler table not understood" % rel)
     for uri, method, fn in rows:
         if OPEN.search(uri): continue
-        body = s.func("static esp_err_t %s(httpd_req_t *req)" % fn)
+        if fn.startswith("web_"):   # shared handler, components/board/web_common.c
+            body = Source.at("components/board/web_common.c").func("esp_err_t %s(httpd_req_t *req)" % fn)
+        else:
+            body = s.func("static esp_err_t %s(httpd_req_t *req)" % fn)
         body = body[body.index("{") + 1:]
         body = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
         body = re.sub(r"//[^\n]*", "", body)

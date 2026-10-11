@@ -2,6 +2,9 @@
 #include "app_config.h"
 #include "auth.h"
 #include "web_common.h"
+#include "app_time.h"
+#include "aux_io.h"
+#include "sntp_sync.h"
 #include "di.h"
 #include "dout.h"
 #include "led.h"
@@ -14,6 +17,7 @@
 #include <lwip/sockets.h>
 
 #include <esp_app_desc.h>
+#include <esp_heap_caps.h>
 #include <esp_http_server.h>
 #include <esp_log.h>
 #include <esp_system.h>
@@ -51,6 +55,18 @@ static void parse_invert_array(cJSON *arr, di_config_t *out, int max, bool *too_
     }
 }
 
+/* A text field of the configuration: only when sent; false if it is not
+   text, not UTF-8 or does not fit. */
+static bool str_field(const cJSON *obj, const char *key, char *dst, size_t cap)
+{
+    const cJSON *v = cJSON_GetObjectItem(obj, key);
+    if (!v || cJSON_IsNull(v)) return true;
+    if (!cJSON_IsString(v) || strlen(v->valuestring) >= cap || !app_config_utf8_ok(v->valuestring))
+        return false;
+    strlcpy(dst, v->valuestring, cap);
+    return true;
+}
+
 /* ----------------------------------------------------------------- /api/config */
 
 static esp_err_t api_config_get(httpd_req_t *req)
@@ -61,6 +77,15 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "device_name", cfg->device_name);
     cJSON_AddNumberToObject(root, "led_mode",    cfg->led_mode);
+    cJSON_AddNumberToObject(root, "di_isolated", APP_CFG_DI_ISOLATED_COUNT);
+
+    cJSON *sntp = cJSON_AddObjectToObject(root, "sntp");
+    cJSON_AddBoolToObject  (sntp, "enable", cfg->sntp.enable);
+    cJSON_AddStringToObject(sntp, "server", cfg->sntp.server);
+    cJSON_AddStringToObject(root, "tz", cfg->tz);
+#if APP_CFG_DI_AUX_COUNT
+    web_aux_config_json(root, cfg);
+#endif
 
     cJSON *di = cJSON_AddArrayToObject(root, "di");
     for (int i = 0; i < APP_CFG_DI_COUNT; i++) {
@@ -125,7 +150,27 @@ static esp_err_t api_config_post(httpd_req_t *req)
     parse_invert_array(cJSON_GetObjectItem(root, "di"),   cfg.di,   APP_CFG_DI_COUNT, &too_long);
     parse_invert_array(cJSON_GetObjectItem(root, "dout"), cfg.dout, APP_CFG_DO_COUNT, &too_long);
 
+    const char *bad = NULL;
+    cJSON *sntp_j = cJSON_GetObjectItem(root, "sntp");
+    if (cJSON_IsObject(sntp_j)) {
+        cJSON *v;
+        if ((v = cJSON_GetObjectItem(sntp_j, "enable")) && cJSON_IsBool(v))
+            cfg.sntp.enable = cJSON_IsTrue(v) ? 1 : 0;
+        if (!str_field(sntp_j, "server", cfg.sntp.server, sizeof(cfg.sntp.server)))
+            bad = "invalid value for sntp.server (wrong type or too long)";
+    }
+    if (!bad && !str_field(root, "tz", cfg.tz, sizeof(cfg.tz)))
+        bad = "invalid value for tz (wrong type or too long)";
+#if APP_CFG_DI_AUX_COUNT
+    if (!bad) bad = web_aux_config_parse(root, &cfg);
+#endif
+
     cJSON_Delete(root);
+
+    if (bad) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, bad);
+        return ESP_OK;
+    }
 
     if (too_long) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "a name is too long (at most 20 bytes as UTF-8)");
@@ -147,8 +192,26 @@ static esp_err_t api_config_post(httpd_req_t *req)
     }
     matter_set_node_label(cfg.device_name);
 
+    /* The pads switch now; their Matter endpoints were made at boot for the
+       mode each had then, so a changed mode reaches Matter after a reboot. */
+    bool reboot = false;
+#if APP_CFG_DI_AUX_COUNT
+    for (int a = 0; a < APP_CFG_DI_AUX_COUNT; a++)
+        if (cfg.aux_mode[a] != (uint8_t)aux_io_mode((uint8_t)a)) reboot = true;
+#endif
+    esp_err_t aux_ret = aux_io_apply();
+    app_time_apply_tz();  /* timezone first, so a sync that follows computes in it */
+    sntp_sync_apply();
+    for (int a = 0; a < APP_CFG_DI_AUX_COUNT; a++) matter_aux_update((uint8_t)a);
+    if (aux_ret != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+            "Saved, but a header pad could not be switched and is in its standard function (see the device log)");
+        return ESP_OK;
+    }
+
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+    httpd_resp_sendstr(req, reboot ? "{\"status\":\"ok\",\"reboot_required\":true}"
+                                   : "{\"status\":\"ok\"}");
     return ESP_OK;
 }
 
@@ -282,10 +345,13 @@ static esp_err_t api_io_state(httpd_req_t *req)
     cJSON *root = cJSON_CreateObject();
     cJSON *di   = cJSON_AddArrayToObject(root, "di");
     cJSON *dout = cJSON_AddArrayToObject(root, "dout");
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < APP_CFG_DI_COUNT; i++)
         cJSON_AddItemToArray(di,   cJSON_CreateBool(di_get((uint8_t)i)));
+    for (int i = 0; i < APP_CFG_DO_COUNT; i++)
         cJSON_AddItemToArray(dout, cJSON_CreateBool(dout_get((uint8_t)i)));
-    }
+#if APP_CFG_DI_AUX_COUNT
+    web_aux_state_json(root);
+#endif
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     httpd_resp_set_type(req, "application/json");
@@ -308,14 +374,27 @@ static esp_err_t api_io_output(httpd_req_t *req)
     cJSON *root = cJSON_Parse(body);
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
 
+    /* 0-7 are DO1-DO8; 8-10 the header pads, while they are outputs. */
+    const int last = APP_CFG_DO_COUNT - 1 + APP_CFG_DI_AUX_COUNT;
     cJSON *ch_j = cJSON_GetObjectItem(root, "channel");
-    if (!cJSON_IsNumber(ch_j) || ch_j->valuedouble < 0 || ch_j->valuedouble > 7 ||
+    if (!cJSON_IsNumber(ch_j) || ch_j->valuedouble < 0 || ch_j->valuedouble > last ||
         ch_j->valuedouble != (int)ch_j->valuedouble) {
         cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "channel 0-7 required");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            last > 7 ? "channel 0-10 required" : "channel 0-7 required");
         return ESP_OK;
     }
     uint8_t ch = (uint8_t)ch_j->valuedouble;
+
+#if APP_CFG_DI_AUX_COUNT
+    if (ch >= APP_CFG_DO_COUNT) {
+        uint8_t a = (uint8_t)(ch - APP_CFG_DO_COUNT);
+        esp_err_t r = web_aux_output(req, a, root);
+        cJSON_Delete(root);
+        matter_aux_update(a);
+        return r;
+    }
+#endif
 
     /* A toggle is one dout_toggle() call, under the output lock: reading
        and setting the opposite lost one of two toggles arriving together. */
@@ -396,10 +475,19 @@ static esp_err_t api_version(httpd_req_t *req)
        password like everything else outside the setup flow. */
     if (!web_check_auth(req)) return web_send_denied(req);
     const esp_app_desc_t *d = esp_app_get_description();
-    char json[160];
+    /* Internal RAM is what Matter runs short of (README): free now, the
+       lowest it has been since boot, and the largest block left. */
+    const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    char json[320];
     snprintf(json, sizeof(json),
-             "{\"version\":\"%s\",\"idf\":\"%s\",\"date\":\"%s\",\"time\":\"%s\"}",
-             d->version, d->idf_ver, d->date, d->time);
+             "{\"version\":\"%s\",\"idf\":\"%s\",\"date\":\"%s\",\"time\":\"%s\","
+             "\"heap_internal_free\":%u,\"heap_internal_min\":%u,\"heap_internal_largest\":%u,"
+             "\"heap_dma_free\":%u}",
+             d->version, d->idf_ver, d->date, d->time,
+             (unsigned)heap_caps_get_free_size(caps),
+             (unsigned)heap_caps_get_minimum_free_size(caps),
+             (unsigned)heap_caps_get_largest_free_block(caps),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, json);
     return ESP_OK;
@@ -458,6 +546,9 @@ static const httpd_uri_t s_handlers[] = {
     { .uri = "/api/io/state",             .method = HTTP_GET,  .handler = api_io_state          },
     { .uri = "/api/io/output",            .method = HTTP_POST, .handler = api_io_output         },
     { .uri = "/api/io/led",               .method = HTTP_POST, .handler = api_io_led            },
+    { .uri = "/api/io/buzzer",            .method = HTTP_POST, .handler = web_api_io_buzzer     },
+    { .uri = "/api/time",                 .method = HTTP_GET,  .handler = web_api_time_get      },
+    { .uri = "/api/time",                 .method = HTTP_POST, .handler = web_api_time_post     },
     { .uri = "/api/matter/pairing",       .method = HTTP_GET,  .handler = api_matter_pairing    },
     { .uri = "/api/matter/decommission",  .method = HTTP_POST, .handler = api_matter_decommission },
     { .uri = "/api/reboot",               .method = HTTP_POST, .handler = api_reboot            },

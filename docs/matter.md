@@ -12,9 +12,29 @@ controller.
 |-----------|-------|-----------------------------|----------------------|------------|
 | 1–8       | 8     | On/Off Plug-in Unit (0x010A) | OnOff (0x0006)       | Read/Write |
 | 9–16      | 8     | Contact Sensor (0x0015)      | BooleanState (0x0045)| Read-only  |
+| 17…       | 0–3   | by pad mode, see below       |                      |            |
 
 Endpoint numbering follows the order of creation: root endpoint is 0, DO1–DO8 are endpoints 1–8, DI1–DI8 are
-endpoints 9–16.
+endpoints 9–16, then one endpoint per header pad that has one, in pad order.
+
+### Header pads (IO1, RXD, TXD)
+
+The three non-isolated 3.3 V pads are set up in the **Pads** tab of the web UI. Each becomes an endpoint by the
+mode it has at boot:
+
+| Pad mode  | Matter device type                 | Clusters                 | Notes                                      |
+|-----------|------------------------------------|--------------------------|--------------------------------------------|
+| input     | Contact Sensor (0x0015)            | BooleanState             | DI channel 8–10                            |
+| output    | On/Off Plug-in Unit (0x010A)       | OnOff                    | starts off after every boot                |
+| pwm       | Dimmable Plug-in Unit (0x010B)     | OnOff, LevelControl      | off = duty 0; level 1–254 = duty 0.4–100 % |
+| analog    | —                                  | —                        | no device type home apps show; web UI only |
+| standard  | —                                  | —                        | UART0 / unused                             |
+
+A mode change switches the pad at once, its endpoint after a reboot (the save answers `reboot_required`). The
+endpoint numbers of the pads after it shift when a pad gains or loses its endpoint; the controller sees the
+endpoint list change. Whether a given home app copes with that without re-pairing has not been tested.
+
+Every active pad endpoint costs internal RAM (1–2.6 KB measured), see *Memory and build notes*.
 
 ### Digital Outputs (DO1–DO8)
 
@@ -121,6 +141,24 @@ Similarly, `CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_DEFAULT=y` allows NimBLE advertising
 fallback during commissioning.
 
 See `sdkconfig.defaults` for the full set of memory-related overrides.
+
+### Internal RAM, measured
+
+Internal RAM is the limit of this firmware. `GET /api/version` reports it (`heap_internal_free`,
+`heap_internal_min` = lowest since boot, `heap_internal_largest`, `heap_dma_free`). Measured on the bench
+board (Ethernet up, setup AP on, BLE advertising, not commissioned):
+
+| Firmware                                             | free    | lowest  | largest block | lowest through commissioning |
+|------------------------------------------------------|---------|---------|---------------|------------------------------|
+| before time, buzzer and pads                         | 19.9 KB | 13.2 KB | 7.7 KB        | 12.4 KB                      |
+| with time, buzzer and pads, all pads standard        | 16.7 KB | 10.1 KB | 7.7 KB        | 9.5 KB                       |
+| same, three pads with endpoints (output, input, pwm) | 13.7 KB | 7.0 KB  | 5.4 KB        | 6.8 KB                       |
+
+Commissioning was done on-network over Ethernet with chip-tool and succeeded in every case; afterwards the
+setup AP and BLE are off and 56–73 KB are free. Commissioning over BLE with a phone was not measured.
+
+The buzzer and pad tasks run on PSRAM stacks to keep this low. Endpoint data is allocated in small blocks,
+which `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` (1024) keeps in internal RAM.
 
 ### Known quirks
 

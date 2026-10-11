@@ -3,6 +3,10 @@
  * Device model:
  *   Endpoints 1–8  : On/Off Plug-in Unit (DO1–DO8, logical output state)
  *   Endpoints 9–16 : Contact Sensor       (DI1–DI8, logical input state)
+ *   Endpoints 17.. : the header pads IO1/RXD/TXD, one each by the mode it has
+ *                    at boot -- input: Contact Sensor, output: On/Off Plug-in
+ *                    Unit, PWM: Dimmable Plug-in Unit (level = duty cycle).
+ *                    Standard and analog pads have none.
  *
  * Commissioning: Bluetooth LE PASE (standard Matter over Wi-Fi).
  * The existing Wi-Fi / Ethernet provisioning runs in parallel; Matter
@@ -18,6 +22,7 @@ extern "C" {
 #include "eth.h"
 #include "wifi_config.h"
 #include "led.h"
+#include "aux_io.h"
 #include <esp_timer.h>
 }
 
@@ -78,6 +83,70 @@ static esp_err_t boolean_state_set_value(chip::EndpointId endpoint_id, bool valu
 static uint16_t s_do_ep[NUM_CHANNELS];
 static uint16_t s_di_ep[NUM_CHANNELS];
 
+/* The header pads: endpoint (0 = none) and the mode it was created for.
+   The endpoint set is fixed once the stack runs, so a pad switched to
+   another mode afterwards keeps its old endpoint, unanswered, until the
+   next boot -- the mode is checked before every use. */
+static uint16_t   s_aux_ep[AUX_PAD_COUNT];
+static aux_mode_t s_aux_ep_mode[AUX_PAD_COUNT];
+/* A PWM pad as a dimmable unit: off is duty 0, on runs the level last set
+   (1..254, scaled to the duty cycle). */
+static uint8_t    s_pwm_level[AUX_PAD_COUNT];
+static bool       s_pwm_on[AUX_PAD_COUNT];
+
+static uint16_t level_to_duty(uint8_t level)
+{
+    return (uint16_t)(((uint32_t)level * AUX_PWM_DUTY_MAX + 127) / 254);
+}
+
+static uint8_t duty_to_level(uint16_t duty_pm)
+{
+    uint32_t l = ((uint32_t)duty_pm * 254 + AUX_PWM_DUTY_MAX / 2) / AUX_PWM_DUTY_MAX;
+    return (uint8_t)(l < 1 ? 1 : l > 254 ? 254 : l);
+}
+
+static int aux_pad_of(uint16_t endpoint_id)
+{
+    for (int a = 0; a < AUX_PAD_COUNT; a++)
+        if (s_aux_ep[a] && s_aux_ep[a] == endpoint_id) return a;
+    return -1;
+}
+
+/* A controller's write to a pad endpoint. The error goes back to the
+   stack, which then refuses the write. */
+static esp_err_t aux_attr_update(int a, uint32_t cluster_id, uint32_t attribute_id,
+                                 esp_matter_attr_val_t *val)
+{
+    if (aux_io_mode((uint8_t)a) != s_aux_ep_mode[a]) {
+        ESP_LOGW(TAG, "AUX%d: mode changed since boot, endpoint inactive until reboot", a + 1);
+        return ESP_ERR_INVALID_STATE;
+    }
+    bool on_off = cluster_id == OnOff::Id && attribute_id == OnOff::Attributes::OnOff::Id;
+    bool level  = cluster_id == LevelControl::Id &&
+                  attribute_id == LevelControl::Attributes::CurrentLevel::Id;
+    if (s_aux_ep_mode[a] == AUX_MODE_OUTPUT && on_off) {
+        ESP_LOGI(TAG, "Matter → AUX%d = %s", a + 1, val->val.b ? "ON" : "OFF");
+        return aux_io_out_set((uint8_t)a, val->val.b);
+    }
+    if (s_aux_ep_mode[a] != AUX_MODE_PWM) return ESP_OK;
+    if (on_off) {
+        esp_err_t r = aux_io_pwm_set((uint8_t)a, 0, val->val.b ? level_to_duty(s_pwm_level[a]) : 0);
+        if (r == ESP_OK) s_pwm_on[a] = val->val.b;
+        ESP_LOGI(TAG, "Matter → AUX%d PWM %s", a + 1, val->val.b ? "on" : "off");
+        return r;
+    }
+    if (level) {
+        if (val->type == ESP_MATTER_VAL_TYPE_NULLABLE_UINT8 && chip::app::NumericAttributeTraits<uint8_t>::IsNullValue(val->val.u8))
+            return ESP_OK;
+        uint8_t l = val->val.u8 < 1 ? 1 : val->val.u8 > 254 ? 254 : val->val.u8;
+        s_pwm_level[a] = l;
+        if (!s_pwm_on[a]) return ESP_OK;   /* kept for the next "on" */
+        ESP_LOGI(TAG, "Matter → AUX%d PWM level %u (duty %.1f %%)", a + 1, l, level_to_duty(l) / 10.0);
+        return aux_io_pwm_set((uint8_t)a, 0, level_to_duty(l));
+    }
+    return ESP_OK;
+}
+
 /* Called by Matter stack when a controller writes an attribute (e.g. toggling a DO). */
 static esp_err_t attr_update_cb(attribute::callback_type_t type,
                                 uint16_t endpoint_id,
@@ -87,6 +156,9 @@ static esp_err_t attr_update_cb(attribute::callback_type_t type,
                                 void *priv_data)
 {
     if (type != PRE_UPDATE) return ESP_OK;
+
+    int pad = aux_pad_of(endpoint_id);
+    if (pad >= 0) return aux_attr_update(pad, cluster_id, attribute_id, val);
 
     if (cluster_id == OnOff::Id && attribute_id == OnOff::Attributes::OnOff::Id) {
         /* Find which DO channel this endpoint corresponds to */
@@ -354,6 +426,48 @@ esp_err_t matter_init(void)
                  cfg->di[i].name[0] ? cfg->di[i].name : "-");
     }
 
+    /* The header pads, by the mode each has now (aux_io_init() ran before). */
+    for (int a = 0; a < AUX_PAD_COUNT; a++) {
+        aux_mode_t m = aux_io_mode((uint8_t)a);
+        endpoint_t *ep = nullptr;
+        if (m == AUX_MODE_INPUT) {
+            contact_sensor::config_t c = {};
+            ep = contact_sensor::create(node, &c, ENDPOINT_FLAG_NONE, nullptr);
+        } else if (m == AUX_MODE_OUTPUT) {
+            on_off_plug_in_unit::config_t c = {};
+            bool on = false;
+            aux_io_out_get((uint8_t)a, &on);
+            c.on_off.on_off = on;
+            ep = on_off_plug_in_unit::create(node, &c, ENDPOINT_FLAG_NONE, nullptr);
+        } else if (m == AUX_MODE_PWM) {
+            dimmable_plug_in_unit::config_t c = {};
+            uint16_t duty = 0;
+            aux_io_pwm_info((uint8_t)a, nullptr, &duty, nullptr);
+            s_pwm_on[a]    = duty > 0;
+            s_pwm_level[a] = duty > 0 ? duty_to_level(duty) : 254;
+            c.on_off.on_off = s_pwm_on[a];
+            c.level_control.current_level = s_pwm_level[a];
+            c.level_control.on_level      = nullable<uint8_t>();
+            /* Null: the stack keeps the state at start-up. The defaults (0)
+               made it switch the unit off at every boot -- through the
+               attribute callback, so a PWM output configured at 25 % ran
+               at 0 %. The pad's own configuration decides what it starts
+               with. */
+            c.on_off_lighting.start_up_on_off              = nullable<uint8_t>();
+            c.level_control_lighting.start_up_current_level = nullable<uint8_t>();
+            ep = dimmable_plug_in_unit::create(node, &c, ENDPOINT_FLAG_NONE, nullptr);
+        } else {
+            continue;   /* standard: not ours; analog: no device type home apps show */
+        }
+        if (!ep) {
+            ESP_LOGE(TAG, "Failed to create AUX%d endpoint", a + 1);
+            return ESP_FAIL;
+        }
+        s_aux_ep[a]      = endpoint::get_id(ep);
+        s_aux_ep_mode[a] = m;
+        ESP_LOGI(TAG, "AUX%d (%s) endpoint_id=%u", a + 1, aux_mode_name(m), s_aux_ep[a]);
+    }
+
     /* Start the Matter stack */
     esp_err_t err = esp_matter::start(event_cb);
     if (err != ESP_OK) {
@@ -368,8 +482,13 @@ esp_err_t matter_init(void)
        the SDK creates on registration. Push the inputs as they are now, or
        one that is active at boot and then stays put is shown wrong until
        its next edge. */
-    for (int i = 0; i < NUM_CHANNELS; i++)
+    for (int i = 0; i < NUM_CHANNELS + AUX_PAD_COUNT; i++)
         matter_di_update((uint8_t)i, di_get((uint8_t)i));
+    /* The pad outputs too: OnOff and CurrentLevel are kept in NVS by the
+       stack and come back from there, which need not be what the pad was
+       configured to start with. */
+    for (int a = 0; a < AUX_PAD_COUNT; a++)
+        matter_aux_update((uint8_t)a);
 
     s_commissioned = chip::Server::GetInstance().GetFabricTable().FabricCount() > 0;
     if (s_commissioned) {
@@ -400,9 +519,14 @@ esp_err_t matter_init(void)
 
 void matter_di_update(uint8_t channel, bool active)
 {
-    if (channel >= NUM_CHANNELS) return;
-    uint16_t ep_id = s_di_ep[channel];
-    if (ep_id == 0) return;  /* not initialised yet */
+    uint16_t ep_id = 0;
+    if (channel < NUM_CHANNELS) {
+        ep_id = s_di_ep[channel];
+    } else if (channel < NUM_CHANNELS + AUX_PAD_COUNT) {
+        int a = channel - NUM_CHANNELS;          /* AUX1..3 are DI channels 8..10 */
+        if (s_aux_ep_mode[a] == AUX_MODE_INPUT) ep_id = s_aux_ep[a];
+    }
+    if (ep_id == 0) return;  /* not initialised yet, or no input endpoint */
 
     esp_err_t err = boolean_state_set_value(ep_id, active);
     if (err != ESP_OK) {
@@ -478,4 +602,25 @@ extern "C" void matter_set_node_label(const char *name)
                           &val);
         ESP_LOGI(TAG, "NodeLabel updated to \"%s\"", s_pending_node_label);
     });
+}
+
+void matter_aux_update(uint8_t a)
+{
+    if (a >= AUX_PAD_COUNT || !s_aux_ep[a]) return;
+    aux_status_t st;
+    aux_io_status(a, &st);
+    if (st.mode != s_aux_ep_mode[a]) return;   /* endpoint stale until reboot */
+    /* report(), not update(): the pad already holds the state -- see
+       matter_do_update(). */
+    if (st.mode == AUX_MODE_OUTPUT) {
+        esp_matter_attr_val_t v = esp_matter_bool(st.out);
+        attribute::report(s_aux_ep[a], OnOff::Id, OnOff::Attributes::OnOff::Id, &v);
+    } else if (st.mode == AUX_MODE_PWM) {
+        s_pwm_on[a] = st.duty_pm > 0;
+        if (st.duty_pm > 0) s_pwm_level[a] = duty_to_level(st.duty_pm);
+        esp_matter_attr_val_t on = esp_matter_bool(s_pwm_on[a]);
+        attribute::report(s_aux_ep[a], OnOff::Id, OnOff::Attributes::OnOff::Id, &on);
+        esp_matter_attr_val_t lv = esp_matter_nullable_uint8(s_pwm_level[a]);
+        attribute::report(s_aux_ep[a], LevelControl::Id, LevelControl::Attributes::CurrentLevel::Id, &lv);
+    }
 }

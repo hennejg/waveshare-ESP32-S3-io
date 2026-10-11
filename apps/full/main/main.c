@@ -31,7 +31,6 @@
 #include "matter.h"
 #endif
 #include "scripting.h"
-#include "app_rtc.h"
 #include "sntp_sync.h"
 #include <sys/time.h>
 #include "freertos/FreeRTOS.h"
@@ -259,21 +258,6 @@ static void on_eth_only_requested(void)
     ESP_LOGI(TAG, "ETH-only mode saved — rebooting");
 }
 
-/* Days-from-civil (UTC) → epoch seconds — dependency-free (avoids relying on timegm). */
-static time_t utc_tm_to_epoch(const struct tm *t)
-{
-    int      y   = t->tm_year + 1900;
-    int      m   = t->tm_mon + 1;
-    int      d   = t->tm_mday;
-    y -= (m <= 2);
-    int      era = (y >= 0 ? y : y - 399) / 400;
-    unsigned yoe = (unsigned)(y - era * 400);
-    unsigned doy = (153u * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
-    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    long     days = (long)era * 146097 + (long)doe - 719468;
-    return (time_t)days * 86400 + t->tm_hour * 3600 + t->tm_min * 60 + t->tm_sec;
-}
-
 /* ------------------------------------------------------------ app_main */
 
 #ifdef CONFIG_APP_MATTER_ENABLE
@@ -314,25 +298,8 @@ void app_main(void)
 
     /* RTC: seed the system clock from the battery-backed PCF85063 if its stored time
      * is valid (i.e. set by a previous SNTP sync). SNTP will refine/correct it once the
-     * network is up; with no valid RTC time we simply wait for SNTP. Non-fatal — a
-     * missing/failed RTC must not stop the device from booting. */
-    if (rtc_dev_init() == ESP_OK) {
-        struct tm rt;
-        bool valid = false;
-        if (rtc_dev_read(&rt, &valid) == ESP_OK && valid) {
-            struct timeval tv = { .tv_sec = utc_tm_to_epoch(&rt), .tv_usec = 0 };
-            settimeofday(&tv, NULL);
-            ESP_LOGI(TAG, "System clock seeded from RTC: %04d-%02d-%02d %02d:%02d:%02d UTC",
-                     rt.tm_year + 1900, rt.tm_mon + 1, rt.tm_mday,
-                     rt.tm_hour, rt.tm_min, rt.tm_sec);
-            /* Real time available before the engine starts → cron may arm at load. */
-            scripting_set_time_valid();
-        } else {
-            ESP_LOGW(TAG, "RTC time not valid yet — waiting for SNTP");
-        }
-    } else {
-        ESP_LOGW(TAG, "RTC not available");
-    }
+     * network is up. Real time available before the engine starts → cron may arm at load. */
+    if (app_time_seed_from_rtc()) scripting_set_time_valid();
 
     /* Load user script from NVS; fall back to built-in demo if none stored. */
     const char *startup_script = DEMO_SCRIPT;
