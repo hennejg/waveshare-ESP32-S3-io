@@ -1,4 +1,5 @@
 #pragma once
+#include <stdbool.h>
 #include "esp_err.h"
 #include "mb_request.h"
 
@@ -12,6 +13,10 @@ esp_err_t mb_server_init(void);
 /* Start the parts that need a working IP stack. Call once the network is up;
    calling it again is harmless. */
 esp_err_t mb_server_net_start(void);
+
+/* Whether mb_server_init() has brought Modbus up (enabled, and the local
+   side ready to serve). */
+bool mb_server_running(void);
 
 /* Answer a request from this board's own I/Os. Safe to call from several
    tasks at once: reads come from cached I/O state behind a short mutex, and

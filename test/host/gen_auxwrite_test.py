@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Builds a host test for Modbus writes to several header pads at once
-(apps/full/main/mb_server.c, components/board/aux_io.c).
+(components/modbus/mb_server.c, components/board/aux_io.c).
 
 Cut out verbatim: local_write_coils(), plan_pwm(), local_write_holding()
 and the register layout from mb_server.c; the pad state and the pad
@@ -30,7 +30,7 @@ def source(rel):
         s.text = subprocess.run(["git", "show", os.environ.get("OLDREV", "HEAD") + ":" + rel],
                                 cwd=ROOT, capture_output=True, text=True, check=True).stdout
     return s
-mb  = source("apps/full/main/mb_server.c")
+mb  = source("components/modbus/mb_server.c")
 aux = source("components/board/aux_io.c")
 
 cuts  = aux.span("static SemaphoreHandle_t s_mux;", "static bool              s_out_inv[AUX_PAD_COUNT];")

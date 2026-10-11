@@ -22,8 +22,8 @@ import pathlib
 from cutter import Source
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-src  = Source.at("apps/full/main/mb_gateway.c")
-hdr  = Source.at("apps/full/main/mb_gateway.h")
+src  = Source.at("components/modbus/mb_gateway.c")
+hdr  = Source.at("components/modbus/mb_gateway.h")
 busy = hdr.defines("MB_GW_BUS_BUSY") if "MB_GW_BUS_BUSY" in hdr.text else "#define MB_GW_BUS_BUSY 0x06  /* old: no code of its own */\n"
 cuts = src.text[src.text.index("static uint8_t transact("):]
 

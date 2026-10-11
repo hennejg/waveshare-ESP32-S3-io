@@ -67,7 +67,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: apps/full/managed_components
-          key: managed-full-${{ hashFiles('apps/full/main/idf_component.yml', 'components/board/idf_component.yml') }}
+          key: managed-full-${{ hashFiles('apps/full/main/idf_component.yml', 'components/board/idf_component.yml', 'components/modbus/idf_component.yml') }}
           restore-keys: managed-full-
 
       - name: Build
@@ -145,7 +145,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: apps/matter/managed_components
-          key: managed-matter-${{ hashFiles('apps/matter/main/idf_component.yml', 'components/board/idf_component.yml') }}
+          key: managed-matter-${{ hashFiles('apps/matter/main/idf_component.yml', 'components/board/idf_component.yml', 'components/modbus/idf_component.yml') }}
           restore-keys: managed-matter-
 
       - name: Build

@@ -93,3 +93,18 @@ class Source:
         if b < 0:
             self._fail(last)
         return self.text[a:b + len(last)] + "\n"
+
+
+def kconfig_default(rel, *names):
+    """#define CONFIG_<name> <default> for Kconfig ints, read from the Kconfig
+    file at rel -- the value a build gets unless an sdkconfig says otherwise,
+    so no number is retyped here either."""
+    import re
+    text = show(rel)
+    out = []
+    for n in names:
+        m = re.search(r"^config %s\b.*?^\s+default\s+(\S+)" % re.escape(n), text, re.S | re.M)
+        if not m:
+            raise SystemExit("cutter: %s has no default in %s" % (n, rel))
+        out.append("#define CONFIG_%s %s\n" % (n, m.group(1)))
+    return "".join(out)

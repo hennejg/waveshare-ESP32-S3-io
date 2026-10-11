@@ -23,10 +23,10 @@ handed to a worker, or refused with "slave device busy" when the pool is full.
 Run through the Makefile: make -C test/host poller
 """
 import pathlib
-from cutter import Source
+from cutter import Source, kconfig_default
 
 ROOT   = pathlib.Path(__file__).resolve().parents[2]
-src    = Source(ROOT / "apps/full/main/mb_tcp_server.c")
+src    = Source(ROOT / "components/modbus/mb_tcp_server.c")
 budget = Source(ROOT / "apps/full/main/net_budget.h")
 
 
@@ -396,7 +396,7 @@ cuts += "".join(src.func(sig) for sig in (          # C declaration order
     "static void pump_slot(int i)",
     "static void sweep_deadlines(void)",
 ))
-defines = (budget.defines("NET_SOCK_MB_CONN") +
+defines = (kconfig_default("components/modbus/Kconfig", "MB_TCP_MAX_CONN", "MB_TCP_BACKLOG") + budget.defines("NET_SOCK_MB_CONN") +
            src.defines("MBAP_HDR", "FRAME_MAX", "MB_TCP_MAX_CONN",
                        "FRAME_WAIT_MS", "SEND_WAIT_MS"))
 out = pathlib.Path(__file__).with_name("test_mb_poller.c")

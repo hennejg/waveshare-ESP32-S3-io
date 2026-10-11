@@ -5,6 +5,11 @@ Target device: Waveshare ESP32-S3-POE-ETH-8DI-8DO
 The board speaks Modbus two ways, configured in the web UI (**Modbus** tab).
 Changes take effect after reboot.
 
+**Matter firmware:** the same register map, as RTU slave on RS-485 and as Modbus TCP server (4 clients at a time),
+nothing else -- no RS-485 master, no gateway, no TCP master. Modbus starts only once the device is commissioned in
+Matter: before that the setup AP and BLE leave too little internal RAM (see `docs/matter.md`). A configuration
+stored by the full firmware with RS-485 set to master runs as slave there.
+
 ## RS-485
 
 | Parameter          | Details                                   |

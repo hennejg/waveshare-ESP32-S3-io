@@ -17,6 +17,9 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
+#include "esp_attr.h"
 #include "freertos/queue.h"
 
 #include "mb_pdu.h"
@@ -24,7 +27,6 @@
 #include "app_config.h"
 #include "mb_server.h"
 #include "mb_gateway.h"
-#include "net_budget.h"
 
 #define TAG "mb_tcp"
 
@@ -50,16 +52,17 @@
  * physics, and mb_gateway_handle() serialises for it. What the pool buys is
  * that everything which does NOT need the segment goes straight through. */
 
-/* A budget, not a capacity -- net_budget.h says what the board can spare. A
+/* A budget, not a capacity -- each app's net_budget.h says what it can
+   spare and checks it against CONFIG_LWIP_MAX_SOCKETS. A
    client arriving when all slots are taken has its connection closed at once,
    which it sees as a reset: the only honest answer, since there is no request
    yet to reply to. The socket it holds for that instant is in the budget too,
    as NET_SOCK_MB_REFUSE. */
-#define MB_TCP_MAX_CONN       NET_SOCK_MB_CONN
+#define MB_TCP_MAX_CONN       CONFIG_MB_TCP_MAX_CONN
 
 /* Room for a burst of connections to wait while the poller is busy elsewhere;
    they cost a TCP PCB each, not a socket -- net_budget.h counts both. */
-#define MB_TCP_BACKLOG        NET_BACKLOG_MB
+#define MB_TCP_BACKLOG        CONFIG_MB_TCP_BACKLOG
 
 #define MBAP_HDR              (MB_MBAP_LEN - 1)   /* the part before uid */
 #define FRAME_MAX             (MB_MBAP_LEN + MB_PDU_MAX)
@@ -154,7 +157,10 @@ typedef struct {
     uint16_t len;
 } job_t;
 
-static conn_t        s_conn[MB_TCP_MAX_CONN];
+/* In PSRAM where the build allows it: 2.3 KB the Matter firmware cannot
+   spare internally. Its fields are only ever loaded and stored -- no atomic
+   read-modify-write, which external RAM would not support. */
+static EXT_RAM_BSS_ATTR conn_t s_conn[MB_TCP_MAX_CONN];
 static QueueHandle_t s_jobs;
 static int           s_listen_fd = -1;
 /* Separate from s_listen_fd on purpose. The poller reads s_listen_fd as its
@@ -634,7 +640,7 @@ static void poller_task(void *arg)
 static void start_unwind(int fd, TaskHandle_t *tasks, int n_tasks)
 {
     for (int i = 0; i < n_tasks; i++)
-        if (tasks[i]) vTaskDelete(tasks[i]);
+        if (tasks[i]) vTaskDeleteWithCaps(tasks[i]);
     s_listen_fd = -1;
     if (fd >= 0)          close(fd);
     if (s_wake_fd >= 0) { close(s_wake_fd); s_wake_fd = -1; }
@@ -728,14 +734,18 @@ esp_err_t mb_tcp_server_start(uint16_t port, uint8_t local_uid)
     for (int i = 0; i < n_workers; i++) {
         char name[16];
         snprintf(name, sizeof(name), "mb_tcp_w%d", i);
-        if (xTaskCreate(worker_task, name, 5120, NULL, 5, &tasks[i]) != pdPASS) {
+        /* Stacks in PSRAM (here and the poller's): internal RAM is what the
+           Matter firmware runs short of, and these tasks never write the
+           flash -- writes to the board go through mb_server's command task. */
+        if (xTaskCreateWithCaps(worker_task, name, 5120, NULL, 5, &tasks[i],
+                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
             ESP_LOGE(TAG, "worker task %d", i);
             start_unwind(fd, tasks, n_workers + 1);
             return ESP_ERR_NO_MEM;
         }
     }
-    if (xTaskCreate(poller_task, "mb_tcp_poll", 5120, NULL, 6,
-                    &tasks[n_workers]) != pdPASS) {
+    if (xTaskCreateWithCaps(poller_task, "mb_tcp_poll", 5120, NULL, 6,
+                            &tasks[n_workers], MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
         ESP_LOGE(TAG, "poller task");
         start_unwind(fd, tasks, n_workers + 1);
         return ESP_ERR_NO_MEM;

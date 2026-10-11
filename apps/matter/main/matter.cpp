@@ -222,7 +222,16 @@ static void event_cb(const ChipDeviceEvent *event, intptr_t arg)
     case chip::DeviceLayer::DeviceEventType::kCommissioningComplete:
         ESP_LOGI(TAG, "Matter commissioning complete");
         s_commissioned = chip::Server::GetInstance().GetFabricTable().FabricCount() > 0;
-        if (s_commissioned) wifi_config_disable_ap();   /* no open setup AP from here on */
+        if (s_commissioned) {
+            wifi_config_disable_ap();   /* no open setup AP from here on */
+            /* A few seconds on, once BLE and the setup AP have handed their
+               memory back: at this event internal RAM is at its lowest (about
+               4 KB measured), too little for what main.c starts. On the CHIP
+               task, from its timer -- no task of our own to create here. */
+            chip::DeviceLayer::SystemLayer().StartTimer(
+                chip::System::Clock::Seconds32(5),
+                [](chip::System::Layer *, void *) { matter_on_commissioned(); }, nullptr);
+        }
         break;
     case chip::DeviceLayer::DeviceEventType::kFabricRemoved:
         s_commissioned = chip::Server::GetInstance().GetFabricTable().FabricCount() > 0;

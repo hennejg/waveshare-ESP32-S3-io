@@ -7,7 +7,14 @@
 #include "dout.h"
 #include "led.h"
 #include "buzzer.h"
-#include "scripting.h"
+/* The rule engine's modbus(ms) watchdog; declared here rather than included,
+   so this component does not need the scripting component (board does the
+   same). Without the engine nothing watches Modbus activity. */
+#ifdef CONFIG_APP_SCRIPTING_ENABLE
+void scripting_on_modbus_activity(void);
+#else
+static inline void scripting_on_modbus_activity(void) {}
+#endif
 #include "mb_gateway.h"
 #include "mb_tcp_server.h"
 #include "mb_ident.h"
@@ -20,6 +27,8 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 
@@ -629,7 +638,10 @@ static esp_err_t start_command_task(void)
     s_cmd_q = xQueueCreate(MB_CMD_QUEUE_DEPTH, sizeof(mb_cmd_t));
     ESP_RETURN_ON_FALSE(s_cmd_q, ESP_ERR_NO_MEM, TAG, "command queue");
 
-    if (xTaskCreate(command_task, "mb_cmd", 4096, NULL, 5, NULL) != pdPASS) {
+    /* Stack in PSRAM: the commands switch outputs, the LED, the buzzer and
+       the pads -- I2C, RMT, LEDC -- and never write the flash. */
+    if (xTaskCreateWithCaps(command_task, "mb_cmd", 4096, NULL, 5, NULL,
+                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
         /* The queue and the mutex go with it: s_local_ready stays false, so
            nothing would ever empty them again. */
         vQueueDelete(s_cmd_q);
@@ -729,6 +741,10 @@ esp_err_t mb_server_init(void)
     /* Ready to accept commands before anything can deliver one. */
     ESP_RETURN_ON_ERROR(start_command_task(), TAG, "command task");
 
+#if !CONFIG_MB_RS485_MASTER
+    if (cfg->modbus.rs485_role == MB_ROLE_MASTER)
+        ESP_LOGW(TAG, "RS-485 master is not part of this firmware — running as RTU slave");
+#else
     if (cfg->modbus.rs485_role == MB_ROLE_MASTER) {
         /* The master serves two clients: the poll table, which reads devices
            on the segment by itself, and -- with the gateway on -- Modbus TCP
@@ -744,8 +760,14 @@ esp_err_t mb_server_init(void)
         mb_gateway_set_forwarding(r == ESP_OK && fwd);
         return r;
     }
+#endif
 
     return start_rtu_slave(cfg);
+}
+
+bool mb_server_running(void)
+{
+    return s_local_ready;
 }
 
 esp_err_t mb_server_net_start(void)

@@ -23,14 +23,14 @@ OLD=1 cuts mb_tcp_server.c from git (OLDREV, default HEAD).
   make -C test/host evict
 """
 import pathlib
-from cutter import Source
+from cutter import Source, kconfig_default
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-src  = Source.at("apps/full/main/mb_tcp_server.c")
+src  = Source.at("components/modbus/mb_tcp_server.c")
 bud  = Source.at("apps/full/main/net_budget.h")
 new = "static int oldest_idle(int64_t now)" in src.text
 
-defines = bud.defines("NET_SOCK_MB_CONN") + src.defines("MBAP_HDR", "FRAME_MAX", "MB_TCP_MAX_CONN", "KEEPALIVE_IDLE_S", "KEEPALIVE_INTVL_S", "KEEPALIVE_COUNT") + \
+defines = kconfig_default("components/modbus/Kconfig", "MB_TCP_MAX_CONN", "MB_TCP_BACKLOG") + bud.defines("NET_SOCK_MB_CONN") + src.defines("MBAP_HDR", "FRAME_MAX", "MB_TCP_MAX_CONN", "KEEPALIVE_IDLE_S", "KEEPALIVE_INTVL_S", "KEEPALIVE_COUNT") + \
           (src.defines("EVICT_IDLE_MS") if new else "#define EVICT_IDLE_MS 2000\n")
 types = src.type("SLOT_BUSY };") + src.type("} conn_t;") + src.type("} job_t;")
 cuts  = (src.func("static inline uint8_t slot_state(int i)") if "slot_state(int i)" in src.text else "")

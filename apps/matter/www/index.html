@@ -131,6 +131,7 @@
     <button type="button" class="tab-btn" data-tab="inputs"  onclick="switchTab('inputs')">Inputs</button>
     <button type="button" class="tab-btn" data-tab="outputs" onclick="switchTab('outputs')">Outputs</button>
     <button type="button" class="tab-btn" data-tab="pads"    onclick="switchTab('pads')">Pads</button>
+    <button type="button" class="tab-btn" data-tab="modbus"  onclick="switchTab('modbus')">Modbus</button>
   </nav>
 
   <form id="form" novalidate>
@@ -231,6 +232,29 @@
       <p class="hint">In Matter a pad is a Contact Sensor (input), an On/Off Plug-in Unit (output)
         or a Dimmable Plug-in Unit (PWM, level = duty cycle). Analog is shown here only.
         A mode change switches the pad at once and its Matter endpoint after a reboot.</p>
+    </div>
+
+    <!-- ── Modbus ── -->
+    <div id="tab-modbus" class="tab-pane">
+      <p id="mb-status" class="hint" style="font-size:.85rem;color:#333">–</p>
+      <label style="font-weight:normal"><input type="checkbox" id="mb_enable"> Modbus RTU slave on RS-485</label>
+      <label>Slave address (1–247)
+        <input type="number" id="mb_address" min="1" max="247" step="1">
+      </label>
+      <label>Baud rate
+        <select id="mb_baudrate">
+          <option>9600</option><option>19200</option><option>38400</option>
+          <option>57600</option><option>115200</option>
+        </select>
+      </label>
+      <label style="font-weight:normal"><input type="checkbox" id="mb_tcp_server"> Modbus TCP server on port 502</label>
+      <label>TCP unit ID (1–247)
+        <input type="number" id="mb_tcp_uid" min="1" max="247" step="1">
+      </label>
+      <p class="hint">Same register map as the full firmware. Modbus starts only once the device is
+        commissioned in Matter, and changes apply after a reboot.
+        <b>Modbus has no authentication:</b> anyone who reaches RS-485 or port 502 can switch the outputs.
+        Enable it only on a network you control.</p>
     </div>
 
     <div class="btn-row">
@@ -477,6 +501,16 @@
         document.getElementById('sntp_enable').checked = !!cfg.sntp?.enable;
         document.getElementById('sntp_server').value   = cfg.sntp?.server ?? '';
         document.getElementById('tz').value            = cfg.tz ?? '';
+        const mb = cfg.modbus ?? {};
+        document.getElementById('mb_enable').checked     = !!mb.enable;
+        document.getElementById('mb_address').value      = mb.address ?? 1;
+        document.getElementById('mb_baudrate').value     = String(mb.baudrate ?? 9600);
+        document.getElementById('mb_tcp_server').checked = !!mb.tcp_server;
+        document.getElementById('mb_tcp_uid').value      = mb.tcp_uid ?? 247;
+        document.getElementById('mb-status').textContent =
+          !mb.enable ? 'Modbus is off.' :
+          mb.running ? 'Modbus is running.' :
+          'Modbus is on, and starts once the device is commissioned in Matter (or after a reboot).';
         buildPads(cfg);
         buildIoPanel(cfg);
         loadTime();
@@ -527,6 +561,14 @@
           tz: document.getElementById('tz').value.trim(),
         };
         if (padCount) cfg.aux = readPads();
+        cfg.modbus = {
+          enable:     document.getElementById('mb_enable').checked,
+          address:    Number(document.getElementById('mb_address').value),
+          baudrate:   Number(document.getElementById('mb_baudrate').value),
+          tcp_server: document.getElementById('mb_tcp_server').checked,
+          tcp_uid:    Number(document.getElementById('mb_tcp_uid').value),
+          rs485_role: 'slave',
+        };
         const r = await apiFetch('/api/config', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -537,7 +579,7 @@
         if (res.status === 'ok') {
           status.className = 'ok';
           status.textContent = res.reboot_required
-            ? 'Saved. A pad changed its mode: reboot for Matter to see it.'
+            ? 'Saved. Reboot to apply (a pad mode or Modbus changed).'
             : 'Saved.';
           load();
         } else {

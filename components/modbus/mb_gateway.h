@@ -12,6 +12,9 @@
 #include "driver/uart.h"
 #include "esp_err.h"
 #include "mb_request.h"
+#include "sdkconfig.h"
+
+#if CONFIG_MB_RS485_MASTER
 
 /* Creates and starts the RTU master on the given UART. The caller owns the
    decision that the port is free: the RTU slave and this master cannot both
@@ -51,3 +54,20 @@ uint8_t mb_gateway_read_regs(uint8_t uid, uint8_t fc, uint16_t addr,
    the gateway could not even try. */
 uint8_t mb_gateway_handle(uint8_t uid, const mb_request_t *req,
                           uint8_t *resp, uint16_t *resp_len);
+
+#else /* no RS-485 master in this firmware: never running, never forwarding */
+
+#define MB_GW_BUS_BUSY 0xFF
+static inline esp_err_t mb_gateway_start(uart_port_t u, uint32_t b, int tx, int rx, int rts, uint16_t t)
+{ (void)u; (void)b; (void)tx; (void)rx; (void)rts; (void)t; return ESP_ERR_NOT_SUPPORTED; }
+static inline bool    mb_gateway_is_running(void)        { return false; }
+static inline void    mb_gateway_set_forwarding(bool on) { (void)on; }
+static inline bool    mb_gateway_forwarding(void)        { return false; }
+static inline uint8_t mb_gateway_read_regs(uint8_t uid, uint8_t fc, uint16_t addr,
+                                           uint16_t count, uint16_t *regs)
+{ (void)uid; (void)fc; (void)addr; (void)count; (void)regs; return 0x0A; }
+static inline uint8_t mb_gateway_handle(uint8_t uid, const mb_request_t *req,
+                                        uint8_t *resp, uint16_t *resp_len)
+{ (void)uid; (void)req; (void)resp; (void)resp_len; return 0x0A; }
+
+#endif

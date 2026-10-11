@@ -18,8 +18,8 @@ import pathlib
 from cutter import Source
 
 src = Source.at("apps/full/main/mb_tcp_master.c")
-req = Source.at("apps/full/main/mb_request.h")
-gw  = Source.at("apps/full/main/mb_gateway.h")
+req = Source.at("components/modbus/mb_request.h")
+gw  = Source.at("components/modbus/mb_gateway.h")
 defines = req.defines("MB_EXC_NONE", "MB_EXC_ILLEGAL_ADDR", "MB_EXC_GW_PATH", "MB_EXC_GW_TARGET") + gw.defines("MB_GW_BUS_BUSY")
 cuts = src.func("static bool read_rtu(const mbm_poll_t *e, uint16_t regs, double *value,")
 

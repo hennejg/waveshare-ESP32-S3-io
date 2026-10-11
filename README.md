@@ -21,7 +21,7 @@ board hardware abstraction layer (`components/board/`):
 | Flavor | Binary | What it includes |
 |--------|--------|-----------------|
 | **Full** (`apps/full/`) | `waveshare_esp32s3_full.bin` | [WiFi provisioning](#connectivity), [Ethernet](#connectivity), [Rule engine](#automation-rules), [MQTT](#mqtt), [CAN bus](#can-bus), [Modbus RTU](#modbus-rtu), [full web UI](#web-configuration-ui) — **no Matter** |
-| **Matter** (`apps/matter/`) | `waveshare_esp32s3_matter.bin` | [WiFi provisioning](#connectivity), [Ethernet](#connectivity), [Matter](#matter) (Apple Home / Google Home), header pads, buzzer, NTP time + RTC, minimal web UI — no rule engine, no MQTT |
+| **Matter** (`apps/matter/`) | `waveshare_esp32s3_matter.bin` | [WiFi provisioning](#connectivity), [Ethernet](#connectivity), [Matter](#matter) (Apple Home / Google Home), header pads, buzzer, NTP time + RTC, Modbus RTU slave + Modbus TCP server, minimal web UI — no rule engine, no MQTT |
 
 **If you are not sure which to use, start with the full firmware** — it is what the CI builds and the releases contain.
 
@@ -205,7 +205,8 @@ It is **not** present in the full firmware because the CHIP SDK exhausts DMA-cap
 the rule engine and MQTT stack.
 
 Flash `apps/matter/` if you need to integrate the device into Apple Home, Google Home, or Home Assistant via the
-Matter protocol. You give up the rule engine, MQTT, CAN bus, and Modbus RTU in exchange.
+Matter protocol. You give up the rule engine, MQTT, CAN bus, the RS-485 master/gateway and the Modbus TCP master in
+exchange; Modbus RTU slave and Modbus TCP server are there, once the device is commissioned.
 
 | Feature               | Description                                                                               |
 |-----------------------|-------------------------------------------------------------------------------------------|
@@ -214,6 +215,7 @@ Matter protocol. You give up the rule engine, MQTT, CAN bus, and Modbus RTU in e
 | **Header pads**       | IO1/RXD/TXD by mode: input → *Contact Sensor*, output → *On/Off Plug-in Unit*, PWM → *Dimmable Plug-in Unit*; analog in the web UI only |
 | **Time**              | NTP sync and the battery-backed RTC, time zone, set by hand from the web UI               |
 | **Buzzer**            | Test beep from the web UI (`POST /api/io/buzzer`)                                         |
+| **Modbus**            | RTU slave on RS-485 and TCP server (port 502, 4 clients), started once commissioned       |
 | **Pairing code**      | Unique passcode + discriminator generated on first boot; survives reboot and decommission |
 | **QR code**           | Shown in the web UI; scan with your home app to pair                                      |
 | **Decommission**      | Erase all fabric data via `POST /api/matter/decommission` or the minimal web UI           |
@@ -463,21 +465,23 @@ python -m esptool --chip esp32s3 -p /dev/ttyUSBx -b 460800 \
 │   │   └── main/
 │   │       ├── main.c            Entry point, event/callback wiring
 │   │       ├── app_mqtt.c/h      MQTT client wrapper
-│   │       ├── app_time.c/h      Timezone / local-time helpers
 │   │       ├── can_server.c/h    CAN bus (Basic + NMEA2000 modes)
-│   │       ├── mb_server.c/h     Modbus RTU slave
+│   │       ├── mb_tcp_master.c/h Modbus TCP master (poll table)
+│   │       ├── net_budget.h      lwIP socket budget, checked at compile time
 │   │       └── web_server.c/h    HTTP config UI + full REST API
-│   └── matter/                   Matter firmware (WiFi + Matter — no rule engine, no MQTT)
+│   └── matter/                   Matter firmware (WiFi + Matter + Modbus slave — no rule engine, no MQTT)
 │       ├── CMakeLists.txt
 │       ├── sdkconfig.defaults
 │       ├── partitions.csv        App-only layout (no SPIFFS)
 │       └── main/
 │           ├── main.c            Thin entry point
-│           ├── matter.cpp/h      Matter integration (esp-matter, 8 DO + 8 DI endpoints)
+│           ├── matter.cpp/h      Matter integration (esp-matter, 8 DO + 8 DI + header pad endpoints)
+│           ├── net_budget.h      lwIP socket budget, checked at compile time
 │           └── web_server.c/h    Minimal HTTP UI + matter/status endpoints
 ├── components/
 │   ├── board/                    Shared hardware abstraction layer (both firmware flavors)
 │   │   ├── app_config.c/h        NVS-backed configuration store
+│   │   ├── app_time.c/h          Time zone, clock seeded from the RTC
 │   │   ├── auth.c/h              Web UI authentication (password + BOOT button token flow)
 │   │   ├── button.c/h            BOOT button — long-press WiFi reset, short-press auth token
 │   │   ├── buzzer.c/h            Piezo buzzer (LEDC PWM) — single beep + sequences
@@ -487,7 +491,9 @@ python -m esptool --chip esp32s3 -p /dev/ttyUSBx -b 460800 \
 │   │   ├── i2c_bus.c/h           Shared I²C bus init
 │   │   ├── led.c/h               WS2812 LED (RMT) — IO and Status modes
 │   │   ├── rtc.c / app_rtc.h     DS3231 battery-backed RTC
-│   │   └── sntp_sync.c/h         SNTP client + RTC write-back
+│   │   ├── sntp_sync.c/h         SNTP client + RTC write-back
+│   │   └── web_common.c/h        Web API parts both firmwares share (auth, time, pads)
+│   ├── modbus/                   Modbus RTU slave, Modbus TCP server, RS-485 gateway (both firmwares)
 │   ├── scripting/                Rule engine (QuickJS DSL — full firmware only)
 │   │   └── RULES.md              Rule language reference
 │   ├── quickjs/                  QuickJS JS engine (git submodule)

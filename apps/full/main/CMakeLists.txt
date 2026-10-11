@@ -1,13 +1,13 @@
 set(SRCS
     "main.c" "app_mqtt.c" "web_server.c"
-    "can_server.c" "mb_server.c" "mb_gateway.c" "mb_tcp_server.c" "mb_pdu.c" "mb_tcp_master.c" "mb_ident.c"
+    "can_server.c" "mb_tcp_master.c"
 )
 
 idf_component_register(
     SRCS ${SRCS}
     INCLUDE_DIRS "."
     REQUIRES esp32-wifi-bootstrap nvs_flash spiffs esp_http_server
-             esp_netif esp_driver_twai esp_wifi esp_coex board scripting lwip
+             esp_netif esp_driver_twai esp_wifi esp_coex board modbus scripting lwip
              esp_app_format
 )
 

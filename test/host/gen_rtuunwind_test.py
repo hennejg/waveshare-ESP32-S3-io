@@ -17,7 +17,7 @@ OLD=1 cuts mb_server.c from git (OLDREV, default HEAD).
 import pathlib
 from cutter import Source
 
-src = Source.at("apps/full/main/mb_server.c")
+src = Source.at("components/modbus/mb_server.c")
 cuts = "static void *s_handle = NULL;\n"
 if "static void rtu_slave_unwind(void)" in src.text:
     cuts += src.span("static void rtu_slave_unwind(void)", "    } while (0)\n")

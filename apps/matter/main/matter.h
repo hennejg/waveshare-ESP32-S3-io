@@ -20,6 +20,9 @@ void        matter_set_node_label(const char *name);
 const char *matter_get_qr_code(void);
 const char *matter_get_manual_code(void);
 bool        matter_is_commissioned(void);
+/* Provided by the application: called on the CHIP task a few seconds after
+   commissioning has completed with a fabric. */
+void        matter_on_commissioned(void);
 
 #else /* CONFIG_APP_MATTER_ENABLE not set */
 

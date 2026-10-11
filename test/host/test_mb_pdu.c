@@ -11,7 +11,7 @@
  * past the frame" from a claim into something the build checks.
  *
  *   cc -std=c11 -Wall -Wextra -fsanitize=address,undefined -I../../apps/full/main \
- *      test_mb_pdu.c ../../apps/full/main/mb_pdu.c -o test_mb_pdu && ./test_mb_pdu
+ *      test_mb_pdu.c ../../components/modbus/mb_pdu.c -o test_mb_pdu && ./test_mb_pdu
  */
 
 #include <stdio.h>

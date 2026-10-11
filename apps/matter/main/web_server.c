@@ -2,6 +2,8 @@
 #include "app_config.h"
 #include "auth.h"
 #include "web_common.h"
+#include "net_budget.h"
+#include "mb_server.h"
 #include "app_time.h"
 #include "aux_io.h"
 #include "sntp_sync.h"
@@ -87,6 +89,16 @@ static esp_err_t api_config_get(httpd_req_t *req)
     web_aux_config_json(root, cfg);
 #endif
 
+    /* Modbus: RTU slave on RS-485 and the Modbus TCP server only. It runs on
+       a commissioned device ("running"); changes apply after a reboot. */
+    cJSON *mb = cJSON_AddObjectToObject(root, "modbus");
+    cJSON_AddBoolToObject  (mb, "enable",     cfg->modbus.enable);
+    cJSON_AddNumberToObject(mb, "address",    cfg->modbus.address);
+    cJSON_AddNumberToObject(mb, "baudrate",   cfg->modbus.baudrate);
+    cJSON_AddBoolToObject  (mb, "tcp_server", cfg->modbus.tcp_server);
+    cJSON_AddNumberToObject(mb, "tcp_uid",    cfg->modbus.tcp_uid);
+    cJSON_AddBoolToObject  (mb, "running",    mb_server_running());
+
     cJSON *di = cJSON_AddArrayToObject(root, "di");
     for (int i = 0; i < APP_CFG_DI_COUNT; i++) {
         cJSON *item = cJSON_CreateObject();
@@ -164,6 +176,36 @@ static esp_err_t api_config_post(httpd_req_t *req)
 #if APP_CFG_DI_AUX_COUNT
     if (!bad) bad = web_aux_config_parse(root, &cfg);
 #endif
+    bool mb_changed = false;
+    cJSON *mb = cJSON_GetObjectItem(root, "modbus");
+    if (!bad && cJSON_IsObject(mb)) {
+        cJSON *v;
+        uint32_t u;
+        if ((v = cJSON_GetObjectItem(mb, "enable")) && cJSON_IsBool(v))
+            cfg.modbus.enable = cJSON_IsTrue(v) ? 1 : 0;
+        if ((v = cJSON_GetObjectItem(mb, "tcp_server")) && cJSON_IsBool(v))
+            cfg.modbus.tcp_server = cJSON_IsTrue(v) ? 1 : 0;
+        if ((v = cJSON_GetObjectItem(mb, "address"))) {
+            if (web_json_uint(v, 1, 247, &u)) cfg.modbus.address = (uint8_t)u;
+            else bad = "modbus.address must be 1-247";
+        }
+        if (!bad && (v = cJSON_GetObjectItem(mb, "baudrate"))) {
+            if (web_json_uint(v, 1200, 921600, &u)) cfg.modbus.baudrate = u;
+            else bad = "modbus.baudrate must be 1200-921600";
+        }
+        if (!bad && (v = cJSON_GetObjectItem(mb, "tcp_uid"))) {
+            if (web_json_uint(v, 1, 247, &u)) cfg.modbus.tcp_uid = (uint8_t)u;
+            else bad = "modbus.tcp_uid must be 1-247";
+        }
+        /* This firmware is only ever an RTU slave; a master stored by the
+           other firmware is cleared on the first save here. */
+        if (!bad && (v = cJSON_GetObjectItem(mb, "rs485_role")) &&
+            !(cJSON_IsString(v) && !strcmp(v->valuestring, "slave")))
+            bad = "only rs485_role \"slave\" in this firmware (no RS-485 master, no gateway)";
+        cfg.modbus.rs485_role = MB_ROLE_SLAVE;
+        cfg.modbus.gateway    = 0;
+        mb_changed = memcmp(&cfg.modbus, &app_config_get()->modbus, sizeof(cfg.modbus)) != 0;
+    }
 
     cJSON_Delete(root);
 
@@ -194,7 +236,7 @@ static esp_err_t api_config_post(httpd_req_t *req)
 
     /* The pads switch now; their Matter endpoints were made at boot for the
        mode each had then, so a changed mode reaches Matter after a reboot. */
-    bool reboot = false;
+    bool reboot = mb_changed;   /* Modbus is set up once, at start */
 #if APP_CFG_DI_AUX_COUNT
     for (int a = 0; a < APP_CFG_DI_AUX_COUNT; a++)
         if (cfg.aux_mode[a] != (uint8_t)aux_io_mode((uint8_t)a)) reboot = true;
@@ -562,6 +604,7 @@ esp_err_t web_server_start(void)
     if (s_server) return ESP_OK;
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.max_open_sockets = NET_SOCK_HTTPD_CLIENTS;   /* the share net_budget.h allots */
     cfg.uri_match_fn     = httpd_uri_match_wildcard;
     cfg.max_uri_handlers = sizeof(s_handlers) / sizeof(s_handlers[0]);
     /* Keep the httpd task stack in internal DMA-capable RAM — PSRAM stacks fail

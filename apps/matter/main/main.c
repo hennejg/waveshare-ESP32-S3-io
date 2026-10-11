@@ -7,6 +7,9 @@
 #include <esp_bt.h>
 #include <esp_heap_caps.h>
 #include <esp_spiffs.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 #include <wifi_config.h>
 #include "app_config.h"
 #include "app_time.h"
@@ -19,6 +22,7 @@
 #include "eth.h"
 #include "led.h"
 #include "matter.h"
+#include "mb_server.h"
 #include "sntp_sync.h"
 #include "web_server.h"
 
@@ -27,11 +31,57 @@
 static bool s_eth_connected  = false;
 static bool s_wifi_connected = false;
 
+/* Modbus (RTU slave, Modbus TCP server) runs only on a commissioned device.
+   Before that the setup AP and BLE leave too little internal RAM: measured,
+   about 10 KB free at the lowest during commissioning, and the RTU slave
+   alone needs more. Once commissioned both are off and 50-70 KB are free.
+   mb_server_init() runs once; mb_server_net_start() whenever an interface
+   comes up (it is idempotent). */
+/* The two paths -- the start below and an interface coming up -- run on
+   different tasks; mb_server_net_start() must not run twice at once. */
+static bool              s_mb_inited;
+static SemaphoreHandle_t s_mb_mux;
+
+static void modbus_net_start_locked(void)
+{
+    if (!s_mb_inited || !(s_eth_connected || s_wifi_connected)) return;
+    esp_err_t r = mb_server_net_start();
+    if (r != ESP_OK) ESP_LOGE(TAG, "Modbus TCP start failed: %s", esp_err_to_name(r));
+}
+
+static void modbus_start(void)
+{
+    if (!s_mb_mux || !matter_is_commissioned()) return;
+    xSemaphoreTake(s_mb_mux, portMAX_DELAY);
+    if (!s_mb_inited) {
+        s_mb_inited = true;
+        esp_err_t r = mb_server_init();
+        if (r != ESP_OK)
+            ESP_LOGE(TAG, "Modbus init failed: %s — continuing without Modbus", esp_err_to_name(r));
+        modbus_net_start_locked();
+    }
+    xSemaphoreGive(s_mb_mux);
+}
+
+/* After a fresh commissioning (matter.cpp waits a few seconds for BLE and
+   the setup AP to hand their memory back). On the CHIP task, from its timer:
+   a task of our own for this needs a 4 KB internal stack, and with one Modbus
+   did not start after a commissioning -- internal RAM was at about 4 KB then. */
+void matter_on_commissioned(void)
+{
+    modbus_start();
+}
+
 static void on_network_ready(void)
 {
     led_status_set_network(true);
     web_server_start();
     sntp_sync_apply();   /* idempotent; per the configuration */
+    if (s_mb_mux) {
+        xSemaphoreTake(s_mb_mux, portMAX_DELAY);
+        modbus_net_start_locked();
+        xSemaphoreGive(s_mb_mux);
+    }
 }
 
 static void on_eth_ready(void)
@@ -73,6 +123,7 @@ static void on_wifi_ap(void *arg, esp_event_base_t base, int32_t id, void *data)
 void app_main(void)
 {
     sntp_sync_init();   /* before anything can bring a network interface up */
+    s_mb_mux = xSemaphoreCreateMutex();
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -142,6 +193,8 @@ void app_main(void)
              esp_get_free_heap_size(),
              heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+
+    if (matter_ret == ESP_OK) modbus_start();   /* already commissioned: now */
 
     esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START, on_wifi_ap, NULL);
     /* No wifi_config_set_eth_available_fn(): its "ETH only" button needs an

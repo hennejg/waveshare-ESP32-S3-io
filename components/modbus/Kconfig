@@ -1,0 +1,30 @@
+menu "Modbus (board)"
+
+config MB_RS485_MASTER
+    bool "RS-485 master and Modbus TCP gateway"
+    default y
+    help
+        Lets the board drive the RS-485 segment as its Modbus master: for the
+        TCP-to-RTU gateway and the RS-485 rows of the poll table. Without it
+        the board is only ever an RTU slave on RS-485; a configuration that
+        says "master" (stored by the other firmware) runs as slave.
+
+config MB_TCP_MAX_CONN
+    int "Modbus TCP clients served at once"
+    range 1 16
+    default 8
+    help
+        Connections the Modbus TCP server (port 502) keeps open at the same
+        time. Each holds an lwIP socket; the application's net_budget.h adds
+        them up against CONFIG_LWIP_MAX_SOCKETS. A client arriving with every
+        slot taken is accepted and closed at once.
+
+config MB_TCP_BACKLOG
+    int "Modbus TCP listen backlog"
+    range 1 32
+    default 16
+    help
+        Connections lwIP may complete before the server accepts them. They
+        hold a TCP PCB each, not a socket.
+
+endmenu

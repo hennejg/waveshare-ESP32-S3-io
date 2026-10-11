@@ -4,8 +4,9 @@
 #   make -C test/host
 
 MAIN  := ../../apps/full/main
+MB    := ../../components/modbus
 CFLAGS := -std=c11 -Wall -Wextra -Werror -O1 -g \
-          -fsanitize=address,undefined -fno-omit-frame-pointer -I$(MAIN)
+          -fsanitize=address,undefined -fno-omit-frame-pointer -I$(MAIN) -I$(MB)
 
 PORT ?= 15020
 
@@ -75,16 +76,16 @@ test_n2khb: gen_n2khb_test.py $(MAIN)/can_server.c
 gwerr: test_gwerr
 	./test_gwerr
 
-test_gwerr: gen_gwerr_test.py $(MAIN)/mb_gateway.c $(MAIN)/mb_gateway.h
+test_gwerr: gen_gwerr_test.py $(MB)/mb_gateway.c $(MB)/mb_gateway.h
 	python3 gen_gwerr_test.py
-	$(CC) $(CFLAGS) -Istubs -Wno-unused-function -Wno-unused-parameter test_gwerr.c $(MAIN)/mb_pdu.c -o $@
+	$(CC) $(CFLAGS) -Istubs -Wno-unused-function -Wno-unused-parameter test_gwerr.c $(MB)/mb_pdu.c -o $@
 
 # The Modbus TCP server at its connection limit: accept_one() and the
 # eviction of the slot idle longest, cut out of mb_tcp_server.c.
 evict: test_evict
 	./test_evict
 
-test_evict: gen_evict_test.py $(MAIN)/mb_tcp_server.c $(MAIN)/net_budget.h
+test_evict: gen_evict_test.py $(MB)/mb_tcp_server.c $(MAIN)/net_budget.h ../../components/modbus/Kconfig
 	python3 gen_evict_test.py
 	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter test_evict.c -o $@
 
@@ -156,7 +157,7 @@ qjs-obj/cJSON.o: $(CJSON)/cJSON.c
 auxwrite: test_auxwrite
 	./test_auxwrite
 
-test_auxwrite: gen_auxwrite_test.py $(MAIN)/mb_server.c ../../components/board/aux_io.c ../../components/board/aux_io.h
+test_auxwrite: gen_auxwrite_test.py $(MB)/mb_server.c ../../components/board/aux_io.c ../../components/board/aux_io.h
 	python3 gen_auxwrite_test.py
 	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-variable -I../../components/board -Istubs test_auxwrite.c -o $@
 
@@ -377,15 +378,15 @@ test_tz: gen_tz_test.py ../../components/quickjs/extern/quickjs/quickjs.c
 poller: test_mb_poller
 	./test_mb_poller
 
-test_mb_poller: gen_poller_test.py $(MAIN)/mb_tcp_server.c $(MAIN)/mb_pdu.c $(MAIN)/mb_pdu.h
+test_mb_poller: gen_poller_test.py $(MB)/mb_tcp_server.c $(MB)/mb_pdu.c $(MB)/mb_pdu.h ../../components/modbus/Kconfig
 	python3 gen_poller_test.py
-	$(CC) $(CFLAGS) test_mb_poller.c $(MAIN)/mb_pdu.c -o $@
+	$(CC) $(CFLAGS) test_mb_poller.c $(MB)/mb_pdu.c -o $@
 
-test_mb_client: test_mb_client.c $(MAIN)/mb_pdu.c $(MAIN)/mb_pdu.h $(MAIN)/mb_request.h
-	$(CC) $(CFLAGS) test_mb_client.c $(MAIN)/mb_pdu.c -o $@
+test_mb_client: test_mb_client.c $(MB)/mb_pdu.c $(MB)/mb_pdu.h $(MB)/mb_request.h
+	$(CC) $(CFLAGS) test_mb_client.c $(MB)/mb_pdu.c -o $@
 
-test_mb_pdu: test_mb_pdu.c $(MAIN)/mb_pdu.c $(MAIN)/mb_pdu.h $(MAIN)/mb_request.h
-	$(CC) $(CFLAGS) test_mb_pdu.c $(MAIN)/mb_pdu.c -o $@
+test_mb_pdu: test_mb_pdu.c $(MB)/mb_pdu.c $(MB)/mb_pdu.h $(MB)/mb_request.h
+	$(CC) $(CFLAGS) test_mb_pdu.c $(MB)/mb_pdu.c -o $@
 
 # The status LED after network loss and after a forced colour, cut out of
 # led.c and auth.c.
@@ -426,7 +427,7 @@ test_jsoncast: gen_jsoncast_test.py qjs-obj/cJSON.o ../../components/board/led.c
 rtuunwind: test_rtuunwind
 	./test_rtuunwind
 
-test_rtuunwind: gen_rtuunwind_test.py $(MAIN)/mb_server.c
+test_rtuunwind: gen_rtuunwind_test.py $(MB)/mb_server.c
 	python3 gen_rtuunwind_test.py
 	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter test_rtuunwind.c -o $@
 
@@ -442,7 +443,7 @@ test_caninit: gen_caninit_test.py $(MAIN)/can_server.c
 rtuerr: test_rtuerr
 	./test_rtuerr
 
-test_rtuerr: gen_rtuerr_test.py $(MAIN)/mb_tcp_master.c $(MAIN)/mb_request.h $(MAIN)/mb_gateway.h
+test_rtuerr: gen_rtuerr_test.py $(MAIN)/mb_tcp_master.c $(MB)/mb_request.h $(MB)/mb_gateway.h
 	python3 gen_rtuerr_test.py
 	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter test_rtuerr.c -o $@
 

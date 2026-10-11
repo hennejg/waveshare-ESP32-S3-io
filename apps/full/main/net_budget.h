@@ -25,7 +25,7 @@
 #define NET_SOCK_SNTP            1
 
 #define NET_SOCK_MB_LISTEN       1   /* the Modbus TCP listening socket      */
-#define NET_SOCK_MB_CONN         8   /* Modbus TCP clients served at once    */
+#define NET_SOCK_MB_CONN         CONFIG_MB_TCP_MAX_CONN   /* Modbus TCP clients served at once */
 /* A client arriving with every slot taken is accepted and closed at once, so
    that it sees a clean close rather than a connection that never answers. For
    that instant it holds a socket of its own, over and above the slots. */
@@ -43,7 +43,7 @@
    does hold a TCP PCB, and those are limited too (below). lwIP queues at most
    CONFIG_LWIP_TCP_ACCEPTMBOX_SIZE of them per listener whatever the backlog
    says; the rest are aborted. */
-#define NET_BACKLOG_MB          16   /* listen() in mb_tcp_server.c          */
+#define NET_BACKLOG_MB           CONFIG_MB_TCP_BACKLOG    /* listen() in mb_tcp_server.c */
 #define NET_BACKLOG_HTTPD        5   /* HTTPD_DEFAULT_CONFIG's backlog_conn  */
 #define NET_BACKLOG_PORTAL       4   /* listen() in wifi_config.c            */
 #define NET_PENDING(b) ((b) < CONFIG_LWIP_TCP_ACCEPTMBOX_SIZE ? (b) : CONFIG_LWIP_TCP_ACCEPTMBOX_SIZE)

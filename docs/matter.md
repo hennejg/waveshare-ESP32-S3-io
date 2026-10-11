@@ -157,6 +157,28 @@ board (Ethernet up, setup AP on, BLE advertising, not commissioned):
 Commissioning was done on-network over Ethernet with chip-tool and succeeded in every case; afterwards the
 setup AP and BLE are off and 56–73 KB are free. Commissioning over BLE with a phone was not measured.
 
+### Modbus
+
+Modbus (RTU slave on RS-485, Modbus TCP server with 4 clients) is in this firmware but starts only once the device
+is commissioned: at boot when it already is, otherwise 5 s after commissioning completes. Measured RAM in the full
+firmware: RTU slave 19 KB internal, with the TCP server 25 KB -- more than the 9–10 KB left before and during
+commissioning, well within the 50–70 KB free afterwards. Its tasks run on PSRAM stacks, the TCP connection table
+lives in PSRAM, and `CONFIG_RINGBUF_PLACE_FUNCTIONS_INTO_FLASH` keeps the UART driver's ring buffer code out of
+IRAM.
+
+Measured with Modbus in the build (all pads standard, Modbus enabled):
+
+| Phase                                                   | internal free (lowest) |
+|---------------------------------------------------------|------------------------|
+| not commissioned, Modbus waiting                        | 14.6 KB (7.5 KB)       |
+| through commissioning                                   | 8.0 KB, DMA-capable 0.6 KB at the lowest |
+| commissioned, Modbus running                            | 40–50 KB               |
+| 4 Modbus TCP clients, 620 requests in 15 s              | 41.6 KB at the lowest  |
+| second fabric commissioned with Modbus running          | 43.8 KB at the lowest  |
+
+The Modbus code costs about 2 KB of internal RAM before commissioning even while Modbus is not running (static
+data and the ring buffer's ISR functions in IRAM).
+
 The buzzer and pad tasks run on PSRAM stacks to keep this low. Endpoint data is allocated in small blocks,
 which `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL` (1024) keeps in internal RAM.
 
