@@ -830,6 +830,15 @@ print(…)                  // log to the console (args joined by space)
 - **Reload resets everything.** Reloading the rule set (device `EVT_RELOAD`, simulator
   "Apply Rules") clears all rules and cancels any pending `.after()` / `.heldFor()`
   timers.
+- **Promise chains are not cancelled by a reload.** Promise jobs (`.then()` on a
+  Promise, `async` functions) that are still queued when the rules are reloaded keep
+  running against the old script. A chain that re-queues itself forever --
+  `function spin() { Promise.resolve().then(spin); }` started from a rule, or an
+  endless `async` loop -- survives every reload: each later event pays the full
+  2 s budget, and the old code keeps switching outputs. Only a reboot stops it. The
+  check before a reload does not catch it, because nothing starts the chain while the
+  script loads. Don't build self-repeating Promise chains; use `every()` or `.after()`
+  for anything that repeats.
 
 > **Simulator note:** the simulator loads the engine (`dsl.js`) once at page load.
 > Editing your *script* and clicking **Apply Rules** re-runs the script, but editing the
