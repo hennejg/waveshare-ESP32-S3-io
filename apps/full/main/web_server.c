@@ -15,6 +15,7 @@
 #endif
 #include "mb_tcp_server.h"
 #include "mb_tcp_master.h"
+#include "mb_status_json.h"
 #include "scripting.h"
 #include "sntp_sync.h"
 
@@ -35,7 +36,6 @@ extern const char DEMO_SCRIPT[];
    3942 bytes through that GET then could not read back. */
 #define RULES_MAX_LEN 3900
 
-#include <math.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
@@ -73,50 +73,8 @@ static httpd_handle_t s_server = NULL;
 
 /* ------------------------------------------------------------------ helpers */
 
-/* api_config_post() takes a field that is sent only when it is valid, and
-   refuses the whole save otherwise. A value out of range or of the wrong
-   type used to be skipped while the page said "Saved": register 70000 made
-   the row poll register 0, unit 300 polled unit 1. A field that is missing,
-   or null -- what the page sends for an empty number box -- leaves the
-   stored value. The first bad field is kept in *bad for the 400. */
-typedef struct { char field[40]; } cfg_err_t;
-
-static void cfg_bad(cfg_err_t *bad, const char *where, const char *key)
-{
-    if (bad && !bad->field[0]) snprintf(bad->field, sizeof(bad->field), "%s%s", where, key);
-}
-
-static bool cfg_uint(const cJSON *obj, const char *where, const char *key,
-                     uint32_t lo, uint32_t hi, uint32_t *out, cfg_err_t *bad)
-{
-    const cJSON *v = cJSON_GetObjectItem(obj, key);
-    if (!v || cJSON_IsNull(v)) return false;
-    if (web_json_uint(v, lo, hi, out)) return true;
-    cfg_bad(bad, where, key);
-    return false;
-}
-
-/* A string is taken whole or not at all. strlcpy() cut an over-long one
-   short -- a different name, and when the cut fell inside a character, an
-   MQTT topic that is not UTF-8, over which the broker closes the
-   connection, again on every reconnect. The page's maxlength counts
-   characters; the limit here is bytes. */
-static bool cfg_str(const cJSON *obj, const char *where, const char *key,
-                    char *dst, size_t cap, cfg_err_t *bad)
-{
-    const cJSON *v = cJSON_GetObjectItem(obj, key);
-    if (!v || cJSON_IsNull(v)) return false;
-    size_t len = cJSON_IsString(v) ? strlen(v->valuestring) : 0;
-    if (!cJSON_IsString(v) || len >= cap || !app_config_utf8_ok(v->valuestring)) {
-        cfg_bad(bad, where, key);
-        return false;
-    }
-    memcpy(dst, v->valuestring, len + 1);
-    return true;
-}
-
 /* Parse a cJSON array of {invert, name} objects into a di_config_t array. */
-static void parse_invert_array(cJSON *arr, di_config_t *out, int max, const char *where, cfg_err_t *bad)
+static void parse_invert_array(cJSON *arr, di_config_t *out, int max, const char *where, web_cfg_err_t *bad)
 {
     if (!cJSON_IsArray(arr)) return;
     int n = cJSON_GetArraySize(arr);
@@ -128,7 +86,7 @@ static void parse_invert_array(cJSON *arr, di_config_t *out, int max, const char
         if (cJSON_IsBool(inv)) out[i].invert = cJSON_IsTrue(inv);
         char w[16];
         snprintf(w, sizeof(w), "%s%d.", where, i + 1);
-        cfg_str(item, w, "name", out[i].name, sizeof(out[i].name), bad);
+        web_cfg_str(item, w, "name", out[i].name, sizeof(out[i].name), bad);
     }
 }
 
@@ -137,30 +95,6 @@ static void parse_invert_array(cJSON *arr, di_config_t *out, int max, const char
 /* The value types and the two readable function codes travel as names rather
    than numbers: a configuration is read by people, and "f32" says what 4 does
    not. */
-/* One table rather than two chains: they are exact inverses, and a type added
-   to one of them alone would read back as something it is not. u16 is the
-   default on both sides and so needs no row. */
-static const struct { const char *name; uint8_t type; } k_mbm_types[] = {
-    { "s16", MBM_VAL_S16 },
-    { "u32", MBM_VAL_U32 },
-    { "s32", MBM_VAL_S32 },
-    { "f32", MBM_VAL_F32 },
-};
-
-static const char *mbm_type_name(uint8_t t)
-{
-    for (size_t i = 0; i < sizeof(k_mbm_types) / sizeof(k_mbm_types[0]); i++)
-        if (k_mbm_types[i].type == t) return k_mbm_types[i].name;
-    return "u16";
-}
-
-static void mbm_type_value(const char *s, uint8_t *out)
-{
-    for (size_t i = 0; i < sizeof(k_mbm_types) / sizeof(k_mbm_types[0]); i++)
-        if (!strcmp(s, k_mbm_types[i].name)) { *out = k_mbm_types[i].type; return; }
-    *out = MBM_VAL_U16;
-}
-
 static esp_err_t api_config_get(httpd_req_t *req)
 {
     if (!web_check_auth(req)) return web_send_denied(req);
@@ -191,27 +125,7 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON_AddBoolToObject  (mb, "tcp_server", cfg->modbus.tcp_server);
     cJSON_AddBoolToObject  (mb, "gateway",    cfg->modbus.gateway);
     cJSON_AddNumberToObject(mb, "tcp_uid",     cfg->modbus.tcp_uid);
-    cJSON *mbm = cJSON_AddArrayToObject(root, "mbm");
-    for (int i = 0; i < APP_CFG_MBM_COUNT; i++) {
-        const mbm_poll_t *e = &cfg->mbm[i];
-        cJSON *o = cJSON_CreateObject();
-        cJSON_AddBoolToObject  (o, "enable",      e->enable);
-        cJSON_AddStringToObject(o, "name",        e->name);
-        cJSON_AddStringToObject(o, "host",        e->host);
-        cJSON_AddNumberToObject(o, "port",        e->port);
-        cJSON_AddNumberToObject(o, "unit_id",     e->unit_id);
-        cJSON_AddStringToObject(o, "fc",          e->fc == 4 ? "input" : "holding");
-        cJSON_AddNumberToObject(o, "reg",         e->reg);
-        cJSON_AddStringToObject(o, "type",        mbm_type_name(e->type));
-        cJSON_AddBoolToObject  (o, "word_swap",   e->word_swap);
-        cJSON_AddStringToObject(o, "transport",   e->transport == MBM_TRANSPORT_RTU ? "rtu" : "tcp");
-        /* Reported as stored. A stored 0 cannot occur: an enabled row with it
-           is refused on the way in, a disabled one stores 1, and
-           app_config_init() turns one from an older blob into 1. */
-        cJSON_AddNumberToObject(o, "scale",       e->scale);
-        cJSON_AddNumberToObject(o, "interval_ms", e->interval_ms);
-        cJSON_AddItemToArray(mbm, o);
-    }
+    web_mbm_config_json(root, cfg);
 
     cJSON_AddNumberToObject(mb, "rs485_tout_ms", cfg->modbus.rs485_tout_ms);
 
@@ -294,11 +208,11 @@ static esp_err_t api_config_post(httpd_req_t *req)
 
     app_config_t cfg;
     memcpy(&cfg, app_config_get(), sizeof(cfg));
-    cfg_err_t bad = { "" };
+    web_cfg_err_t bad = { "" };
 
-    cfg_str(root, "", "device_name", cfg.device_name, sizeof(cfg.device_name), &bad);
-    cfg_str(root, "", "mqtt_url",    cfg.mqtt_url,    sizeof(cfg.mqtt_url),    &bad);
-    cfg_str(root, "", "mqtt_user",   cfg.mqtt_user,   sizeof(cfg.mqtt_user),   &bad);
+    web_cfg_str(root, "", "device_name", cfg.device_name, sizeof(cfg.device_name), &bad);
+    web_cfg_str(root, "", "mqtt_url",    cfg.mqtt_url,    sizeof(cfg.mqtt_url),    &bad);
+    web_cfg_str(root, "", "mqtt_user",   cfg.mqtt_user,   sizeof(cfg.mqtt_user),   &bad);
     /* The prefix is used verbatim as a publish topic and as the last-will
        topic. '#' and '+' are illegal there (MQTT 3.1.1 3.3.2.1 / 4.7) and a
        conforming broker closes the connection on CONNECT, after which MQTT
@@ -316,14 +230,14 @@ static esp_err_t api_config_post(httpd_req_t *req)
                                     "or start or end with '/'");
                 return ESP_OK;
             }
-            cfg_str(root, "", "mqtt_topic_prefix", cfg.mqtt_topic_prefix, sizeof(cfg.mqtt_topic_prefix), &bad);
+            web_cfg_str(root, "", "mqtt_topic_prefix", cfg.mqtt_topic_prefix, sizeof(cfg.mqtt_topic_prefix), &bad);
         }
     }
 
     /* Password: only update when a non-empty value is sent */
     cJSON *pass = cJSON_GetObjectItem(root, "mqtt_password");
     if (cJSON_IsString(pass) && pass->valuestring[0])
-        cfg_str(root, "", "mqtt_password", cfg.mqtt_password, sizeof(cfg.mqtt_password), &bad);
+        web_cfg_str(root, "", "mqtt_password", cfg.mqtt_password, sizeof(cfg.mqtt_password), &bad);
 
     parse_invert_array(cJSON_GetObjectItem(root, "di"), cfg.di, APP_CFG_DI_COUNT, "di.", &bad);
 #if APP_CFG_DI_AUX_COUNT
@@ -339,24 +253,24 @@ static esp_err_t api_config_post(httpd_req_t *req)
     parse_invert_array(cJSON_GetObjectItem(root, "dout"), cfg.dout, APP_CFG_DO_COUNT, "dout.", &bad);
 
     uint32_t n;
-    if (cfg_uint(root, "", "led_mode", LED_MODE_IO, LED_MODE_STATUS, &n, &bad))
+    if (web_cfg_uint(root, "", "led_mode", LED_MODE_IO, LED_MODE_STATUS, &n, &bad))
         cfg.led_mode = (uint8_t)n;
 
     cJSON *can_j = cJSON_GetObjectItem(root, "can");
     if (cJSON_IsObject(can_j)) {
-        if (cfg_uint(can_j, "can.", "mode", 0, 2, &n, &bad))
+        if (web_cfg_uint(can_j, "can.", "mode", 0, 2, &n, &bad))
             cfg.can.mode = (uint8_t)n;
-        if (cfg_uint(can_j, "can.", "n2k_addr", 1, 251, &n, &bad))
+        if (web_cfg_uint(can_j, "can.", "n2k_addr", 1, 251, &n, &bad))
             cfg.can.n2k_addr = (uint8_t)n;
         /* base_id .. base_id + 5 are used for TX and RX matching, so the
            whole block has to fit in the 11-bit standard range. */
-        if (cfg_uint(can_j, "can.", "base_id", 0, APP_CFG_CAN_BASE_ID_MAX, &n, &bad))
+        if (web_cfg_uint(can_j, "can.", "base_id", 0, APP_CFG_CAN_BASE_ID_MAX, &n, &bad))
             cfg.can.base_id = (uint16_t)n;
         /* Outside this range twai_new_node_onchip() refuses the value and
            can_server_init() fails — see the boot-order note in main.c. */
-        if (cfg_uint(can_j, "can.", "bitrate", 10000, 1000000, &n, &bad))
+        if (web_cfg_uint(can_j, "can.", "bitrate", 10000, 1000000, &n, &bad))
             cfg.can.bitrate = n;
-        if (cfg_uint(can_j, "can.", "tx_interval_ms", 0, UINT16_MAX, &n, &bad))
+        if (web_cfg_uint(can_j, "can.", "tx_interval_ms", 0, UINT16_MAX, &n, &bad))
             cfg.can.tx_interval_ms = (uint16_t)n;
     }
 
@@ -365,9 +279,9 @@ static esp_err_t api_config_post(httpd_req_t *req)
         cJSON *v;
         if ((v = cJSON_GetObjectItem(mb, "enable"))   && cJSON_IsBool(v))
             cfg.modbus.enable = cJSON_IsTrue(v) ? 1 : 0;
-        if (cfg_uint(mb, "modbus.", "address", 1, 247, &n, &bad))
+        if (web_cfg_uint(mb, "modbus.", "address", 1, 247, &n, &bad))
             cfg.modbus.address = (uint8_t)n;
-        if (cfg_uint(mb, "modbus.", "baudrate", 1200, 921600, &n, &bad))
+        if (web_cfg_uint(mb, "modbus.", "baudrate", 1200, 921600, &n, &bad))
             cfg.modbus.baudrate = n;
         if ((v = cJSON_GetObjectItem(mb, "rs485_role")) && cJSON_IsString(v)) {
             if      (!strcmp(v->valuestring, "slave"))  cfg.modbus.rs485_role = MB_ROLE_SLAVE;
@@ -377,9 +291,9 @@ static esp_err_t api_config_post(httpd_req_t *req)
             cfg.modbus.tcp_server = cJSON_IsTrue(v) ? 1 : 0;
         if ((v = cJSON_GetObjectItem(mb, "gateway")) && cJSON_IsBool(v))
             cfg.modbus.gateway = cJSON_IsTrue(v) ? 1 : 0;
-        if (cfg_uint(mb, "modbus.", "tcp_uid", 1, 247, &n, &bad))
+        if (web_cfg_uint(mb, "modbus.", "tcp_uid", 1, 247, &n, &bad))
             cfg.modbus.tcp_uid = (uint8_t)n;
-        if (cfg_uint(mb, "modbus.", "rs485_tout_ms", MB_RS485_TOUT_MIN_MS, MB_RS485_TOUT_MAX_MS, &n, &bad))
+        if (web_cfg_uint(mb, "modbus.", "rs485_tout_ms", MB_RS485_TOUT_MIN_MS, MB_RS485_TOUT_MAX_MS, &n, &bad))
             cfg.modbus.rs485_tout_ms = (uint16_t)n;
 
         /* Two combinations are worth refusing rather than quietly accepting.
@@ -410,99 +324,11 @@ static esp_err_t api_config_post(httpd_req_t *req)
     cJSON *mbm_j = cJSON_GetObjectItem(root, "mbm");
     bool mbm_present = cJSON_IsArray(mbm_j);
     if (mbm_present) {
-        /* The array replaces the table wholesale rather than being merged into
-           it: a partial update would leave an entry the user deleted in the
-           UI still being polled. Entries past the end are cleared. */
-        memset(cfg.mbm, 0, sizeof(cfg.mbm));
-        int n = cJSON_GetArraySize(mbm_j);
-        if (n > APP_CFG_MBM_COUNT) n = APP_CFG_MBM_COUNT;
-
-        for (int i = 0; i < n; i++) {
-            cJSON *o = cJSON_GetArrayItem(mbm_j, i);
-            if (!cJSON_IsObject(o)) continue;
-            mbm_poll_t *e = &cfg.mbm[i];
-            cJSON *v;
-            uint32_t u;
-            char w[12];
-            snprintf(w, sizeof(w), "mbm.%d.", i + 1);
-
-            e->port = MBM_PORT_DEFAULT; e->unit_id = MBM_UNIT_ID_DEFAULT;
-            e->fc = MBM_FC_DEFAULT; e->scale = 1.0f; e->interval_ms = MBM_INTERVAL_DEFAULT_MS;
-
-            /* A script writing "enable": 1 rather than true would otherwise
-               store a silently disabled entry and get 200 back. */
-            if ((v = cJSON_GetObjectItem(o, "enable"))) {
-                if (cJSON_IsBool(v))        e->enable = cJSON_IsTrue(v) ? 1 : 0;
-                else if (cJSON_IsNumber(v)) e->enable = v->valuedouble != 0 ? 1 : 0;
-            }
-            /* Only a row that is polled is held to its ranges: what a
-               disabled row's hidden boxes hold must not block the save. */
-            cfg_err_t *rb = e->enable ? &bad : NULL;
-            cfg_str(o, w, "name", e->name, sizeof(e->name), rb);
-            cfg_str(o, w, "host", e->host, sizeof(e->host), rb);
-            if (cfg_uint(o, w, "port", 1, 65535, &u, rb))
-                e->port = (uint16_t)u;
-            if (cfg_uint(o, w, "unit_id", 1, 247, &u, rb))
-                e->unit_id = (uint8_t)u;
-            if ((v = cJSON_GetObjectItem(o, "fc")) && cJSON_IsString(v))
-                e->fc = strcmp(v->valuestring, "input") == 0 ? 4 : 3;
-            if (cfg_uint(o, w, "reg", 0, 65535, &u, rb))
-                e->reg = (uint16_t)u;
-            if ((v = cJSON_GetObjectItem(o, "type")) && cJSON_IsString(v))
-                mbm_type_value(v->valuestring, &e->type);
-            if ((v = cJSON_GetObjectItem(o, "word_swap")) && cJSON_IsBool(v))
-                e->word_swap = cJSON_IsTrue(v) ? 1 : 0;
-            if ((v = cJSON_GetObjectItem(o, "transport")) && cJSON_IsString(v))
-                e->transport = strcmp(v->valuestring, "rtu") == 0 ? MBM_TRANSPORT_RTU : MBM_TRANSPORT_TCP;
-            if ((v = cJSON_GetObjectItem(o, "scale")) && cJSON_IsNumber(v)) {
-                /* The only field with no natural range, and the one that can
-                   carry an infinity straight through to MQTT: cJSON parses
-                   1e400 as inf, cJSON_IsNumber accepts it, and the published
-                   value becomes the literal "inf". Zero is refused too --
-                   it silently turns every reading into nothing. */
-                /* Checked as stored: 1e-50 is a non-zero double and a zero
-                   float. */
-                double sc  = v->valuedouble;
-                float  scf = (float)sc;
-                if (isfinite(sc) && sc > -1e9 && sc < 1e9 && scf != 0.0f)
-                    e->scale = scf;
-                else if (e->enable)
-                    e->scale = 0.0f;   /* flagged below */
-                else
-                    /* Nothing reads a disabled row, so nothing to refuse --
-                       but storing 0 would hand it out on GET, and enabling
-                       the row as it stands would then be refused. */
-                    e->scale = 1.0f;
-            }
-            if (cfg_uint(o, w, "interval_ms", MBM_INTERVAL_MIN_MS, MBM_INTERVAL_MAX_MS, &u, rb))
-                e->interval_ms = u;
-
-            /* A name that is empty or carries MQTT syntax would make a topic
-               nothing can subscribe to, so the entry is refused rather than
-               quietly polled into nowhere. */
-            if (e->enable) {
-                const char *why = NULL;
-                if (!e->name[0])                  why = "a Modbus master entry needs a name";
-                else if (strpbrk(e->name, "#+/")) why = "a Modbus master name must not contain '#', '+' or '/'";
-                else if (!e->host[0] && e->transport != MBM_TRANSPORT_RTU)
-                                                  why = "a Modbus master entry needs a host";
-                else if (e->scale == 0.0f)        why = "a Modbus master scale must be a non-zero finite number";
-                else {
-                    /* Two entries of the same name would publish to one topic
-                       and feed one rule key, last poll winning at random.
-                       app_config_io_names_ok() does the same for the I/O names. */
-                    for (int j = 0; j < i; j++)
-                        if (cfg.mbm[j].enable && !strcmp(cfg.mbm[j].name, e->name)) {
-                            why = "two Modbus master entries have the same name";
-                            break;
-                        }
-                }
-                if (why) {
-                    cJSON_Delete(root);
-                    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, why);
-                    return ESP_OK;
-                }
-            }
+        const char *why = web_mbm_config_parse(mbm_j, &cfg, true, &bad);
+        if (why) {
+            cJSON_Delete(root);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, why);
+            return ESP_OK;
         }
     }
 
@@ -511,10 +337,10 @@ static esp_err_t api_config_post(httpd_req_t *req)
         cJSON *v;
         if ((v = cJSON_GetObjectItem(sntp_j, "enable")) && cJSON_IsBool(v))
             cfg.sntp.enable = cJSON_IsTrue(v) ? 1 : 0;
-        cfg_str(sntp_j, "sntp.", "server", cfg.sntp.server, sizeof(cfg.sntp.server), &bad);
+        web_cfg_str(sntp_j, "sntp.", "server", cfg.sntp.server, sizeof(cfg.sntp.server), &bad);
     }
 
-    cfg_str(root, "", "tz", cfg.tz, sizeof(cfg.tz), &bad);
+    web_cfg_str(root, "", "tz", cfg.tz, sizeof(cfg.tz), &bad);
 
     cJSON_Delete(root);
 
@@ -1216,36 +1042,7 @@ static esp_err_t api_modbus_status(httpd_req_t *req)
         return ESP_OK;
     }
 
-    mb_tcp_stats_t st;
-    mb_tcp_server_get_stats(&st);
-    cJSON *srv = cJSON_AddObjectToObject(root, "tcp_server");
-    cJSON_AddNumberToObject(srv, "accepted",   st.accepted);
-    cJSON_AddNumberToObject(srv, "refused",    st.refused);
-    cJSON_AddNumberToObject(srv, "evicted",    st.evicted);
-    cJSON_AddNumberToObject(srv, "requests",   st.requests);
-    cJSON_AddNumberToObject(srv, "exceptions", st.exceptions);
-    cJSON_AddNumberToObject(srv, "forwarded",  st.forwarded);
-    cJSON_AddNumberToObject(srv, "overloaded", st.overloaded);
-    cJSON_AddNumberToObject(srv, "malformed",  st.malformed);
-
-    mbm_status_t ms[APP_CFG_MBM_COUNT];
-    uint8_t n = mb_tcp_master_get_status(ms, APP_CFG_MBM_COUNT);
-    cJSON *arr = cJSON_AddArrayToObject(root, "tcp_master");
-    for (uint8_t i = 0; i < n; i++) {
-        cJSON *o = cJSON_CreateObject();
-        cJSON_AddStringToObject(o, "name",    ms[i].name);
-        cJSON_AddBoolToObject  (o, "enabled", ms[i].enabled);
-        if (ms[i].valid) {
-            cJSON_AddNumberToObject(o, "value",  ms[i].value);
-            cJSON_AddNumberToObject(o, "age_ms", (double)ms[i].age_ms);
-        } else {
-            cJSON_AddNullToObject(o, "value");
-        }
-        cJSON_AddNumberToObject(o, "reads",  ms[i].reads);
-        cJSON_AddNumberToObject(o, "errors", ms[i].errors);
-        if (ms[i].last_error[0]) cJSON_AddStringToObject(o, "last_error", ms[i].last_error);
-        cJSON_AddItemToArray(arr, o);
-    }
+    mb_status_json(root);
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);

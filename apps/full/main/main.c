@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <string.h>
 #include <nvs_flash.h>
 #include <esp_heap_caps.h>
@@ -172,6 +173,29 @@ static void on_mqtt_message(const char *topic, size_t tlen,
 
 static void on_mqtt_publish(void) { led_status_flash_tx(); }
 
+/* A value the poll table has read: on MQTT as modbus/<name>, and straight to
+   the rule engine under the same topic rather than round the broker -- a
+   rule must work on a board with no broker configured, and the broker does
+   not echo our own publishes back to us anyway. */
+static void on_modbus_value(uint8_t index, const mbm_poll_t *e, double value)
+{
+    (void)index;
+    char topic[8 + APP_CFG_MBM_NAME_LEN + 1];
+    snprintf(topic, sizeof(topic), "modbus/%s", e->name);
+
+    char payload[32];
+    /* Six significant digits turn a 32-bit counter into 4.29497e+09, which
+       reads back as 4294970000 -- the status API and the published value then
+       disagree about the same reading. Ten covers u32 and s32 exactly without
+       printing noise from below a float32's precision. */
+    int len = snprintf(payload, sizeof(payload), "%.10g", value);
+    if (len < 0) return;
+    if (len >= (int)sizeof(payload)) len = (int)sizeof(payload) - 1;
+
+    app_mqtt_publish(topic, payload, len, 0, false);
+    scripting_on_mqtt_message(topic, strlen(topic), payload, (size_t)len);
+}
+
 /* ------------------------------------------------- network callbacks */
 
 /* on_network_ready() runs once per interface, and the two arrive on
@@ -329,7 +353,7 @@ void app_main(void)
     if (mb_ret != ESP_OK)
         ESP_LOGE(TAG, "Modbus server init failed: %s — continuing without Modbus",
                  esp_err_to_name(mb_ret));
-    esp_err_t mbm_init_ret = mb_tcp_master_init();
+    esp_err_t mbm_init_ret = mb_tcp_master_init(on_modbus_value, false);
     if (mbm_init_ret != ESP_OK)
         ESP_LOGE(TAG, "Modbus TCP master init failed: %s — continuing without it",
                  esp_err_to_name(mbm_init_ret));

@@ -241,6 +241,7 @@ static void modbus_normalize(app_config_t *c)
         if (e->fc != 3 && e->fc != 4)                      e->fc          = MBM_FC_DEFAULT;
         if (!e->interval_ms)                               e->interval_ms = MBM_INTERVAL_DEFAULT_MS;
         if (e->transport > MBM_TRANSPORT_RTU)              e->transport   = MBM_TRANSPORT_TCP;
+        if (e->matter > MBM_MATTER_MAX)                    e->matter      = MBM_MATTER_NONE;
         /* The one value the web API refuses on the way in: an untouched row
            handed out with scale 0 came straight back as a 400 the moment a
            client enabled it without changing anything else. */

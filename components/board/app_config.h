@@ -83,6 +83,18 @@
 #define MBM_TRANSPORT_RTU     1
 #define MBM_INTERVAL_MAX_MS 86400000   /* a day */
 
+/* What a value is to Matter (Matter firmware only): the sensor endpoint it
+   is reported on, and the unit the scaled value has to be in. The full
+   firmware stores the field and ignores it. */
+#define MBM_MATTER_NONE         0
+#define MBM_MATTER_TEMPERATURE  1   /* degrees Celsius        */
+#define MBM_MATTER_HUMIDITY     2   /* percent relative humidity */
+#define MBM_MATTER_PRESSURE     3   /* hPa                    */
+#define MBM_MATTER_FLOW         4   /* cubic metres per hour  */
+#define MBM_MATTER_POWER        5   /* W                      */
+#define MBM_MATTER_ENERGY       6   /* kWh, a meter reading   */
+#define MBM_MATTER_MAX          MBM_MATTER_ENERGY
+
 typedef struct {
     uint8_t  enable;
     uint8_t  unit_id;      /* 1–247                                          */
@@ -92,7 +104,8 @@ typedef struct {
     uint8_t  transport;    /* MBM_TRANSPORT_*; was padding, so 0 = TCP       */
     uint16_t reg;          /* zero-based, as on the wire                     */
     uint16_t port;         /* usually 502                                    */
-    uint16_t _pad2;
+    uint8_t  matter;       /* MBM_MATTER_*; was padding, so 0 = none         */
+    uint8_t  _pad2;
     uint32_t interval_ms;
     float    scale;        /* the raw value is multiplied by this            */
     char     name[APP_CFG_MBM_NAME_LEN + 1];  /* MQTT topic and rule key     */

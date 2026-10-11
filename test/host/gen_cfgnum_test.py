@@ -42,6 +42,19 @@ if old:
     body = web.span("    cJSON *led_mode_v = cJSON_GetObjectItem(root, \"led_mode\");",
                     "            cfg.can.tx_interval_ms = (uint16_t)v->valuedouble;\n    }\n")
     norm = "static void can_normalize(app_config_t *c) { (void)c; }\n"
+elif "web_cfg_uint(" in web.text:
+    # cfg_uint() and its error type moved to web_common.c as web_cfg_*.
+    common = source("components/board/web_common.c")
+    whdr   = source("components/board/web_common.h")
+    cuts = (json_uint_cut()
+            + whdr.span("typedef struct { char field[40]; } web_cfg_err_t;", "typedef struct { char field[40]; } web_cfg_err_t;")
+            + common.func("void web_cfg_bad(web_cfg_err_t *bad, const char *where, const char *key)")
+            + common.func("bool web_cfg_uint(const cJSON *obj, const char *where, const char *key,"))
+    body = ("    web_cfg_err_t bad = { \"\" };\n"
+            + web.span("    uint32_t n;\n    if (web_cfg_uint(root, \"\", \"led_mode\"",
+                       "            cfg.can.tx_interval_ms = (uint16_t)n;\n    }\n")
+            + "    (void)bad;\n")
+    norm = cfg.func("static void can_normalize(app_config_t *c)")
 elif "static bool cfg_uint(" not in web.text:
     cuts = json_uint_cut()
     body = web.span("    uint32_t n;\n    if (json_uint(cJSON_GetObjectItem(root, \"led_mode\")",

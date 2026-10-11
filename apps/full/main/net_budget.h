@@ -30,7 +30,7 @@
    that it sees a clean close rather than a connection that never answers. For
    that instant it holds a socket of its own, over and above the slots. */
 #define NET_SOCK_MB_REFUSE       1
-#define NET_SOCK_MB_MASTER       3   /* kept open to the devices this board polls */
+#define NET_SOCK_MB_MASTER       CONFIG_MB_TCP_MASTER_CONNS   /* kept open to the devices this board polls */
 
 /* The WiFi provisioning portal (esp32-wifi-bootstrap, wifi_config.c): its own
    HTTP listener, the one client it serves at a time, and the captive DNS

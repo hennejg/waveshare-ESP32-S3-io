@@ -752,6 +752,10 @@ esp_err_t mb_server_init(void)
            which needs a working IP stack app_main() does not have yet;
            mb_server_net_start() finishes that part. */
         bool fwd = cfg->modbus.gateway && cfg->modbus.tcp_server;
+#if !CONFIG_MB_GATEWAY
+        if (cfg->modbus.gateway)
+            ESP_LOGW(TAG, "the gateway is not part of this firmware — RS-485 master for the poll table only");
+#endif
         if (cfg->modbus.gateway && !cfg->modbus.tcp_server)
             ESP_LOGW(TAG, "gateway is on but the Modbus TCP server is off — nothing to forward");
         esp_err_t r = mb_gateway_start(MB_UART, cfg->modbus.baudrate,

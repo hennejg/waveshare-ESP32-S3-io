@@ -12,8 +12,8 @@ PORT ?= 15020
 
 # Every target below; GEN are the ones a gen_<name>_test.py writes as
 # test_<name>.c and builds into test_<name>.
-TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel
-GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel
+TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel mbmmatter
+GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel mbmmatter
 
 .PHONY: all clean $(TESTS)
 all: test_mb_pdu $(TESTS)
@@ -93,7 +93,7 @@ test_evict: gen_evict_test.py $(MB)/mb_tcp_server.c $(MAIN)/net_budget.h ../../c
 master: test_mb_master
 	./test_mb_master
 
-test_mb_master: gen_master_test.py $(MAIN)/mb_tcp_master.c ../../components/board/app_config.h
+test_mb_master: gen_master_test.py $(MB)/mb_tcp_master.c $(MAIN)/main.c $(MB)/Kconfig ../../components/board/app_config.h
 	python3 gen_master_test.py
 	$(CC) $(CFLAGS) -I../../components/board -Istubs test_mb_master.c -o $@
 
@@ -101,7 +101,7 @@ test_mb_master: gen_master_test.py $(MAIN)/mb_tcp_master.c ../../components/boar
 dns: test_mb_dns
 	./test_mb_dns
 
-test_mb_dns: gen_dns_test.py $(MAIN)/mb_tcp_master.c $(MAIN)/net_budget.h ../../components/board/app_config.h
+test_mb_dns: gen_dns_test.py $(MB)/mb_tcp_master.c $(MB)/Kconfig ../../components/board/app_config.h
 	python3 gen_dns_test.py
 	$(CC) $(CFLAGS) -I../../components/board -Istubs test_mb_dns.c -o $@
 
@@ -443,7 +443,7 @@ test_caninit: gen_caninit_test.py $(MAIN)/can_server.c
 rtuerr: test_rtuerr
 	./test_rtuerr
 
-test_rtuerr: gen_rtuerr_test.py $(MAIN)/mb_tcp_master.c $(MB)/mb_request.h $(MB)/mb_gateway.h
+test_rtuerr: gen_rtuerr_test.py $(MB)/mb_tcp_master.c $(MB)/mb_request.h $(MB)/mb_gateway.h
 	python3 gen_rtuerr_test.py
 	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter test_rtuerr.c -o $@
 
@@ -489,3 +489,12 @@ padlevel: test_padlevel
 test_padlevel: gen_padlevel_test.py ../../apps/matter/main/matter.cpp ../../components/board/aux_io.h
 	python3 gen_padlevel_test.py
 	$(CC) $(CFLAGS) -Wno-unused-function test_padlevel.c -o $@
+
+# The poll table's values as Matter sensors: unit conversion, the table's
+# check, when a save needs a reboot, and no gateway without CONFIG_MB_GATEWAY.
+mbmmatter: test_mbmmatter
+	./test_mbmmatter
+
+test_mbmmatter: gen_mbmmatter_test.py qjs-obj/cJSON.o ../../apps/matter/main/mbm_value.c ../../apps/matter/main/matter_mbm.cpp ../../components/board/web_common.c ../../components/board/web_common.h ../../components/board/app_config.c ../../components/board/app_config.h ../../components/modbus/mb_gateway.c
+	python3 gen_mbmmatter_test.py
+	$(CC) $(CFLAGS) -I$(CJSON) -I../../components/board -Istubs -Wno-unused-function test_mbmmatter.c qjs-obj/cJSON.o -lm -o $@

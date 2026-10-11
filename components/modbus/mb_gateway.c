@@ -4,6 +4,7 @@
 
 #include <string.h>
 #include "esp_check.h"
+#include "sdkconfig.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -58,7 +59,13 @@ bool mb_gateway_is_running(void)
 
 static bool s_forwarding;
 
+/* Without the gateway in the build the master only serves the poll table,
+   whatever the stored configuration says. */
+#if CONFIG_MB_GATEWAY
 void mb_gateway_set_forwarding(bool on) { s_forwarding = on; }
+#else
+void mb_gateway_set_forwarding(bool on) { (void)on; s_forwarding = false; }
+#endif
 bool mb_gateway_forwarding(void)        { return s_forwarding && s_master != NULL; }
 
 /* Takes back a half-finished start. This matters more than it looks: the

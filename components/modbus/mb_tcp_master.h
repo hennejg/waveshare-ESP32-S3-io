@@ -1,11 +1,13 @@
 #pragma once
 
-/* Modbus TCP master: the board reading other people's devices.
+/* The poll table: the board reading other people's devices, on the network
+ * (Modbus TCP master, CONFIG_MB_TCP_MASTER) or on the RS-485 segment (with
+ * RS-485 set to master, CONFIG_MB_RS485_MASTER).
  *
  * Each configured entry names one value -- where it lives and how to read it.
- * A value that comes back is published on MQTT under "modbus/<name>" and fed
- * to the rule engine under the same name, so a rule can act on it with
- * mqtt("modbus/<name>") whether or not a broker is connected.
+ * What becomes of a value that comes back is the application's: the full
+ * firmware publishes it on MQTT under "modbus/<name>" and feeds it to the
+ * rule engine, the Matter firmware reports it on a sensor endpoint.
  *
  * Reading only. Writing to somebody else's device is a decision with
  * consequences on the other end, and nothing has asked for it.
@@ -16,9 +18,15 @@
 #include "app_config.h"
 #include "esp_err.h"
 
+/* Called on the polling task for every value read, with the entry's index
+   in the table and the entry as the task has it. Must not block for long:
+   the next entry waits. */
+typedef void (*mb_tcp_master_sink_t)(uint8_t index, const mbm_poll_t *e, double value);
+
 /* Creates what start() and reload() share. Call once from app_main(), before
-   the network can come up. */
-esp_err_t mb_tcp_master_init(void);
+   the network can come up. psram_stack puts the polling task's stack in
+   PSRAM: only for a sink that never touches the flash. */
+esp_err_t mb_tcp_master_init(mb_tcp_master_sink_t sink, bool psram_stack);
 
 /* True if an enabled, complete entry reads a device on RS-485: such an entry
    needs no network, and the poller is started at boot for it. */

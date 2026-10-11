@@ -22,7 +22,9 @@
 #include "eth.h"
 #include "led.h"
 #include "matter.h"
+#include "matter_mbm.h"
 #include "mb_server.h"
+#include "mb_tcp_master.h"
 #include "sntp_sync.h"
 #include "web_server.h"
 
@@ -31,12 +33,13 @@
 static bool s_eth_connected  = false;
 static bool s_wifi_connected = false;
 
-/* Modbus (RTU slave, Modbus TCP server) runs only on a commissioned device.
-   Before that the setup AP and BLE leave too little internal RAM: measured,
-   about 10 KB free at the lowest during commissioning, and the RTU slave
-   alone needs more. Once commissioned both are off and 50-70 KB are free.
-   mb_server_init() runs once; mb_server_net_start() whenever an interface
-   comes up (it is idempotent). */
+/* Modbus (RTU slave or RS-485 master with the poll table, Modbus TCP server)
+   runs only on a commissioned device. Modbus has no authentication: a device
+   nobody has taken into a fabric yet does not answer on RS-485 or port 502.
+   (This was a RAM limit first -- about 10 KB free during commissioning --
+   until the Matter stack's static data moved to PSRAM; now 74 KB are left
+   at the lowest.) mb_server_init() runs once; mb_server_net_start() whenever
+   an interface comes up (it is idempotent). */
 /* The two paths -- the start below and an interface coming up -- run on
    different tasks; mb_server_net_start() must not run twice at once. */
 static bool              s_mb_inited;
@@ -58,9 +61,30 @@ static void modbus_start(void)
         esp_err_t r = mb_server_init();
         if (r != ESP_OK)
             ESP_LOGE(TAG, "Modbus init failed: %s — continuing without Modbus", esp_err_to_name(r));
+        /* RS-485 rows need no network; the task starts only with one enabled. */
+        if (r == ESP_OK && mb_tcp_master_has_rtu()) {
+            r = mb_tcp_master_start();
+            if (r != ESP_OK) ESP_LOGE(TAG, "Modbus poll table: %s", esp_err_to_name(r));
+        }
         modbus_net_start_locked();
     }
     xSemaphoreGive(s_mb_mux);
+}
+
+/* The poll table was changed in the web UI. Applied at once, but only where
+   Modbus already runs: before commissioning the save waits for the start. */
+void app_modbus_table_changed(void)
+{
+    if (!s_mb_mux) return;
+    xSemaphoreTake(s_mb_mux, portMAX_DELAY);
+    if (s_mb_inited) mb_tcp_master_reload();
+    xSemaphoreGive(s_mb_mux);
+}
+
+/* A value the poll table read: to its Matter sensor endpoint, if it has one. */
+static void on_modbus_value(uint8_t index, const mbm_poll_t *e, double value)
+{
+    matter_mbm_update(index, e->matter, value);
 }
 
 /* After a fresh commissioning (matter.cpp waits a few seconds for BLE and
@@ -124,6 +148,10 @@ void app_main(void)
 {
     sntp_sync_init();   /* before anything can bring a network interface up */
     s_mb_mux = xSemaphoreCreateMutex();
+    /* The sink only hands the value to the CHIP task, never touches the
+       flash: the polling task can run on a PSRAM stack. */
+    if (mb_tcp_master_init(on_modbus_value, true) != ESP_OK)
+        ESP_LOGE(TAG, "Modbus poll table init failed");
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());

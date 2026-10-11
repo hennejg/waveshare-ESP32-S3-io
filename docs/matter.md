@@ -13,9 +13,43 @@ controller.
 | 1–8       | 8     | On/Off Plug-in Unit (0x010A) | OnOff (0x0006)       | Read/Write |
 | 9–16      | 8     | Contact Sensor (0x0015)      | BooleanState (0x0045)| Read-only  |
 | 17…       | 0–3   | by pad mode, see below       |                      |            |
+| …         | 0–8   | by Modbus row, see below     |                      | Read-only  |
 
 Endpoint numbering follows the order of creation: root endpoint is 0, DO1–DO8 are endpoints 1–8, DI1–DI8 are
-endpoints 9–16, then one endpoint per header pad that has one, in pad order.
+endpoints 9–16, then one endpoint per header pad that has one, in pad order, then one per Modbus sensor row, in
+row order. `CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT` (28) holds all of them at once; `matter_mbm.cpp`
+checks that at compile time.
+
+### Modbus values (RS-485 master)
+
+With RS-485 set to master in the **Modbus** tab, the board reads up to eight values from devices on the RS-485
+segment -- the table described in `docs/modbus.md` (*Reading other Modbus devices*), RS-485 rows only. Each row
+with a Matter type becomes a sensor endpoint; the scale has to bring the value into the unit given here:
+
+| Matter type | Matter device type                | Attribute                              | Scale to | Reported as      |
+|-------------|-----------------------------------|----------------------------------------|----------|------------------|
+| temperature | Temperature Sensor (0x0302)       | MeasuredValue                          | °C       | 0.01 °C          |
+| humidity    | Humidity Sensor (0x0307)          | MeasuredValue                          | %        | 0.01 %           |
+| pressure    | Pressure Sensor (0x0305)          | MeasuredValue                          | hPa      | 1 hPa (0.1 kPa)  |
+| flow        | Flow Sensor (0x0306)              | MeasuredValue                          | m³/h     | 0.1 m³/h         |
+| power       | Electrical Sensor (0x0510)        | ElectricalPowerMeasurement.ActivePower | W        | mW               |
+| energy      | Electrical Sensor (0x0510)        | ElectricalEnergyMeasurement.CumulativeEnergyImported | kWh (meter reading) | mWh |
+
+A value outside what the attribute can hold (e.g. a temperature above 327.67 °C, a negative humidity) is not
+reported rather than clipped; the attribute keeps its last value. A row without a Matter type is read and shown
+in the web UI only.
+
+Register, scale and interval apply on save; a different Matter type, or a row switched on or off, changes the
+endpoint list and answers `reboot_required`. The full firmware keeps the Matter type of each row when it saves
+the table, so switching firmware does not lose it.
+
+Electrical power measurement requires an accuracy entry. The board does not know the meter's accuracy and
+reports ±0 over the full range -- a placeholder, not a statement about the meter. Whether a certification test
+accepts that has not been checked.
+
+Verified on the bench (Eastron SDM630 twin on RS-485, chip-tool): all six types read back on endpoints 17–22,
+each within 1 % of the value the poll table shows at the same moment (the twin's values drift between reads), a
+scale change reported without reboot.
 
 ### Header pads (IO1, RXD, TXD)
 
@@ -176,10 +210,14 @@ Measured after both changes (all pads standard, Modbus enabled):
 | 4 Modbus TCP clients, 656 requests in 15 s              | --            | 110.5 KB | 102.8 KB           |
 | second fabric commissioned with Modbus running          | --            | 121.5 KB | 113.6 KB           |
 
+The RS-485 master adds 2.6 KB of static internal RAM (126.6 KB in all); its poll task runs on a PSRAM stack. With
+six Modbus sensor endpoints, before commissioning: 73.3 KB free (lowest 66.7 KB, DMA-capable 65.5 KB); after
+commissioning and polling: 119.7 KB free, 58.0 KB at the lowest.
+
 ### Modbus
 
-Modbus (RTU slave on RS-485, Modbus TCP server with 4 clients) is in this firmware but starts only once the device
-is commissioned: at boot when it already is, otherwise 5 s after commissioning completes. Measured RAM in the full
+Modbus (RTU slave or RS-485 master on RS-485, Modbus TCP server with 4 clients) is in this firmware but starts only
+once the device is commissioned: at boot when it already is, otherwise 5 s after commissioning completes. Measured RAM in the full
 firmware: RTU slave 19 KB internal, with the TCP server 25 KB -- more than the 9–10 KB left before and during
 commissioning, well within the 50–70 KB free afterwards. Its tasks run on PSRAM stacks, the TCP connection table
 lives in PSRAM, and `CONFIG_RINGBUF_PLACE_FUNCTIONS_INTO_FLASH` keeps the UART driver's ring buffer code out of

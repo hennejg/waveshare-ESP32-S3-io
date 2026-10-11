@@ -5,10 +5,11 @@ Target device: Waveshare ESP32-S3-POE-ETH-8DI-8DO
 The board speaks Modbus two ways, configured in the web UI (**Modbus** tab).
 Changes take effect after reboot.
 
-**Matter firmware:** the same register map, as RTU slave on RS-485 and as Modbus TCP server (4 clients at a time),
-nothing else -- no RS-485 master, no gateway, no TCP master. Modbus starts only once the device is commissioned in
-Matter: before that the setup AP and BLE leave too little internal RAM (see `docs/matter.md`). A configuration
-stored by the full firmware with RS-485 set to master runs as slave there.
+**Matter firmware:** the same register map, as RTU slave on RS-485 and as Modbus TCP server (4 clients at a time).
+RS-485 can instead be master: the board then reads the RS-485 rows of the table below and reports them on Matter
+sensor endpoints (see `docs/matter.md`). No gateway and no Modbus TCP master: a stored gateway setting forwards
+nothing, and a row on the network is refused on save. Modbus starts only once the device is commissioned in Matter,
+so nothing on the network or the bus reaches the board before a controller owns it.
 
 ## RS-485
 
@@ -124,6 +125,7 @@ requests, one transaction at a time.
 | Swap | the two registers of a 32-bit value the other way round (CDAB) |
 | Scale | the raw value is multiplied by this |
 | Every | poll interval, 200 ms to a day |
+| Matter | which Matter sensor the value becomes (Matter firmware only, see `docs/matter.md`); the full firmware keeps it as it is |
 
 Reading only. Nothing is ever written to the other device.
 

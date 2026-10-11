@@ -117,3 +117,5 @@ dependencies.lock
 /test/host/test_mqttfrag.c
 /test/host/test_padlevel
 /test/host/test_padlevel.c
+/test/host/test_mbmmatter
+/test/host/test_mbmmatter.c

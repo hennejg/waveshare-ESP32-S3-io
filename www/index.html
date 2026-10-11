@@ -1139,8 +1139,13 @@ rule('my-rule')
       document.getElementById('mbm_port_' + i).disabled = rtu;
     }
 
+    // The Matter type of each row is set in the Matter firmware's page. Kept
+    // here as it came, so that saving from this page does not clear it.
+    var mbmMatter = [];
+
     function renderMbm(list) {
       list = list || [];
+      mbmMatter = list.map(function (e) { return (e && e.matter) || 'none'; });
       var box = document.getElementById('mbm_rows');
       box.innerHTML = '';
       for (var i = 0; i < MBM_ROWS; i++) {
@@ -1215,6 +1220,7 @@ rule('my-rule')
           word_swap:   document.getElementById('mbm_sw_' + i).checked,
           scale:       parseFloat(document.getElementById('mbm_scale_' + i).value),
           interval_ms: parseInt(document.getElementById('mbm_int_'  + i).value, 10),
+          matter:      mbmMatter[i] || 'none',
         });
       }
       return out;

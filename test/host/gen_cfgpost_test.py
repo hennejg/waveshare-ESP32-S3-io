@@ -31,7 +31,19 @@ src = Source.at("apps/full/main/web_server.c")
 new = "static bool cfg_uint(" in src.text
 cuts = src.defines("BODY_MAX") + (Source.at("components/board/web_common.c").func("bool web_json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out)")
                                           if "web_json_uint(" in src.text else src.func("static bool json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out)"))
-if new:
+common = "web_cfg_uint(" in src.text   # helpers and poll table moved to web_common.c
+if common:
+    wc  = Source.at("components/board/web_common.c")
+    cuts += (Source.at("components/board/web_common.h").span("typedef struct { char field[40]; } web_cfg_err_t;", "typedef struct { char field[40]; } web_cfg_err_t;")
+             + wc.func("void web_cfg_bad(web_cfg_err_t *bad, const char *where, const char *key)")
+             + wc.func("bool web_cfg_uint(const cJSON *obj, const char *where, const char *key,")
+             + wc.func("bool web_cfg_str(const cJSON *obj, const char *where, const char *key,")
+             + src.func("static void parse_invert_array(cJSON *arr, di_config_t *out, int max, const char *where, web_cfg_err_t *bad)")
+             + wc.span("static const struct { const char *name; uint8_t type; } k_mbm_types[] = {", "};")
+             + wc.func("static void mbm_type_value(const char *s, uint8_t *out)")
+             + wc.span("static const char *const k_mbm_matter[MBM_MATTER_MAX + 1] = {", "};")
+             + wc.func("const char *web_mbm_config_parse(const cJSON *mbm_j, app_config_t *cfg,"))
+elif new:
     cuts += (src.span("typedef struct { char field[40]; } cfg_err_t;", "typedef struct { char field[40]; } cfg_err_t;")
              + src.func("static void cfg_bad(cfg_err_t *bad, const char *where, const char *key)")
              + src.func("static bool cfg_uint(const cJSON *obj, const char *where, const char *key,")
@@ -39,9 +51,10 @@ if new:
              + src.func("static void parse_invert_array(cJSON *arr, di_config_t *out, int max, const char *where, cfg_err_t *bad)"))
 else:
     cuts += src.func("static void parse_invert_array(cJSON *arr, di_config_t *out, int max)")
-cuts += src.span("static const struct { const char *name; uint8_t type; } k_mbm_types[] = {", "};")
-cuts += src.func("static void mbm_type_value(const char *s, uint8_t *out)")
-if new:
+if not common:
+    cuts += src.span("static const struct { const char *name; uint8_t type; } k_mbm_types[] = {", "};")
+    cuts += src.func("static void mbm_type_value(const char *s, uint8_t *out)")
+if new or common:
     cuts = Source.at("components/board/app_config.c").func("bool app_config_utf8_ok(const char *s)") + cuts
 cuts += src.func("static esp_err_t api_config_post(httpd_req_t *req)")
 

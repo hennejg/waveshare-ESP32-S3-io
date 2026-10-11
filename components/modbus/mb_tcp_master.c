@@ -18,13 +18,13 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
 
 #include "app_config.h"
-#include "app_mqtt.h"
 #include "mb_pdu.h"
 #include "mb_gateway.h"
-#include "net_budget.h"
-#include "scripting.h"
+#include "sdkconfig.h"
 
 #define TAG "mb_master"
 
@@ -70,7 +70,11 @@ _Static_assert(MBM_VAL_U16 == MB_VAL_U16 && MBM_VAL_S16 == MB_VAL_S16 &&
    should not see a new connection every second. The share is what the board
    can spare, not what the table could use: eight entries on eight distinct
    hosts will redial, which costs a connect per poll and nothing else. */
-#define CONN_CACHE       NET_SOCK_MB_MASTER
+#if CONFIG_MB_TCP_MASTER
+#define CONN_CACHE       CONFIG_MB_TCP_MASTER_CONNS
+#else
+#define CONN_CACHE       1        /* no network rows: nothing is ever dialled */
+#endif
 #define CONN_IDLE_MS    60000
 
 typedef struct {
@@ -119,6 +123,7 @@ typedef struct {
 static conn_t        s_conns[CONN_CACHE];
 static entry_state_t s_state[APP_CFG_MBM_COUNT];
 static bool              s_running;
+static bool              s_psram_stack;
 static uint16_t          s_tid;
 /* s_state is written by the polling task and read by the HTTP task. The
    64-bit fields are two stores on this core, so without this a status request
@@ -159,6 +164,7 @@ static bool entry_active(const mbm_poll_t *e)
     return e->enable && e->name[0] && (e->transport == MBM_TRANSPORT_RTU || e->host[0]);
 }
 
+#if CONFIG_MB_TCP_MASTER
 /* ------------------------------------------------------------ connections */
 
 static void conn_close(conn_t *c)
@@ -403,6 +409,8 @@ static bool io_all(int fd, uint8_t *buf, size_t len, bool sending, bool *closed)
     return true;
 }
 
+#endif /* CONFIG_MB_TCP_MASTER */
+
 /* The registers of an answer -- big endian, as on the wire -- into the scaled
    value. Shared by both transports. */
 static bool decode_scaled(const mbm_poll_t *e, const uint8_t *data, double *value,
@@ -447,6 +455,7 @@ static bool read_rtu(const mbm_poll_t *e, uint16_t regs, double *value,
     return decode_scaled(e, wire, value, err, err_len);
 }
 
+#if CONFIG_MB_TCP_MASTER
 /* What happened to one attempt, and whether trying again could change it. */
 typedef enum { RD_OK, RD_FAILED, RD_STALE_CONN } rd_result_t;
 
@@ -515,6 +524,7 @@ static rd_result_t read_once(const mbm_poll_t *e, uint16_t regs, double *value,
 
     return decode_scaled(e, data, value, err, err_len) ? RD_OK : RD_FAILED;
 }
+#endif /* CONFIG_MB_TCP_MASTER */
 
 /* A connection kept from an earlier poll may have been closed at the other
    end without us hearing: the send succeeds into a half-closed socket and the
@@ -536,36 +546,22 @@ static bool read_value(const mbm_poll_t *e, double *value, char *err, size_t err
 
     if (e->transport == MBM_TRANSPORT_RTU) return read_rtu(e, regs, value, err, err_len);
 
+#if !CONFIG_MB_TCP_MASTER
+    snprintf(err, err_len, "network rows are not part of this firmware");
+    return false;
+#else
     rd_result_t r = read_once(e, regs, value, err, err_len);
     if (r == RD_OK)     return true;
     if (r == RD_FAILED) return false;
     return read_once(e, regs, value, err, err_len) == RD_OK;   /* once more, fresh */
+#endif
 }
 
 /* ------------------------------------------------------------- publishing */
 
-static void publish(const mbm_poll_t *e, double value)
-{
-    char topic[8 + APP_CFG_MBM_NAME_LEN + 1];
-    snprintf(topic, sizeof(topic), "modbus/%s", e->name);
-
-    char payload[32];
-    /* Six significant digits turn a 32-bit counter into 4.29497e+09, which
-       reads back as 4294970000 -- the status API and the published value then
-       disagree about the same reading. Ten covers u32 and s32 exactly without
-       printing noise from below a float32's precision. */
-    int len = snprintf(payload, sizeof(payload), "%.10g", value);
-    if (len < 0) return;
-    if (len >= (int)sizeof(payload)) len = (int)sizeof(payload) - 1;
-
-    app_mqtt_publish(topic, payload, len, 0, false);
-
-    /* The same topic goes straight to the rule engine rather than round the
-       broker: a rule must work on a board with no broker configured, and the
-       broker does not echo our own publishes back to us anyway. The string is
-       the relative topic, which is what a rule writes. */
-    scripting_on_mqtt_message(topic, strlen(topic), payload, (size_t)len);
-}
+/* Where a value goes is the application's business: MQTT and the rule engine
+   in one firmware, Matter endpoints in the other. */
+static mb_tcp_master_sink_t s_sink;
 
 /* ------------------------------------------------------------------ task */
 
@@ -588,7 +584,7 @@ static void poll_entry(const mbm_poll_t *e, entry_state_t *st)
         st->backoff_ms = 0;
         st->last_error[0] = '\0';
         ST_UNLOCK();
-        publish(e, value);
+        if (s_sink) s_sink((uint8_t)(e - s_active), e, value);
         ESP_LOGD(TAG, "%s = %.10g", e->name, value);
     } else {
         st->errors++;
@@ -630,9 +626,11 @@ static void apply_staged_config(void)
 
     /* A cached socket may lead to a device nobody asks about any more, and a
        cached name to an address nobody has looked at since the save. */
+#if CONFIG_MB_TCP_MASTER
     for (int i = 0; i < CONN_CACHE; i++)
         if (s_conns[i].fd >= 0) conn_close(&s_conns[i]);
     dns_flush();
+#endif
 }
 
 static void master_task(void *arg)
@@ -668,7 +666,9 @@ static void master_task(void *arg)
             if (st->due_ms < next) next = st->due_ms;
         }
 
+#if CONFIG_MB_TCP_MASTER
         conn_reap_idle();
+#endif
 
         int64_t sleep_ms = next - now_ms();
         if (sleep_ms < 20)   sleep_ms = 20;     /* never spin */
@@ -700,8 +700,10 @@ bool mb_tcp_master_has_rtu(void)
     return false;
 }
 
-esp_err_t mb_tcp_master_init(void)
+esp_err_t mb_tcp_master_init(mb_tcp_master_sink_t sink, bool psram_stack)
 {
+    s_sink        = sink;
+    s_psram_stack = psram_stack;
     if (!s_state_mux) s_state_mux = xSemaphoreCreateMutex();
     if (!s_start_mux) s_start_mux = xSemaphoreCreateMutex();
     ESP_RETURN_ON_FALSE(s_state_mux && s_start_mux, ESP_ERR_NO_MEM, TAG, "mutexes");
@@ -722,9 +724,11 @@ static esp_err_t start_locked(void)
 
     for (int i = 0; i < CONN_CACHE; i++) s_conns[i].fd = -1;
 
-    ESP_RETURN_ON_FALSE(
-        xTaskCreate(master_task, "mb_master", 5120, NULL, 4, NULL) == pdPASS,
-        ESP_ERR_NO_MEM, TAG, "master task");
+    BaseType_t ok = s_psram_stack
+        ? xTaskCreateWithCaps(master_task, "mb_master", 5120, NULL, 4, NULL,
+                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+        : xTaskCreate(master_task, "mb_master", 5120, NULL, 4, NULL);
+    ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "master task");
 
     s_running = true;
     ESP_LOGI(TAG, "reading %d value%s from other Modbus devices",

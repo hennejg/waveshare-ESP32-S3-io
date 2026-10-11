@@ -40,7 +40,9 @@ CONFIG_LWIP_IPV6_NUM_ADDRESSES=6
 CONFIG_LWIP_HOOK_IP6_ROUTE_DEFAULT=y
 CONFIG_LWIP_HOOK_ND6_GET_GW_DEFAULT=y
 
-CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT=20
+# Root + 8 outputs + 8 inputs + 3 header pads + 8 Modbus sensor rows;
+# matter_mbm.cpp checks the sum at compile time.
+CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT=28
 
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 CONFIG_CHIP_TASK_STACK_SIZE=8192
@@ -68,11 +70,14 @@ CONFIG_APP_MQTT_ENABLE=n
 CONFIG_APP_SCRIPTING_ENABLE=n
 CONFIG_APP_MATTER_ENABLE=y
 
-# Modbus: RTU slave on RS-485 and the Modbus TCP server, nothing else -- no
-# RS-485 master, no gateway, no TCP master. Started only once the device is
-# commissioned (main.c): before that the setup AP and BLE leave too little
-# internal RAM. Four TCP clients at a time, a short backlog.
-CONFIG_MB_RS485_MASTER=n
+# Modbus: RTU slave or RS-485 master on RS-485, and the Modbus TCP server.
+# As master the board reads the RS-485 rows of the poll table and reports
+# them on Matter sensor endpoints. No gateway, no Modbus TCP master. Started
+# only once the device is commissioned (main.c). Four TCP clients at a time,
+# a short backlog.
+CONFIG_MB_RS485_MASTER=y
+CONFIG_MB_GATEWAY=n
+CONFIG_MB_TCP_MASTER=n
 CONFIG_MB_TCP_MAX_CONN=4
 CONFIG_MB_TCP_BACKLOG=4
 # The UART driver's ring buffer functions sit in IRAM by default, 2.9 KB of

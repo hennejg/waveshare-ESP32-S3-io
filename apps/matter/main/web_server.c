@@ -4,6 +4,8 @@
 #include "web_common.h"
 #include "net_budget.h"
 #include "mb_server.h"
+#include "mb_status_json.h"
+#include "matter_mbm.h"
 #include "app_time.h"
 #include "aux_io.h"
 #include "sntp_sync.h"
@@ -89,15 +91,20 @@ static esp_err_t api_config_get(httpd_req_t *req)
     web_aux_config_json(root, cfg);
 #endif
 
-    /* Modbus: RTU slave on RS-485 and the Modbus TCP server only. It runs on
-       a commissioned device ("running"); changes apply after a reboot. */
+    /* Modbus: RTU slave or RS-485 master (poll table, RS-485 rows), and the
+       Modbus TCP server; no gateway. It runs on a commissioned device
+       ("running"); changes to these settings apply after a reboot. */
     cJSON *mb = cJSON_AddObjectToObject(root, "modbus");
-    cJSON_AddBoolToObject  (mb, "enable",     cfg->modbus.enable);
-    cJSON_AddNumberToObject(mb, "address",    cfg->modbus.address);
-    cJSON_AddNumberToObject(mb, "baudrate",   cfg->modbus.baudrate);
-    cJSON_AddBoolToObject  (mb, "tcp_server", cfg->modbus.tcp_server);
-    cJSON_AddNumberToObject(mb, "tcp_uid",    cfg->modbus.tcp_uid);
-    cJSON_AddBoolToObject  (mb, "running",    mb_server_running());
+    cJSON_AddBoolToObject  (mb, "enable",        cfg->modbus.enable);
+    cJSON_AddNumberToObject(mb, "address",       cfg->modbus.address);
+    cJSON_AddNumberToObject(mb, "baudrate",      cfg->modbus.baudrate);
+    cJSON_AddStringToObject(mb, "rs485_role",
+                            cfg->modbus.rs485_role == MB_ROLE_MASTER ? "master" : "slave");
+    cJSON_AddNumberToObject(mb, "rs485_tout_ms", cfg->modbus.rs485_tout_ms);
+    cJSON_AddBoolToObject  (mb, "tcp_server",    cfg->modbus.tcp_server);
+    cJSON_AddNumberToObject(mb, "tcp_uid",       cfg->modbus.tcp_uid);
+    cJSON_AddBoolToObject  (mb, "running",       mb_server_running());
+    web_mbm_config_json(root, cfg);
 
     cJSON *di = cJSON_AddArrayToObject(root, "di");
     for (int i = 0; i < APP_CFG_DI_COUNT; i++) {
@@ -163,6 +170,7 @@ static esp_err_t api_config_post(httpd_req_t *req)
     parse_invert_array(cJSON_GetObjectItem(root, "dout"), cfg.dout, APP_CFG_DO_COUNT, &too_long);
 
     const char *bad = NULL;
+    char bad_buf[128];
     cJSON *sntp_j = cJSON_GetObjectItem(root, "sntp");
     if (cJSON_IsObject(sntp_j)) {
         cJSON *v;
@@ -197,14 +205,31 @@ static esp_err_t api_config_post(httpd_req_t *req)
             if (web_json_uint(v, 1, 247, &u)) cfg.modbus.tcp_uid = (uint8_t)u;
             else bad = "modbus.tcp_uid must be 1-247";
         }
-        /* This firmware is only ever an RTU slave; a master stored by the
-           other firmware is cleared on the first save here. */
-        if (!bad && (v = cJSON_GetObjectItem(mb, "rs485_role")) &&
-            !(cJSON_IsString(v) && !strcmp(v->valuestring, "slave")))
-            bad = "only rs485_role \"slave\" in this firmware (no RS-485 master, no gateway)";
-        cfg.modbus.rs485_role = MB_ROLE_SLAVE;
-        cfg.modbus.gateway    = 0;
+        if (!bad && (v = cJSON_GetObjectItem(mb, "rs485_role"))) {
+            if (cJSON_IsString(v) && !strcmp(v->valuestring, "slave"))       cfg.modbus.rs485_role = MB_ROLE_SLAVE;
+            else if (cJSON_IsString(v) && !strcmp(v->valuestring, "master")) cfg.modbus.rs485_role = MB_ROLE_MASTER;
+            else bad = "modbus.rs485_role must be \"slave\" or \"master\"";
+        }
+        if (!bad && (v = cJSON_GetObjectItem(mb, "rs485_tout_ms"))) {
+            if (web_json_uint(v, MB_RS485_TOUT_MIN_MS, MB_RS485_TOUT_MAX_MS, &u)) cfg.modbus.rs485_tout_ms = (uint16_t)u;
+            else bad = "modbus.rs485_tout_ms out of range";
+        }
+        /* No gateway in this firmware; one stored by the other firmware is
+           cleared on the first save here. */
+        cfg.modbus.gateway = 0;
         mb_changed = memcmp(&cfg.modbus, &app_config_get()->modbus, sizeof(cfg.modbus)) != 0;
+    }
+    /* The poll table: RS-485 rows only, each optionally a Matter sensor. */
+    cJSON *mbm_j = cJSON_GetObjectItem(root, "mbm");
+    bool mbm_changed = false;
+    if (!bad && cJSON_IsArray(mbm_j)) {
+        web_cfg_err_t fb = { "" };
+        bad = web_mbm_config_parse(mbm_j, &cfg, false, &fb);
+        if (!bad && fb.field[0]) {
+            snprintf(bad_buf, sizeof(bad_buf), "invalid value for %s (wrong type, out of range or too long)", fb.field);
+            bad = bad_buf;
+        }
+        mbm_changed = memcmp(cfg.mbm, app_config_get()->mbm, sizeof(cfg.mbm)) != 0;
     }
 
     cJSON_Delete(root);
@@ -229,14 +254,19 @@ static esp_err_t api_config_post(httpd_req_t *req)
         return ESP_OK;
     }
 
+    /* The sensor endpoints were made at boot from the table as it was. */
+    bool ep_changed = matter_mbm_endpoints_differ(&cfg, app_config_get());
+
     if (app_config_update(&cfg) != ESP_OK) {
         return web_send_json(req, "500 Internal Server Error", "{\"error\":\"configuration could not be stored\"}");
     }
     matter_set_node_label(cfg.device_name);
+    /* Rows that keep their endpoint read the new register at once. */
+    if (mbm_changed) app_modbus_table_changed();
 
     /* The pads switch now; their Matter endpoints were made at boot for the
        mode each had then, so a changed mode reaches Matter after a reboot. */
-    bool reboot = mb_changed;   /* Modbus is set up once, at start */
+    bool reboot = mb_changed || ep_changed;   /* Modbus is set up once, at start */
 #if APP_CFG_DI_AUX_COUNT
     for (int a = 0; a < APP_CFG_DI_AUX_COUNT; a++)
         if (cfg.aux_mode[a] != (uint8_t)aux_io_mode((uint8_t)a)) reboot = true;
@@ -508,6 +538,25 @@ static esp_err_t api_io_led(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* -------------------------------------------------------- /api/modbus/status */
+
+static esp_err_t api_modbus_status(httpd_req_t *req)
+{
+    if (!web_check_auth(req)) return web_send_denied(req);
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_OK;
+    }
+    mb_status_json(root);
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json ? json : "{}");
+    cJSON_free(json);
+    return ESP_OK;
+}
+
 /* -------------------------------------------------------------- /api/version */
 
 static esp_err_t api_version(httpd_req_t *req)
@@ -595,6 +644,7 @@ static const httpd_uri_t s_handlers[] = {
     { .uri = "/api/matter/decommission",  .method = HTTP_POST, .handler = api_matter_decommission },
     { .uri = "/api/reboot",               .method = HTTP_POST, .handler = api_reboot            },
     { .uri = "/api/factory-reset",        .method = HTTP_POST, .handler = api_factory_reset     },
+    { .uri = "/api/modbus/status",        .method = HTTP_GET,  .handler = api_modbus_status     },
     { .uri = "/api/version",              .method = HTTP_GET,  .handler = api_version           },
     { .uri = "/*",                        .method = HTTP_GET,  .handler = file_get              },
 };

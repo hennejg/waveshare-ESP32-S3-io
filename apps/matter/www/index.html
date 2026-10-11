@@ -64,6 +64,24 @@
                cursor:pointer; border-radius:4px 4px 0 0; }
     .tab-btn:hover:not(.active) { color:#333; background:#f5f5f5; }
     .tab-btn.active { color:#1a73e8; border-bottom-color:#1a73e8; font-weight:600; }
+    /* Poll table: one block per row, settings open while it is polled. */
+    .mbm-entry { border:1px solid #e8e8e8; border-radius:4px; padding:.45rem .55rem; margin-top:.45rem; }
+    .mbm-entry.off { background:#fafafa; }
+    .mbm-head { display:flex; align-items:center; gap:.5rem; }
+    .mbm-head input[type="text"] { margin-top:0; padding:.3rem .45rem; font-size:.9rem;
+                                   flex:1 1 8rem; min-width:0; }
+    .mbm-stat { flex:1 1 7rem; text-align:right; font-size:.75rem; color:#888;
+                white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .mbm-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(6.5rem,1fr));
+                gap:.35rem .5rem; margin-top:.45rem; }
+    .mbm-entry.off .mbm-grid { display:none; }
+    .mbm-poll { display:flex; align-items:center; gap:.25rem; margin:0; font-size:.75rem;
+                font-weight:600; color:#555; white-space:nowrap; cursor:pointer; }
+    .mbm-poll input { margin:0; }
+    .mbm-entry.off .mbm-poll { color:#999; }
+    .mbm-f { margin-top:0; font-size:.7rem; font-weight:600; color:#777; text-transform:uppercase; }
+    .mbm-f input, .mbm-f select { width:100%; margin-top:.1rem; padding:.3rem .4rem; font-size:.85rem; }
+    .mbm-f input[type="checkbox"] { width:auto; margin-top:.35rem; }
     .tab-pane { display:none; }
     .tab-pane.active { display:block; }
     /* Action button row */
@@ -237,9 +255,18 @@
     <!-- ── Modbus ── -->
     <div id="tab-modbus" class="tab-pane">
       <p id="mb-status" class="hint" style="font-size:.85rem;color:#333">–</p>
-      <label style="font-weight:normal"><input type="checkbox" id="mb_enable"> Modbus RTU slave on RS-485</label>
-      <label>Slave address (1–247)
+      <label style="font-weight:normal"><input type="checkbox" id="mb_enable"> Modbus on RS-485</label>
+      <label>RS-485 role
+        <select id="mb_role" onchange="updateMbRole()">
+          <option value="slave">slave — answers a master on the bus</option>
+          <option value="master">master — reads the devices in the table below</option>
+        </select>
+      </label>
+      <label id="mb_address_row">Slave address (1–247)
         <input type="number" id="mb_address" min="1" max="247" step="1">
+      </label>
+      <label id="mb_tout_row">Response timeout (ms, 50–10000)
+        <input type="number" id="mb_tout" min="50" max="10000" step="10">
       </label>
       <label>Baud rate
         <select id="mb_baudrate">
@@ -252,9 +279,19 @@
         <input type="number" id="mb_tcp_uid" min="1" max="247" step="1">
       </label>
       <p class="hint">Same register map as the full firmware. Modbus starts only once the device is
-        commissioned in Matter, and changes apply after a reboot.
+        commissioned in Matter; the settings above apply after a reboot.
         <b>Modbus has no authentication:</b> anyone who reaches RS-485 or port 502 can switch the outputs.
         Enable it only on a network you control.</p>
+
+      <h2>Read devices on RS-485</h2>
+      <p class="hint">With RS-485 set to master, each row is one value this device reads by itself
+        and, with a Matter type, reports on a Matter sensor endpoint. Scale the value to the unit
+        of its type: °C, % (humidity), hPa, m³/h, W, kWh (a meter reading). Reading only;
+        nothing is ever written to the other device. A changed register or scale applies on save;
+        a changed Matter type, or a row switched on or off, after a reboot.</p>
+      <div id="mbm_rows"></div>
+      <p class="hint">The register number is the zero-based one from the device's manual, not the
+        4xxxx form. If a 32-bit value comes out as nonsense, tick Swap.</p>
     </div>
 
     <div class="btn-row">
@@ -268,12 +305,133 @@
 
   <script>
     /* ---- Tab switching ---- */
+    /* ---- Modbus: role and poll table ---- */
+    const MBM_ROWS   = 8;
+    const MBM_TYPES  = [['u16','u16'], ['s16','s16'], ['u32','u32'], ['s32','s32'], ['f32','float32']];
+    const MBM_MATTER = [['none','—'], ['temperature','temperature °C'], ['humidity','humidity %'],
+                        ['pressure','pressure hPa'], ['flow','flow m³/h'], ['power','power W'],
+                        ['energy','energy kWh']];
+    let mbmPollTimer = null;
+
+    function updateMbRole() {
+      const master = document.getElementById('mb_role').value === 'master';
+      // As a master the device has no address of its own; only a master waits.
+      document.getElementById('mb_address_row').style.display = master ? 'none' : '';
+      document.getElementById('mb_tout_row').style.display    = master ? '' : 'none';
+    }
+
+    function startMbmPoll() {
+      if (mbmPollTimer) return;
+      refreshMbmStatus();
+      mbmPollTimer = setInterval(refreshMbmStatus, 5000);
+    }
+    function stopMbmPoll() {
+      if (mbmPollTimer) { clearInterval(mbmPollTimer); mbmPollTimer = null; }
+    }
+
+    function _mbmF(label, html) { return '<label class="mbm-f">' + label + html + '</label>'; }
+    function _mbmOpts(list, cur) {
+      return list.map(t => '<option value="' + t[0] + '"' + (cur === t[0] ? ' selected' : '') + '>' +
+                           t[1] + '</option>').join('');
+    }
+
+    function mbmToggle(i) {
+      document.getElementById('mbm_row_' + i)
+        .classList.toggle('off', !document.getElementById('mbm_en_' + i).checked);
+    }
+
+    function renderMbm(list) {
+      list = list || [];
+      const box = document.getElementById('mbm_rows');
+      box.innerHTML = '';
+      for (let i = 0; i < MBM_ROWS; i++) {
+        const e = list[i] || {};
+        // A row stored by the full firmware for a network device is not read
+        // here; it is shown so that saving does not lose it, and is refused
+        // on save if it is switched on.
+        const net = e.transport === 'tcp' && !!e.host;
+        const d = document.createElement('div');
+        d.className = 'mbm-entry';
+        d.id = 'mbm_row_' + i;
+        d.dataset.transport = net ? 'tcp' : 'rtu';
+        d.innerHTML =
+          '<div class="mbm-head">' +
+            '<label class="mbm-poll" title="Read this value; the settings open while it is on">' +
+              '<input type="checkbox" id="mbm_en_' + i + '"' + (e.enable ? ' checked' : '') +
+                     ' onchange="mbmToggle(' + i + ')">Read</label>' +
+            '<input type="text" id="mbm_name_' + i + '" maxlength="20" placeholder="name — row ' + (i + 1) + '">' +
+            '<span class="mbm-stat" id="mbm_stat_' + i + '">' + (net ? 'network device (not read here)' : '\u2014') + '</span>' +
+          '</div>' +
+          '<div class="mbm-grid">' +
+            _mbmF('Unit', '<input type="number" id="mbm_uid_' + i + '" min="1" max="247" value="' + (e.unit_id || 1) + '">') +
+            _mbmF('Read', '<select id="mbm_fc_' + i + '">' + _mbmOpts([['holding','holding'], ['input','input']], e.fc === 'input' ? 'input' : 'holding') + '</select>') +
+            _mbmF('Register', '<input type="number" id="mbm_reg_' + i + '" min="0" max="65535" value="' + (e.reg || 0) + '">') +
+            _mbmF('Type', '<select id="mbm_type_' + i + '">' + _mbmOpts(MBM_TYPES, e.type || 'u16') + '</select>') +
+            _mbmF('Swap', '<input type="checkbox" id="mbm_sw_' + i + '"' + (e.word_swap ? ' checked' : '') +
+                          ' title="The two registers of a 32-bit value the other way round (CDAB)">') +
+            _mbmF('Scale', '<input type="number" id="mbm_scale_' + i + '" step="any" value="' + (e.scale != null ? e.scale : 1) + '">') +
+            _mbmF('Every (ms)', '<input type="number" id="mbm_int_' + i + '" min="200" step="100" value="' + (e.interval_ms || 5000) + '">') +
+            _mbmF('Matter', '<select id="mbm_matter_' + i + '">' + _mbmOpts(MBM_MATTER, e.matter || 'none') + '</select>') +
+          '</div>';
+        box.appendChild(d);
+        // Text through .value, never markup: a name cannot smuggle HTML in.
+        document.getElementById('mbm_name_' + i).value = e.name || '';
+        d.dataset.host = e.host || '';
+        d.dataset.port = e.port || 502;
+        mbmToggle(i);
+      }
+    }
+
+    function collectMbm() {
+      const out = [];
+      for (let i = 0; i < MBM_ROWS; i++) {
+        const row = document.getElementById('mbm_row_' + i);
+        // Every row, empty ones included: the device stores them by position.
+        out.push({
+          enable:      document.getElementById('mbm_en_' + i).checked,
+          name:        document.getElementById('mbm_name_' + i).value.trim(),
+          transport:   row.dataset.transport,
+          host:        row.dataset.host,
+          port:        parseInt(row.dataset.port, 10),
+          unit_id:     parseInt(document.getElementById('mbm_uid_' + i).value, 10),
+          fc:          document.getElementById('mbm_fc_' + i).value,
+          reg:         parseInt(document.getElementById('mbm_reg_' + i).value, 10),
+          type:        document.getElementById('mbm_type_' + i).value,
+          word_swap:   document.getElementById('mbm_sw_' + i).checked,
+          scale:       parseFloat(document.getElementById('mbm_scale_' + i).value),
+          interval_ms: parseInt(document.getElementById('mbm_int_' + i).value, 10),
+          matter:      document.getElementById('mbm_matter_' + i).value,
+        });
+      }
+      return out;
+    }
+
+    // What each row last read: the only way to tell a wrong register from a
+    // device that does not answer.
+    async function refreshMbmStatus() {
+      try {
+        const r = await apiFetch('/api/modbus/status');
+        if (!r.ok) return;
+        const d = await r.json();
+        (d.tcp_master || []).forEach((m, i) => {
+          const cell = document.getElementById('mbm_stat_' + i);
+          const row  = document.getElementById('mbm_row_' + i);
+          if (!cell || (row && row.dataset.transport === 'tcp')) return;
+          if (!m.enabled)           cell.textContent = '\u2014';
+          else if (m.last_error)    cell.textContent = m.last_error;
+          else if (m.value == null) cell.textContent = 'waiting…';
+          else cell.textContent = m.value + '  (' + Math.round(m.age_ms / 1000) + ' s ago)';
+        });
+      } catch (_) { /* the page works without it */ }
+    }
+
     function switchTab(name) {
       document.querySelectorAll('.tab-btn').forEach(b =>
         b.classList.toggle('active', b.dataset.tab === name));
       document.querySelectorAll('.tab-pane').forEach(p =>
         p.classList.toggle('active', p.id === 'tab-' + name));
       try { localStorage.setItem('active_tab', name); } catch (_) {}
+      if (name === 'modbus') startMbmPoll(); else stopMbmPoll();
     }
 
     (function initTabs() {
@@ -503,6 +661,8 @@
         document.getElementById('tz').value            = cfg.tz ?? '';
         const mb = cfg.modbus ?? {};
         document.getElementById('mb_enable').checked     = !!mb.enable;
+        document.getElementById('mb_role').value         = mb.rs485_role === 'master' ? 'master' : 'slave';
+        document.getElementById('mb_tout').value         = mb.rs485_tout_ms ?? 1000;
         document.getElementById('mb_address').value      = mb.address ?? 1;
         document.getElementById('mb_baudrate').value     = String(mb.baudrate ?? 9600);
         document.getElementById('mb_tcp_server').checked = !!mb.tcp_server;
@@ -511,6 +671,8 @@
           !mb.enable ? 'Modbus is off.' :
           mb.running ? 'Modbus is running.' :
           'Modbus is on, and starts once the device is commissioned in Matter (or after a reboot).';
+        updateMbRole();
+        renderMbm(cfg.mbm);
         buildPads(cfg);
         buildIoPanel(cfg);
         loadTime();
@@ -567,8 +729,10 @@
           baudrate:   Number(document.getElementById('mb_baudrate').value),
           tcp_server: document.getElementById('mb_tcp_server').checked,
           tcp_uid:    Number(document.getElementById('mb_tcp_uid').value),
-          rs485_role: 'slave',
+          rs485_role: document.getElementById('mb_role').value,
+          rs485_tout_ms: Number(document.getElementById('mb_tout').value),
         };
+        cfg.mbm = collectMbm();
         const r = await apiFetch('/api/config', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -579,7 +743,7 @@
         if (res.status === 'ok') {
           status.className = 'ok';
           status.textContent = res.reboot_required
-            ? 'Saved. Reboot to apply (a pad mode or Modbus changed).'
+            ? 'Saved. Reboot to apply (a pad mode, Modbus or a Matter sensor changed).'
             : 'Saved.';
           load();
         } else {

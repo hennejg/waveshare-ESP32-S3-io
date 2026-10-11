@@ -14,11 +14,11 @@ while the HTTP task replaced it with an unsynchronised memcpy.
   make -C test/host master
 """
 import pathlib
-from cutter import Source
+from cutter import Source, kconfig_default
 
 ROOT   = pathlib.Path(__file__).resolve().parents[2]
-src    = Source(ROOT / "apps/full/main/mb_tcp_master.c")
-budget = Source(ROOT / "apps/full/main/net_budget.h")
+src    = Source(ROOT / "components/modbus/mb_tcp_master.c")
+app    = Source(ROOT / "apps/full/main/main.c")
 
 
 HARNESS = r'''
@@ -103,6 +103,10 @@ static int app_mqtt_publish(const char *t, const char *p, int len, int qos, bool
 static void scripting_on_mqtt_message(const char *t, size_t tl, const char *d, size_t dl)
 { (void)t; (void)tl; (void)d; (void)dl; }
 
+/* The application's end, as the full firmware hands it to the poll table. */
+typedef void (*mb_tcp_master_sink_t)(uint8_t index, const mbm_poll_t *e, double value);
+static mb_tcp_master_sink_t s_sink;
+
 /* --- cut from mb_tcp_master.c ------------------------------------------ */
 __CUT__
 /* ----------------------------------------------------------------------- */
@@ -131,6 +135,7 @@ static void http_saves_new_entry(void)
 int main(void)
 {
     printf("Konfigurationsuebergabe des Modbus-TCP-Masters\n");
+    s_sink = on_modbus_value;
 
     /* 1. A save that lands in the middle of a poll must not reach that poll.
           The previous design read the shared table directly, and a copy
@@ -242,7 +247,6 @@ int main(void)
 
 cuts = "".join(src.func(sig) for sig in (
     "static bool read_value(const mbm_poll_t *e, double *value, char *err, size_t err_len)",
-    "static void publish(const mbm_poll_t *e, double value)",
     "static void poll_entry(const mbm_poll_t *e, entry_state_t *st)",
     "static void apply_staged_config(void)",
     "static void stage_config(void)",
@@ -251,8 +255,11 @@ cuts = "".join(src.func(sig) for sig in (
 # explains them; take them with their explanation.
 decl = src.span("static mbm_poll_t    s_active", "static volatile bool s_reload_pending;")
 
+cuts = app.func("static void on_modbus_value(uint8_t index, const mbm_poll_t *e, double value)") + cuts
+
 out = pathlib.Path(__file__).with_name("test_mb_master.c")
-defines = (budget.defines("NET_SOCK_MB_MASTER") +
+defines = ("#define CONFIG_MB_TCP_MASTER 1\n" +
+           kconfig_default("components/modbus/Kconfig", "MB_TCP_MASTER_CONNS") +
            src.defines("CONN_CACHE", "BACKOFF_FIRST_MS", "BACKOFF_MAX_MS"))
 out.write_text(HARNESS.replace("__DEFINES__", defines)
                       .replace("__TYPES__", src.type("} rd_result_t;") +

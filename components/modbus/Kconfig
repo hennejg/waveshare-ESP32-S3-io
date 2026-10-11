@@ -1,13 +1,40 @@
 menu "Modbus (board)"
 
 config MB_RS485_MASTER
-    bool "RS-485 master and Modbus TCP gateway"
+    bool "RS-485 master"
     default y
     help
-        Lets the board drive the RS-485 segment as its Modbus master: for the
-        TCP-to-RTU gateway and the RS-485 rows of the poll table. Without it
-        the board is only ever an RTU slave on RS-485; a configuration that
-        says "master" (stored by the other firmware) runs as slave.
+        Lets the board drive the RS-485 segment as its Modbus master, for the
+        RS-485 rows of the poll table and, with MB_GATEWAY, for the Modbus
+        TCP gateway. Without it the board is only ever an RTU slave on
+        RS-485; a configuration that says "master" (stored by the other
+        firmware) runs as slave.
+
+config MB_GATEWAY
+    bool "Modbus TCP to RS-485 gateway"
+    depends on MB_RS485_MASTER
+    default y
+    help
+        Forwards Modbus TCP requests for other unit IDs to the devices on the
+        RS-485 segment. Without it a stored "gateway" setting is ignored and
+        the master serves the poll table only.
+
+config MB_TCP_MASTER
+    bool "Poll table rows on the network (Modbus TCP master)"
+    default y
+    help
+        Lets the poll table read devices over Modbus TCP as well as on
+        RS-485. Without it network rows are refused and only RS-485 rows are
+        read.
+
+config MB_TCP_MASTER_CONNS
+    int "Connections kept open to polled network devices"
+    depends on MB_TCP_MASTER
+    range 1 8
+    default 3
+    help
+        Sockets the poll table keeps open between polls; the application's
+        net_budget.h adds them up against CONFIG_LWIP_MAX_SOCKETS.
 
 config MB_TCP_MAX_CONN
     int "Modbus TCP clients served at once"

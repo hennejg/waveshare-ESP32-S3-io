@@ -14,6 +14,7 @@
  */
 
 #include "matter.h"
+#include "matter_mbm.h"
 
 extern "C" {
 #include "dout.h"
@@ -476,6 +477,9 @@ esp_err_t matter_init(void)
         s_aux_ep_mode[a] = m;
         ESP_LOGI(TAG, "AUX%d (%s) endpoint_id=%u", a + 1, aux_mode_name(m), s_aux_ep[a]);
     }
+
+    /* Values the poll table reads from devices on RS-485 */
+    if (matter_mbm_create(node) != ESP_OK) return ESP_FAIL;
 
     /* Start the Matter stack */
     esp_err_t err = esp_matter::start(event_cb);

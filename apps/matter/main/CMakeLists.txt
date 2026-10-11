@@ -1,5 +1,5 @@
 set(SRCS
-    "main.c" "matter.cpp" "web_server.c"
+    "main.c" "matter.cpp" "matter_mbm.cpp" "mbm_value.c" "web_server.c"
 )
 
 idf_component_register(

@@ -13,6 +13,7 @@
 void scripting_on_time_sync(void);
 #endif
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -596,3 +597,204 @@ esp_err_t web_aux_output(httpd_req_t *req, uint8_t a, const cJSON *root)
     return ESP_OK;
 }
 #endif
+
+/* --------------------------------------------------------- configuration fields */
+
+/* api_config_post() takes a field that is sent only when it is valid, and
+   refuses the whole save otherwise. A value out of range or of the wrong
+   type used to be skipped while the page said "Saved": register 70000 made
+   the row poll register 0, unit 300 polled unit 1. A field that is missing,
+   or null -- what the page sends for an empty number box -- leaves the
+   stored value. The first bad field is kept in *bad for the 400. */
+void web_cfg_bad(web_cfg_err_t *bad, const char *where, const char *key)
+{
+    if (bad && !bad->field[0]) snprintf(bad->field, sizeof(bad->field), "%s%s", where, key);
+}
+
+bool web_cfg_uint(const cJSON *obj, const char *where, const char *key,
+                  uint32_t lo, uint32_t hi, uint32_t *out, web_cfg_err_t *bad)
+{
+    const cJSON *v = cJSON_GetObjectItem(obj, key);
+    if (!v || cJSON_IsNull(v)) return false;
+    if (web_json_uint(v, lo, hi, out)) return true;
+    web_cfg_bad(bad, where, key);
+    return false;
+}
+
+/* A string is taken whole or not at all. strlcpy() cut an over-long one
+   short -- a different name, and when the cut fell inside a character, an
+   MQTT topic that is not UTF-8, over which the broker closes the
+   connection, again on every reconnect. The page's maxlength counts
+   characters; the limit here is bytes. */
+bool web_cfg_str(const cJSON *obj, const char *where, const char *key,
+                 char *dst, size_t cap, web_cfg_err_t *bad)
+{
+    const cJSON *v = cJSON_GetObjectItem(obj, key);
+    if (!v || cJSON_IsNull(v)) return false;
+    size_t len = cJSON_IsString(v) ? strlen(v->valuestring) : 0;
+    if (!cJSON_IsString(v) || len >= cap || !app_config_utf8_ok(v->valuestring)) {
+        web_cfg_bad(bad, where, key);
+        return false;
+    }
+    memcpy(dst, v->valuestring, len + 1);
+    return true;
+}
+
+/* ------------------------------------------------------------------ poll table */
+
+/* One table rather than two chains: they are exact inverses, and a type added
+   to one of them alone would read back as something it is not. u16 is the
+   default on both sides and so needs no row. */
+static const struct { const char *name; uint8_t type; } k_mbm_types[] = {
+    { "s16", MBM_VAL_S16 },
+    { "u32", MBM_VAL_U32 },
+    { "s32", MBM_VAL_S32 },
+    { "f32", MBM_VAL_F32 },
+};
+
+static const char *mbm_type_name(uint8_t t)
+{
+    for (size_t i = 0; i < sizeof(k_mbm_types) / sizeof(k_mbm_types[0]); i++)
+        if (k_mbm_types[i].type == t) return k_mbm_types[i].name;
+    return "u16";
+}
+
+static void mbm_type_value(const char *s, uint8_t *out)
+{
+    for (size_t i = 0; i < sizeof(k_mbm_types) / sizeof(k_mbm_types[0]); i++)
+        if (!strcmp(s, k_mbm_types[i].name)) { *out = k_mbm_types[i].type; return; }
+    *out = MBM_VAL_U16;
+}
+
+/* Indexed by MBM_MATTER_*. */
+static const char *const k_mbm_matter[MBM_MATTER_MAX + 1] = {
+    "none", "temperature", "humidity", "pressure", "flow", "power", "energy",
+};
+
+void web_mbm_config_json(cJSON *root, const app_config_t *cfg)
+{
+    cJSON *mbm = cJSON_AddArrayToObject(root, "mbm");
+    for (int i = 0; i < APP_CFG_MBM_COUNT; i++) {
+        const mbm_poll_t *e = &cfg->mbm[i];
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddBoolToObject  (o, "enable",      e->enable);
+        cJSON_AddStringToObject(o, "name",        e->name);
+        cJSON_AddStringToObject(o, "host",        e->host);
+        cJSON_AddNumberToObject(o, "port",        e->port);
+        cJSON_AddNumberToObject(o, "unit_id",     e->unit_id);
+        cJSON_AddStringToObject(o, "fc",          e->fc == 4 ? "input" : "holding");
+        cJSON_AddNumberToObject(o, "reg",         e->reg);
+        cJSON_AddStringToObject(o, "type",        mbm_type_name(e->type));
+        cJSON_AddBoolToObject  (o, "word_swap",   e->word_swap);
+        cJSON_AddStringToObject(o, "transport",   e->transport == MBM_TRANSPORT_RTU ? "rtu" : "tcp");
+        /* Reported as stored. A stored 0 cannot occur: an enabled row with it
+           is refused on the way in, a disabled one stores 1, and
+           app_config_init() turns one from an older blob into 1. */
+        cJSON_AddNumberToObject(o, "scale",       e->scale);
+        cJSON_AddNumberToObject(o, "interval_ms", e->interval_ms);
+        cJSON_AddStringToObject(o, "matter",      k_mbm_matter[e->matter <= MBM_MATTER_MAX ? e->matter : 0]);
+        cJSON_AddItemToArray(mbm, o);
+    }
+}
+
+const char *web_mbm_config_parse(const cJSON *mbm_j, app_config_t *cfg,
+                                 bool network_rows, web_cfg_err_t *bad)
+{
+    /* The array replaces the table wholesale rather than being merged into
+       it: a partial update would leave an entry the user deleted in the
+       UI still being polled. Entries past the end are cleared. */
+    memset(cfg->mbm, 0, sizeof(cfg->mbm));
+    int n = cJSON_GetArraySize(mbm_j);
+    if (n > APP_CFG_MBM_COUNT) n = APP_CFG_MBM_COUNT;
+
+    for (int i = 0; i < n; i++) {
+        cJSON *o = cJSON_GetArrayItem(mbm_j, i);
+        if (!cJSON_IsObject(o)) continue;
+        mbm_poll_t *e = &cfg->mbm[i];
+        cJSON *v;
+        uint32_t u;
+        char w[12];
+        snprintf(w, sizeof(w), "mbm.%d.", i + 1);
+
+        e->port = MBM_PORT_DEFAULT; e->unit_id = MBM_UNIT_ID_DEFAULT;
+        e->fc = MBM_FC_DEFAULT; e->scale = 1.0f; e->interval_ms = MBM_INTERVAL_DEFAULT_MS;
+
+        /* A script writing "enable": 1 rather than true would otherwise
+           store a silently disabled entry and get 200 back. */
+        if ((v = cJSON_GetObjectItem(o, "enable"))) {
+            if (cJSON_IsBool(v))        e->enable = cJSON_IsTrue(v) ? 1 : 0;
+            else if (cJSON_IsNumber(v)) e->enable = v->valuedouble != 0 ? 1 : 0;
+        }
+        /* Only a row that is polled is held to its ranges: what a
+           disabled row's hidden boxes hold must not block the save. */
+        web_cfg_err_t *rb = e->enable ? bad : NULL;
+        web_cfg_str(o, w, "name", e->name, sizeof(e->name), rb);
+        web_cfg_str(o, w, "host", e->host, sizeof(e->host), rb);
+        if (web_cfg_uint(o, w, "port", 1, 65535, &u, rb))
+            e->port = (uint16_t)u;
+        if (web_cfg_uint(o, w, "unit_id", 1, 247, &u, rb))
+            e->unit_id = (uint8_t)u;
+        if ((v = cJSON_GetObjectItem(o, "fc")) && cJSON_IsString(v))
+            e->fc = strcmp(v->valuestring, "input") == 0 ? 4 : 3;
+        if (web_cfg_uint(o, w, "reg", 0, 65535, &u, rb))
+            e->reg = (uint16_t)u;
+        if ((v = cJSON_GetObjectItem(o, "type")) && cJSON_IsString(v))
+            mbm_type_value(v->valuestring, &e->type);
+        if ((v = cJSON_GetObjectItem(o, "word_swap")) && cJSON_IsBool(v))
+            e->word_swap = cJSON_IsTrue(v) ? 1 : 0;
+        if ((v = cJSON_GetObjectItem(o, "transport")) && cJSON_IsString(v))
+            e->transport = strcmp(v->valuestring, "rtu") == 0 ? MBM_TRANSPORT_RTU : MBM_TRANSPORT_TCP;
+        if ((v = cJSON_GetObjectItem(o, "scale")) && cJSON_IsNumber(v)) {
+            /* The only field with no natural range, and the one that can
+               carry an infinity straight through to MQTT: cJSON parses
+               1e400 as inf, cJSON_IsNumber accepts it, and the published
+               value becomes the literal "inf". Zero is refused too --
+               it silently turns every reading into nothing. */
+            /* Checked as stored: 1e-50 is a non-zero double and a zero
+               float. */
+            double sc  = v->valuedouble;
+            float  scf = (float)sc;
+            if (isfinite(sc) && sc > -1e9 && sc < 1e9 && scf != 0.0f)
+                e->scale = scf;
+            else if (e->enable)
+                e->scale = 0.0f;   /* flagged below */
+            else
+                /* Nothing reads a disabled row, so nothing to refuse --
+                   but storing 0 would hand it out on GET, and enabling
+                   the row as it stands would then be refused. */
+                e->scale = 1.0f;
+        }
+        if (web_cfg_uint(o, w, "interval_ms", MBM_INTERVAL_MIN_MS, MBM_INTERVAL_MAX_MS, &u, rb))
+            e->interval_ms = u;
+        /* Unknown text is a bad field rather than "none": a row meant for a
+           sensor endpoint would otherwise quietly get none. */
+        if ((v = cJSON_GetObjectItem(o, "matter")) && !cJSON_IsNull(v)) {
+            int k = -1;
+            if (cJSON_IsString(v))
+                for (int j = 0; j <= MBM_MATTER_MAX; j++)
+                    if (!strcmp(v->valuestring, k_mbm_matter[j])) { k = j; break; }
+            if (k >= 0) e->matter = (uint8_t)k;
+            else        web_cfg_bad(rb, w, "matter");
+        }
+
+        /* A name that is empty or carries MQTT syntax would make a topic
+           nothing can subscribe to, so the entry is refused rather than
+           quietly polled into nowhere. */
+        if (e->enable) {
+            if (!e->name[0])                  return "a Modbus master entry needs a name";
+            if (strpbrk(e->name, "#+/"))      return "a Modbus master name must not contain '#', '+' or '/'";
+            if (e->transport != MBM_TRANSPORT_RTU && !network_rows)
+                                              return "this firmware reads devices on RS-485 only";
+            if (!e->host[0] && e->transport != MBM_TRANSPORT_RTU)
+                                              return "a Modbus master entry needs a host";
+            if (e->scale == 0.0f)             return "a Modbus master scale must be a non-zero finite number";
+            /* Two entries of the same name would publish to one topic
+               and feed one rule key, last poll winning at random.
+               app_config_io_names_ok() does the same for the I/O names. */
+            for (int j = 0; j < i; j++)
+                if (cfg->mbm[j].enable && !strcmp(cfg->mbm[j].name, e->name))
+                    return "two Modbus master entries have the same name";
+        }
+    }
+    return NULL;
+}
