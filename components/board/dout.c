@@ -20,6 +20,7 @@ bool app_mqtt_is_connected(void);
 #include "i2c_bus.h"
 
 #define TAG          "dout"
+#define BULK_PAYLOAD_MAX 256   /* output/set payloads at or above this are ignored */
 #define NUM_DO       8
 #define TCA9554_ADDR 0x20
 
@@ -339,13 +340,10 @@ void dout_on_mqtt_message(const char *topic, size_t tlen,
     static const char BULK_TOPIC[] = "output/set";
     const size_t bs = sizeof(BULK_TOPIC) - 1;
     if (tlen == bs && memcmp(topic, BULK_TOPIC, bs) == 0) {
-        char buf[256];
-        if (dlen == 0 || dlen >= sizeof(buf)) return;
-        memcpy(buf, data, dlen);
-        buf[dlen] = '\0';
+        if (dlen == 0 || dlen >= BULK_PAYLOAD_MAX) return;
 
-        if (buf[0] == '[') {
-            cJSON *arr = cJSON_Parse(buf);
+        if (data[0] == '[') {
+            cJSON *arr = cJSON_ParseWithLength(data, dlen);   /* in place, no stack copy */
             if (!cJSON_IsArray(arr)) {
                 ESP_LOGW(TAG, "output/set: invalid JSON array");
                 cJSON_Delete(arr);

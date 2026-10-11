@@ -40,6 +40,7 @@ bool scripting_on_analog(uint8_t pad, int mv);
 #endif
 
 #define TAG "aux"
+#define PWM_PAYLOAD_MAX 96   /* aux/N/pwm/set payloads at or above this are refused */
 
 _Static_assert(sizeof(((app_config_t *)0)->aux_mode) == AUX_PAD_COUNT, "aux_mode[] is not one per pad");
 _Static_assert(sizeof(((app_config_t *)0)->aux_pwm) / sizeof(((app_config_t *)0)->aux_pwm[0]) == AUX_PAD_COUNT,
@@ -788,17 +789,14 @@ void aux_io_on_mqtt_message(const char *topic, size_t tlen, const char *data, si
         return;
     uint8_t a = (uint8_t)(topic[4] - '1');
 
-    char buf[96];
-    if (dlen >= sizeof(buf)) { ESP_LOGW(TAG, "aux/%u/pwm/set: payload too long", a + 1); return; }
-    memcpy(buf, data, dlen);
-    buf[dlen] = '\0';
+    if (dlen >= PWM_PAYLOAD_MAX) { ESP_LOGW(TAG, "aux/%u/pwm/set: payload too long", a + 1); return; }
 
     /* A bare number is a duty cycle; an object may carry duty, freq or both.
        Whatever is present has to be a number in range -- a field that is
        there but wrong is refused, never read as "keep". */
     bool    has_duty = false, has_freq = false, bad = false;
     double  duty = 0, freq = 0;
-    cJSON  *j = cJSON_Parse(buf);
+    cJSON  *j = cJSON_ParseWithLength(data, dlen);   /* in place, no stack copy */
     if (cJSON_IsNumber(j)) {
         has_duty = true; duty = j->valuedouble;
     } else if (cJSON_IsObject(j)) {

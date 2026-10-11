@@ -11,8 +11,8 @@ PORT ?= 15020
 
 # Every target below; GEN are the ones a gen_<name>_test.py writes as
 # test_<name>.c and builds into test_<name>.
-TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl
-GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl
+TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload
+GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload
 
 .PHONY: all clean $(TESTS)
 all: test_mb_pdu $(TESTS)
@@ -464,3 +464,11 @@ test_portalurl: gen_portalurl_test.py ../../components/esp32-wifi-bootstrap/src/
 
 clean:
 	rm -rf $(GEN:%=test_%) $(GEN:%=test_%.c) test_resume_old_dsl.js test_uiauth.js test_qjs_interrupt test_mb_pdu test_mb_client test_mb_poller test_mb_poller.c test_mb_master test_mb_master.c test_mb_dns test_mb_dns.c test_qjs_cron qjs-obj mbt-obj *.dSYM
+
+# MQTT LED and buzzer payloads parsed in place, cut out of led.c and buzzer.c.
+payload: test_payload
+	./test_payload
+
+test_payload: gen_payload_test.py qjs-obj/cJSON.o ../../components/board/led.c ../../components/board/buzzer.c
+	python3 gen_payload_test.py
+	$(CC) $(CFLAGS) -I$(CJSON) -Wno-unused-function -Wno-unused-parameter test_payload.c qjs-obj/cJSON.o -lm -o $@

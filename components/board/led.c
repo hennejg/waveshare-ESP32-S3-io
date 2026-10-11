@@ -19,6 +19,7 @@ bool app_mqtt_is_connected(void);
 #include "esp_log.h"
 
 #define TAG         "led"
+#define LED_PAYLOAD_MAX 1024   /* led/set payloads at or above this are ignored */
 #define LED_GPIO    GPIO_NUM_38
 #define SEQ_MAX     16
 #define DUR_MAX_MS  30000u
@@ -332,25 +333,26 @@ void led_on_mqtt_message(const char *topic, size_t tlen,
     const size_t sl = sizeof(TOPIC) - 1;
     if (tlen != sl || memcmp(topic, TOPIC, sl) != 0) return;
 
-    char buf[1024];
-    if (dlen == 0 || dlen >= sizeof(buf)) return;
-    memcpy(buf, data, dlen);
-    buf[dlen] = '\0';
+    /* Parsed in place -- cJSON takes the length, so the payload needs no
+       NUL-terminated copy on the MQTT task's stack. */
+    if (dlen == 0 || dlen >= LED_PAYLOAD_MAX) return;
 
     /* "#RRGGBB" — instant set, no queue */
-    if (buf[0] == '#') {
+    if (data[0] == '#') {
+        char hex[8];
         uint8_t r, g, b;
-        if (parse_hex(buf, &r, &g, &b)) {
+        if (dlen >= 7) { memcpy(hex, data, 7); hex[7] = '\0'; }
+        if (dlen >= 7 && parse_hex(hex, &r, &g, &b)) {
             hw_apply(r, g, b);
             if (app_mqtt_is_connected()) publish_color();
         } else {
-            ESP_LOGW(TAG, "Invalid colour: %s", buf);
+            ESP_LOGW(TAG, "Invalid colour: %.*s", (int)dlen, data);
         }
         return;
     }
 
     /* {"color":"#RRGGBB","duration":N} or [{...},{...}] — goes through task */
-    cJSON *root = cJSON_Parse(buf);
+    cJSON *root = cJSON_ParseWithLength(data, dlen);
     if (!root) { ESP_LOGW(TAG, "JSON parse failed"); return; }
 
     led_seq_t seq = { .count = 0 };

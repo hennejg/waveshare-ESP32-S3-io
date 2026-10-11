@@ -15,6 +15,7 @@ int app_mqtt_subscribe(const char *topic, int qos);
 #include "esp_log.h"
 
 #define TAG        "buzzer"
+#define BUZZER_PAYLOAD_MAX 1024   /* buzzer/beep payloads at or above this are ignored */
 #define GPIO_BUZZER GPIO_NUM_46
 #define LEDC_MODE   LEDC_LOW_SPEED_MODE
 #define LEDC_TIMER  LEDC_TIMER_0
@@ -172,12 +173,10 @@ void buzzer_on_mqtt_message(const char *topic, size_t tlen,
     const size_t sl = sizeof(TOPIC) - 1;
     if (tlen != sl || memcmp(topic, TOPIC, sl) != 0) return;
 
-    char buf[1024];
-    if (dlen == 0 || dlen >= sizeof(buf)) return;
-    memcpy(buf, data, dlen);
-    buf[dlen] = '\0';
+    /* Parsed in place: cJSON takes the length, no copy on the MQTT task's stack. */
+    if (dlen == 0 || dlen >= BUZZER_PAYLOAD_MAX) return;
 
-    cJSON *root = cJSON_Parse(buf);
+    cJSON *root = cJSON_ParseWithLength(data, dlen);
     if (!root) { ESP_LOGW(TAG, "JSON parse failed"); return; }
 
     bseq_t seq = { .count = 0 };

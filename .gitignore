@@ -111,3 +111,5 @@ dependencies.lock
 /test/host/test_mqttdrop.c
 /test/host/test_portalurl
 /test/host/test_portalurl.c
+/test/host/test_payload
+/test/host/test_payload.c

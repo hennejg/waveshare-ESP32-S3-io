@@ -205,6 +205,7 @@ function _reset_rules() {
     _cancel_all_timers();
     _rules = [];
     _cronTriggers = [];        // timers already cancelled above; drop the old trigger registry
+    _mqttIndex = Object.create(null);   // topic index of the old rules
     _activityWatchdogs = {};   // drop modbus()/can() health watchdogs from the old rule set
     _watchOutputs = false;
     _passes = [];              // a cut-short pass of the old rules has nothing left to visit
@@ -584,8 +585,9 @@ function _cronNext(f, fromMs) {
 // Clock validity gates cron. Until the wall-clock is real (host _time_valid() — set by an
 // RTC seed at boot or the first SNTP sync) cron stays unarmed, so "0 7 * * *" can't fire
 // ~7 h after boot off a 1970 clock. Without the host binding (simulator, tests) the clock
-// is assumed real, so cron behaves as before. All cron triggers are tracked so the host
-// can re-arm them when the clock jumps from boot-relative to real (see _on_time_sync).
+// is assumed real, so cron behaves as before. Cron triggers of registered rules are
+// tracked so the host can re-arm them when the clock jumps from boot-relative to real
+// (see _on_time_sync); a cron() no rule uses is never armed and holds no timer slot.
 var _clockValid   = (typeof _time_valid === 'function') ? !!_time_valid() : true;
 var _cronTriggers = [];
 
@@ -595,10 +597,10 @@ function CronCondition(expr) {
     this._factKey = 'time:' + (++_timeSeq);
     this._armed    = false;
     this._timer    = null;
-    _cronTriggers.push(this);
 }
 CronCondition.prototype._check = function() { return this._armed; };
 CronCondition.prototype._arm = function() {
+    if (_cronTriggers.indexOf(this) < 0) _cronTriggers.push(this);   // first rule using it
     if (this._timer != null) return;       // already armed (shared across rules)
     if (!_clockValid) return;              // suppressed until time is valid; _on_time_sync arms
     var self = this;
@@ -872,6 +874,7 @@ RuleBuilder.prototype.then = function(fn) {
         };
         this._rule.action = function() { _run_steps(ref, 0); };
         _rules.push(this._rule);
+        _indexMqtt(this._conditions);
         // Arm any time triggers (every/cron) now that the rule is live. Idempotent,
         // so a trigger shared across rules is armed once; _reset_rules cancels them.
         for (var ci = 0; ci < this._conditions.length; ci++) {
@@ -912,24 +915,35 @@ function _run_steps(r, idx) {
 
 // ── Internal event handlers — called from C ──────────────────────────────────
 
+// MQTT conditions of the registered rules by topic, each once even when rules
+// share it -- a shared stale() was fed (its timer re-created) once per rule.
+// A null-prototype map: a topic like "constructor" is no inherited key.
+var _mqttIndex = Object.create(null);   // topic → { conds: [MqttCondition], stale: [StaleCondition] }
+function _indexMqtt(conds) {
+    for (var j = 0; j < conds.length; j++) {
+        var c = conds[j], list;
+        if (c instanceof MqttCondition) list = 'conds';
+        else if (c instanceof StaleCondition) list = 'stale';
+        else continue;
+        var e = _mqttIndex[c.topic] || (_mqttIndex[c.topic] = { conds: [], stale: [] });
+        if (e[list].indexOf(c) < 0) e[list].push(c);
+    }
+}
+
 function _on_mqtt(topic, payload) {
     _retry_arms();                   // slots may have freed since (a reload, a clear)
     _resetCascade();                 // root event — fresh cascade budget (stale feeds may emit)
-    var armed = [], feed = [];
-    for (var i = 0; i < _rules.length; i++) {
-        var conds = _rules[i].conditions;
-        for (var j = 0; j < conds.length; j++) {
-            var c = conds[j];
-            if (c instanceof MqttCondition && c.topic === topic) {
-                c.value = payload;
-                c._seen = true;
-                if (c._once) { c._armed = true; armed.push(c); }
-            } else if (c instanceof StaleCondition && c.topic === topic) {
-                feed.push(c);
-            }
+    var e = _mqttIndex[topic];
+    var armed = [];
+    if (e) {
+        for (var i = 0; i < e.conds.length; i++) {
+            var c = e.conds[i];
+            c.value = payload;
+            c._seen = true;
+            if (c._once) { c._armed = true; armed.push(c); }
         }
+        for (var fi = 0; fi < e.stale.length; fi++) e.stale[fi]._feed();   // re-arm stale watchdogs
     }
-    for (var fi = 0; fi < feed.length; fi++) feed[fi]._feed();   // re-arm stale watchdogs
     _fire_matching('mqtt:' + topic);
     // Disarm edge conditions: they match only during this message's pass, so a
     // later _on_input → _fire_matching won't re-fire the rule.
