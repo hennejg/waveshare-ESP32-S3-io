@@ -24,7 +24,9 @@ from cutter import Source
 
 src = Source.at("apps/full/main/can_server.c")
 new = "static void can_tick(TickType_t now)" in src.text
-cuts = (src.defines("HB_PERIOD_MS", "CAN_MODE_BASIC", "CAN_MODE_N2K", "TX_POLL_MS",
+# The N2K heartbeat has its own 60 s period since the Basic one stayed at 1 s.
+hb = ("HB_PERIOD_MS", "N2K_HB_PERIOD_MS") if "#define N2K_HB_PERIOD_MS" in src.text else ("HB_PERIOD_MS",)
+cuts = (src.defines(*hb, "CAN_MODE_BASIC", "CAN_MODE_N2K", "TX_POLL_MS",
                     "N2K_PGN_ADDRESS_CLAIM", "N2K_PGN_ISO_REQUEST", "N2K_PGN_HEARTBEAT", "N2K_PGN_SW_STATUS",
                     "N2K_PGN_SW_CONTROL", "N2K_PGN_PROPRIETARY", "N2K_MFR_CODE", "N2K_ADDR_NULL",
                     "N2K_ADDR_GLOBAL", "N2K_DI_INSTANCE", "N2K_DO_INSTANCE")

@@ -107,7 +107,7 @@ from the null address 254), answers address-claim requests the same way, and sen
 |--------|-----------|---------------------------------------------------------------------|
 | 60928  | TX        | ISO Address Claim — on startup and in response to ISO Request       |
 | 59904  | RX        | ISO Request — device responds with claim or bank status             |
-| 126993 | TX        | Heartbeat — single frame, 1 s interval (field 1 = 1000 ms)          |
+| 126993 | TX        | Heartbeat — single frame, 60 s interval (field 1 = 60000 ms)        |
 | 127501 | TX        | Binary Switch Bank Status — DI bank (inst. 0) and DO bank (inst. 1) |
 | 127502 | RX        | Switch Bank Control — commands DO bank (inst. 1)                    |
 | 126720 | RX + TX   | Manufacturer Proprietary Fast-Packet — LED and buzzer               |

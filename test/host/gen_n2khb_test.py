@@ -8,7 +8,8 @@ What it pins down, found by a review and checked against canboat
 (pgn-generated-data.h: 126993 Heartbeat, PACKET_SINGLE, field 1
 DURATION_UFIX16_MS): the heartbeat is one 8-byte frame whose first field is
 the transmit interval in milliseconds. It went out as a 9-byte fast-packet
-with the interval in 0.01 s.
+with the interval in 0.01 s. It also went out every second; the NMEA 2000
+output period is 60 s (60000 ms), and the interval field says so.
 OLD=1 cuts can_server.c from git (OLDREV, default HEAD).
 
   make -C test/host n2khb
@@ -18,7 +19,9 @@ from cutter import Source
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 src  = Source.at("apps/full/main/can_server.c")
-cuts  = src.defines("HB_PERIOD_MS", "N2K_PGN_HEARTBEAT", "N2K_ADDR_GLOBAL")
+# Before the 60 s period the N2K heartbeat used the Basic-mode constant.
+period = "N2K_HB_PERIOD_MS" if "#define N2K_HB_PERIOD_MS" in src.text else "HB_PERIOD_MS"
+cuts  = src.defines(period, "N2K_PGN_HEARTBEAT", "N2K_ADDR_GLOBAL")
 cuts += src.func("static uint32_t n2k_make_id(uint32_t pgn, uint8_t pri, uint8_t src, uint8_t dst)")
 cuts += src.func("static void n2k_tx_heartbeat(void)")
 
@@ -50,7 +53,7 @@ int main(void)
         uint32_t pgn = (last_id >> 8) & 0x3FFFF, pri = (last_id >> 26) & 7, src = last_id & 0xFF;
         unsigned ms = last[0] | last[1] << 8;
         if (pgn != 126993 || pri != 7 || src != s_addr) { failures++; printf("  FEHLER: PGN %u Prio %u Quelle %u\n", pgn, pri, src); }
-        if (ms != HB_PERIOD_MS) { failures++; printf("  FEHLER: Intervall-Feld %u statt %u ms\n", ms, HB_PERIOD_MS); }
+        if (ms != 60000) { failures++; printf("  FEHLER: Intervall-Feld %u statt 60000 ms\n", ms); }
         if (last[2] != 1) { failures++; printf("  FEHLER: Sequenzzaehler %u statt 1\n", last[2]); }
         if (!failures) printf("  ein 8-Byte-Frame, PGN %u, Prio %u, Intervall %u ms, Sequenz zaehlt\n", pgn, pri, ms);
     }

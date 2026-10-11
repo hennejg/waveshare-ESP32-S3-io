@@ -28,7 +28,10 @@
 /* Do not repeat the bus-off warning more often than this. A node alone on the
    bus cycles through bus-off indefinitely; the log must stay readable. */
 #define BUS_OFF_LOG_MS 10000
-#define HB_PERIOD_MS 1000
+#define HB_PERIOD_MS 1000        /* Basic mode heartbeat */
+/* PGN 126993 goes out every 60 s, the NMEA 2000 output period (vendor PGN
+   references give 60000 ms); every 1 s was 60 times that. */
+#define N2K_HB_PERIOD_MS 60000u
 #define RX_QUEUE_DEPTH 32
 
 #define CAN_MODE_BASIC  1
@@ -353,7 +356,7 @@ static void n2k_send_address_claim(uint8_t addr)
 static void n2k_tx_heartbeat(void)
 {
     uint8_t payload[8];
-    uint16_t interval_ms = HB_PERIOD_MS;
+    uint16_t interval_ms = N2K_HB_PERIOD_MS;
     payload[0] = interval_ms & 0xFF;
     payload[1] = (interval_ms >> 8) & 0xFF;
     payload[2] = s_hb_seq;
@@ -610,7 +613,7 @@ static void can_tick(TickType_t now)
         }
 
         if (s_ac_state == AC_ACTIVE) {
-            if ((now - last_hb) >= pdMS_TO_TICKS(HB_PERIOD_MS)) {
+            if ((now - last_hb) >= pdMS_TO_TICKS(N2K_HB_PERIOD_MS)) {
                 n2k_tx_heartbeat(); last_hb = now;
             }
             if (di != last_di || due) { n2k_tx_di_bank(); last_di = di; }
