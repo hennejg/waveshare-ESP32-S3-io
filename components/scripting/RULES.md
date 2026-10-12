@@ -515,7 +515,7 @@ goes away. These primitives detect that absence and let you gate fallback behavi
 | `mqtt(topic).stale(ms)` | a watchdog **auto-fed** by messages on `topic` — matches when no message for `ms` |
 | `mqttConnected()` / `mqttDown()` | the broker connection state (fed by the firmware) |
 | `modbus(ms)` | upstream **MODBUS** command health: a watchdog auto-fed by each inbound coil/holding-register write |
-| `can(ms)` | upstream **CAN/NMEA2000** command health: a watchdog auto-fed by each inbound control write |
+| `can(ms)` | upstream **CAN/NMEA2000** command health: a watchdog auto-fed by each control command carried out (an unknown opcode, a buzzer at 0 Hz or an incomplete message does not feed it) |
 
 A watchdog **starts alive with a grace period** (the timeout is armed when a rule using
 it registers), so a healthy system has `ms` after boot to check in before fallback kicks

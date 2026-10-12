@@ -21,7 +21,8 @@ led = Source.at("components/board/led.c")
 buz = Source.at("components/board/buzzer.c")
 
 led_cut = (led.defines("DUR_MAX_MS") + led.type("} led_step_t;")
-           + led.func("static uint8_t hex_digit(char c)")
+           + led.func("static int hex_digit(char c)" if "static int hex_digit(char c)" in led.text
+                      else "static uint8_t hex_digit(char c)")
            + led.func("static bool parse_hex(const char *s, uint8_t *r, uint8_t *g, uint8_t *b)")
            + led.func("static bool parse_step(cJSON *obj, led_step_t *s)"))
 buz_cut = (buz.defines("FREQ_MIN", "FREQ_MAX", "DUR_MIN_MS", "DUR_MAX_MS") + buz.type("} bstep_t;")

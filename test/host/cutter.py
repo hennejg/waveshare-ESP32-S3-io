@@ -124,5 +124,7 @@ def json_exact_if_used(cut):
     and nothing for code from before it existed."""
     if "json_parse_exact(" not in cut:
         return ""
+    jx = Source.at("components/board/json_exact.c")
     return ("#include <string.h>\n"
-            + Source.at("components/board/json_exact.c").func("cJSON *json_parse_exact(const char *data, size_t n)"))
+            + (jx.func("static bool escapes_nul(const char *d, size_t n)") if "static bool escapes_nul(" in jx.text else "")
+            + jx.func("cJSON *json_parse_exact(const char *data, size_t n)"))

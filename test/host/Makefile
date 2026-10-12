@@ -12,8 +12,8 @@ PORT ?= 15020
 
 # Every target below; GEN are the ones a gen_<name>_test.py writes as
 # test_<name>.c and builds into test_<name>.
-TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel mbmmatter canmatter pwmlevel canfmt rulesubs nulbytes mqttowner
-GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel mbmmatter canmatter pwmlevel canfmt rulesubs nulbytes mqttowner
+TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel mbmmatter canmatter pwmlevel canfmt rulesubs nulbytes mqttowner ledinit
+GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel mbmmatter canmatter pwmlevel canfmt rulesubs nulbytes mqttowner ledinit
 
 .PHONY: all clean $(TESTS)
 all: test_mb_pdu $(TESTS)
@@ -302,7 +302,7 @@ test_pwmfail: gen_pwmfail_test.py ../../components/board/aux_io.c
 timeset: test_timeset
 	./test_timeset
 
-test_timeset: gen_timeset_test.py qjs-obj/cJSON.o $(MAIN)/web_server.c ../../components/board/web_common.c
+test_timeset: gen_timeset_test.py qjs-obj/cJSON.o $(MAIN)/web_server.c ../../components/board/web_common.c ../../components/board/json_exact.c
 	python3 gen_timeset_test.py
 	$(CC) $(CFLAGS) -I$(CJSON) -Wno-unused-function test_timeset.c qjs-obj/cJSON.o -o $@
 
@@ -310,14 +310,14 @@ test_timeset: gen_timeset_test.py qjs-obj/cJSON.o $(MAIN)/web_server.c ../../com
 cfgpost: test_cfgpost
 	./test_cfgpost
 
-test_cfgpost: gen_cfgpost_test.py qjs-obj/cJSON.o $(MAIN)/web_server.c ../../components/board/app_config.h ../../components/board/web_common.c
+test_cfgpost: gen_cfgpost_test.py qjs-obj/cJSON.o $(MAIN)/web_server.c ../../components/board/app_config.h ../../components/board/web_common.c ../../components/board/json_exact.c
 	python3 gen_cfgpost_test.py
 	$(CC) $(CFLAGS) -I$(CJSON) -I../../components/board -Istubs -Wno-unused-function test_cfgpost.c qjs-obj/cJSON.o -lm -o $@
 
 reseterr: test_reseterr
 	./test_reseterr
 
-test_reseterr: gen_reseterr_test.py qjs-obj/cJSON.o $(MAIN)/web_server.c
+test_reseterr: gen_reseterr_test.py qjs-obj/cJSON.o $(MAIN)/web_server.c ../../components/board/json_exact.c
 	python3 gen_reseterr_test.py
 	$(CC) $(CFLAGS) -I$(CJSON) -Wno-unused-function -Wno-unused-parameter test_reseterr.c qjs-obj/cJSON.o -o $@
 
@@ -470,7 +470,7 @@ clean:
 payload: test_payload
 	./test_payload
 
-test_payload: gen_payload_test.py qjs-obj/cJSON.o ../../components/board/led.c ../../components/board/buzzer.c
+test_payload: gen_payload_test.py qjs-obj/cJSON.o ../../components/board/led.c ../../components/board/buzzer.c ../../components/board/json_exact.c
 	python3 gen_payload_test.py
 	$(CC) $(CFLAGS) -I$(CJSON) -Wno-unused-function -Wno-unused-parameter test_payload.c qjs-obj/cJSON.o -lm -o $@
 
@@ -550,3 +550,12 @@ mqttowner: test_mqttowner
 test_mqttowner: gen_mqttowner_test.py $(MAIN)/app_mqtt.c $(MAIN)/app_mqtt.h
 	python3 gen_mqttowner_test.py
 	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter test_mqttowner.c -o $@
+
+# The RGB LED driver: start-up failures, instant colours against sequences,
+# the colour format -- led.c taken whole.
+ledinit: test_ledinit
+	./test_ledinit
+
+test_ledinit: gen_ledinit_test.py ../../components/board/led.c ../../components/board/json_exact.c qjs-obj/cJSON.o
+	python3 gen_ledinit_test.py
+	$(CC) $(CFLAGS) -I$(CJSON) -Wno-unused-function -Wno-unused-parameter -Wno-unused-variable -Wno-missing-field-initializers test_ledinit.c qjs-obj/cJSON.o -lm -o $@

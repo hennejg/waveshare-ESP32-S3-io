@@ -35,10 +35,19 @@ def limit(src, name, old):
 
 led_cut = (limit(led, "LED_PAYLOAD_MAX", 1024) + led.defines("SEQ_MAX", "DUR_MAX_MS")
            + led.type("} led_step_t;") + led.type("} led_seq_t;")
-           + led.func("static uint8_t hex_digit(char c)")
+           + led.func("static int hex_digit(char c)" if "static int hex_digit(char c)" in led.text
+                      else "static uint8_t hex_digit(char c)")
            + led.func("static bool parse_hex(const char *s, uint8_t *r, uint8_t *g, uint8_t *b)")
            + led.func("static bool parse_step(cJSON *obj, led_step_t *s)")
            + led.func("void led_on_mqtt_message("))
+if "static void io_instant(" in led.text:
+    # Since an instant colour ends a running sequence (ledinit tests that):
+    # the handler goes through io_instant() and the LED lock -- here the
+    # colour is applied straight away, as before.
+    led_cut = ("static int io_lock_obj; static void *s_io_lock = &io_lock_obj;\n"
+               "static volatile uint32_t s_gen; static void *s_led_task;\n"
+               "static void io_instant(uint8_t r, uint8_t g, uint8_t b) { hw_apply(r, g, b); }\n"
+               "static void xTaskNotifyGive(void *t) { (void)t; }\n") + led_cut
 buz_cut = (limit(buz, "BUZZER_PAYLOAD_MAX", 1024)
            + buz.defines("SEQ_MAX", "FREQ_MIN", "FREQ_MAX", "DUR_MIN_MS", "DUR_MAX_MS")
            + buz.type("} bstep_t;") + buz.type("} bseq_t;")

@@ -131,3 +131,5 @@ test/host/test_nulbytes
 test/host/test_nulbytes.c
 test/host/test_mqttowner
 test/host/test_mqttowner.c
+test/host/test_ledinit
+test/host/test_ledinit.c

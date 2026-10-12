@@ -57,7 +57,7 @@ static bool basic_send(uint16_t id, const uint8_t *d, uint8_t dlc)
 static bool basic_tx_di(uint8_t b) { (void)b; return true; }
 static void basic_tx_do(void) {}
 static uint8_t do_cmds;
-static void basic_apply_do(uint8_t op, uint8_t mask) { (void)op; (void)mask; do_cmds++; }
+static bool basic_apply_do(uint8_t op, uint8_t mask) { (void)mask; do_cmds++; return op <= 3; }
 static void led_set_rgb(uint8_t r, uint8_t g, uint8_t b) { (void)r; (void)g; (void)b; }
 static void buzzer_beep_once(uint32_t f, uint32_t d) { (void)f; (void)d; }
 static bool di_get(int i) { (void)i; return false; }

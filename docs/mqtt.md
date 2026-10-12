@@ -221,7 +221,9 @@ In Status mode, LED commands from MQTT, Modbus, and CAN are ignored.
 #RRGGBB
 ```
 
-Sets the LED immediately and permanently. Case-insensitive hex. Example: `#ff8000`
+Sets the LED immediately and permanently. Case-insensitive hex, exactly seven characters (`#ff0000xyz` or
+`#zzzzzz` is refused). Example: `#ff8000`. It ends a running sequence -- as does a colour set over Modbus, CAN,
+a rule or the web page.
 
 Turn off: `#000000`
 

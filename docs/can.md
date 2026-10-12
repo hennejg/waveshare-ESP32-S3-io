@@ -153,7 +153,8 @@ Manufacturer code `0x7FF` (bytes 0–1 of payload). Sub-function byte at offset 
 
 Both fit in a single fast-packet frame (6 payload bytes in first frame). The fast-packet length counts the
 manufacturer code, the sub-function and the arguments: LED 6, buzzer 6 -- or 5 without the duration byte, which
-then beeps 200 ms.
+then beeps 200 ms. Any other length is not carried out: a first frame announcing more is part of a multi-frame
+message, which is not supported.
 
 ### Interaction with MQTT and Modbus
 

@@ -194,8 +194,9 @@ static void basic_tx_do(void)
     if (basic_send(s_base + 2, f, 2)) { s_last_do = f[1]; s_do_sent = true; }
 }
 
-/* DO opcodes: 0=WRITE, 1=SET, 2=CLEAR, 3=TOGGLE */
-static void basic_apply_do(uint8_t op, uint8_t mask)
+/* DO opcodes: 0=WRITE, 1=SET, 2=CLEAR, 3=TOGGLE. False for any other:
+   nothing done, and not a command -- see basic_handle_rx(). */
+static bool basic_apply_do(uint8_t op, uint8_t mask)
 {
     /* One atomic change rather than a read followed by eight single-bit
        writes: dout_set() rewrites the whole port each time, so the outputs
@@ -208,25 +209,28 @@ static void basic_apply_do(uint8_t op, uint8_t mask)
     case 1: ret = dout_modify(mask, 0u, 0u);             break;   /* SET    */
     case 2: ret = dout_modify(0u, mask, 0u);             break;   /* CLEAR  */
     case 3: ret = dout_modify(0u, 0u, mask);             break;   /* TOGGLE */
-    default: return;
+    default: return false;
     }
     if (ret != ESP_OK) ESP_LOGW(TAG, "DO command failed: %s", esp_err_to_name(ret));
     basic_tx_do();
+    return true;
 }
 
+/* command_seen() only for a frame that was a command and was carried out:
+   it feeds the rules' can(ms) watchdog, and a stream of frames with an
+   unknown opcode kept a fallback from ever starting although no command
+   was being executed. */
 static void basic_handle_rx(const rx_msg_t *m)
 {
     if (m->id == (uint16_t)(s_base + 2) && m->dlc == 2) {
-        basic_apply_do(m->data[0], m->data[1]);
-        command_seen();
+        if (basic_apply_do(m->data[0], m->data[1])) command_seen();
     } else if (m->id == (uint16_t)(s_base + 3) && m->dlc == 3) {
         led_set_rgb(m->data[0], m->data[1], m->data[2]);
         command_seen();
-    } else if (m->id == (uint16_t)(s_base + 4) && m->dlc >= 2) {
+    } else if (m->id == (uint16_t)(s_base + 4) && (m->dlc == 2 || m->dlc == 3)) {
         uint16_t f = (uint16_t)(m->data[0] | (m->data[1] << 8));
-        uint32_t d = (m->dlc >= 3) ? (uint32_t)m->data[2] * 10u : 200u;
-        if (f > 0) buzzer_beep_once(f, d);
-        command_seen();
+        uint32_t d = (m->dlc == 3) ? (uint32_t)m->data[2] * 10u : 200u;
+        if (f > 0) { buzzer_beep_once(f, d); command_seen(); }
     } else if (m->id == (uint16_t)(s_base + 5) && m->dlc == 0) {
         uint8_t di = 0;
         for (int i = 0; i < 8; i++) if (di_get(i)) di |= (uint8_t)(1u << i);
@@ -531,7 +535,9 @@ static void n2k_handle_rx(const rx_msg_t *m)
         /* Only single-frame fast-packet messages are supported. The length
          * counts the manufacturer code (2), the sub-function (1) and the
          * arguments: LED 3 -> 6, buzzer 2 or 3 -> 5 or 6. Both fit in frame
-         * 0 (6 payload bytes). Multi-frame messages are discarded. */
+         * 0 (6 payload bytes). Exactly those lengths: a first frame that
+         * announces more (100) is part of a multi-frame message, and its LED
+         * bytes were carried out although the message was never whole. */
         uint8_t fp_frame = m->data[0] & 0x1F;
         if (fp_frame != 0) return;   /* only first frame */
         /* data[1]=total len, data[2]=mfr_lo, data[3]=mfr_hi, data[4]=sub_fn ... */
@@ -540,17 +546,16 @@ static void n2k_handle_rx(const rx_msg_t *m)
            a standard stack sends the reserved bits set and industry 4. */
         if ((mfr & 0x7FF) != N2K_MFR_CODE) return;
         uint8_t sub_fn = m->data[4];
-        if (sub_fn == 0x01 && m->data[1] >= 6) {          /* LED */
+        if (sub_fn == 0x01 && m->data[1] == 6) {          /* LED */
             led_set_rgb(m->data[5], m->data[6], m->data[7]);
             command_seen();
-        } else if (sub_fn == 0x02 && m->data[1] >= 5) {   /* Buzzer */
+        } else if (sub_fn == 0x02 && (m->data[1] == 5 || m->data[1] == 6)) {   /* Buzzer */
             /* The duration is the third argument, length 6. It was read
                only from 7 on, so every documented command beeped 200 ms,
                and one without the duration (length 5) was dropped. */
             uint16_t freq = (uint16_t)m->data[5] | ((uint16_t)m->data[6] << 8);
-            uint32_t dur  = (m->data[1] >= 6) ? (uint32_t)m->data[7] * 10u : 200u;
-            if (freq > 0) buzzer_beep_once(freq, dur);
-            command_seen();
+            uint32_t dur  = (m->data[1] == 6) ? (uint32_t)m->data[7] * 10u : 200u;
+            if (freq > 0) { buzzer_beep_once(freq, dur); command_seen(); }
         }
     }
 }

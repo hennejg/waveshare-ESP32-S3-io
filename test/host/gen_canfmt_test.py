@@ -45,7 +45,8 @@ cuts = (src.defines("HB_PERIOD_MS", "N2K_HB_PERIOD_MS", "CAN_MODE_BASIC", "CAN_M
         + src.func("static void basic_tx_heartbeat(void)")
         + src.func("static bool basic_tx_di(uint8_t bits)")
         + src.func("static void basic_tx_do(void)")
-        + src.func("static void basic_apply_do(uint8_t op, uint8_t mask)")
+        + src.func("static bool basic_apply_do(uint8_t op, uint8_t mask)" if "static bool basic_apply_do(" in src.text
+                   else "static void basic_apply_do(uint8_t op, uint8_t mask)")
         + src.func("static void basic_handle_rx(const rx_msg_t *m)")
         + src.func("static void n2k_handle_rx(const rx_msg_t *m)")
         + src.func("static void can_tick(TickType_t now)"))
@@ -72,7 +73,9 @@ static TickType_t ticks;
 static TickType_t xTaskGetTickCount(void) { return ticks; }
 typedef struct { uint32_t id; uint8_t ide; uint8_t dlc; uint8_t data[8]; } rx_msg_t;
 typedef struct { bool (*online)(void); void (*on_command)(void); bool psram_stack; } can_server_hooks_t;
-static can_server_hooks_t s_hooks;
+static int cmds;
+static void on_cmd(void) { cmds++; }
+static can_server_hooks_t s_hooks = { .on_command = on_cmd };
 
 typedef struct { struct { uint16_t tx_interval_ms; } can; } app_config_t;
 static app_config_t cfg = { { 0 } };
@@ -181,6 +184,27 @@ int main(void)
     n2k_handle_rx(&m);
     CHECK(dout_state == 0x01, "Schaltsteuerung 127502 Schalter 1 an: 0x%02X", dout_state);
     if (failures == f0) printf("  NMEA 2000: LED, Summer mit/ohne Dauer, Schaltsteuerung\n");
+
+    /* Not a command, or not whole: nothing done, the watchdog not fed. */
+    f0 = failures;
+    s_mode = CAN_MODE_BASIC; dout_state = 0x0F; led_n = beep_n = 0;
+    cmds = 0; basic(2, 2, 255, 0xFF, 0);
+    CHECK(dout_state == 0x0F && cmds == 0, "Basic Opcode 255: Ausgaenge 0x%02X, Watchdog %d Mal gefuettert", dout_state, cmds);
+    cmds = 0; basic(2, 2, 1, 0x10, 0);
+    CHECK(dout_state == 0x1F && cmds == 1, "Basic SET: Watchdog %d Mal gefuettert", cmds);
+    cmds = 0; basic(4, 2, 0, 0, 0);
+    CHECK(beep_n == 0 && cmds == 0, "Basic Summer 0 Hz: Watchdog gefuettert");
+    { rx_msg_t m8 = { .id = (uint32_t)(s_base + 4), .ide = 0, .dlc = 8, .data = { 0xD0, 0x07, 50, 1, 2, 3, 4, 5 } };
+      cmds = 0; basic_handle_rx(&m8);
+      CHECK(beep_n == 0 && cmds == 0, "Basic Summer mit DLC 8 ausgefuehrt"); }
+    s_mode = CAN_MODE_N2K; s_ac_state = AC_ACTIVE;
+    cmds = 0; prop(100, 0x01, 9, 9, 9);
+    CHECK(led_n == 0 && cmds == 0, "N2K LED, erstes Fragment einer 100-Byte-Nachricht, ausgefuehrt");
+    cmds = 0; prop(7, 0x02, 0xD0, 0x07, 50);
+    CHECK(beep_n == 0 && cmds == 0, "N2K Summer mit Laenge 7 ausgefuehrt");
+    cmds = 0; prop(6, 0x01, 1, 2, 3);
+    CHECK(led_n == 1 && cmds == 1, "N2K LED Laenge 6: Watchdog %d Mal gefuettert", cmds);
+    if (failures == f0) printf("  ungueltig oder unvollstaendig: nicht ausgefuehrt, Watchdog nicht gefuettert\n");
 
     printf("%s\n", failures ? "FEHLER" : "alles in Ordnung");
     return failures ? 1 : 0;
