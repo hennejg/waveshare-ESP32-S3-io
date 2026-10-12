@@ -1038,13 +1038,20 @@ static void update_rule_subscriptions(JSContext *ctx)
     JSValue fn = JS_GetPropertyStr(ctx, g, "_mqtt_topics");
     budget_start();
     JSValue arr = JS_IsFunction(ctx, fn) ? JS_Call(ctx, fn, g, 0, NULL) : JS_UNDEFINED;
-    if (JS_IsException(arr) || JS_IsArray(ctx, arr) <= 0) goto list_failed;
+    if (JS_IsException(arr)) goto list_failed;
+    /* No _mqtt_topics() -- dsl.js did not load, or a script replaced it --
+       or no list from it: no topics besides "rules/#". Trying again would
+       give the same, and logged it every SUB_RETRY_MS. */
+    int is_list = JS_IsArray(ctx, arr);
+    if (is_list < 0) goto list_failed;
     uint32_t len = 0;
-    JSValue lv = JS_GetPropertyStr(ctx, arr, "length");
-    if (JS_IsException(lv)) { JS_FreeValue(ctx, lv); goto list_failed; }
-    int len_result = JS_ToUint32(ctx, &len, lv);
-    JS_FreeValue(ctx, lv);
-    if (len_result < 0) goto list_failed;
+    if (is_list) {
+        JSValue lv = JS_GetPropertyStr(ctx, arr, "length");
+        if (JS_IsException(lv)) { JS_FreeValue(ctx, lv); goto list_failed; }
+        int len_result = JS_ToUint32(ctx, &len, lv);
+        JS_FreeValue(ctx, lv);
+        if (len_result < 0) goto list_failed;
+    }
     for (uint32_t i = 0; i < len; i++) {
         JSValue v = JS_GetPropertyUint32(ctx, arr, i);
         if (JS_IsException(v)) { JS_FreeValue(ctx, v); goto list_failed; }

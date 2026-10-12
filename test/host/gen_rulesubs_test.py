@@ -23,6 +23,8 @@ loading the same rules again did not try again. Now:
   - a (re)connect subscribes "rules/#" and the whole list;
   - failed list allocation, listing or string conversion keeps the old
     list intact and retries the topics of the current rules.
+  - no _mqtt_topics(), or no list from it, is no topics but "rules/#",
+    not a failure retried (and logged) every 10 s.
 OLD=1 cuts scripting.c from git (OLDREV, default HEAD); before the fix the
 function did not exist, so the generator stops there.
 
@@ -235,6 +237,22 @@ int main(int argc, char **argv)
         CHECK(nsub == 0 && nunsub == 0, "JS-Listenfehler installiert Teil-Liste (Fall %d)", fault);
         ticks += 2000; RETRY(e);
         CHECK(has(subs, nsub, "recovered/topic"), "JS-Listenfehler nicht erneut versucht (Fall %d)", fault);
+        JS_FreeContext(e);
+        update_rule_subscriptions(d);
+    }
+
+    /* No _mqtt_topics() at all, or one that gives no list: no topics but
+       "rules/#", and nothing left to retry -- a retry would fail the same
+       way and log it every 10 s. */
+    static const char *const gone[] = { "_mqtt_topics = null;", "_mqtt_topics = function(){ return 'x/y'; };" };
+    for (int g = 0; g < 2; g++) {
+        JSContext *e = load(rt, dsl, "rule('g').when(mqtt('gone/topic')).then(function(){});");
+        JSValue ev = JS_Eval(e, gone[g], strlen(gone[g]), "gone.js", JS_EVAL_TYPE_GLOBAL);
+        JS_FreeValue(e, ev);
+        nsub = nunsub = 0;
+        update_rule_subscriptions(e);
+        CHECK(!s_topics_retry && s_nsubs == 1 && !strcmp(s_subs[0].topic, "rules/#") && has(unsubs, nunsub, "new/heartbeat"),
+              "%s: nicht als keine Topics gewertet (Wiederholung %d, %d Abos)", gone[g], s_topics_retry, s_nsubs);
         JS_FreeContext(e);
         update_rule_subscriptions(d);
     }
