@@ -146,7 +146,7 @@ static bool has(char (*l)[160], int n, const char *t) { for (int i = 0; i < n; i
 int main(int argc, char **argv)
 {
     printf("Regeln: MQTT-Abonnements beim Broker\n");
-    const char *dsl = slurp(argc > 1 ? argv[1] : "../../components/scripting/dsl.js");
+    char *dsl = slurp(argc > 1 ? argv[1] : "../../components/scripting/dsl.js");
     s_subs_mux = &mux_obj;
     JSRuntime *rt = JS_NewRuntime();
 
@@ -262,6 +262,7 @@ int main(int argc, char **argv)
 
     if (!failures) printf("  gelesene Topics abonniert, Neuladen gleicht ab, Verbindung abonniert alle, Verweigerte wiederholt\n");
     JS_FreeContext(a); JS_FreeContext(b); JS_FreeRuntime(rt);
+    free(dsl);   /* LeakSanitizer (Linux) counts it */
     printf("%s\n", failures ? "FEHLER" : "alles in Ordnung");
     return failures ? 1 : 0;
 }

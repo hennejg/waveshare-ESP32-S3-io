@@ -55,11 +55,11 @@ static const app_config_t *app_config_get(void) { return &cfg; }
 
 typedef int *esp_mqtt_client_handle_t;
 static int client_obj; static esp_mqtt_client_handle_t s_client = &client_obj;
-static char sent[64][200]; static int nsent;
+static char sent[64][300]; static int nsent;   /* "UNSUB " + any topic the 256-byte buffer holds */
 static int esp_mqtt_client_subscribe(esp_mqtt_client_handle_t c, const char *t, int q)
-{ (void)c; (void)q; if (nsent < 64) snprintf(sent[nsent++], 200, "SUB %s", t); return 1; }
+{ (void)c; (void)q; if (nsent < 64) snprintf(sent[nsent++], sizeof sent[0], "SUB %s", t); return 1; }
 static int esp_mqtt_client_unsubscribe(esp_mqtt_client_handle_t c, const char *t)
-{ (void)c; if (nsent < 64) snprintf(sent[nsent++], 200, "UNSUB %s", t); return 1; }
+{ (void)c; if (nsent < 64) snprintf(sent[nsent++], sizeof sent[0], "UNSUB %s", t); return 1; }
 static int mux_obj;
 
 __CUT__

@@ -59,6 +59,8 @@ HARNESS = r"""
 #define DEBUG(...) ((void)0)
 #define AF_INET 2
 struct sockaddr { int sa_family; };
+/* glibc's <unistd.h> declares socklen_t itself; the stub's is its own. */
+#define socklen_t test_socklen_t
 typedef int socklen_t;
 typedef struct { uint8_t b[4]; } ip4_addr_t;
 #define ip4_addr1(a) ((a)->b[0])
