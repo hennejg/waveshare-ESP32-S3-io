@@ -75,12 +75,23 @@ def reboot():
 
 # ------------------------------------------------------------------ Modbus TCP
 _tid = 0
+def recvn(s, n):
+    """Exactly n bytes: one recv() may return part of a response."""
+    b = b""
+    while len(b) < n:
+        d = s.recv(n - len(b))
+        if not d: raise ConnectionError("connection closed after %d of %d bytes" % (len(b), n))
+        b += d
+    return b
 def mb(pdu, uid=247):
     global _tid
     _tid = (_tid + 1) & 0xFFFF
     with socket.create_connection((HOST, 502), timeout=3) as s:
         s.sendall(struct.pack(">HHHB", _tid, 0, len(pdu) + 1, uid) + pdu)
-        hdr = s.recv(7); body = s.recv(256)
+        tid, proto, length, ruid = struct.unpack(">HHHB", recvn(s, 7))
+        if tid != _tid or proto != 0 or ruid != uid or length < 2:
+            raise RuntimeError("Modbus header %d/%d/%d/%d" % (tid, proto, length, ruid))
+        body = recvn(s, length - 1)   # the length counts the unit id, already read
     if body[0] & 0x80: raise RuntimeError("Modbus exception %d" % body[1])
     return body
 def coil(addr, on): mb(struct.pack(">BHH", 5, addr, 0xFF00 if on else 0))
@@ -94,10 +105,24 @@ STORE = tempfile.mkdtemp(prefix="matter_it_")
 def ct(*args, t=120):
     r = subprocess.run([CT] + list(args) + ["--storage-directory", STORE], capture_output=True, text=True, timeout=t)
     return r.returncode, re.sub(r"\x1b\[[0-9;]*m", "", r.stdout + r.stderr)   # chip-tool colours its log
+RETRIES = []
+def ct_retry(*args):
+    """chip-tool once more when the transaction itself failed (rc != 0):
+    on the bench one read in a run now and then does, a different one each
+    time. Every retry is listed at the end, so a pattern does not hide."""
+    rc, out = ct(*args)
+    if rc != 0:
+        tail = [l[-160:] for l in out.splitlines() if l.strip()][-3:]
+        RETRIES.append((" ".join(args), rc, tail))
+        rc, out = ct(*args)
+    return rc, out
 def read(cluster, attr, ep, key):
-    rc, out = ct(cluster, "read", attr, "1", str(ep))
+    rc, out = ct_retry(cluster, "read", attr, "1", str(ep))
     m = re.findall(r"%s: (\S+)" % key, out)
-    return m[-1] if rc == 0 and m else None
+    if rc == 0 and m: return m[-1]
+    print("    (chip-tool %s %s %d: rc %d)\n    " % (cluster, attr, ep, rc)
+          + "\n    ".join([l[-160:] for l in out.splitlines() if l.strip()][-6:]), flush=True)
+    return None
 def until(cluster, attr, ep, key, want, limit=6.0):
     """Seconds until the attribute reads want, or None: a report is
     asynchronous (the change goes through the CHIP task)."""
@@ -107,8 +132,12 @@ def until(cluster, attr, ep, key, want, limit=6.0):
         if time.time() - t0 > limit: return None
         time.sleep(0.3)
 def device_types(ep):
-    rc, out = ct("descriptor", "read", "device-type-list", "1", str(ep))
-    return [int(x) for x in re.findall(r"DeviceType: (\d+)", out)]
+    rc, out = ct_retry("descriptor", "read", "device-type-list", "1", str(ep))
+    dts = [int(x) for x in re.findall(r"DeviceType: (\d+)", out)]
+    if not dts:
+        print("    (chip-tool descriptor %d: rc %d)\n    " % (ep, rc)
+              + "\n    ".join([l[-160:] for l in out.splitlines() if l.strip()][-6:]), flush=True)
+    return dts
 
 # ------------------------------------------------------------------ CAN
 def can(cmd, t=15):
@@ -127,6 +156,9 @@ KINDS = [("temperature", 0, 0.1, 0x0302, "temperaturemeasurement", "measured-val
          ("flow",        70, 1,  0x0306, "flowmeasurement", "measured-value", "MeasuredValue", 10),
          ("power",       0,  10, 0x0510, "electricalpowermeasurement", "active-power", "ActivePower", 1e3),
          ("energy",      70, 100, 0x0510, "electricalenergymeasurement", "cumulative-energy-imported", "Energy", 1e6)]
+# What the sensors report in -- the attributes' whole range (matter_mbm.cpp).
+RANGES = {"temperature": ("-27315", "32767"), "humidity": ("0", "10000"),
+          "pressure": ("-32767", "32767"), "flow": ("0", "65534")}
 rows = [row(name="s%d" % i, reg=r, scale=sc, matter=k) for i, (k, r, sc, *_ ) in enumerate(KINDS)]
 setup = {"modbus": {"enable": True, "rs485_role": "master", "rs485_tout_ms": 1000, "tcp_server": True, "tcp_uid": 247},
          "mbm": rows, "aux": [{"mode": "pwm"}, {"mode": "standard"}, {"mode": "standard"}],
@@ -171,7 +203,12 @@ try:
         v = read(cl, attr, ep, key)
         want_v = st["s%d" % i].get("value")
         good = v not in (None, "null") and want_v is not None and abs(int(v) - want_v * f) <= max(abs(want_v * f) * 0.01, 1)
-        check(dt in device_types(ep) and good, "%s auf Endpunkt %d: %s (Modbus %s)" % (k, ep, v, want_v))
+        dts = device_types(ep)
+        check(dt in dts and good, "%s auf Endpunkt %d: %s (Modbus %s), Geraetetypen %s" % (k, ep, v, want_v, [hex(x) for x in dts]))
+        if k in RANGES:
+            lo = read(cl, "min-measured-value", ep, "MinMeasuredValue")
+            hi = read(cl, "max-measured-value", ep, "MaxMeasuredValue")
+            check((lo, hi) == RANGES[k], "%s: Messbereich %s..%s (erwartet %s..%s)" % ((k, lo, hi) + RANGES[k]))
 
     print("2. Rueckmeldung an Matter")
     for i in range(3):
@@ -223,5 +260,7 @@ finally:
     call("POST", "/api/config", keep)
     reboot()
     shutil.rmtree(STORE, ignore_errors=True)
-print("%d ok, %d FEHL" % (ok, bad))
+for cmd, rc, tail in RETRIES:
+    print("  (wiederholt: chip-tool %s, rc %d)\n      %s" % (cmd, rc, "\n      ".join(tail)))
+print("%d ok, %d FEHL, %d chip-tool-Wiederholung(en)" % (ok, bad, len(RETRIES)))
 sys.exit(1 if bad else 0)

@@ -158,17 +158,20 @@ static void tx_failed(uint32_t id, esp_err_t err)
     }
 }
 
-static void basic_send(uint16_t id, const uint8_t *data, uint8_t dlc)
+/* Whether the driver took the frame. A state report that was not taken is
+   sent again on the next tick -- see can_tick(). */
+static bool basic_send(uint16_t id, const uint8_t *data, uint8_t dlc)
 {
     if (dlc > 8) dlc = 8;
     twai_frame_t *f = tx_claim(data, dlc, 0x00);
-    if (!f) { tx_failed(id, ESP_ERR_NO_MEM); return; }
+    if (!f) { tx_failed(id, ESP_ERR_NO_MEM); return false; }
     /* buffer_len must describe the payload, not the buffer: the driver rejects
        the frame unless header.dlc == twaifd_len2dlc(buffer_len). */
     f->header = (twai_frame_header_t){ .id = id, .dlc = dlc, .ide = 0, .rtr = 0 };
     f->buffer_len = dlc;
     esp_err_t r = twai_node_transmit(s_node, f, 5);
-    if (r != ESP_OK) { tx_release(f); tx_failed(id, r); }
+    if (r != ESP_OK) { tx_release(f); tx_failed(id, r); return false; }
+    return true;
 }
 
 static void basic_tx_heartbeat(void)
@@ -177,13 +180,14 @@ static void basic_tx_heartbeat(void)
     basic_send(s_base + 0, &s, 1);
 }
 
-static void basic_tx_di(uint8_t bits) { basic_send(s_base + 1, &bits, 1); }
+static bool basic_tx_di(uint8_t bits) { return basic_send(s_base + 1, &bits, 1); }
 
+/* s_last_do only once the frame is taken: set before, a failed send counted
+   as sent and, without a periodic interval, the new state never went out. */
 static void basic_tx_do(void)
 {
-    uint8_t f[2] = {0, 0};
-    f[1] = s_last_do = dout_get_all();
-    basic_send(s_base + 2, f, 2);
+    uint8_t f[2] = {0, dout_get_all()};
+    if (basic_send(s_base + 2, f, 2)) s_last_do = f[1];
 }
 
 /* DO opcodes: 0=WRITE, 1=SET, 2=CLEAR, 3=TOGGLE */
@@ -283,15 +287,16 @@ static uint32_t n2k_decode_id(uint32_t can_id, uint8_t *src, uint8_t *dst)
 
 /* ---- Frame send ---- */
 
-static void n2k_send_frame(uint32_t can_id, const uint8_t *data, uint8_t dlc)
+static bool n2k_send_frame(uint32_t can_id, const uint8_t *data, uint8_t dlc)
 {
     if (dlc > 8) dlc = 8;
     twai_frame_t *f = tx_claim(data, dlc, 0xFF);   /* see basic_send() */
-    if (!f) { tx_failed(can_id, ESP_ERR_NO_MEM); return; }
+    if (!f) { tx_failed(can_id, ESP_ERR_NO_MEM); return false; }
     f->header = (twai_frame_header_t){ .id = can_id, .dlc = dlc, .ide = 1, .rtr = 0 };
     f->buffer_len = dlc;
     esp_err_t r = twai_node_transmit(s_node, f, 5);
-    if (r != ESP_OK) { tx_release(f); tx_failed(can_id, r); }
+    if (r != ESP_OK) { tx_release(f); tx_failed(can_id, r); return false; }
+    return true;
 }
 
 /* Fast-packet sender: handles messages > 8 bytes. */
@@ -386,21 +391,22 @@ static void encode_switch_bank(uint8_t data[8], uint8_t instance, uint8_t bitmas
     memset(data + 3, 0xFF, 5);    /* switches 9-28: not available */
 }
 
-static void n2k_tx_di_bank(void)
+static bool n2k_tx_di_bank(void)
 {
     uint8_t bitmask = 0;
     for (int i = 0; i < 8; i++) if (di_get(i)) bitmask |= (uint8_t)(1u << i);
     uint8_t data[8];
     encode_switch_bank(data, N2K_DI_INSTANCE, bitmask);
-    n2k_send_frame(n2k_make_id(N2K_PGN_SW_STATUS, 3, s_addr, N2K_ADDR_GLOBAL), data, 8);
+    return n2k_send_frame(n2k_make_id(N2K_PGN_SW_STATUS, 3, s_addr, N2K_ADDR_GLOBAL), data, 8);
 }
 
 static void n2k_tx_do_bank(void)
 {
-    uint8_t bitmask = s_last_do = dout_get_all();
+    uint8_t bitmask = dout_get_all();
     uint8_t data[8];
     encode_switch_bank(data, N2K_DO_INSTANCE, bitmask);
-    n2k_send_frame(n2k_make_id(N2K_PGN_SW_STATUS, 3, s_addr, N2K_ADDR_GLOBAL), data, 8);
+    if (n2k_send_frame(n2k_make_id(N2K_PGN_SW_STATUS, 3, s_addr, N2K_ADDR_GLOBAL), data, 8))
+        s_last_do = bitmask;   /* see basic_tx_do() */
 }
 
 /* Proprietary fast-packet for LED or buzzer. */
@@ -601,7 +607,10 @@ static void can_tick(TickType_t now)
         if ((now - last_hb) >= pdMS_TO_TICKS(HB_PERIOD_MS)) {
             basic_tx_heartbeat(); last_hb = now;
         }
-        if (di != last_di || due) { basic_tx_di(di); last_di = di; }
+        /* A report the driver did not take stays due: last_di and
+           s_last_do move only with a frame that went out, so the next tick
+           tries again (every TX_POLL_MS; tx_failed() keeps the log quiet). */
+        if ((di != last_di || due) && basic_tx_di(di)) last_di = di;
         if (dout_get_all() != s_last_do || due) basic_tx_do();
         if (due) last_per = now;
     }
@@ -613,8 +622,10 @@ static void can_tick(TickType_t now)
             (now - s_claim_tick) >= pdMS_TO_TICKS(250)) {
             s_ac_state = AC_ACTIVE;
             ESP_LOGI(TAG, "N2k address %u claimed", s_addr);
-            n2k_tx_heartbeat(); n2k_tx_di_bank(); n2k_tx_do_bank();
-            last_di = di;
+            n2k_tx_heartbeat();
+            bool di_sent = n2k_tx_di_bank();
+            n2k_tx_do_bank();
+            if (di_sent) last_di = di;
             last_hb = last_per = now;
             due = false;
         }
@@ -623,7 +634,7 @@ static void can_tick(TickType_t now)
             if ((now - last_hb) >= pdMS_TO_TICKS(N2K_HB_PERIOD_MS)) {
                 n2k_tx_heartbeat(); last_hb = now;
             }
-            if (di != last_di || due) { n2k_tx_di_bank(); last_di = di; }
+            if ((di != last_di || due) && n2k_tx_di_bank()) last_di = di;
             if (dout_get_all() != s_last_do || due) n2k_tx_do_bank();
             if (due) last_per = now;
         }

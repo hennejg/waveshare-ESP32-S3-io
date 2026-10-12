@@ -643,9 +643,11 @@ bool web_cfg_str(const cJSON *obj, const char *where, const char *key,
 /* ------------------------------------------------------------------ poll table */
 
 /* One table rather than two chains: they are exact inverses, and a type added
-   to one of them alone would read back as something it is not. u16 is the
-   default on both sides and so needs no row. */
+   to one of them alone would read back as something it is not. u16 has a row
+   since an unknown name is refused rather than read as u16; a stored type
+   outside the table still reads back as u16. */
 static const struct { const char *name; uint8_t type; } k_mbm_types[] = {
+    { "u16", MBM_VAL_U16 },
     { "s16", MBM_VAL_S16 },
     { "u32", MBM_VAL_U32 },
     { "s32", MBM_VAL_S32 },
@@ -659,11 +661,25 @@ static const char *mbm_type_name(uint8_t t)
     return "u16";
 }
 
-static void mbm_type_value(const char *s, uint8_t *out)
+static bool mbm_type_value(const char *s, uint8_t *out)
 {
     for (size_t i = 0; i < sizeof(k_mbm_types) / sizeof(k_mbm_types[0]); i++)
-        if (!strcmp(s, k_mbm_types[i].name)) { *out = k_mbm_types[i].type; return; }
-    *out = MBM_VAL_U16;
+        if (!strcmp(s, k_mbm_types[i].name)) { *out = k_mbm_types[i].type; return true; }
+    return false;
+}
+
+/* A field given as one of two words. Absent or null: false, nothing changes.
+   Anything else than the two words is a bad field -- read as the other word
+   it used to be stored silently ("input " as holding, "RTU" as network). */
+static bool mbm_word(const cJSON *o, const char *where, const char *key,
+                     const char *w0, const char *w1, bool *is_w1, web_cfg_err_t *bad)
+{
+    const cJSON *v = cJSON_GetObjectItem(o, key);
+    if (!v || cJSON_IsNull(v)) return false;
+    if (cJSON_IsString(v) && !strcmp(v->valuestring, w0)) { *is_w1 = false; return true; }
+    if (cJSON_IsString(v) && !strcmp(v->valuestring, w1)) { *is_w1 = true;  return true; }
+    web_cfg_bad(bad, where, key);
+    return false;
 }
 
 /* Indexed by MBM_MATTER_*. */
@@ -751,9 +767,10 @@ const char *web_mbm_config_parse(const cJSON *mbm_j, app_config_t *cfg,
 
         /* A script writing "enable": 1 rather than true would otherwise
            store a silently disabled entry and get 200 back. */
-        if ((v = cJSON_GetObjectItem(o, "enable"))) {
+        if ((v = cJSON_GetObjectItem(o, "enable")) && !cJSON_IsNull(v)) {
             if (cJSON_IsBool(v))        e->enable = cJSON_IsTrue(v) ? 1 : 0;
             else if (cJSON_IsNumber(v)) e->enable = v->valuedouble != 0 ? 1 : 0;
+            else                        web_cfg_bad(bad, w, "enable");   /* "true" as text */
         }
         /* Only a row that is polled is held to its ranges: what a
            disabled row's hidden boxes hold must not block the save. */
@@ -764,17 +781,26 @@ const char *web_mbm_config_parse(const cJSON *mbm_j, app_config_t *cfg,
             e->port = (uint16_t)u;
         if (web_cfg_uint(o, w, "unit_id", 1, 247, &u, rb))
             e->unit_id = (uint8_t)u;
-        if ((v = cJSON_GetObjectItem(o, "fc")) && cJSON_IsString(v))
-            e->fc = strcmp(v->valuestring, "input") == 0 ? 4 : 3;
+        bool word;
+        if (mbm_word(o, w, "fc", "holding", "input", &word, rb))
+            e->fc = word ? 4 : 3;
         if (web_cfg_uint(o, w, "reg", 0, 65535, &u, rb))
             e->reg = (uint16_t)u;
-        if ((v = cJSON_GetObjectItem(o, "type")) && cJSON_IsString(v))
-            mbm_type_value(v->valuestring, &e->type);
-        if ((v = cJSON_GetObjectItem(o, "word_swap")) && cJSON_IsBool(v))
-            e->word_swap = cJSON_IsTrue(v) ? 1 : 0;
-        if ((v = cJSON_GetObjectItem(o, "transport")) && cJSON_IsString(v))
-            e->transport = strcmp(v->valuestring, "rtu") == 0 ? MBM_TRANSPORT_RTU : MBM_TRANSPORT_TCP;
-        if ((v = cJSON_GetObjectItem(o, "scale")) && cJSON_IsNumber(v)) {
+        /* Every field that is given has to be what it says: an unknown type
+           read as u16, or a scale sent as text kept at 1, would store a row
+           that reads values off by a factor and still answer 200. */
+        if ((v = cJSON_GetObjectItem(o, "type")) && !cJSON_IsNull(v))
+            if (!cJSON_IsString(v) || !mbm_type_value(v->valuestring, &e->type))
+                web_cfg_bad(rb, w, "type");
+        if ((v = cJSON_GetObjectItem(o, "word_swap")) && !cJSON_IsNull(v)) {
+            if (cJSON_IsBool(v)) e->word_swap = cJSON_IsTrue(v) ? 1 : 0;
+            else                 web_cfg_bad(rb, w, "word_swap");
+        }
+        if (mbm_word(o, w, "transport", "tcp", "rtu", &word, rb))
+            e->transport = word ? MBM_TRANSPORT_RTU : MBM_TRANSPORT_TCP;
+        if ((v = cJSON_GetObjectItem(o, "scale")) && !cJSON_IsNull(v) && !cJSON_IsNumber(v))
+            web_cfg_bad(rb, w, "scale");
+        else if (v && cJSON_IsNumber(v)) {
             /* The only field with no natural range, and the one that can
                carry an infinity straight through to MQTT: cJSON parses
                1e400 as inf, cJSON_IsNumber accepts it, and the published
@@ -809,7 +835,10 @@ const char *web_mbm_config_parse(const cJSON *mbm_j, app_config_t *cfg,
 
         /* A name that is empty or carries MQTT syntax would make a topic
            nothing can subscribe to, so the entry is refused rather than
-           quietly polled into nowhere. */
+           quietly polled into nowhere. A row with a bad field is not
+           judged further: its transport or host may be what was bad, and
+           the caller names that field rather than a consequence of it. */
+        if (bad && bad->field[0]) return NULL;
         if (e->enable) {
             if (!e->name[0])                  return "a Modbus master entry needs a name";
             if (strpbrk(e->name, "#+/"))      return "a Modbus master name must not contain '#', '+' or '/'";

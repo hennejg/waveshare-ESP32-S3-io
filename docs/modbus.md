@@ -129,6 +129,10 @@ requests, one transaction at a time.
 
 Reading only. Nothing is ever written to the other device.
 
+Every field of an enabled row that is sent has to be what it says: an unknown `fc`, `type` or `transport`, a
+scale sent as text or a non-boolean `word_swap` is refused with 400 naming the field (`mbm.1.scale`), rather
+than stored as a default that would read values off by a factor. `null` counts as not sent.
+
 Unlike the settings above, this table takes effect on save — no reboot.
 
 ### Where the value goes

@@ -159,6 +159,8 @@ Both fit in a single fast-packet frame (6 payload bytes in first frame).
   published on `output/N` MQTT topics.
 - **DI state** (PGN 127501) is read from the same hardware state used by all three interfaces.
 - MQTT, Modbus, and CAN (either mode) operate simultaneously if all are configured.
+- A status frame (inputs, outputs) the driver does not take -- queue full, bus-off -- counts as not sent and goes
+  out again on the next pass of the worker (every 50 ms), also with a TX interval of 0.
 
 ---
 

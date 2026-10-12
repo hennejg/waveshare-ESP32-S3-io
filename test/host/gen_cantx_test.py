@@ -38,9 +38,9 @@ cuts = (src.defines(*hb, "CAN_MODE_BASIC", "CAN_MODE_N2K", "TX_POLL_MS",
         + src.func("static void n2k_send_address_claim(uint8_t addr)")
         + src.func("static void n2k_tx_heartbeat(void)")
         + src.func("static void encode_switch_bank(uint8_t data[8], uint8_t instance, uint8_t bitmask)")
-        + src.func("static void n2k_tx_di_bank(void)")
+        + src.func(("static bool n2k_tx_di_bank(void)" if "static bool n2k_tx_di_bank(void)" in src.text else "static void n2k_tx_di_bank(void)"))
         + src.func("static void n2k_tx_do_bank(void)")
-        + src.func("static void basic_tx_di(uint8_t bits)")
+        + src.func(("static bool basic_tx_di(uint8_t bits)" if "static bool basic_tx_di(uint8_t bits)" in src.text else "static void basic_tx_di(uint8_t bits)"))
         + src.func("static void basic_tx_do(void)")
         + src.func("static void n2k_handle_rx(const rx_msg_t *m)"))
 if new:
@@ -88,10 +88,16 @@ static uint8_t s_name[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
 
 /* The bus. */
 static struct { uint32_t id; uint8_t d[8]; } bus[256]; static int nbus;
-static void n2k_send_frame(uint32_t id, const uint8_t *d, uint8_t dlc)
-{ if (nbus < 256) { bus[nbus].id = id; memcpy(bus[nbus].d, d, dlc); nbus++; } }
-static void basic_send(uint16_t id, const uint8_t *d, uint8_t dlc)
-{ if (nbus < 256) { bus[nbus].id = id; memcpy(bus[nbus].d, d, dlc); nbus++; } }
+/* fail_tx: the driver refuses the frame (queue full, bus-off). Returning
+   bool suits both the code that looks at it and the code before, which did
+   not. */
+static bool fail_tx;
+static bool n2k_send_frame(uint32_t id, const uint8_t *d, uint8_t dlc)
+{ if (fail_tx) return false; if (nbus < 256) { bus[nbus].id = id; memcpy(bus[nbus].d, d, dlc); nbus++; } return true; }
+static bool basic_send(uint16_t id, const uint8_t *d, uint8_t dlc)
+{ if (fail_tx) return false; if (nbus < 256) { bus[nbus].id = id; memcpy(bus[nbus].d, d, dlc); nbus++; } return true; }
+static int frames_to(uint32_t id, int byte, uint8_t want)
+{ int n = 0; for (int i = 0; i < nbus; i++) if (bus[i].id == id && bus[i].d[byte] == want) n++; return n; }
 static void basic_tx_heartbeat(void) {}
 
 __CUT__
@@ -163,6 +169,30 @@ int main(void)
     for (int i = 0; i < 10; i++) can_tick(ticks);    /* ten passes, no time passing */
     CHECK(count(N2K_PGN_SW_STATUS, 0, -1) <= 1, "Intervall 5 ms: %d DI-Frames in einem Tick", count(N2K_PGN_SW_STATUS, 0, -1));
     if (failures == f0) printf("  Intervall unter einem Tick: hoechstens ein Mal pro Tick\n");
+
+    /* 5. A state report the driver refused is not counted as sent: with no
+       periodic interval it would otherwise never go out. */
+    f0 = failures;
+    cfg.can.tx_interval_ms = 0;
+    for (int m = 1; m <= 2; m++) {
+        s_mode = (uint8_t)m; s_ac_state = AC_ACTIVE;
+        ticks += 5; can_tick(ticks);                   /* in step */
+        fail_tx = true;
+        dout_state ^= 0x40; di_state ^= 0x01;
+        ticks += 5; can_tick(ticks);                   /* refused */
+        fail_tx = false; nbus = 0;
+        ticks += 5; can_tick(ticks);
+        if (m == 1) {
+            CHECK(frames_to(0x102, 1, dout_state) == 1, "Basic: abgelehnter Ausgangsstatus nicht wiederholt");
+            CHECK(frames_to(0x101, 0, di_state) == 1,   "Basic: abgelehnter Eingangsstatus nicht wiederholt");
+        } else {
+            CHECK(count(N2K_PGN_SW_STATUS, 1, -1) == 1, "N2K: abgelehnte Ausgangsbank nicht wiederholt (%d)", count(N2K_PGN_SW_STATUS, 1, -1));
+            CHECK(count(N2K_PGN_SW_STATUS, 0, -1) == 1, "N2K: abgelehnte Eingangsbank nicht wiederholt (%d)", count(N2K_PGN_SW_STATUS, 0, -1));
+        }
+        nbus = 0; ticks += 5; can_tick(ticks);
+        CHECK(nbus == 0, "Modus %d: nach erfolgreicher Wiederholung noch %d Frames", m, nbus);
+    }
+    if (failures == f0) printf("  abgelehnte Statusmeldung: beim naechsten Tick wiederholt, danach Ruhe\n");
 
     printf("%s\n", failures ? "FEHLER" : "alles in Ordnung");
     return failures ? 1 : 0;

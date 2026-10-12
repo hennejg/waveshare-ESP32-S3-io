@@ -40,7 +40,9 @@ if common:
              + wc.func("bool web_cfg_str(const cJSON *obj, const char *where, const char *key,")
              + src.func("static void parse_invert_array(cJSON *arr, di_config_t *out, int max, const char *where, web_cfg_err_t *bad)")
              + wc.span("static const struct { const char *name; uint8_t type; } k_mbm_types[] = {", "};")
-             + wc.func("static void mbm_type_value(const char *s, uint8_t *out)")
+             + (wc.func("static bool mbm_type_value(const char *s, uint8_t *out)")
+                + wc.func("static bool mbm_word(const cJSON *o, const char *where, const char *key,")
+                if "static bool mbm_word(" in wc.text else wc.func("static void mbm_type_value(const char *s, uint8_t *out)"))
              + wc.span("static const char *const k_mbm_matter[MBM_MATTER_MAX + 1] = {", "};")
              + wc.func("const char *web_mbm_config_parse(const cJSON *mbm_j, app_config_t *cfg,"))
     if "web_can_config_parse(" in src.text:   # the CAN fields, shared with the Matter firmware
@@ -125,6 +127,11 @@ static int failures;
 #define ROW(en, reg) "{\"enable\":" #en ",\"name\":\"zaehler\",\"host\":\"10.0.0.5\",\"port\":502,\"unit_id\":1," \
                      "\"fc\":\"holding\",\"reg\":" #reg ",\"type\":\"u16\",\"scale\":1,\"interval_ms\":5000}"
 
+/* A valid enabled row with one field added after the others (cJSON takes
+   the first of a duplicated key, so the field must not be in ROW). */
+#define ROWX(extra) "{\"enable\":true,\"name\":\"zaehler\",\"host\":\"10.0.0.5\",\"port\":502,\"unit_id\":1," \
+                    "\"reg\":5,\"interval_ms\":5000," extra "}"
+
 int main(void)
 {
     printf("Konfiguration speichern (POST /api/config)\n");
@@ -143,6 +150,14 @@ int main(void)
     f0 = failures;
     static const struct { const char *json; const char *what; } bad[] = {
         { "{\"mbm\":[" ROW(true, 70000) "]}",            "Register 70000" },
+        /* Given but not what it says: stored as holding, u16, network or
+           scale 1 before -- values off by a factor, and 200. */
+        { "{\"mbm\":[" ROWX("\"fc\":\"inputs\"") "]}",         "fc \"inputs\"" },
+        { "{\"mbm\":[" ROWX("\"type\":\"float\"") "]}",        "type \"float\"" },
+        { "{\"mbm\":[" ROWX("\"scale\":\"0.01\"") "]}",        "scale als String" },
+        { "{\"mbm\":[" ROWX("\"transport\":\"RTU\"") "]}",     "transport \"RTU\"" },
+        { "{\"mbm\":[" ROWX("\"word_swap\":1") "]}",           "word_swap als Zahl" },
+        { "{\"mbm\":[{\"enable\":\"true\",\"name\":\"z\"}]}",     "enable als String" },
         { "{\"modbus\":{\"address\":0}}",                "Modbus-Adresse 0" },
         { "{\"can\":{\"tx_interval_ms\":70000}}",        "tx_interval_ms 70000" },
         { "{\"can\":{\"bitrate\":\"500000\"}}",          "Bitrate als String" },
@@ -154,6 +169,15 @@ int main(void)
         post(bad[i].json);
         CHECK(status == 400 && updates == 0, "%s: Status %d, %d Mal gespeichert (%s)", bad[i].what, status, updates, resp);
     }
+    post("{\"mbm\":[{\"enable\":true,\"name\":\"z\",\"unit_id\":1,\"reg\":5,\"transport\":\"RTU\"}]}");
+    CHECK(status == 400 && strstr(resp, "mbm.1.transport"), "falsches transport ohne Host: Meldung nennt nicht das Feld (%s)", resp);
+    post("{\"mbm\":[" ROWX("\"fc\":\"input\",\"type\":\"f32\",\"scale\":0.01,\"transport\":\"tcp\",\"word_swap\":true") "]}");
+    CHECK(status == 200 && stored.mbm[0].fc == 4 && stored.mbm[0].scale == 0.01f && stored.mbm[0].word_swap,
+          "gueltige Werte nicht uebernommen (%d %s)", status, resp);
+    post("{\"mbm\":[" ROWX("\"fc\":null,\"scale\":null") "]}");
+    CHECK(status == 200 && stored.mbm[0].fc == 3 && stored.mbm[0].scale == 1.0f, "null-Felder einer Zeile abgelehnt (%d %s)", status, resp);
+    post("{\"mbm\":[{\"enable\":false,\"name\":\"z\",\"fc\":\"x\",\"type\":\"x\",\"scale\":\"x\"}]}");
+    CHECK(status == 200, "deaktivierte Zeile mit ungueltigen Feldern blockiert (%d %s)", status, resp);
     post("{\"mbm\":[" ROW(false, 70000) "]}");
     CHECK(status == 200, "deaktivierte Zeile mit Register 70000 blockiert das Speichern (%d %s)", status, resp);
     post("{\"modbus\":{\"address\":null},\"di\":[{\"name\":\"Gr\xc3\xb6\xc3\x9f" "e\"}]}");

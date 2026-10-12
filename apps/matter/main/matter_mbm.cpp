@@ -225,19 +225,40 @@ esp_err_t matter_mbm_create(esp_matter::node_t *node)
         uint8_t k = cfg->mbm[i].matter;
         endpoint_t *ep = nullptr;
         switch (k) {
+        /* MinMeasuredValue/MaxMeasuredValue: the range mbm_matter_value()
+           reports in, which is the attribute's whole range. Set rather than
+           left to the SDK: its legacy data model makes them null (unknown),
+           the generated one 0/0 -- a range no reported value is in, and for
+           the temperature cluster a pair it refuses (max >= min + 1) by
+           aborting. */
         case MBM_MATTER_TEMPERATURE: {
-            /* The range mbm_matter_value() reports in. Explicit rather than
-               left null: the SDK's cluster dies on a non-null pair with
-               max < min + 1, and a default of 0/0 would be exactly that. */
             temperature_sensor::config_t c;
             c.temperature_measurement.min_measured_value = nullable<int16_t>(-27315);
             c.temperature_measurement.max_measured_value = nullable<int16_t>(32767);
             ep = temperature_sensor::create(node, &c, ENDPOINT_FLAG_NONE, nullptr);
             break;
         }
-        case MBM_MATTER_HUMIDITY:    { humidity_sensor::config_t c;    ep = humidity_sensor::create(node, &c, ENDPOINT_FLAG_NONE, nullptr);    break; }
-        case MBM_MATTER_PRESSURE:    { pressure_sensor::config_t c;    ep = pressure_sensor::create(node, &c, ENDPOINT_FLAG_NONE, nullptr);    break; }
-        case MBM_MATTER_FLOW:        { flow_sensor::config_t c;        ep = flow_sensor::create(node, &c, ENDPOINT_FLAG_NONE, nullptr);        break; }
+        case MBM_MATTER_HUMIDITY: {
+            humidity_sensor::config_t c;
+            c.relative_humidity_measurement.min_measured_value = nullable<uint16_t>(0);
+            c.relative_humidity_measurement.max_measured_value = nullable<uint16_t>(10000);
+            ep = humidity_sensor::create(node, &c, ENDPOINT_FLAG_NONE, nullptr);
+            break;
+        }
+        case MBM_MATTER_PRESSURE: {
+            pressure_sensor::config_t c;
+            c.pressure_measurement.min_measured_value = nullable<int16_t>(-32767);
+            c.pressure_measurement.max_measured_value = nullable<int16_t>(32767);
+            ep = pressure_sensor::create(node, &c, ENDPOINT_FLAG_NONE, nullptr);
+            break;
+        }
+        case MBM_MATTER_FLOW: {
+            flow_sensor::config_t c;
+            c.flow_measurement.min_measured_value = nullable<uint16_t>(0);
+            c.flow_measurement.max_measured_value = nullable<uint16_t>(65534);
+            ep = flow_sensor::create(node, &c, ENDPOINT_FLAG_NONE, nullptr);
+            break;
+        }
         case MBM_MATTER_POWER:
         case MBM_MATTER_ENERGY: {
             electrical_sensor::config_t c;

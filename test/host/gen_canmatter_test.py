@@ -52,9 +52,9 @@ static can_server_hooks_t s_hooks;
 static uint16_t s_base = 0x100;
 static uint8_t  s_last_do;
 static uint8_t  hb[8]; static int nhb;
-static void basic_send(uint16_t id, const uint8_t *d, uint8_t dlc)
-{ if (id == s_base) { memcpy(hb, d, dlc); nhb++; } }
-static void basic_tx_di(uint8_t b) { (void)b; }
+static bool basic_send(uint16_t id, const uint8_t *d, uint8_t dlc)
+{ if (id == s_base) { memcpy(hb, d, dlc); nhb++; } return true; }
+static bool basic_tx_di(uint8_t b) { (void)b; return true; }
 static void basic_tx_do(void) {}
 static uint8_t do_cmds;
 static void basic_apply_do(uint8_t op, uint8_t mask) { (void)op; (void)mask; do_cmds++; }
