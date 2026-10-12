@@ -7,10 +7,18 @@
    own name, so a glibc that declares them does not clash.
 
    No libc header here: this comes before a test's own feature macros
-   (_DEFAULT_SOURCE, _POSIX_C_SOURCE), which must precede the first one. */
+   (_DEFAULT_SOURCE, _POSIX_C_SOURCE), which must precede the first one.
+
+   glibc under -std=c11 also hides POSIX itself -- strdup(), gmtime_r(),
+   usleep(), getaddrinfo() -- which macOS declares regardless and newlib
+   has. _DEFAULT_SOURCE opens it, spelled as gen_tz_test.py spells it so
+   that its own definition is no redefinition. */
 #ifndef HOST_COMPAT_H
 #define HOST_COMPAT_H
 #if defined(__linux__)
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
 static inline __SIZE_TYPE__ host_strlcpy(char *d, const char *s, __SIZE_TYPE__ n)
 {
     __SIZE_TYPE__ l = __builtin_strlen(s);

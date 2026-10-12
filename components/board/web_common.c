@@ -786,8 +786,8 @@ const char *web_mbm_config_parse(const cJSON *mbm_j, app_config_t *cfg,
         mbm_poll_t *e = &cfg->mbm[i];
         cJSON *v;
         uint32_t u;
-        char w[12];
-        snprintf(w, sizeof(w), "mbm.%d.", i + 1);
+        char w[16];   /* room for any unsigned, so no compiler sees a truncation */
+        snprintf(w, sizeof(w), "mbm.%u.", (unsigned)i + 1u);
 
         e->port = MBM_PORT_DEFAULT; e->unit_id = MBM_UNIT_ID_DEFAULT;
         e->fc = MBM_FC_DEFAULT; e->scale = 1.0f; e->interval_ms = MBM_INTERVAL_DEFAULT_MS;

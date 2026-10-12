@@ -172,6 +172,12 @@ jobs:
       - name: Install a host compiler with the sanitizers
         run: apt-get update && apt-get install -y --no-install-recommends build-essential
 
+      # make uiauth runs the web UIs' Basic-Auth code (btoa, TextEncoder).
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+
       # Every generator cuts the firmware source it tests, so a test that no
       # longer matches the code it guards stops here.
       - name: Build and run the host tests

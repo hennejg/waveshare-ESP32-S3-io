@@ -256,7 +256,18 @@ test_resync: gen_resync_test.py ../../components/scripting/scripting.c
 QJS     := ../../components/quickjs/extern/quickjs
 QJS_SRC := quickjs.c libregexp.c libunicode.c cutils.c dtoa.c
 QJS_OBJ := $(QJS_SRC:%.c=qjs-obj/%.o)
-qjs-obj/%.o: $(QJS)/%.c
+# The firmware's build applies components/quickjs/patches at configure time;
+# a fresh checkout (CI) has the pristine submodule, so apply them here the
+# same way: only those not in place yet.
+QJS_PATCHES := $(abspath $(sort $(wildcard ../../components/quickjs/patches/*.patch)))
+.PHONY: qjs-patched
+qjs-patched:
+	@for p in $(QJS_PATCHES); do \
+	    git -C $(QJS) apply --reverse --check "$$p" 2>/dev/null || \
+	    { git -C $(QJS) apply "$$p" && echo "QuickJS-Patch angewandt: $${p##*/}"; } || exit 1; \
+	done
+
+qjs-obj/%.o: $(QJS)/%.c | qjs-patched
 	@mkdir -p qjs-obj
 	$(CC) -O1 -w -D_GNU_SOURCE -DCONFIG_VERSION='"host"' -I$(QJS) -c $< -o $@
 
@@ -370,7 +381,7 @@ test_resume: gen_resume_test.py ../../components/scripting/scripting.c $(QJS_OBJ
 tz: test_tz
 	./test_tz
 
-test_tz: gen_tz_test.py ../../components/quickjs/extern/quickjs/quickjs.c
+test_tz: gen_tz_test.py ../../components/quickjs/extern/quickjs/quickjs.c | qjs-patched
 	python3 gen_tz_test.py
 	$(CC) $(CFLAGS) test_tz.c -o $@
 

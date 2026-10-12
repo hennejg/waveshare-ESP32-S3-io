@@ -56,7 +56,8 @@ static int recv_body(httpd_req_t *r, char *buf, size_t cap) { (void)r; snprintf(
 #define web_send_json send_json
 #define web_recv_body recv_body
 static time_t clock_set;
-#define settimeofday(tv, tz) (clock_set = (tv)->tv_sec, 0)
+static int test_settimeofday(const struct timeval *tv, const void *tz) { (void)tz; clock_set = tv->tv_sec; return 0; }
+#define settimeofday test_settimeofday
 static esp_err_t rtc_dev_set(const struct tm *t) { (void)t; return ESP_OK; }
 static void iso8601_utc(time_t t, char *b, size_t n) { (void)t; snprintf(b, n, "x"); }
 static int time_syncs;

@@ -298,7 +298,8 @@ static void worker_task(void *arg)
         __atomic_store_n(&c->state, SLOT_IDLE, __ATOMIC_RELEASE);
 
         uint64_t one = 1;                     /* the connection can be polled again */
-        (void)write(s_wake_fd, &one, sizeof(one));
+        ssize_t woke = write(s_wake_fd, &one, sizeof(one));
+        (void)woke;   /* a full eventfd is already a wake-up */
 
         check_stack("worker", &stack_next_us);
     }
