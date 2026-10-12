@@ -8,7 +8,13 @@
   <style>
     *, *::before, *::after { box-sizing: border-box; }
     body { font-family: system-ui, sans-serif; max-width: 560px; margin: 2rem auto; padding: 0 1rem; color: #222; }
-    h1 { font-size: 1.3rem; margin: 0 0 .9rem; }
+    h1 { font-size: 1.3rem; margin: 0 0 .9rem; display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+    /* Which firmware this is: the two look alike, and the device name
+       replaces the title once the configuration is loaded. */
+    .fw-badge { font-size: .7rem; font-weight: 600; letter-spacing: .02em; padding: .15rem .5rem;
+                border-radius: 999px; color: #fff; white-space: nowrap; }
+    .fw-badge.full   { background: #2f6f9f; }
+    .fw-badge.matter { background: #7b4fa3; }
     h2 { font-size: .95rem; color: #555; border-bottom: 1px solid #e8e8e8; padding-bottom: .25rem; margin: 1.5rem 0 .6rem; }
     label { display: block; margin-top: 1rem; font-size: 0.85rem; font-weight: 600; color: #555; }
     input[type="text"], input[type="password"] {
@@ -159,7 +165,7 @@
     </div>
   </div>
 
-  <h1 id="page-title">Device Configuration</h1>
+  <h1><span id="page-title">Device Configuration</span><span id="fw-badge" class="fw-badge full" title="Firmware variant">Full firmware</span></h1>
 
   <nav class="tab-bar">
     <button type="button" class="tab-btn" data-tab="device"  onclick="switchTab('device')">Device</button>
@@ -1683,7 +1689,14 @@ rule('my-rule')
         if (!r.ok) return;
         const v = await r.json();
         document.getElementById('fw-version').textContent =
-          'fw ' + v.version + ' · ' + v.idf + ' · ' + v.date;
+          'fw ' + (v.variant ? v.variant + ' ' : '') + v.version + ' · ' + v.idf + ' · ' + v.date;
+        /* The device's own word over the page's: a web partition left over
+           from the other firmware would otherwise name the wrong one. */
+        if (v.variant === 'full' || v.variant === 'matter') {
+          const b = document.getElementById('fw-badge');
+          b.className = 'fw-badge ' + v.variant;
+          b.textContent = v.variant === 'full' ? 'Full firmware' : 'Matter firmware';
+        }
       } catch (_) {}
     }
     initAuth();

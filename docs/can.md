@@ -7,6 +7,10 @@ Interface: ESP32-S3 TWAI peripheral — GPIO2 (TX), GPIO3 (RX)
 
 Three modes are available, selected in the web UI (CAN Bus section). Changes take effect after reboot.
 
+Both firmwares have CAN. In the Matter firmware it starts only once the device is commissioned, outputs switched
+over CAN are reported to the Matter controllers, and the Basic-mode heartbeat status stays `0x01` (no MQTT
+broker there); see `docs/matter.md`.
+
 | Mode         | Frame format    | Bit rate           | Description             |
 |--------------|-----------------|--------------------|-------------------------|
 | **Off**      | —               | —                  | CAN peripheral disabled |

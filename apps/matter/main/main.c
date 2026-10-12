@@ -17,6 +17,7 @@
 #include "aux_io.h"
 #include "button.h"
 #include "buzzer.h"
+#include "can_server.h"
 #include "di.h"
 #include "dout.h"
 #include "eth.h"
@@ -34,8 +35,9 @@ static bool s_eth_connected  = false;
 static bool s_wifi_connected = false;
 
 /* Modbus (RTU slave or RS-485 master with the poll table, Modbus TCP server)
-   runs only on a commissioned device. Modbus has no authentication: a device
-   nobody has taken into a fabric yet does not answer on RS-485 or port 502.
+   and CAN run only on a commissioned device. Neither has authentication: a
+   device nobody has taken into a fabric yet does not answer on RS-485, CAN
+   or port 502.
    (This was a RAM limit first -- about 10 KB free during commissioning --
    until the Matter stack's static data moved to PSRAM; now 74 KB are left
    at the lowest.) mb_server_init() runs once; mb_server_net_start() whenever
@@ -52,11 +54,19 @@ static void modbus_net_start_locked(void)
     if (r != ESP_OK) ESP_LOGE(TAG, "Modbus TCP start failed: %s", esp_err_to_name(r));
 }
 
-static void modbus_start(void)
+static void fieldbus_start(void)
 {
     if (!s_mb_mux || !matter_is_commissioned()) return;
     xSemaphoreTake(s_mb_mux, portMAX_DELAY);
     if (!s_mb_inited) {
+        /* CAN once, like Modbus. Its worker only switches outputs and the
+           LED and sends frames, so its stack can be in PSRAM. Heartbeat
+           status stays 0x01: there is no broker in this firmware. */
+        const can_server_hooks_t can_hooks = { .psram_stack = true };
+        esp_err_t c = can_server_init(&can_hooks);
+        if (c != ESP_OK)
+            ESP_LOGE(TAG, "CAN init failed: %s — continuing without CAN", esp_err_to_name(c));
+
         s_mb_inited = true;
         esp_err_t r = mb_server_init();
         if (r != ESP_OK)
@@ -93,7 +103,7 @@ static void on_modbus_value(uint8_t index, const mbm_poll_t *e, double value)
    did not start after a commissioning -- internal RAM was at about 4 KB then. */
 void matter_on_commissioned(void)
 {
-    modbus_start();
+    fieldbus_start();
 }
 
 static void on_network_ready(void)
@@ -222,7 +232,7 @@ void app_main(void)
              heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 
-    if (matter_ret == ESP_OK) modbus_start();   /* already commissioned: now */
+    if (matter_ret == ESP_OK) fieldbus_start();   /* already commissioned: now */
 
     esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START, on_wifi_ap, NULL);
     /* No wifi_config_set_eth_available_fn(): its "ETH only" button needs an

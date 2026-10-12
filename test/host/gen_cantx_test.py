@@ -22,7 +22,7 @@ OLD=1 cuts can_server.c from git (OLDREV, default HEAD).
 import pathlib
 from cutter import Source
 
-src = Source.at("apps/full/main/can_server.c")
+src = Source.at("components/can/can_server.c", "apps/full/main/can_server.c")
 new = "static void can_tick(TickType_t now)" in src.text
 # The N2K heartbeat has its own 60 s period since the Basic one stayed at 1 s.
 hb = ("HB_PERIOD_MS", "N2K_HB_PERIOD_MS") if "#define N2K_HB_PERIOD_MS" in src.text else ("HB_PERIOD_MS",)
@@ -81,6 +81,7 @@ static uint8_t dout_get_all(void) { return dout_state; }
 static bool di_get(int i) { return (di_state >> i) & 1; }
 static esp_err_t dout_modify(uint8_t set, uint8_t clr, uint8_t tog) { dout_state = (uint8_t)(((dout_state | set) & ~clr) ^ tog); return ESP_OK; }
 static void scripting_on_can_activity(void) {}
+static void command_seen(void) {}
 static void led_set_rgb(uint8_t r, uint8_t g, uint8_t b) { (void)r; (void)g; (void)b; }
 static void buzzer_beep_once(uint32_t f, uint32_t d) { (void)f; (void)d; }
 static uint8_t s_name[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };

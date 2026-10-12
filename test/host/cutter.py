@@ -30,12 +30,20 @@ class Source:
         self.text = path.read_text()
 
     @classmethod
-    def at(cls, rel):
-        """The file at rel (from the repository root), honouring OLD/OLDREV."""
+    def at(cls, rel, *was):
+        """The file at rel (from the repository root), honouring OLD/OLDREV.
+        was: where the file lived before it moved, tried in turn when OLDREV
+        does not have rel yet."""
         s = cls.__new__(cls)
-        s.path = ROOT / rel
-        s.text = show(rel)
-        return s
+        for r in (rel,) + was:
+            try:
+                s.text = show(r)
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                if r == ((rel,) + was)[-1]:
+                    raise
+                continue
+            s.path = ROOT / r
+            return s
 
     def _fail(self, what):
         raise SystemExit("%s: %s not found in %s" % (__name__, what, self.path.name))

@@ -671,6 +671,36 @@ static const char *const k_mbm_matter[MBM_MATTER_MAX + 1] = {
     "none", "temperature", "humidity", "pressure", "flow", "power", "energy",
 };
 
+void web_can_config_json(cJSON *root, const app_config_t *cfg)
+{
+    cJSON *can = cJSON_AddObjectToObject(root, "can");
+    cJSON_AddNumberToObject(can, "mode",           cfg->can.mode);
+    cJSON_AddNumberToObject(can, "n2k_addr",       cfg->can.n2k_addr);
+    cJSON_AddNumberToObject(can, "base_id",        cfg->can.base_id);
+    cJSON_AddNumberToObject(can, "bitrate",        cfg->can.bitrate);
+    cJSON_AddNumberToObject(can, "tx_interval_ms", cfg->can.tx_interval_ms);
+}
+
+void web_can_config_parse(const cJSON *can_j, app_config_t *cfg, web_cfg_err_t *bad)
+{
+    if (!cJSON_IsObject(can_j)) return;
+    uint32_t n;
+    if (web_cfg_uint(can_j, "can.", "mode", 0, 2, &n, bad))
+        cfg->can.mode = (uint8_t)n;
+    if (web_cfg_uint(can_j, "can.", "n2k_addr", 1, 251, &n, bad))
+        cfg->can.n2k_addr = (uint8_t)n;
+    /* base_id .. base_id + 5 are used for TX and RX matching, so the
+       whole block has to fit in the 11-bit standard range. */
+    if (web_cfg_uint(can_j, "can.", "base_id", 0, APP_CFG_CAN_BASE_ID_MAX, &n, bad))
+        cfg->can.base_id = (uint16_t)n;
+    /* Outside this range twai_new_node_onchip() refuses the value and
+       can_server_init() fails. */
+    if (web_cfg_uint(can_j, "can.", "bitrate", 10000, 1000000, &n, bad))
+        cfg->can.bitrate = n;
+    if (web_cfg_uint(can_j, "can.", "tx_interval_ms", 0, UINT16_MAX, &n, bad))
+        cfg->can.tx_interval_ms = (uint16_t)n;
+}
+
 void web_mbm_config_json(cJSON *root, const app_config_t *cfg)
 {
     cJSON *mbm = cJSON_AddArrayToObject(root, "mbm");

@@ -148,6 +148,35 @@ jobs:
             apps/matter/build/partition_table/partition-table.bin
             apps/matter/build/flash_args
 
+  host-tests:
+    name: Host tests (test/host)
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.5.4   # cJSON and mbedtls come from its IDF, as on a developer machine
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: false   # the esp-idf submodule is replaced by the container's IDF below
+
+      - name: Fix git safe directory (Docker container runs as root)
+        run: git config --global --add safe.directory '*'
+
+      - name: Check out the QuickJS submodule
+        run: git submodule update --init components/quickjs/extern/quickjs
+
+      # The Makefile reaches cJSON and mbedtls through ../../esp-idf.
+      - name: Point esp-idf at the container's IDF
+        run: rm -rf esp-idf && ln -s "$IDF_PATH" esp-idf
+
+      - name: Install a host compiler with the sanitizers
+        run: apt-get update && apt-get install -y --no-install-recommends build-essential
+
+      # Every generator cuts the firmware source it tests, so a test that no
+      # longer matches the code it guards stops here.
+      - name: Build and run the host tests
+        run: make -C test/host
+
   rule-engine-tests:
     name: Rule engine tests
     runs-on: ubuntu-latest

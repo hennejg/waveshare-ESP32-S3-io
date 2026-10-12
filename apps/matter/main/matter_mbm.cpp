@@ -225,7 +225,16 @@ esp_err_t matter_mbm_create(esp_matter::node_t *node)
         uint8_t k = cfg->mbm[i].matter;
         endpoint_t *ep = nullptr;
         switch (k) {
-        case MBM_MATTER_TEMPERATURE: { temperature_sensor::config_t c; ep = temperature_sensor::create(node, &c, ENDPOINT_FLAG_NONE, nullptr); break; }
+        case MBM_MATTER_TEMPERATURE: {
+            /* The range mbm_matter_value() reports in. Explicit rather than
+               left null: the SDK's cluster dies on a non-null pair with
+               max < min + 1, and a default of 0/0 would be exactly that. */
+            temperature_sensor::config_t c;
+            c.temperature_measurement.min_measured_value = nullable<int16_t>(-27315);
+            c.temperature_measurement.max_measured_value = nullable<int16_t>(32767);
+            ep = temperature_sensor::create(node, &c, ENDPOINT_FLAG_NONE, nullptr);
+            break;
+        }
         case MBM_MATTER_HUMIDITY:    { humidity_sensor::config_t c;    ep = humidity_sensor::create(node, &c, ENDPOINT_FLAG_NONE, nullptr);    break; }
         case MBM_MATTER_PRESSURE:    { pressure_sensor::config_t c;    ep = pressure_sensor::create(node, &c, ENDPOINT_FLAG_NONE, nullptr);    break; }
         case MBM_MATTER_FLOW:        { flow_sensor::config_t c;        ep = flow_sensor::create(node, &c, ENDPOINT_FLAG_NONE, nullptr);        break; }

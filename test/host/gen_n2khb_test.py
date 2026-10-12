@@ -18,7 +18,7 @@ import pathlib
 from cutter import Source
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-src  = Source.at("apps/full/main/can_server.c")
+src  = Source.at("components/can/can_server.c", "apps/full/main/can_server.c")
 # Before the 60 s period the N2K heartbeat used the Basic-mode constant.
 period = "N2K_HB_PERIOD_MS" if "#define N2K_HB_PERIOD_MS" in src.text else "HB_PERIOD_MS"
 cuts  = src.defines(period, "N2K_PGN_HEARTBEAT", "N2K_ADDR_GLOBAL")

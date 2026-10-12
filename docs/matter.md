@@ -75,8 +75,11 @@ Every active pad endpoint costs internal RAM (1–2.6 KB measured), see *Memory 
 Controllers can read and toggle outputs. A write from a Matter controller (e.g. turning a plug on/off in Apple Home)
 is applied via `dout_set()` and reflected immediately in MQTT, Modbus, and CAN.
 
-The current output state is kept in sync via `matter_do_update()` so that manual changes via MQTT/Modbus/CAN are
-visible to the Matter controller without requiring a separate read.
+Every change of an output, whoever made it (Modbus, CAN, the web page, Matter itself), goes through
+`dout_modify()`, which hands the channels that moved to `matter_do_changed()`; the CHIP task then reports them to
+the controllers. The header pads do the same through the pad task (`matter_aux_changed()`), so a PWM duty set
+over Modbus also updates the level Matter switches back to on the next "on". A changed invert setting is applied
+on save: the inputs are read again and reported, the relays rewritten -- no Matter state moves for an output.
 
 ### Digital Inputs (DI1–DI8) — Contact Sensors
 
@@ -213,6 +216,22 @@ Measured after both changes (all pads standard, Modbus enabled):
 The RS-485 master adds 2.6 KB of static internal RAM (126.6 KB in all); its poll task runs on a PSRAM stack. With
 six Modbus sensor endpoints, before commissioning: 73.3 KB free (lowest 66.7 KB, DMA-capable 65.5 KB); after
 commissioning and polling: 119.7 KB free, 58.0 KB at the lowest.
+
+### CAN
+
+The CAN server of the full firmware (Basic mode and NMEA 2000, `docs/can.md`) is in this firmware too,
+configured in the **CAN Bus** tab. Like Modbus it starts only once the device is commissioned -- CAN has no
+authentication -- and its settings apply after a reboot. Outputs switched over CAN are reported to the
+controllers. In Basic mode the heartbeat status is always `0x01`: there is no MQTT broker here. CAN adds 1.3 KB
+of static internal RAM (127.9 KB in all); its worker runs on a PSRAM stack.
+
+### Testing
+
+`test/hw/matter_it.py` runs on a board with this firmware and a controller (chip-tool): endpoint creation for
+outputs, inputs, a PWM pad and every Modbus sensor type, reports to Matter after Modbus and CAN writes, invert
+changes on save, and that neither Modbus TCP nor CAN answers before commissioning. Board address, web password
+and chip-tool path come from the environment; see the file's header. The logic that does not need the CHIP
+stack is covered by the host tests (`make -C test/host`), which CI runs on every pull request.
 
 ### Modbus
 

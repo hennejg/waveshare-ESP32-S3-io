@@ -7,6 +7,7 @@ set(EXTRA_COMPONENT_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}/../../components/board"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../components/esp32-wifi-bootstrap"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../components/modbus"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../components/can"
 )
 
 # esp-matter is required for this app.

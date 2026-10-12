@@ -1,11 +1,9 @@
 #include "can_server.h"
 #include "app_config.h"
-#include "app_mqtt.h"
 #include "di.h"
 #include "dout.h"
 #include "led.h"
 #include "buzzer.h"
-#include "scripting.h"
 
 #include <string.h>
 #include <inttypes.h>
@@ -19,6 +17,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "freertos/idf_additions.h"
 
 #define TAG          "can"
 #define CAN_TX_GPIO  GPIO_NUM_2
@@ -42,6 +41,14 @@
 static twai_node_handle_t s_node = NULL;
 static uint8_t            s_mode;
 static QueueHandle_t      s_rx_q;
+static can_server_hooks_t s_hooks;   /* what the firmware lets CAN tell it */
+
+/* A control frame was acted on: the rule engine's command-health feed in
+   the full firmware. */
+static void command_seen(void)
+{
+    if (s_hooks.on_command) s_hooks.on_command();
+}
 
 typedef struct { uint32_t id; uint8_t ide; uint8_t dlc; uint8_t data[8]; } rx_msg_t;
 
@@ -166,7 +173,7 @@ static void basic_send(uint16_t id, const uint8_t *data, uint8_t dlc)
 
 static void basic_tx_heartbeat(void)
 {
-    uint8_t s = app_mqtt_is_connected() ? 0x03 : 0x01;
+    uint8_t s = (s_hooks.online && s_hooks.online()) ? 0x03 : 0x01;
     basic_send(s_base + 0, &s, 1);
 }
 
@@ -203,15 +210,15 @@ static void basic_handle_rx(const rx_msg_t *m)
 {
     if (m->id == (uint16_t)(s_base + 2) && m->dlc == 2) {
         basic_apply_do(m->data[0], m->data[1]);
-        scripting_on_can_activity();   /* upstream control write → CAN command-health feed */
+        command_seen();
     } else if (m->id == (uint16_t)(s_base + 3) && m->dlc == 3) {
         led_set_rgb(m->data[0], m->data[1], m->data[2]);
-        scripting_on_can_activity();
+        command_seen();
     } else if (m->id == (uint16_t)(s_base + 4) && m->dlc >= 2) {
         uint16_t f = (uint16_t)(m->data[0] | (m->data[1] << 8));
         uint32_t d = (m->dlc >= 3) ? (uint32_t)m->data[2] * 10u : 200u;
         if (f > 0) buzzer_beep_once(f, d);
-        scripting_on_can_activity();
+        command_seen();
     } else if (m->id == (uint16_t)(s_base + 5) && m->dlc == 0) {
         uint8_t di = 0;
         for (int i = 0; i < 8; i++) if (di_get(i)) di |= (uint8_t)(1u << i);
@@ -506,7 +513,7 @@ static void n2k_handle_rx(const rx_msg_t *m)
                 ESP_LOGW(TAG, "N2k switch control failed: %s", esp_err_to_name(ret));
         }
         n2k_tx_do_bank();
-        scripting_on_can_activity();   /* upstream DO control → CAN command-health feed */
+        command_seen();
         return;
     }
 
@@ -525,12 +532,12 @@ static void n2k_handle_rx(const rx_msg_t *m)
         uint8_t sub_fn = m->data[4];
         if (sub_fn == 0x01 && m->data[1] >= 6) {          /* LED */
             led_set_rgb(m->data[5], m->data[6], m->data[7]);
-            scripting_on_can_activity();
+            command_seen();
         } else if (sub_fn == 0x02 && m->data[1] >= 6) {   /* Buzzer */
             uint16_t freq = (uint16_t)m->data[5] | ((uint16_t)m->data[6] << 8);
             uint32_t dur  = (m->data[1] >= 7) ? (uint32_t)m->data[7] * 10u : 200u;
             if (freq > 0) buzzer_beep_once(freq, dur);
-            scripting_on_can_activity();
+            command_seen();
         }
     }
 }
@@ -639,9 +646,15 @@ static void can_worker_task(void *arg)
 
 /* ================================================================ public */
 
-esp_err_t can_server_init(void)
+bool can_server_running(void)
+{
+    return s_node != NULL;
+}
+
+esp_err_t can_server_init(const can_server_hooks_t *hooks)
 {
     const app_config_t *cfg = app_config_get();
+    if (hooks) s_hooks = *hooks;
     s_mode = cfg->can.mode;
     if (s_mode == 0) { ESP_LOGI(TAG, "CAN disabled"); return ESP_OK; }
 
@@ -695,7 +708,12 @@ esp_err_t can_server_init(void)
         ESP_LOGI(TAG, "N2k mode — preferred addr=0x%02x mfr=0x%03x", s_addr, N2K_MFR_CODE);
     }
 
-    if (xTaskCreate(can_worker_task, "can", 4096, NULL, 5, NULL) != pdPASS) {
+    /* The worker touches neither the flash nor an ISR path, so its stack can
+       live in PSRAM where the firmware is short of internal RAM. */
+    BaseType_t ok = s_hooks.psram_stack
+        ? xTaskCreateWithCaps(can_worker_task, "can", 4096, NULL, 5, NULL, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+        : xTaskCreate(can_worker_task, "can", 4096, NULL, 5, NULL);
+    if (ok != pdPASS) {
         err = ESP_ERR_NO_MEM; step = "worker task";
         twai_node_disable(s_node);
         goto fail;

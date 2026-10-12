@@ -94,6 +94,7 @@ static aux_mode_t s_aux_ep_mode[AUX_PAD_COUNT];
    (1..254, scaled to the duty cycle). */
 static uint8_t    s_pwm_level[AUX_PAD_COUNT];
 static bool       s_pwm_on[AUX_PAD_COUNT];
+static volatile bool s_started;   /* esp_matter::start() succeeded */
 
 static uint16_t level_to_duty(uint8_t level)
 {
@@ -140,10 +141,13 @@ static esp_err_t aux_attr_update(int a, uint32_t cluster_id, uint32_t attribute_
         if (val->type == ESP_MATTER_VAL_TYPE_NULLABLE_UINT8 && chip::app::NumericAttributeTraits<uint8_t>::IsNullValue(val->val.u8))
             return ESP_OK;
         uint8_t l = val->val.u8 < 1 ? 1 : val->val.u8 > 254 ? 254 : val->val.u8;
-        s_pwm_level[a] = l;
-        if (!s_pwm_on[a]) return ESP_OK;   /* kept for the next "on" */
+        if (!s_pwm_on[a]) { s_pwm_level[a] = l; return ESP_OK; }   /* kept for the next "on" */
         ESP_LOGI(TAG, "Matter → AUX%d PWM level %u (duty %.1f %%)", a + 1, l, level_to_duty(l) / 10.0);
-        return aux_io_pwm_set((uint8_t)a, 0, level_to_duty(l));
+        /* Remembered only once the pad took it: a refused level must not be
+           what the next "on" switches to. */
+        esp_err_t r = aux_io_pwm_set((uint8_t)a, 0, level_to_duty(l));
+        if (r == ESP_OK) s_pwm_level[a] = l;
+        return r;
     }
     return ESP_OK;
 }
@@ -489,6 +493,7 @@ esp_err_t matter_init(void)
     }
 
     ESP_LOGI(TAG, "Matter stack started — %d DO + %d DI endpoints", NUM_CHANNELS, NUM_CHANNELS);
+    s_started = true;   /* matter_do_changed() may schedule work from here on */
 
     /* The BooleanState cluster starts at false whatever the endpoint config
        said -- the value only reaches the attribute store, not the cluster
@@ -598,6 +603,43 @@ void matter_do_update(uint8_t channel, bool state)
                       OnOff::Id,
                       OnOff::Attributes::OnOff::Id,
                       &val);
+}
+
+/* Outputs switched by anyone (dout_modify()) are reported here. Collected
+   into one mask and handed to the CHIP task once: a burst of changes is one
+   piece of work, and the report reads what the port holds when it runs, so
+   the last report is the last state. A change Matter made itself is reported
+   back with the value it already has -- harmless. */
+static volatile uint8_t s_do_dirty;
+
+void matter_do_changed(uint8_t mask)
+{
+    if (!mask || !s_started) return;
+    if (__atomic_fetch_or(&s_do_dirty, mask, __ATOMIC_RELAXED)) return;   /* already scheduled */
+    CHIP_ERROR err = chip::DeviceLayer::PlatformMgr().ScheduleWork([](intptr_t) {
+        uint8_t d = __atomic_exchange_n(&s_do_dirty, 0, __ATOMIC_RELAXED);
+        for (uint8_t i = 0; i < NUM_CHANNELS; i++)
+            if (d & (1u << i)) matter_do_update(i, dout_get(i));
+    });
+    /* Not scheduled: clear the mask, or no later change would schedule again. */
+    if (err != CHIP_NO_ERROR) __atomic_store_n(&s_do_dirty, 0, __ATOMIC_RELAXED);
+}
+
+/* The same for the header pads: matter_aux_update() also refreshes the
+   cached PWM state, which aux_attr_update() uses on the CHIP task -- so it
+   runs there too, never on the pad task. */
+static volatile uint8_t s_aux_dirty;
+
+void matter_aux_changed(uint8_t mask)
+{
+    if (!mask || !s_started) return;
+    if (__atomic_fetch_or(&s_aux_dirty, mask, __ATOMIC_RELAXED)) return;   /* already scheduled */
+    CHIP_ERROR err = chip::DeviceLayer::PlatformMgr().ScheduleWork([](intptr_t) {
+        uint8_t d = __atomic_exchange_n(&s_aux_dirty, 0, __ATOMIC_RELAXED);
+        for (uint8_t a = 0; a < AUX_PAD_COUNT; a++)
+            if (d & (1u << a)) matter_aux_update(a);
+    });
+    if (err != CHIP_NO_ERROR) __atomic_store_n(&s_aux_dirty, 0, __ATOMIC_RELAXED);
 }
 
 /* Buffer is static so the lambda can capture it by pointer across the ScheduleWork call. */

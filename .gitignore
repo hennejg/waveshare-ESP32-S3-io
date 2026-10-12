@@ -119,3 +119,7 @@ dependencies.lock
 /test/host/test_padlevel.c
 /test/host/test_mbmmatter
 /test/host/test_mbmmatter.c
+test/host/test_canmatter
+test/host/test_canmatter.c
+test/host/test_pwmlevel
+test/host/test_pwmlevel.cpp

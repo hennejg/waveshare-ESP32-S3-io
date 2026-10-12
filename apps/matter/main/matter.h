@@ -12,9 +12,15 @@ extern "C" {
 esp_err_t   matter_init(void);
 void        matter_di_update(uint8_t channel, bool active);
 void        matter_do_update(uint8_t channel, bool state);
+/* Outputs (bit n = DO n+1) changed: reported to the controllers from the
+   CHIP task. Any task; outside the output lock. */
+void        matter_do_changed(uint8_t mask);
 /* Header pad a changed outside Matter (web UI): report its output or PWM
    state to the controllers. Inputs go through matter_di_update(8 + a). */
 void        matter_aux_update(uint8_t a);
+/* Header pads changed (bit a = pad a): reported from the CHIP task, like
+   matter_do_changed(). Any task. */
+void        matter_aux_changed(uint8_t mask);
 void        matter_decommission(void);
 void        matter_set_node_label(const char *name);
 const char *matter_get_qr_code(void);
@@ -29,7 +35,9 @@ void        matter_on_commissioned(void);
 static inline esp_err_t   matter_init(void)                       { return ESP_OK; }
 static inline void        matter_di_update(uint8_t c, bool s)     { (void)c; (void)s; }
 static inline void        matter_do_update(uint8_t c, bool s)     { (void)c; (void)s; }
+static inline void        matter_do_changed(uint8_t m)            { (void)m; }
 static inline void        matter_aux_update(uint8_t a)            { (void)a; }
+static inline void        matter_aux_changed(uint8_t m)           { (void)m; }
 static inline void        matter_decommission(void)               {}
 static inline void        matter_set_node_label(const char *n)    { (void)n; }
 static inline const char *matter_get_qr_code(void)                { return ""; }

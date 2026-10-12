@@ -43,6 +43,8 @@ if common:
              + wc.func("static void mbm_type_value(const char *s, uint8_t *out)")
              + wc.span("static const char *const k_mbm_matter[MBM_MATTER_MAX + 1] = {", "};")
              + wc.func("const char *web_mbm_config_parse(const cJSON *mbm_j, app_config_t *cfg,"))
+    if "web_can_config_parse(" in src.text:   # the CAN fields, shared with the Matter firmware
+        cuts += wc.func("void web_can_config_parse(const cJSON *can_j, app_config_t *cfg, web_cfg_err_t *bad)")
 elif new:
     cuts += (src.span("typedef struct { char field[40]; } cfg_err_t;", "typedef struct { char field[40]; } cfg_err_t;")
              + src.func("static void cfg_bad(cfg_err_t *bad, const char *where, const char *key)")

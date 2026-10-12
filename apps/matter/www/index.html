@@ -8,7 +8,13 @@
   <style>
     *, *::before, *::after { box-sizing: border-box; }
     body { font-family: system-ui, sans-serif; max-width: 560px; margin: 2rem auto; padding: 0 1rem; color: #222; }
-    h1 { font-size: 1.3rem; margin: 0 0 .9rem; }
+    h1 { font-size: 1.3rem; margin: 0 0 .9rem; display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+    /* Which firmware this is: the two look alike, and the device name
+       replaces the title once the configuration is loaded. */
+    .fw-badge { font-size: .7rem; font-weight: 600; letter-spacing: .02em; padding: .15rem .5rem;
+                border-radius: 999px; color: #fff; white-space: nowrap; }
+    .fw-badge.full   { background: #2f6f9f; }
+    .fw-badge.matter { background: #7b4fa3; }
     h2 { font-size: .95rem; color: #555; border-bottom: 1px solid #e8e8e8; padding-bottom: .25rem; margin: 1.5rem 0 .6rem; }
     label { display: block; margin-top: 1rem; font-size: 0.85rem; font-weight: 600; color: #555; }
     input[type="text"], input[type="password"] {
@@ -141,7 +147,7 @@
     </div>
   </div>
 
-  <h1 id="page-title">Waveshare Matter</h1>
+  <h1><span id="page-title">Waveshare Matter</span><span id="fw-badge" class="fw-badge matter" title="Firmware variant">Matter firmware</span></h1>
 
   <nav class="tab-bar">
     <button type="button" class="tab-btn" data-tab="matter"  onclick="switchTab('matter')">Matter</button>
@@ -150,6 +156,7 @@
     <button type="button" class="tab-btn" data-tab="outputs" onclick="switchTab('outputs')">Outputs</button>
     <button type="button" class="tab-btn" data-tab="pads"    onclick="switchTab('pads')">Pads</button>
     <button type="button" class="tab-btn" data-tab="modbus"  onclick="switchTab('modbus')">Modbus</button>
+    <button type="button" class="tab-btn" data-tab="can"     onclick="switchTab('can')">CAN Bus</button>
   </nav>
 
   <form id="form" novalidate>
@@ -294,6 +301,45 @@
         4xxxx form. If a 32-bit value comes out as nonsense, tick Swap.</p>
     </div>
 
+    <!-- ── CAN Bus / NMEA2000 ── -->
+    <div id="tab-can" class="tab-pane">
+      <p id="can-status" class="hint" style="font-size:.85rem;color:#333">–</p>
+      <label>Mode
+        <select id="can_mode" onchange="updateCanFields()">
+          <option value="0">Off</option>
+          <option value="1">Basic (11-bit standard frames)</option>
+          <option value="2">NMEA2000 (29-bit extended, 250 kbit/s)</option>
+        </select>
+      </label>
+      <div id="can_basic_fields">
+        <label>Base CAN ID (hex, 0x000–0x7FF)
+          <input type="text" id="can_base_id" maxlength="5" placeholder="0x100">
+        </label>
+        <label>Bit Rate
+          <select id="can_bitrate">
+            <option value="125000">125 kbit/s</option>
+            <option value="250000">250 kbit/s</option>
+            <option value="500000">500 kbit/s</option>
+            <option value="1000000">1 Mbit/s</option>
+          </select>
+        </label>
+      </div>
+      <div id="can_n2k_fields">
+        <label>Preferred Source Address (1–251)
+          <input type="number" id="can_n2k_addr" min="1" max="251" value="80">
+        </label>
+        <p class="hint">If already taken on the bus, the device will claim the next free address automatically.</p>
+      </div>
+      <label>Periodic DI/DO TX interval (ms, 0 = on-change only)
+        <input type="number" id="can_tx_interval" min="0" max="60000" value="1000">
+      </label>
+      <p class="hint">GPIO2 (TX) / GPIO3 (RX). Same frames as the full firmware (docs/can.md); outputs
+        switched over CAN are reported to the Matter controllers. CAN starts only once the device is
+        commissioned in Matter; the settings apply after a reboot. In Basic mode the heartbeat status
+        is always 0x01 — there is no MQTT broker in this firmware.
+        <b>CAN has no authentication:</b> any node on the bus can switch the outputs.</p>
+    </div>
+
     <div class="btn-row">
       <button type="submit" id="btn">Save</button>
       <button type="button" id="reboot-btn">Reboot</button>
@@ -312,6 +358,12 @@
                         ['pressure','pressure hPa'], ['flow','flow m³/h'], ['power','power W'],
                         ['energy','energy kWh']];
     let mbmPollTimer = null;
+
+    function updateCanFields() {
+      const mode = parseInt(document.getElementById('can_mode').value, 10);
+      document.getElementById('can_basic_fields').style.display = mode === 1 ? '' : 'none';
+      document.getElementById('can_n2k_fields').style.display   = mode === 2 ? '' : 'none';
+    }
 
     function updateMbRole() {
       const master = document.getElementById('mb_role').value === 'master';
@@ -673,6 +725,17 @@
           'Modbus is on, and starts once the device is commissioned in Matter (or after a reboot).';
         updateMbRole();
         renderMbm(cfg.mbm);
+        const can = cfg.can ?? {};
+        document.getElementById('can_mode').value        = can.mode ?? 0;
+        document.getElementById('can_n2k_addr').value    = can.n2k_addr ?? 80;
+        document.getElementById('can_base_id').value     = '0x' + (can.base_id ?? 0x100).toString(16).toUpperCase();
+        document.getElementById('can_bitrate').value     = can.bitrate ?? 250000;
+        document.getElementById('can_tx_interval').value = can.tx_interval_ms ?? 1000;
+        document.getElementById('can-status').textContent =
+          !can.mode ? 'CAN is off.' :
+          can.running ? 'CAN is running.' :
+          'CAN is on, and starts once the device is commissioned in Matter (or after a reboot).';
+        updateCanFields();
         buildPads(cfg);
         buildIoPanel(cfg);
         loadTime();
@@ -733,6 +796,14 @@
           rs485_tout_ms: Number(document.getElementById('mb_tout').value),
         };
         cfg.mbm = collectMbm();
+        const canBase = parseInt(document.getElementById('can_base_id').value, 16);
+        cfg.can = {
+          mode:           parseInt(document.getElementById('can_mode').value, 10),
+          n2k_addr:       parseInt(document.getElementById('can_n2k_addr').value, 10),
+          base_id:        Number.isNaN(canBase) ? -1 : canBase,   // refused by the device, named in the error
+          bitrate:        parseInt(document.getElementById('can_bitrate').value, 10),
+          tx_interval_ms: parseInt(document.getElementById('can_tx_interval').value, 10),
+        };
         const r = await apiFetch('/api/config', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -743,7 +814,7 @@
         if (res.status === 'ok') {
           status.className = 'ok';
           status.textContent = res.reboot_required
-            ? 'Saved. Reboot to apply (a pad mode, Modbus or a Matter sensor changed).'
+            ? 'Saved. Reboot to apply (a pad mode, Modbus, CAN or a Matter sensor changed).'
             : 'Saved.';
           load();
         } else {
@@ -995,7 +1066,14 @@
         if (!r.ok) return;
         const v = await r.json();
         document.getElementById('fw-version').textContent =
-          'fw ' + v.version + ' · ' + v.idf + ' · ' + v.date;
+          'fw ' + (v.variant ? v.variant + ' ' : '') + v.version + ' · ' + v.idf + ' · ' + v.date;
+        /* The device's own word over the page's: a web partition left over
+           from the other firmware would otherwise name the wrong one. */
+        if (v.variant === 'full' || v.variant === 'matter') {
+          const b = document.getElementById('fw-badge');
+          b.className = 'fw-badge ' + v.variant;
+          b.textContent = v.variant === 'full' ? 'Full firmware' : 'Matter firmware';
+        }
       } catch (_) {}
     }
     initAuth();

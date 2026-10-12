@@ -12,8 +12,8 @@ PORT ?= 15020
 
 # Every target below; GEN are the ones a gen_<name>_test.py writes as
 # test_<name>.c and builds into test_<name>.
-TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel mbmmatter
-GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel mbmmatter
+TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel mbmmatter canmatter pwmlevel
+GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel mbmmatter canmatter pwmlevel
 
 .PHONY: all clean $(TESTS)
 all: test_mb_pdu $(TESTS)
@@ -60,14 +60,14 @@ test_mqttstate: gen_mqttstate_test.py ../../components/scripting/scripting.c
 cantx: test_cantx
 	./test_cantx
 
-test_cantx: gen_cantx_test.py $(MAIN)/can_server.c
+test_cantx: gen_cantx_test.py ../../components/can/can_server.c
 	python3 gen_cantx_test.py
 	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter -Wno-unused-variable test_cantx.c -o $@
 
 n2khb: test_n2khb
 	./test_n2khb
 
-test_n2khb: gen_n2khb_test.py $(MAIN)/can_server.c
+test_n2khb: gen_n2khb_test.py ../../components/can/can_server.c
 	python3 gen_n2khb_test.py
 	$(CC) $(CFLAGS) -Wno-unused-function test_n2khb.c -o $@
 
@@ -435,7 +435,7 @@ test_rtuunwind: gen_rtuunwind_test.py $(MB)/mb_server.c
 caninit: test_caninit
 	./test_caninit
 
-test_caninit: gen_caninit_test.py $(MAIN)/can_server.c
+test_caninit: gen_caninit_test.py ../../components/can/can_server.c
 	python3 gen_caninit_test.py
 	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter -Wno-unused-variable test_caninit.c -o $@
 
@@ -498,3 +498,20 @@ mbmmatter: test_mbmmatter
 test_mbmmatter: gen_mbmmatter_test.py qjs-obj/cJSON.o ../../apps/matter/main/mbm_value.c ../../apps/matter/main/matter_mbm.cpp ../../components/board/web_common.c ../../components/board/web_common.h ../../components/board/app_config.c ../../components/board/app_config.h ../../components/modbus/mb_gateway.c
 	python3 gen_mbmmatter_test.py
 	$(CC) $(CFLAGS) -I$(CJSON) -I../../components/board -Istubs -Wno-unused-function test_mbmmatter.c qjs-obj/cJSON.o -lm -o $@
+
+# CAN's hooks into the firmware and outputs reported to Matter, cut out of
+# can_server.c and dout.c.
+canmatter: test_canmatter
+	./test_canmatter
+
+test_canmatter: gen_canmatter_test.py ../../components/can/can_server.c ../../components/board/dout.c
+	python3 gen_canmatter_test.py
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter -Wno-unused-variable test_canmatter.c -o $@
+
+# A pad's PWM level as Matter remembers it, cut out of matter.cpp (C++).
+pwmlevel: test_pwmlevel
+	./test_pwmlevel
+
+test_pwmlevel: gen_pwmlevel_test.py ../../apps/matter/main/matter.cpp
+	python3 gen_pwmlevel_test.py
+	c++ -std=c++17 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wno-unused-function test_pwmlevel.cpp -o $@

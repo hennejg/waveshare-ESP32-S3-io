@@ -109,12 +109,7 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON_AddStringToObject(root, "mqtt_topic_prefix", cfg->mqtt_topic_prefix);
     cJSON_AddNumberToObject(root, "led_mode",          cfg->led_mode);
 
-    cJSON *can = cJSON_AddObjectToObject(root, "can");
-    cJSON_AddNumberToObject(can, "mode",           cfg->can.mode);
-    cJSON_AddNumberToObject(can, "n2k_addr",       cfg->can.n2k_addr);
-    cJSON_AddNumberToObject(can, "base_id",        cfg->can.base_id);
-    cJSON_AddNumberToObject(can, "bitrate",        cfg->can.bitrate);
-    cJSON_AddNumberToObject(can, "tx_interval_ms", cfg->can.tx_interval_ms);
+    web_can_config_json(root, cfg);
 
     cJSON *mb = cJSON_AddObjectToObject(root, "modbus");
     cJSON_AddBoolToObject  (mb, "enable",   cfg->modbus.enable);
@@ -256,23 +251,7 @@ static esp_err_t api_config_post(httpd_req_t *req)
     if (web_cfg_uint(root, "", "led_mode", LED_MODE_IO, LED_MODE_STATUS, &n, &bad))
         cfg.led_mode = (uint8_t)n;
 
-    cJSON *can_j = cJSON_GetObjectItem(root, "can");
-    if (cJSON_IsObject(can_j)) {
-        if (web_cfg_uint(can_j, "can.", "mode", 0, 2, &n, &bad))
-            cfg.can.mode = (uint8_t)n;
-        if (web_cfg_uint(can_j, "can.", "n2k_addr", 1, 251, &n, &bad))
-            cfg.can.n2k_addr = (uint8_t)n;
-        /* base_id .. base_id + 5 are used for TX and RX matching, so the
-           whole block has to fit in the 11-bit standard range. */
-        if (web_cfg_uint(can_j, "can.", "base_id", 0, APP_CFG_CAN_BASE_ID_MAX, &n, &bad))
-            cfg.can.base_id = (uint16_t)n;
-        /* Outside this range twai_new_node_onchip() refuses the value and
-           can_server_init() fails — see the boot-order note in main.c. */
-        if (web_cfg_uint(can_j, "can.", "bitrate", 10000, 1000000, &n, &bad))
-            cfg.can.bitrate = n;
-        if (web_cfg_uint(can_j, "can.", "tx_interval_ms", 0, UINT16_MAX, &n, &bad))
-            cfg.can.tx_interval_ms = (uint16_t)n;
-    }
+    web_can_config_parse(cJSON_GetObjectItem(root, "can"), &cfg, &bad);
 
     cJSON *mb = cJSON_GetObjectItem(root, "modbus");
     if (cJSON_IsObject(mb)) {
@@ -1018,9 +997,9 @@ static esp_err_t api_version(httpd_req_t *req)
     };
     esp_reset_reason_t rr = esp_reset_reason();
     const char *rs = ((size_t)rr < sizeof(reasons) / sizeof(reasons[0]) && reasons[rr]) ? reasons[rr] : "other";
-    char json[200];
+    char json[256];
     snprintf(json, sizeof(json),
-             "{\"version\":\"%s\",\"idf\":\"%s\",\"date\":\"%s\",\"time\":\"%s\",\"reset_reason\":\"%s\"}",
+             "{\"variant\":\"full\",\"version\":\"%s\",\"idf\":\"%s\",\"date\":\"%s\",\"time\":\"%s\",\"reset_reason\":\"%s\"}",
              d->version, d->idf_ver, d->date, d->time, rs);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, json);

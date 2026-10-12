@@ -21,7 +21,7 @@ board hardware abstraction layer (`components/board/`):
 | Flavor | Binary | What it includes |
 |--------|--------|-----------------|
 | **Full** (`apps/full/`) | `waveshare_esp32s3_full.bin` | [WiFi provisioning](#connectivity), [Ethernet](#connectivity), [Rule engine](#automation-rules), [MQTT](#mqtt), [CAN bus](#can-bus), [Modbus RTU](#modbus-rtu), [full web UI](#web-configuration-ui) — **no Matter** |
-| **Matter** (`apps/matter/`) | `waveshare_esp32s3_matter.bin` | [WiFi provisioning](#connectivity), [Ethernet](#connectivity), [Matter](#matter) (Apple Home / Google Home), header pads, buzzer, NTP time + RTC, Modbus RTU slave or RS-485 master (values as Matter sensors) + Modbus TCP server, minimal web UI — no rule engine, no MQTT |
+| **Matter** (`apps/matter/`) | `waveshare_esp32s3_matter.bin` | [WiFi provisioning](#connectivity), [Ethernet](#connectivity), [Matter](#matter) (Apple Home / Google Home), header pads, buzzer, NTP time + RTC, Modbus RTU slave or RS-485 master (values as Matter sensors) + Modbus TCP server, CAN bus, minimal web UI — no rule engine, no MQTT |
 
 **If you are not sure which to use, start with the full firmware** — it is what the CI builds and the releases contain.
 
@@ -115,7 +115,8 @@ The UI also provides **Save**, **Reboot**, and **Factory Reset** buttons.
 All endpoints except the auth flow require an `Authorization: Basic base64(:<password>)` header.
 Until a password has been set they answer `403 {"error":"setup_required"}`: a device that has not been
 set up yet is closed, not open, and the only way in is the button-confirmed password flow.
-That includes `/api/version` and `/api/time`.
+That includes `/api/version` and `/api/time`. `/api/version` names the firmware in `"variant"` (`"full"` or
+`"matter"`); both web UIs show it as a badge next to the title, so the two look-alike pages cannot be confused.
 
 Requests a browser sends on behalf of another site are refused even with the right password
 (`Sec-Fetch-Site` other than `same-origin`/`none`, or an `Origin` that is not the device itself): once
@@ -205,8 +206,8 @@ It is **not** present in the full firmware because the CHIP SDK exhausts DMA-cap
 the rule engine and MQTT stack.
 
 Flash `apps/matter/` if you need to integrate the device into Apple Home, Google Home, or Home Assistant via the
-Matter protocol. You give up the rule engine, MQTT, CAN bus, the RS-485 gateway and the Modbus TCP master in
-exchange; Modbus RTU slave or RS-485 master and the Modbus TCP server are there, once the device is commissioned. As
+Matter protocol. You give up the rule engine, MQTT, the RS-485 gateway and the Modbus TCP master in exchange;
+Modbus RTU slave or RS-485 master, the Modbus TCP server and CAN are there, once the device is commissioned. As
 master the board reads values from devices on RS-485 and reports them as Matter sensors.
 
 | Feature               | Description                                                                               |
@@ -466,10 +467,9 @@ python -m esptool --chip esp32s3 -p /dev/ttyUSBx -b 460800 \
 │   │   └── main/
 │   │       ├── main.c            Entry point, event/callback wiring
 │   │       ├── app_mqtt.c/h      MQTT client wrapper
-│   │       ├── can_server.c/h    CAN bus (Basic + NMEA2000 modes)
 │   │       ├── net_budget.h      lwIP socket budget, checked at compile time
 │   │       └── web_server.c/h    HTTP config UI + full REST API
-│   └── matter/                   Matter firmware (WiFi + Matter + Modbus — no rule engine, no MQTT)
+│   └── matter/                   Matter firmware (WiFi + Matter + Modbus + CAN — no rule engine, no MQTT)
 │       ├── CMakeLists.txt
 │       ├── sdkconfig.defaults
 │       ├── partitions.csv        App-only layout (no SPIFFS)
@@ -495,6 +495,7 @@ python -m esptool --chip esp32s3 -p /dev/ttyUSBx -b 460800 \
 │   │   ├── rtc.c / app_rtc.h     DS3231 battery-backed RTC
 │   │   ├── sntp_sync.c/h         SNTP client + RTC write-back
 │   │   └── web_common.c/h        Web API parts both firmwares share (auth, time, pads)
+│   ├── can/                      CAN bus, Basic + NMEA2000 modes (both firmwares)
 │   ├── modbus/                   Modbus RTU slave, Modbus TCP server, RS-485 gateway, poll table (both firmwares)
 │   ├── scripting/                Rule engine (QuickJS DSL — full firmware only)
 │   │   └── RULES.md              Rule language reference

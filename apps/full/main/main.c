@@ -357,7 +357,13 @@ void app_main(void)
     if (mbm_init_ret != ESP_OK)
         ESP_LOGE(TAG, "Modbus TCP master init failed: %s — continuing without it",
                  esp_err_to_name(mbm_init_ret));
-    esp_err_t can_ret = can_server_init();
+    /* Heartbeat status: the broker; control frames feed the rule engine's
+       CAN command-health check. */
+    const can_server_hooks_t can_hooks = {
+        .online     = app_mqtt_is_connected,
+        .on_command = scripting_on_can_activity,
+    };
+    esp_err_t can_ret = can_server_init(&can_hooks);
     if (can_ret != ESP_OK)
         ESP_LOGE(TAG, "CAN server init failed: %s — continuing without CAN",
                  esp_err_to_name(can_ret));

@@ -2,6 +2,9 @@
 #include "app_config.h"
 #include "di.h"
 #include "dout.h"
+#ifdef CONFIG_APP_MATTER_ENABLE
+#include "matter.h"
+#endif
 
 #include <limits.h>
 #include <math.h>
@@ -686,9 +689,14 @@ static void aux_task(void *arg)
 #ifdef CONFIG_APP_MQTT_ENABLE
         for (uint8_t a = 0; a < AUX_PAD_COUNT; a++)
             if (dirty & (1u << a)) publish_pad(a);
-#else
-        (void)dirty;
 #endif
+#ifdef CONFIG_APP_MATTER_ENABLE
+        /* Whoever changed the pad -- Modbus, the web page or Matter itself --
+           the controllers hear of it, and Matter's remembered PWM level
+           follows a duty set from outside. */
+        matter_aux_changed(dirty);
+#endif
+        (void)dirty;
 
         TickType_t now = xTaskGetTickCount();
         if ((int32_t)(now - next_sample) < 0) continue;      /* not time yet */

@@ -5,6 +5,7 @@
 #include "net_budget.h"
 #include "mb_server.h"
 #include "mb_status_json.h"
+#include "can_server.h"
 #include "matter_mbm.h"
 #include "app_time.h"
 #include "aux_io.h"
@@ -105,6 +106,8 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON_AddNumberToObject(mb, "tcp_uid",       cfg->modbus.tcp_uid);
     cJSON_AddBoolToObject  (mb, "running",       mb_server_running());
     web_mbm_config_json(root, cfg);
+    web_can_config_json(root, cfg);
+    cJSON_AddBoolToObject(cJSON_GetObjectItem(root, "can"), "running", can_server_running());
 
     cJSON *di = cJSON_AddArrayToObject(root, "di");
     for (int i = 0; i < APP_CFG_DI_COUNT; i++) {
@@ -232,6 +235,18 @@ static esp_err_t api_config_post(httpd_req_t *req)
         mbm_changed = memcmp(cfg.mbm, app_config_get()->mbm, sizeof(cfg.mbm)) != 0;
     }
 
+    /* CAN, set up once at start like Modbus. */
+    bool can_changed = false;
+    if (!bad) {
+        web_cfg_err_t fb = { "" };
+        web_can_config_parse(cJSON_GetObjectItem(root, "can"), &cfg, &fb);
+        if (fb.field[0]) {
+            snprintf(bad_buf, sizeof(bad_buf), "invalid value for %s (wrong type or out of range)", fb.field);
+            bad = bad_buf;
+        }
+        can_changed = memcmp(&cfg.can, &app_config_get()->can, sizeof(cfg.can)) != 0;
+    }
+
     cJSON_Delete(root);
 
     if (bad) {
@@ -266,7 +281,7 @@ static esp_err_t api_config_post(httpd_req_t *req)
 
     /* The pads switch now; their Matter endpoints were made at boot for the
        mode each had then, so a changed mode reaches Matter after a reboot. */
-    bool reboot = mb_changed || ep_changed;   /* Modbus is set up once, at start */
+    bool reboot = mb_changed || can_changed || ep_changed;   /* Modbus and CAN are set up once, at start */
 #if APP_CFG_DI_AUX_COUNT
     for (int a = 0; a < APP_CFG_DI_AUX_COUNT; a++)
         if (cfg.aux_mode[a] != (uint8_t)aux_io_mode((uint8_t)a)) reboot = true;
@@ -274,7 +289,16 @@ static esp_err_t api_config_post(httpd_req_t *req)
     esp_err_t aux_ret = aux_io_apply();
     app_time_apply_tz();  /* timezone first, so a sync that follows computes in it */
     sntp_sync_apply();
-    for (int a = 0; a < APP_CFG_DI_AUX_COUNT; a++) matter_aux_update((uint8_t)a);
+    /* A changed invert: the inputs read again and reported, the relays
+       written with it now -- not at the next output command, which would
+       flip channels nobody touched. Same as the full firmware. */
+    di_publish_all();
+    esp_err_t dout_ret = dout_publish_all();
+    if (dout_ret != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+            "Saved, but the outputs could not be re-applied and may still use the old invert setting (see the device log)");
+        return ESP_OK;
+    }
     if (aux_ret != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
             "Saved, but a header pad could not be switched and is in its standard function (see the device log)");
@@ -461,9 +485,8 @@ static esp_err_t api_io_output(httpd_req_t *req)
 #if APP_CFG_DI_AUX_COUNT
     if (ch >= APP_CFG_DO_COUNT) {
         uint8_t a = (uint8_t)(ch - APP_CFG_DO_COUNT);
-        esp_err_t r = web_aux_output(req, a, root);
+        esp_err_t r = web_aux_output(req, a, root);   /* Matter hears of it from aux_io */
         cJSON_Delete(root);
-        matter_aux_update(a);
         return r;
     }
 #endif
@@ -486,15 +509,12 @@ static esp_err_t api_io_output(httpd_req_t *req)
         return ESP_OK;
     }
 
-    /* The hardware moved; tell the Matter side, or a controller keeps
-       showing the state before this request. dout_get(): what the port
-       really holds, not what was asked. */
+    /* The Matter side hears of the change from dout_modify(). */
     if (set_ret != ESP_OK) {
         ESP_LOGW(TAG, "output %d: set failed: %s", ch + 1, esp_err_to_name(set_ret));
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "output write failed");
         return ESP_OK;
     }
-    matter_do_update(ch, dout_get(ch));
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
     return ESP_OK;
@@ -571,7 +591,7 @@ static esp_err_t api_version(httpd_req_t *req)
     const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
     char json[320];
     snprintf(json, sizeof(json),
-             "{\"version\":\"%s\",\"idf\":\"%s\",\"date\":\"%s\",\"time\":\"%s\","
+             "{\"variant\":\"matter\",\"version\":\"%s\",\"idf\":\"%s\",\"date\":\"%s\",\"time\":\"%s\","
              "\"heap_internal_free\":%u,\"heap_internal_min\":%u,\"heap_internal_largest\":%u,"
              "\"heap_dma_free\":%u}",
              d->version, d->idf_ver, d->date, d->time,

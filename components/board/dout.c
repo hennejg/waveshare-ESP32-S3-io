@@ -7,6 +7,9 @@ int  app_mqtt_subscribe(const char *topic, int qos);
 bool app_mqtt_is_connected(void);
 #include "cJSON.h"
 #endif
+#ifdef CONFIG_APP_MATTER_ENABLE
+#include "matter.h"
+#endif
 
 #include <string.h>
 #include <ctype.h>
@@ -270,6 +273,11 @@ esp_err_t dout_modify(uint8_t set, uint8_t clear, uint8_t toggle)
        from our own confirmations coming back off the broker. */
 #ifdef CONFIG_APP_MQTT_ENABLE
     mark_publish((uint8_t)(before ^ after));
+#endif
+#ifdef CONFIG_APP_MATTER_ENABLE
+    /* Whoever switched it -- Modbus, CAN, the web page or Matter itself --
+       the controllers hear of it. */
+    matter_do_changed((uint8_t)(before ^ after));
 #endif
     return ret;
 }

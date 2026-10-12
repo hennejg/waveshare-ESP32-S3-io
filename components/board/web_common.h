@@ -32,6 +32,11 @@ bool web_cfg_uint(const cJSON *obj, const char *where, const char *key,
 bool web_cfg_str(const cJSON *obj, const char *where, const char *key,
                  char *dst, size_t cap, web_cfg_err_t *bad);
 
+/* The "can" object of GET /api/config, and of a POST into cfg->can (absent:
+   nothing changes). A field of the wrong type or range is named in *bad. */
+void        web_can_config_json(cJSON *root, const app_config_t *cfg);
+void        web_can_config_parse(const cJSON *can, app_config_t *cfg, web_cfg_err_t *bad);
+
 /* The poll table ("mbm") in GET /api/config, and the "mbm" array of a POST
    into cfg->mbm, replacing the table. network_rows: whether this firmware
    reads devices over Modbus TCP. Returns why the request is refused, or
