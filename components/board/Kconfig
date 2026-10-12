@@ -26,7 +26,7 @@ config APP_AUX_DI_ENABLE
         GPIO1 also as analog input (ADC1 channel 0, 0..3.1 V).  The change takes effect on saving;
         no reboot.  Every pin starts in its standard function.  One thing does
         change with the option on: the input table in NVS has eleven entries,
-        which an eight-input firmware (older releases, Matter) cannot read
+        which an eight-input firmware (older releases) cannot read
         back -- going back loses the input names (README).
 
         Standard function: GPIO1 is high-impedance (this firmware does not use
