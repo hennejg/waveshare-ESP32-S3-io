@@ -44,7 +44,7 @@ static QueueHandle_t      s_queue;
 static bool               s_status_mode;
 /* IO mode. An instant colour (MQTT "#RRGGBB", led_set_rgb() from Modbus,
    CAN, rules or the web page) is meant to stay; a sequence running at the
-   time used to put its next step over it. Every instant colour bumps s_gen,
+   time used to put its next step over it. Every new command bumps s_gen,
    and a sequence queued before it stops. s_io_lock makes "still current?"
    and the write of a step one step: an instant colour cannot land between
    them and be overwritten by the step after all. */
@@ -126,14 +126,20 @@ static void io_instant(uint8_t r, uint8_t g, uint8_t b)
     xSemaphoreTake(s_io_lock, portMAX_DELAY);
     s_gen++;
     hw_apply(r, g, b);
+    xTaskNotifyGive(s_led_task);   /* serialized with the next sequence's drain */
     xSemaphoreGive(s_io_lock);
-    xTaskNotifyGive(s_led_task);   /* wakes a step that is waiting out its time */
 }
 
 /* The steps of one sequence, until it ends, an instant colour comes, or a
    newer sequence is queued. */
 static void run_sequence(const led_seq_t *seq)
 {
+    /* A notification that arrived while we waited on the queue belongs to
+       the command before this run, not to its first step. Producers notify
+       under this lock, so draining cannot swallow a newer command's wake. */
+    xSemaphoreTake(s_io_lock, portMAX_DELAY);
+    ulTaskNotifyTake(pdTRUE, 0);
+    xSemaphoreGive(s_io_lock);
     for (int i = 0; i < seq->count; i++) {
         xSemaphoreTake(s_io_lock, portMAX_DELAY);
         bool current = seq->gen == s_gen;
@@ -429,9 +435,11 @@ void led_on_mqtt_message(const char *topic, size_t tlen,
     cJSON_Delete(root);
 
     if (seq.count > 0) {
-        seq.gen = s_gen;
+        xSemaphoreTake(s_io_lock, portMAX_DELAY);
+        seq.gen = ++s_gen;
         xQueueOverwrite(s_queue, &seq);
         xTaskNotifyGive(s_led_task);   /* the running one stops at once */
+        xSemaphoreGive(s_io_lock);
     } else {
         ESP_LOGW(TAG, "No valid steps in LED command");
     }

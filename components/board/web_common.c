@@ -99,6 +99,32 @@ bool web_json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out)
     return true;
 }
 
+bool web_led_color_parse(const cJSON *root, uint8_t *r, uint8_t *g, uint8_t *b)
+{
+    if (!cJSON_IsObject(root)) return false;
+    cJSON *color = cJSON_GetObjectItem(root, "color");
+    uint32_t rgb[3];
+    if (color) {
+        if (!cJSON_IsString(color)) return false;
+        const char *s = color->valuestring;
+        if (strlen(s) != 7 || s[0] != '#' ||
+            strspn(s + 1, "0123456789abcdefABCDEF") != 6) return false;
+        for (int i = 0; i < 3; i++) {
+            char pair[3] = { s[1 + 2 * i], s[2 + 2 * i], '\0' };
+            rgb[i] = (uint32_t)strtoul(pair, NULL, 16);
+        }
+    } else {
+        static const char *const keys[] = { "r", "g", "b" };
+        for (int i = 0; i < 3; i++) {
+            cJSON *v = cJSON_GetObjectItem(root, keys[i]);
+            if (!web_json_uint(v, 0, 255, &rgb[i]) || v->valuedouble != rgb[i])
+                return false;
+        }
+    }
+    *r = (uint8_t)rgb[0]; *g = (uint8_t)rgb[1]; *b = (uint8_t)rgb[2];
+    return true;
+}
+
 /* ------------------------------------------------------------------ auth check */
 
 /* A request a browser sends on behalf of a page from somewhere else: a form

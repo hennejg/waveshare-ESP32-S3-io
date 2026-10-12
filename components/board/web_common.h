@@ -20,6 +20,9 @@ const char *web_mime_type(const char *path);
 int  web_recv_body(httpd_req_t *req, char *buf, size_t cap);
 /* A JSON number as an unsigned integer within [lo, hi]. */
 bool web_json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out);
+/* A complete LED command: exact #RRGGBB or three integer RGB components.
+   Invalid commands leave the caller's colour unchanged. */
+bool web_led_color_parse(const cJSON *root, uint8_t *r, uint8_t *g, uint8_t *b);
 
 /* Fields of POST /api/config: taken only when valid. A field that is
    missing or null leaves the stored value; one of the wrong type or out of

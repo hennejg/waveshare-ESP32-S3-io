@@ -30,7 +30,7 @@ def source(rel):
 web = source("apps/full/main/web_server.c")
 # json_uint() moved to components/board/web_common.c as web_json_uint().
 def json_uint_cut():
-    if "web_json_uint(" not in web.text:
+    if "static bool json_uint(" in web.text:
         return web.func("static bool json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out)")
     return source("components/board/web_common.c").func(
         "bool web_json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out)")

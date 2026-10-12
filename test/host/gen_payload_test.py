@@ -48,6 +48,9 @@ if "static void io_instant(" in led.text:
                "static volatile uint32_t s_gen; static void *s_led_task;\n"
                "static void io_instant(uint8_t r, uint8_t g, uint8_t b) { hw_apply(r, g, b); }\n"
                "static void xTaskNotifyGive(void *t) { (void)t; }\n") + led_cut
+    led_cut = ("#define portMAX_DELAY 0\n"
+               "static void xSemaphoreTake(void *m, int t) { (void)m; (void)t; }\n"
+               "static void xSemaphoreGive(void *m) { (void)m; }\n") + led_cut
 buz_cut = (limit(buz, "BUZZER_PAYLOAD_MAX", 1024)
            + buz.defines("SEQ_MAX", "FREQ_MIN", "FREQ_MAX", "DUR_MIN_MS", "DUR_MAX_MS")
            + buz.type("} bstep_t;") + buz.type("} bseq_t;")

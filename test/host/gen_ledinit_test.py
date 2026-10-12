@@ -73,10 +73,19 @@ static int xSemaphoreTake(SemaphoreHandle_t m, TickType_t t) { (void)m; (void)t;
 static int xSemaphoreGive(SemaphoreHandle_t m) { (void)m; return pdTRUE; }
 static int xTaskCreate(void (*fn)(void *), const char *n, int st, void *a, int pr, TaskHandle_t *h)
 { (void)fn; (void)n; (void)st; (void)a; (void)pr; if (fail_task) return 0; tasks++; if (h) *h = &objs[nobj++ % 16]; return pdPASS; }
-static void xTaskNotifyGive(TaskHandle_t t) { (void)t; }
+static uint32_t notifications, waited_ms;
+static void xTaskNotifyGive(TaskHandle_t t) { (void)t; notifications++; }
 /* A step waiting out its time: the test can let something happen meanwhile. */
 static void (*during_wait)(void);
-static uint32_t ulTaskNotifyTake(int clear, TickType_t t) { (void)clear; (void)t; if (during_wait) { void (*f)(void) = during_wait; during_wait = NULL; f(); } return 0; }
+static uint32_t ulTaskNotifyTake(int clear, TickType_t t) {
+    if (!notifications && t) {
+        if (during_wait) { void (*f)(void) = during_wait; during_wait = NULL; f(); }
+        else waited_ms += t;
+    }
+    uint32_t n = notifications;
+    if (clear) notifications = 0; else if (notifications) notifications--;
+    return n;
+}
 static void vTaskDelay(TickType_t t) { (void)t; }
 static int queued;
 static int xQueueReceive(QueueHandle_t q, void *p, TickType_t t) { (void)q; (void)p; (void)t; return 0; }
@@ -121,6 +130,7 @@ static void reset_init(void)
 {
     s_strip = NULL; s_queue = NULL; s_io_lock = NULL; s_led_task = NULL; s_flash_q = NULL;
     fail_queue = fail_task = fail_mutex = 0; live_queues = live_mutexes = tasks = strips = 0;
+    notifications = waited_ms = 0;
 }
 static void instant_black(void) { led_set_rgb(0, 0, 0); }
 static void mqtt_black(void)    { led_on_mqtt_message("led/set", 7, "#000000", 7); }
@@ -161,6 +171,15 @@ int main(void)
     CHECK(nwritten == 0, "Sequenz von vor der Sofortfarbe noch gelaufen (%d Farben)", nwritten);
     seq.gen = s_gen; nwritten = 0; run_sequence(&seq);
     CHECK(nwritten == 2 && written[1] == 0x00FF00, "Sequenz nach der Sofortfarbe laeuft nicht durch");
+    /* A command wakes the task even when it was waiting for a queue item,
+       rather than a step's timeout. That old notification must not shorten
+       the first step of the sequence it has just received. */
+    static const char timed[] = "[{\"color\":\"#ff0000\",\"duration\":1000},{\"color\":\"#00ff00\",\"duration\":1000}]";
+    led_on_mqtt_message("led/set", 7, timed, sizeof timed - 1);
+    seq.gen = s_gen; waited_ms = 0; nwritten = 0;
+    run_sequence(&seq);
+    CHECK(waited_ms == 2000 && nwritten == 2,
+          "neue Sequenz: %u ms statt 2000 ms (Startbenachrichtigung verkuerzt ersten Schritt)", (unsigned)waited_ms);
     if (failures == f0) printf("  Sofortfarbe beendet eine laufende oder wartende Sequenz\n");
 
     f0 = failures;

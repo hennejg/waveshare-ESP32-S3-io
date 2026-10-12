@@ -142,6 +142,10 @@ The matter firmware exposes a smaller API: `/api/auth/*`, `/api/config` (subset,
 `/api/modbus/status`, `/api/matter/pairing` (GET — QR code + commissioning status), and `/api/matter/decommission` (POST — erase
 fabrics and reboot).
 
+`POST /api/io/led` accepts either `{"color":"#RRGGBB"}` (exactly six hex digits)
+or `{"r":255,"g":128,"b":0}` (all three components, integers from 0 to 255).
+Invalid commands return HTTP 400 without changing the LED, in both firmwares.
+
 ### Automation Rules
 
 A built-in rule engine wires digital inputs, digital outputs, and MQTT messages together

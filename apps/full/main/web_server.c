@@ -747,21 +747,12 @@ static esp_err_t api_io_led(httpd_req_t *req)
     cJSON *root = json_parse_exact(body, (size_t)n);
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
 
-    uint8_t r = 0, g = 0, b = 0;
-    cJSON *color_j = cJSON_GetObjectItem(root, "color");
-    if (cJSON_IsString(color_j) && color_j->valuestring[0] == '#') {
-        unsigned int ri = 0, gi = 0, bi = 0;
-        if (sscanf(color_j->valuestring + 1, "%02x%02x%02x", &ri, &gi, &bi) == 3) {
-            r = (uint8_t)ri; g = (uint8_t)gi; b = (uint8_t)bi;
-        }
-    } else {
-        cJSON *rj = cJSON_GetObjectItem(root, "r");
-        cJSON *gj = cJSON_GetObjectItem(root, "g");
-        cJSON *bj = cJSON_GetObjectItem(root, "b");
-        uint32_t n;
-        if (web_json_uint(rj, 0, 255, &n)) r = (uint8_t)n;
-        if (web_json_uint(gj, 0, 255, &n)) g = (uint8_t)n;
-        if (web_json_uint(bj, 0, 255, &n)) b = (uint8_t)n;
+    uint8_t r, g, b;
+    if (!web_led_color_parse(root, &r, &g, &b)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "Expected color #RRGGBB or integer r, g, b in 0-255");
+        return ESP_OK;
     }
     cJSON_Delete(root);
 

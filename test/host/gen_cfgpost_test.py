@@ -30,7 +30,7 @@ from cutter import Source, json_exact_if_used
 src = Source.at("apps/full/main/web_server.c")
 new = "static bool cfg_uint(" in src.text
 cuts = src.defines("BODY_MAX") + (Source.at("components/board/web_common.c").func("bool web_json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out)")
-                                          if "web_json_uint(" in src.text else src.func("static bool json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out)"))
+                                          if "static bool json_uint(" not in src.text else src.func("static bool json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out)"))
 common = "web_cfg_uint(" in src.text   # helpers and poll table moved to web_common.c
 if common:
     wc  = Source.at("components/board/web_common.c")
