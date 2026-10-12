@@ -12,8 +12,8 @@ PORT ?= 15020
 
 # Every target below; GEN are the ones a gen_<name>_test.py writes as
 # test_<name>.c and builds into test_<name>.
-TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel mbmmatter canmatter pwmlevel canfmt rulesubs nulbytes mqttowner ledinit ledapi
-GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel mbmmatter canmatter pwmlevel canfmt rulesubs nulbytes mqttowner ledinit ledapi
+TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel mbmmatter canmatter pwmlevel canfmt rulesubs nulbytes mqttowner ledinit ledapi scriptinit
+GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel mbmmatter canmatter pwmlevel canfmt rulesubs nulbytes mqttowner ledinit ledapi scriptinit
 
 .PHONY: all clean $(TESTS)
 all: test_mb_pdu $(TESTS)
@@ -567,3 +567,11 @@ ledapi: test_ledapi
 test_ledapi: gen_ledapi_test.py $(MAIN)/web_server.c ../../apps/matter/main/web_server.c ../../components/board/web_common.c ../../components/board/json_exact.c qjs-obj/cJSON.o
 	python3 gen_ledapi_test.py
 	$(CC) $(CFLAGS) -I$(CJSON) test_ledapi.c qjs-obj/cJSON.o -lm -o $@
+
+# Startup allocation failures and resource ownership in the rule engine.
+scriptinit: test_scriptinit
+	./test_scriptinit
+
+test_scriptinit: gen_scriptinit_test.py ../../components/scripting/scripting.c
+	python3 gen_scriptinit_test.py
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter -Wno-unused-variable test_scriptinit.c -o $@

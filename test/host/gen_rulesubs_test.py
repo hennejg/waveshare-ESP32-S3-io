@@ -20,7 +20,9 @@ loading the same rules again did not try again. Now:
     firmware delivers itself (modbus/...);
   - a reload unsubscribes what the new rules no longer read and subscribes
     only what is new;
-  - a (re)connect subscribes "rules/#" and the whole list.
+  - a (re)connect subscribes "rules/#" and the whole list;
+  - failed list allocation, listing or string conversion keeps the old
+    list intact and retries the topics of the current rules.
 OLD=1 cuts scripting.c from git (OLDREV, default HEAD); before the fix the
 function did not exist, so the generator stops there.
 
@@ -32,7 +34,8 @@ from cutter import Source
 src = Source.at("components/scripting/scripting.c")
 if "static void update_rule_subscriptions(JSContext *ctx)" not in src.text:
     sys.exit("FEHLER: update_rule_subscriptions() fehlt -- nur rules/# wird abonniert")
-if "static void subs_retry_due(void)" not in src.text:
+retry_sig = "static void subs_retry_due(JSContext *ctx)" if "static void subs_retry_due(JSContext *ctx)" in src.text else "static void subs_retry_due(void)"
+if retry_sig not in src.text:
     sys.exit("FEHLER: subs_retry_due() fehlt -- ein verweigertes Abo gilt als eingerichtet")
 cuts = (src.defines("MAX_TOPIC_LEN", "RULES_TOPIC")
         + src.span("#define MAX_RULE_SUBS 33", "static volatile bool     s_subs_retry;      /* an entry is not ok */")
@@ -42,7 +45,9 @@ cuts = (src.defines("MAX_TOPIC_LEN", "RULES_TOPIC")
         + src.func("static bool sub_try(const char *t)")
         + src.func("static void subs_apply(bool all)")
         + src.func("static void subs_lost(void)")
-        + src.func("static void subs_retry_due(void)")
+        + (src.span("static bool              s_topics_retry;", "static bool              s_topics_retry;") if "static bool              s_topics_retry;" in src.text else "")
+        + "static void update_rule_subscriptions(JSContext *ctx);\n"
+        + src.func(retry_sig)
         + src.func("static void update_rule_subscriptions(JSContext *ctx)")
         + src.func("void scripting_on_mqtt_connected(void)"))
 
@@ -62,7 +67,12 @@ HARNESS = r"""
 #define MALLOC_CAP_SPIRAM 1
 #define MALLOC_CAP_8BIT   2
 #define heap_caps_malloc(n, c)    malloc(n)
-#define heap_caps_calloc(k, n, c) calloc(k, n)
+static bool fail_list_alloc;
+static void *list_calloc(size_t k, size_t n) {
+    if (fail_list_alloc) { fail_list_alloc = false; return NULL; }
+    return calloc(k, n);
+}
+#define heap_caps_calloc(k, n, c) list_calloc(k, n)
 #define heap_caps_free(p)         free(p)
 typedef int *SemaphoreHandle_t;
 #define portMAX_DELAY 0
@@ -172,12 +182,12 @@ int main(int argc, char **argv)
     strcpy(refuse, "cmd/blink");
     subs_lost(); nsub = 0; scripting_on_mqtt_connected();
     refuse[0] = 0;
-    nsub = 0; ticks += 100; subs_retry_due();   /* < 10 s since the last try: not yet */
+    nsub = 0; ticks += 100; RETRY(a2);   /* < 10 s since the last try: not yet */
     int early = nsub;
-    ticks += 2000; subs_retry_due();
+    ticks += 2000; RETRY(a2);
     CHECK(early <= 1 && has(subs, nsub, "cmd/blink") && s_subs[sub_find(s_subs, s_nsubs, "cmd/blink")].ok,
           "verweigertes Abo nicht nach Ablauf der Wartezeit wiederholt (%d frueh, %d gesamt)", early, nsub);
-    nsub = 0; ticks += 2000; subs_retry_due();
+    nsub = 0; ticks += 2000; RETRY(a2);
     CHECK(nsub == 0, "eingerichtete Abos wiederholt (%d)", nsub);
 
     JSContext *b = load(rt, dsl,
@@ -197,8 +207,39 @@ int main(int argc, char **argv)
     JSContext *c = load(rt, dsl, "rule('z').when(mqtt('z/1')).then(function(){});");
     nsub = 0; update_rule_subscriptions(c);
     CHECK(nsub == 0 && s_subs_retry, "ohne Verbindung abonniert oder nicht vorgemerkt (%d)", nsub);
-    s_mqtt_up = true; ticks += 2000; subs_retry_due();
+    s_mqtt_up = true; ticks += 2000; RETRY(c);
     CHECK(has(subs, nsub, "z/1") && has(subs, nsub, "rules/#"), "nach dem Verbinden nicht nachgeholt (%d)", nsub);
+
+    /* A failed list allocation must not strand the new rules on the old
+       subscriptions. Retry from the context that is actually running. */
+    JSContext *d = load(rt, dsl, "rule('d').when(mqtt('new/heartbeat')).then(function(){});");
+    fail_list_alloc = true; nsub = nunsub = 0;
+    update_rule_subscriptions(d);
+    CHECK(nsub == 0 && nunsub == 0, "fehlgeschlagene Liste veraendert Abos");
+    ticks += 2000; RETRY(d);
+    CHECK(has(subs, nsub, "new/heartbeat") && has(unsubs, nunsub, "z/1"),
+          "nach Speicherfehler bleibt alte Topic-Liste dauerhaft aktiv");
+
+    /* Listing and string conversion can themselves throw. No partial list
+       may replace the old one, and the next retry must recover. */
+    static const char *faults[] = {
+        "var savedTopics = _mqtt_topics, first = true; _mqtt_topics = function(){ if(first){first=false; throw Error('temporary');} return savedTopics(); };",
+        "var savedTopics = _mqtt_topics, first = true; _mqtt_topics = function(){ if(first){first=false; return ['partial/topic', {toString:function(){throw Error('temporary');}}];} return savedTopics(); };"
+    };
+    for (int fault = 0; fault < 2; fault++) {
+        JSContext *e = load(rt, dsl, "rule('e').when(mqtt('recovered/topic')).then(function(){});");
+        JSValue ev = JS_Eval(e, faults[fault], strlen(faults[fault]), "fault.js", JS_EVAL_TYPE_GLOBAL);
+        JS_FreeValue(e, ev);
+        nsub = nunsub = 0;
+        update_rule_subscriptions(e);
+        CHECK(nsub == 0 && nunsub == 0, "JS-Listenfehler installiert Teil-Liste (Fall %d)", fault);
+        ticks += 2000; RETRY(e);
+        CHECK(has(subs, nsub, "recovered/topic"), "JS-Listenfehler nicht erneut versucht (Fall %d)", fault);
+        JS_FreeContext(e);
+        update_rule_subscriptions(d);
+    }
+    JS_FreeContext(d);
+
     JS_FreeContext(a2); JS_FreeContext(c);
 
     if (!failures) printf("  gelesene Topics abonniert, Neuladen gleicht ab, Verbindung abonniert alle, Verweigerte wiederholt\n");
@@ -208,5 +249,6 @@ int main(int argc, char **argv)
 }
 """
 out = pathlib.Path(__file__).with_name("test_rulesubs.c")
-out.write_text(HARNESS.replace("__CUT__", cuts))
+retry_call = "subs_retry_due(ctx)" if "JSContext *ctx" in retry_sig else "subs_retry_due()"
+out.write_text(("#define RETRY(ctx) " + retry_call + "\n") + HARNESS.replace("__CUT__", cuts))
 print("erzeugt:", out.name)

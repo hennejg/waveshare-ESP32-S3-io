@@ -961,6 +961,7 @@ static rule_sub_t        s_subs[MAX_RULE_SUBS];
 static int               s_nsubs;
 static SemaphoreHandle_t s_subs_mux;
 static volatile bool     s_subs_retry;      /* an entry is not ok */
+static bool              s_topics_retry;   /* loaded rules' list was not built */
 
 static bool sub_wanted(const char *t, size_t len)
 {
@@ -1022,22 +1023,11 @@ static void subs_lost(void)
     xSemaphoreGive(s_subs_mux);
 }
 
-/* On the engine task, every pass: refused subscriptions again, at most
-   every SUB_RETRY_MS and only while connected. */
-static void subs_retry_due(void)
-{
-    static TickType_t last;
-    if (!s_subs_retry || !s_mqtt_up) return;
-    TickType_t now = xTaskGetTickCount();
-    if (last && now - last < pdMS_TO_TICKS(SUB_RETRY_MS)) return;
-    last = now;
-    subs_apply(false);
-}
-
 /* After a load, on the engine task. */
 static void update_rule_subscriptions(JSContext *ctx)
 {
     if (!g_scripting_io || !g_scripting_io->mqtt_subscribe || !s_subs_mux) return;
+    s_topics_retry = true;
     rule_sub_t *want = heap_caps_calloc(2, sizeof(s_subs), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!want) { ESP_LOGE(TAG, "rule topics not updated: out of memory"); return; }
     rule_sub_t *old = want + MAX_RULE_SUBS;
@@ -1048,28 +1038,31 @@ static void update_rule_subscriptions(JSContext *ctx)
     JSValue fn = JS_GetPropertyStr(ctx, g, "_mqtt_topics");
     budget_start();
     JSValue arr = JS_IsFunction(ctx, fn) ? JS_Call(ctx, fn, g, 0, NULL) : JS_UNDEFINED;
-    if (JS_IsException(arr)) {
-        JS_FreeValue(ctx, JS_GetException(ctx));
-        ESP_LOGE(TAG, "rule topics could not be listed; subscriptions unchanged");
-        JS_FreeValue(ctx, fn); JS_FreeValue(ctx, g); heap_caps_free(want);
-        return;
-    }
+    if (JS_IsException(arr) || JS_IsArray(ctx, arr) <= 0) goto list_failed;
     uint32_t len = 0;
     JSValue lv = JS_GetPropertyStr(ctx, arr, "length");
-    JS_ToUint32(ctx, &len, lv);
+    if (JS_IsException(lv)) { JS_FreeValue(ctx, lv); goto list_failed; }
+    int len_result = JS_ToUint32(ctx, &len, lv);
     JS_FreeValue(ctx, lv);
+    if (len_result < 0) goto list_failed;
     for (uint32_t i = 0; i < len; i++) {
         JSValue v = JS_GetPropertyUint32(ctx, arr, i);
+        if (JS_IsException(v)) { JS_FreeValue(ctx, v); goto list_failed; }
         size_t tl = 0;
         const char *t = JS_ToCStringLen(ctx, &tl, v);
-        if (t && sub_wanted(t, tl)) {
+        if (!t) {
+            JS_FreeValue(ctx, v);
+            goto list_failed;
+        }
+        if (sub_wanted(t, tl)) {
             if (n < MAX_RULE_SUBS) strcpy(want[n++].topic, t);
             else skipped++;
         }
-        if (t) JS_FreeCString(ctx, t);
+        JS_FreeCString(ctx, t);
         JS_FreeValue(ctx, v);
     }
     JS_FreeValue(ctx, arr); JS_FreeValue(ctx, fn); JS_FreeValue(ctx, g);
+    s_topics_retry = false;
     if (skipped)
         ESP_LOGW(TAG, "rules read %d MQTT topics more than the %d subscribed: those receive nothing",
                  skipped, MAX_RULE_SUBS - 1);
@@ -1100,18 +1093,66 @@ static void update_rule_subscriptions(JSContext *ctx)
         sub_try(want[i].topic);
     }
     heap_caps_free(want);
+    return;
+
+list_failed:
+    /* Do not replace a working list with a partial one after an allocation
+       or JS conversion failed. The engine retries the current context. */
+    JS_FreeValue(ctx, JS_GetException(ctx));
+    ESP_LOGE(TAG, "rule topics could not be listed; subscriptions unchanged, retry pending");
+    JS_FreeValue(ctx, arr); JS_FreeValue(ctx, fn); JS_FreeValue(ctx, g);
+    heap_caps_free(want);
+}
+
+/* On the engine task: rebuild a failed list before retrying subscriptions,
+   at most every SUB_RETRY_MS and only while connected. */
+static void subs_retry_due(JSContext *ctx)
+{
+    static TickType_t last;
+    if ((!s_subs_retry && !s_topics_retry) || !s_mqtt_up) return;
+    TickType_t now = xTaskGetTickCount();
+    if (last && now - last < pdMS_TO_TICKS(SUB_RETRY_MS)) return;
+    last = now;
+    if (s_topics_retry) {
+        update_rule_subscriptions(ctx);
+        if (s_topics_retry) return;
+    }
+    subs_apply(false);
+}
+
+/* Allocation can fail even after the task's stack was allocated. Keep the
+   queue available and retry without dereferencing a NULL runtime/context. */
+static JSContext *engine_context_new(JSRuntime **runtime)
+{
+    JSRuntime *rt = JS_NewRuntime2(&s_psram_alloc, NULL);
+    *runtime = NULL;
+    if (!rt) return NULL;
+    JS_SetMemoryLimit(rt, JS_HEAP_LIMIT);
+    JS_SetMaxStackSize(rt, JS_STACK_LIMIT);
+    JS_SetGCThreshold(rt, 256 * 1024);
+    JS_SetInterruptHandler(rt, js_interrupt, NULL);
+    JSContext *ctx = JS_NewContext(rt);
+    if (!ctx) {
+        JS_FreeRuntime(rt);
+        return NULL;
+    }
+    *runtime = rt;
+    return ctx;
 }
 
 static void scripting_task(void *arg)
 {
-    JSRuntime *rt = JS_NewRuntime2(&s_psram_alloc, NULL);
-    JS_SetMemoryLimit(rt, JS_HEAP_LIMIT);
+    JSRuntime *rt;
+    JSContext *ctx;
+    bool logged_oom = false;
+    while (!(ctx = engine_context_new(&rt))) {
+        if (!logged_oom) {
+            ESP_LOGE(TAG, "Rule engine: out of memory; retrying startup");
+            logged_oom = true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
     size_t heap_limit = JS_HEAP_LIMIT;   /* in force; a reload may raise it */
-    JS_SetMaxStackSize(rt, JS_STACK_LIMIT);
-    JS_SetGCThreshold(rt, 256 * 1024);
-    JS_SetInterruptHandler(rt, js_interrupt, NULL);
-
-    JSContext *ctx = JS_NewContext(rt);
 
     scripting_register_bindings(ctx);
     register_timer_bindings(ctx);
@@ -1141,7 +1182,7 @@ static void scripting_task(void *arg)
         recover_interrupt(ctx);
         drain_overflow(ctx);   /* timers the event queue could not take, in order */
         recover_interrupt(ctx);
-        subs_retry_due();
+        subs_retry_due(ctx);
         /* Promise jobs left by a drain that ran over, or queued by any of the
            calls above, which do not drain: they used to wait for the next
            queued event, on a quiet device indefinitely. Nothing to do and
@@ -1347,6 +1388,9 @@ static void scripting_task(void *arg)
 
 esp_err_t scripting_init(const char *user_script, const scripting_io_t *io)
 {
+    if (!user_script || !io) return ESP_ERR_INVALID_ARG;
+    if (s_queue || s_store_task || s_engine_task) return ESP_ERR_INVALID_STATE;
+    bool made_subs_mux = !s_subs_mux;
     s_user_script  = user_script;
     g_scripting_io = io;
     /* Without it the connect handler subscribes nothing, not even "rules/#". */
@@ -1359,36 +1403,44 @@ esp_err_t scripting_init(const char *user_script, const scripting_io_t *io)
     s_reload_lock = xSemaphoreCreateMutex();
     if (!s_reload_lock) {
         ESP_LOGE(TAG, "Failed to create reload status lock");
-        return ESP_ERR_NO_MEM;
+        goto no_mem;
     }
 
     s_send_lock = xSemaphoreCreateMutex();
     if (!s_send_lock) {
         ESP_LOGE(TAG, "Failed to create event lock");
-        return ESP_ERR_NO_MEM;
+        goto no_mem;
     }
 
     s_queue = xQueueCreate(QUEUE_DEPTH, sizeof(scripting_evt_t));
     if (!s_queue) {
         ESP_LOGE(TAG, "Failed to create event queue");
-        return ESP_ERR_NO_MEM;
+        goto no_mem;
     }
 
     if (xTaskCreate(store_task, "rules_store", 4096, NULL, TASK_PRIORITY, &s_store_task) != pdPASS) {
-        vQueueDelete(s_queue);
         ESP_LOGE(TAG, "Failed to create rules store task");
-        return ESP_ERR_NO_MEM;
+        goto no_mem;
     }
     BaseType_t ok = xTaskCreateWithCaps(scripting_task, "scripting",
                                         TASK_STACK_BYTES / sizeof(StackType_t),
                                         NULL, TASK_PRIORITY, &s_engine_task,
                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ok != pdPASS) {
-        vQueueDelete(s_queue);
         ESP_LOGE(TAG, "Failed to create scripting task");
-        return ESP_ERR_NO_MEM;
+        goto no_mem;
     }
     return ESP_OK;
+
+no_mem:
+    /* No engine task is running on this path. Stop its store helper before
+       freeing resources, and clear handles so producers cannot use them. */
+    if (s_store_task) { vTaskDelete(s_store_task); s_store_task = NULL; }
+    if (s_queue) { vQueueDelete(s_queue); s_queue = NULL; }
+    if (s_send_lock) { vSemaphoreDelete(s_send_lock); s_send_lock = NULL; }
+    if (s_reload_lock) { vSemaphoreDelete(s_reload_lock); s_reload_lock = NULL; }
+    if (made_subs_mux && s_subs_mux) { vSemaphoreDelete(s_subs_mux); s_subs_mux = NULL; }
+    return ESP_ERR_NO_MEM;
 }
 
 void scripting_on_mqtt_connected(void)

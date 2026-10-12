@@ -135,3 +135,5 @@ test/host/test_ledinit
 test/host/test_ledinit.c
 test/host/test_ledapi
 test/host/test_ledapi.c
+test/host/test_scriptinit
+test/host/test_scriptinit.c

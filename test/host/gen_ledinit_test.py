@@ -103,16 +103,18 @@ static esp_err_t esp_timer_create(const esp_timer_create_args_t *a, esp_timer_ha
 static esp_err_t esp_timer_start_periodic(esp_timer_handle_t h, uint64_t us) { (void)h; (void)us; return ESP_OK; }
 static esp_err_t esp_timer_stop(esp_timer_handle_t h) { (void)h; return ESP_OK; }
 
-/* The LED strip: the colours written, in order. */
+/* Record the existing RGB wire bytes. Match the
+   SDK's RGB API and its default GRB format, rather than hiding an R/G swap. */
 typedef obj_t *led_strip_handle_t;
-typedef struct { int strip_gpio_num; int max_leds; } led_strip_config_t;
+#define LED_STRIP_COLOR_COMPONENT_FMT_RGB 1
+typedef struct { int strip_gpio_num; int max_leds; int color_component_format; } led_strip_config_t;
 typedef struct { uint32_t resolution_hz; struct { int with_dma; } flags; } led_strip_rmt_config_t;
-static int strips;
+static int strips, strip_format;
 static esp_err_t led_strip_new_rmt_device(const led_strip_config_t *c, const led_strip_rmt_config_t *r, led_strip_handle_t *h)
-{ (void)c; (void)r; strips++; *h = &objs[nobj++ % 16]; return ESP_OK; }
+{ strip_format = c->color_component_format; (void)r; strips++; *h = &objs[nobj++ % 16]; return ESP_OK; }
 static esp_err_t led_strip_del(led_strip_handle_t h) { (void)h; strips--; return ESP_OK; }
 static uint32_t written[32]; static int nwritten; static uint8_t px[3];
-static esp_err_t led_strip_set_pixel(led_strip_handle_t h, int i, uint8_t g, uint8_t r, uint8_t b) { (void)h; (void)i; px[0] = r; px[1] = g; px[2] = b; return ESP_OK; }
+static esp_err_t led_strip_set_pixel(led_strip_handle_t h, int i, uint8_t r, uint8_t g, uint8_t b) { (void)h; (void)i; px[0] = strip_format == LED_STRIP_COLOR_COMPONENT_FMT_RGB ? r : g; px[1] = strip_format == LED_STRIP_COLOR_COMPONENT_FMT_RGB ? g : r; px[2] = b; return ESP_OK; }
 static esp_err_t led_strip_refresh(led_strip_handle_t h) { (void)h; if (nwritten < 32) written[nwritten++] = (uint32_t)px[0] << 16 | px[1] << 8 | px[2]; return ESP_OK; }
 static esp_err_t led_strip_clear(led_strip_handle_t h) { (void)h; return ESP_OK; }
 
@@ -154,6 +156,11 @@ int main(void)
     }
     reset_init(); cfg.led_mode = LED_MODE_IO; led_init();
     if (!failures) printf("  led_init: Queue, Mutex und Task geprueft, bei Fehler freigegeben, ESP_ERR_NO_MEM\n");
+
+    nwritten = 0;
+    led_set_rgb(255, 0, 0); led_set_rgb(0, 255, 0); led_set_rgb(0, 0, 255);
+    CHECK(nwritten == 3 && written[0] == 0xFF0000 && written[1] == 0x00FF00 && written[2] == 0x0000FF,
+          "RGB-Drahtreihenfolge: primaere Farben vertauscht");
 
     int f0 = failures;
     led_seq_t seq = { .count = 2, .gen = s_gen,

@@ -82,7 +82,7 @@ static esp_err_t esp_timer_stop(esp_timer_handle_t t) { (void)t; return 0; }
 
 typedef void *led_strip_handle_t;
 static uint8_t px_r, px_g, px_b;
-static void led_strip_set_pixel(led_strip_handle_t s, int i, uint8_t g, uint8_t r, uint8_t b) { (void)s; (void)i; px_r = r; px_g = g; px_b = b; }
+static void led_strip_set_pixel(led_strip_handle_t s, int i, uint8_t r, uint8_t g, uint8_t b) { (void)s; (void)i; px_r = r; px_g = g; px_b = b; }
 static void led_strip_refresh(led_strip_handle_t s) { (void)s; }
 static void led_force_set(uint8_t r, uint8_t g, uint8_t b);
 #ifndef HAVE_RELEASE
