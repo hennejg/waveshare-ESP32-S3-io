@@ -22,9 +22,23 @@ from cutter import Source
 mq = Source.at("apps/full/main/app_mqtt.c")
 bd = Source.at("components/scripting/bindings.c")
 mk = "static bool make_topic(" if "static bool make_topic(" in mq.text else "static void make_topic("
+# Since subscriptions have owners, the two go through the _as() pair and its
+# table (left unallocated here: nothing recorded, every unsubscribe sent).
+owners = ""
+if "int app_mqtt_subscribe_as(" in mq.text:
+    owners = ("typedef int *SemaphoreHandle_t;\n#define portMAX_DELAY 0\n"
+              "static void xSemaphoreTake(SemaphoreHandle_t m, int t) { (void)m; (void)t; }\n"
+              "static void xSemaphoreGive(SemaphoreHandle_t m) { (void)m; }\n"
+              + Source.at("apps/full/main/app_mqtt.h").defines("APP_MQTT_OWNER_FW", "APP_MQTT_OWNER_RULES")
+              + mq.span("#define SUBS_MAX      64", "static bool              s_subs_full;")
+              + mq.func("static void subs_add(unsigned owner, const char *topic)")
+              + mq.func("static int subs_remove(unsigned owner, const char *topic)")
+              + mq.func("int app_mqtt_subscribe_as(unsigned owner, const char *topic, int qos)")
+              + mq.func("int app_mqtt_unsubscribe_as(unsigned owner, const char *topic)"))
 cuts = (mq.defines("TOPIC_MAXLEN")
         + mq.func(mk + "const char *topic, char *buf, size_t buf_len)")
         + mq.func("int app_mqtt_publish(const char *topic, const char *payload, int len,")
+        + owners
         + mq.func("int app_mqtt_subscribe(const char *topic, int qos)")
         + mq.func("int app_mqtt_unsubscribe(const char *topic)")
         + bd.func("static JSValue js_mqtt_publish(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)"))

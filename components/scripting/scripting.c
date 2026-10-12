@@ -941,14 +941,26 @@ static esp_err_t store_off_psram(scripting_store_fn_t fn, const char *arg)
    documented watchdog example -- never received a message and its watchdog
    fired with the other side alive. The topics the loaded rules read are
    subscribed besides it, and the list follows every reload: what a new rule
-   set no longer reads is unsubscribed. Not subscribed: "$..." (the engine's
-   own '$sys/mqtt', and broker-reserved), wildcards (a rule's topic is a
-   name, matched as it is), what "rules/#" covers, and what the firmware
-   delivers itself (mqtt_local). */
-#define MAX_RULE_SUBS 32
-static char              s_subs[MAX_RULE_SUBS][MAX_TOPIC_LEN];
+   set no longer reads is unsubscribed (app_mqtt keeps a filter another
+   module holds). Not subscribed: "$..." (the engine's own '$sys/mqtt', and
+   broker-reserved), wildcards (a rule's topic is a name, matched as it is),
+   what "rules/#" covers, and what the firmware delivers itself
+   (mqtt_local).
+
+   Wanted and in place are kept apart: an entry is `ok` only once the client
+   took the SUBSCRIBE. A refused one (client out of memory, not connected)
+   used to count as done -- the topic stayed silent for the session, and
+   loading the same rules again did not try again. Refused entries are
+   tried again every SUB_RETRY_MS while connected; a lost connection makes
+   every entry not ok, and the connect handler subscribes them all. Entry 0
+   is "rules/#". What the broker answers in its SUBACK is not seen here. */
+#define MAX_RULE_SUBS 33          /* "rules/#" and 32 topics of the rules */
+#define SUB_RETRY_MS  10000
+typedef struct { char topic[MAX_TOPIC_LEN]; bool ok; } rule_sub_t;
+static rule_sub_t        s_subs[MAX_RULE_SUBS];
 static int               s_nsubs;
 static SemaphoreHandle_t s_subs_mux;
+static volatile bool     s_subs_retry;      /* an entry is not ok */
 
 static bool sub_wanted(const char *t, size_t len)
 {
@@ -959,20 +971,78 @@ static bool sub_wanted(const char *t, size_t len)
     return true;
 }
 
-static bool sub_in(char (*list)[MAX_TOPIC_LEN], int n, const char *t)
+static int sub_find(const rule_sub_t *list, int n, const char *t)
 {
-    for (int i = 0; i < n; i++) if (!strcmp(list[i], t)) return true;
-    return false;
+    for (int i = 0; i < n; i++) if (!strcmp(list[i].topic, t)) return i;
+    return -1;
+}
+
+/* Records the result of subscribing t, if t is still wanted. */
+static void sub_mark(const char *t, bool ok)
+{
+    xSemaphoreTake(s_subs_mux, portMAX_DELAY);
+    int i = sub_find(s_subs, s_nsubs, t);
+    if (i >= 0) s_subs[i].ok = ok;
+    if (!ok) s_subs_retry = true;
+    xSemaphoreGive(s_subs_mux);
+}
+
+static bool sub_try(const char *t)
+{
+    bool ok = g_scripting_io->mqtt_subscribe(t, 0) >= 0;
+    sub_mark(t, ok);
+    return ok;
+}
+
+/* Subscribes every entry that is not ok (all = every entry). */
+static void subs_apply(bool all)
+{
+    if (!g_scripting_io || !g_scripting_io->mqtt_subscribe || !s_subs_mux) return;
+    rule_sub_t *t = heap_caps_malloc(sizeof(s_subs), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!t) { s_subs_retry = true; ESP_LOGE(TAG, "rule topics not subscribed: out of memory"); return; }
+    xSemaphoreTake(s_subs_mux, portMAX_DELAY);
+    int n = s_nsubs;
+    memcpy(t, s_subs, sizeof(s_subs));
+    s_subs_retry = false;
+    xSemaphoreGive(s_subs_mux);
+    int failed = 0;
+    for (int i = 0; i < n; i++)
+        if ((all || !t[i].ok) && !sub_try(t[i].topic)) failed++;
+    if (failed) ESP_LOGW(TAG, "%d MQTT subscription(s) of the rules refused; tried again in %d s",
+                         failed, SUB_RETRY_MS / 1000);
+    heap_caps_free(t);
+}
+
+/* The broker connection went: nothing is subscribed until the next one. */
+static void subs_lost(void)
+{
+    if (!s_subs_mux) return;
+    xSemaphoreTake(s_subs_mux, portMAX_DELAY);
+    for (int i = 0; i < s_nsubs; i++) s_subs[i].ok = false;
+    xSemaphoreGive(s_subs_mux);
+}
+
+/* On the engine task, every pass: refused subscriptions again, at most
+   every SUB_RETRY_MS and only while connected. */
+static void subs_retry_due(void)
+{
+    static TickType_t last;
+    if (!s_subs_retry || !s_mqtt_up) return;
+    TickType_t now = xTaskGetTickCount();
+    if (last && now - last < pdMS_TO_TICKS(SUB_RETRY_MS)) return;
+    last = now;
+    subs_apply(false);
 }
 
 /* After a load, on the engine task. */
 static void update_rule_subscriptions(JSContext *ctx)
 {
     if (!g_scripting_io || !g_scripting_io->mqtt_subscribe || !s_subs_mux) return;
-    char (*want)[MAX_TOPIC_LEN] = heap_caps_calloc(2, sizeof(s_subs), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    rule_sub_t *want = heap_caps_calloc(2, sizeof(s_subs), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!want) { ESP_LOGE(TAG, "rule topics not updated: out of memory"); return; }
-    char (*old)[MAX_TOPIC_LEN] = want + MAX_RULE_SUBS;
+    rule_sub_t *old = want + MAX_RULE_SUBS;
     int n = 0, skipped = 0;
+    strcpy(want[n++].topic, RULES_TOPIC);
 
     JSValue g  = JS_GetGlobalObject(ctx);
     JSValue fn = JS_GetPropertyStr(ctx, g, "_mqtt_topics");
@@ -993,7 +1063,7 @@ static void update_rule_subscriptions(JSContext *ctx)
         size_t tl = 0;
         const char *t = JS_ToCStringLen(ctx, &tl, v);
         if (t && sub_wanted(t, tl)) {
-            if (n < MAX_RULE_SUBS) strcpy(want[n++], t);
+            if (n < MAX_RULE_SUBS) strcpy(want[n++].topic, t);
             else skipped++;
         }
         if (t) JS_FreeCString(ctx, t);
@@ -1002,25 +1072,33 @@ static void update_rule_subscriptions(JSContext *ctx)
     JS_FreeValue(ctx, arr); JS_FreeValue(ctx, fn); JS_FreeValue(ctx, g);
     if (skipped)
         ESP_LOGW(TAG, "rules read %d MQTT topics more than the %d subscribed: those receive nothing",
-                 skipped, MAX_RULE_SUBS);
+                 skipped, MAX_RULE_SUBS - 1);
 
+    /* What stays keeps its state: in place stays in place, refused is
+       tried again below -- also when the same rules are loaded again. */
     xSemaphoreTake(s_subs_mux, portMAX_DELAY);
     int nold = s_nsubs;
     memcpy(old, s_subs, sizeof(s_subs));
+    for (int i = 0; i < n; i++) {
+        int k = sub_find(old, nold, want[i].topic);
+        want[i].ok = k >= 0 && old[k].ok;
+    }
     memcpy(s_subs, want, sizeof(s_subs));
     s_nsubs = n;
     xSemaphoreGive(s_subs_mux);
 
-    /* Not connected, a call fails: the connect handler subscribes the list,
-       and a clean session forgot the old ones anyway. */
     for (int i = 0; i < nold; i++)
-        if (!sub_in(want, n, old[i]) && g_scripting_io->mqtt_unsubscribe)
-            g_scripting_io->mqtt_unsubscribe(old[i]);
-    for (int i = 0; i < n; i++)
-        if (!sub_in(old, nold, want[i])) {
-            ESP_LOGI(TAG, "rules read MQTT topic '%s': subscribed", want[i]);
-            g_scripting_io->mqtt_subscribe(want[i], 0);
-        }
+        if (sub_find(want, n, old[i].topic) < 0 && g_scripting_io->mqtt_unsubscribe)
+            g_scripting_io->mqtt_unsubscribe(old[i].topic);
+    /* Not connected (or the connect handler ran before s_mqtt_up was set):
+       left to the retry, which runs once the connection is up. */
+    for (int i = 0; i < n; i++) {
+        if (want[i].ok) continue;
+        if (!s_mqtt_up) { s_subs_retry = true; continue; }
+        if (sub_find(old, nold, want[i].topic) < 0)
+            ESP_LOGI(TAG, "rules read MQTT topic '%s': subscribing", want[i].topic);
+        sub_try(want[i].topic);
+    }
     heap_caps_free(want);
 }
 
@@ -1063,6 +1141,7 @@ static void scripting_task(void *arg)
         recover_interrupt(ctx);
         drain_overflow(ctx);   /* timers the event queue could not take, in order */
         recover_interrupt(ctx);
+        subs_retry_due();
         /* Promise jobs left by a drain that ran over, or queued by any of the
            calls above, which do not drain: they used to wait for the next
            queued event, on a quiet device indefinitely. Nothing to do and
@@ -1270,7 +1349,12 @@ esp_err_t scripting_init(const char *user_script, const scripting_io_t *io)
 {
     s_user_script  = user_script;
     g_scripting_io = io;
+    /* Without it the connect handler subscribes nothing, not even "rules/#". */
     if (!s_subs_mux) s_subs_mux = xSemaphoreCreateMutex();
+    if (!s_subs_mux) {
+        ESP_LOGE(TAG, "subscription lock: out of memory");
+        return ESP_ERR_NO_MEM;
+    }
 
     s_reload_lock = xSemaphoreCreateMutex();
     if (!s_reload_lock) {
@@ -1309,24 +1393,18 @@ esp_err_t scripting_init(const char *user_script, const scripting_io_t *io)
 
 void scripting_on_mqtt_connected(void)
 {
-    if (!g_scripting_io || !g_scripting_io->mqtt_subscribe) return;
-    g_scripting_io->mqtt_subscribe(RULES_TOPIC, 0);
-    /* Copied under the lock, subscribed outside it: a subscribe can wait on
-       the client, and the engine task updates the list meanwhile. A topic
-       it adds now is subscribed by it as well -- twice is harmless. */
-    if (!s_subs_mux) return;
-    char (*t)[MAX_TOPIC_LEN] = heap_caps_malloc(sizeof(s_subs), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!t) { ESP_LOGE(TAG, "rule topics not subscribed: out of memory"); return; }
-    xSemaphoreTake(s_subs_mux, portMAX_DELAY);
-    int n = s_nsubs;
-    memcpy(t, s_subs, sizeof(s_subs));
-    xSemaphoreGive(s_subs_mux);
-    for (int i = 0; i < n; i++) g_scripting_io->mqtt_subscribe(t[i], 0);
-    heap_caps_free(t);
+    /* Before anything is loaded the list holds only "rules/#". */
+    if (s_subs_mux && s_nsubs == 0) {
+        xSemaphoreTake(s_subs_mux, portMAX_DELAY);
+        if (s_nsubs == 0) { strcpy(s_subs[0].topic, RULES_TOPIC); s_subs[0].ok = false; s_nsubs = 1; }
+        xSemaphoreGive(s_subs_mux);
+    }
+    subs_apply(true);
 }
 
 void scripting_on_mqtt_state(bool up)
 {
+    if (!up) subs_lost();
     s_mqtt_up = up;
     s_mqtt_known = true;
     __atomic_fetch_or(&s_pending, PENDING_MQTT_STATE, __ATOMIC_RELEASE);

@@ -110,7 +110,8 @@ Each output can be given a **name** (max 20 characters, no `/`, `+` or `#`, not 
 
 The payload is the word and nothing else: a NUL byte or anything after the word refuses the command
 (`on\0off` is not `on`). JSON payloads (bulk outputs, LED, buzzer, PWM) are one JSON value, then only
-white space -- `50 off` or an object with bytes appended is refused, not read as the value in front.
+white space -- `50 off` or an object with bytes appended is refused, not read as the value in front -- and a string
+in it must not contain `\u0000` (`["on\u0000off"]` is refused, not read as `on`).
 
 ### Individual output commands
 

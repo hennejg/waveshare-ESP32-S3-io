@@ -43,6 +43,67 @@ static bool make_topic(const char *topic, char *buf, size_t buf_len)
     return n < buf_len;
 }
 
+/* ── Subscriptions and their owners ─────────────────────────────────────────
+   See app_mqtt_subscribe_as(). Filters as the owners pass them (relative);
+   the same string from two owners is the same broker subscription. In PSRAM,
+   allocated with the client. A table that could not record an owner this
+   session makes an unsubscribe of a filter it does not know a no-op: it
+   cannot tell whether someone else holds it. */
+#define SUBS_MAX      64
+#define SUB_TOPIC_MAX 192
+typedef struct { char topic[SUB_TOPIC_MAX]; uint8_t owners; } sub_entry_t;
+static sub_entry_t      *s_subs;
+static SemaphoreHandle_t s_subs_mux;
+static bool              s_subs_full;
+
+static void subs_clear(void)
+{
+    if (!s_subs) return;
+    xSemaphoreTake(s_subs_mux, portMAX_DELAY);
+    memset(s_subs, 0, SUBS_MAX * sizeof(*s_subs));
+    s_subs_full = false;
+    xSemaphoreGive(s_subs_mux);
+}
+
+static void subs_add(unsigned owner, const char *topic)
+{
+    if (!s_subs) return;
+    xSemaphoreTake(s_subs_mux, portMAX_DELAY);
+    int free_i = -1;
+    bool done = false;
+    for (int i = 0; i < SUBS_MAX && !done; i++) {
+        if (s_subs[i].owners && !strcmp(s_subs[i].topic, topic)) { s_subs[i].owners |= owner; done = true; }
+        else if (!s_subs[i].owners && free_i < 0) free_i = i;
+    }
+    if (!done) {
+        if (free_i >= 0 && strlen(topic) < SUB_TOPIC_MAX) {
+            strcpy(s_subs[free_i].topic, topic);
+            s_subs[free_i].owners = (uint8_t)owner;
+        } else {
+            s_subs_full = true;
+        }
+    }
+    xSemaphoreGive(s_subs_mux);
+}
+
+/* The owners left once owner is off, or -1 for a filter not in the table. */
+static int subs_remove(unsigned owner, const char *topic)
+{
+    if (!s_subs) return -1;
+    int left = -1;
+    xSemaphoreTake(s_subs_mux, portMAX_DELAY);
+    for (int i = 0; i < SUBS_MAX; i++) {
+        if (s_subs[i].owners && !strcmp(s_subs[i].topic, topic)) {
+            s_subs[i].owners &= (uint8_t)~owner;
+            left = s_subs[i].owners;
+            break;
+        }
+    }
+    if (left < 0 && s_subs_full) left = APP_MQTT_OWNER_FW;   /* unknown: keep it */
+    xSemaphoreGive(s_subs_mux);
+    return left;
+}
+
 /* ------------------------------------------------------------------ health */
 
 static void publish_health(void)
@@ -135,6 +196,7 @@ static void mqtt_event_handler(void *arg, esp_event_base_t base,
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "Connected to broker");
         s_connected = true;
+        subs_clear();   /* a new session holds none; the callbacks below subscribe again */
         publish_health();
         if (s_health_timer) {
             esp_timer_stop(s_health_timer);   /* no-op if not running */
@@ -236,6 +298,17 @@ esp_err_t app_mqtt_start(void)
         return ESP_OK;
     }
 
+    if (!s_subs) {
+        s_subs     = heap_caps_calloc(SUBS_MAX, sizeof(*s_subs), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        s_subs_mux = xSemaphoreCreateMutex();
+        if (!s_subs || !s_subs_mux) {
+            /* Without the record an unsubscribe cannot know the other owners. */
+            ESP_LOGE(TAG, "subscription table: out of memory -- MQTT disabled");
+            heap_caps_free(s_subs); s_subs = NULL;
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = cfg->mqtt_url,
     };
@@ -326,20 +399,32 @@ int app_mqtt_publish(const char *topic, const char *payload, int len,
     return id;
 }
 
-int app_mqtt_subscribe(const char *topic, int qos)
+int app_mqtt_subscribe_as(unsigned owner, const char *topic, int qos)
 {
     if (!s_client) return -1;
     char full[TOPIC_MAXLEN];
     if (!make_topic(topic, full, sizeof(full))) return -1;
+    subs_add(owner, topic);   /* wanted even if this attempt fails: the owner tries again */
     return esp_mqtt_client_subscribe(s_client, full, qos);
+}
+
+int app_mqtt_unsubscribe_as(unsigned owner, const char *topic)
+{
+    if (!s_client) return -1;
+    char full[TOPIC_MAXLEN];
+    if (!make_topic(topic, full, sizeof(full))) return -1;
+    if (subs_remove(owner, topic) > 0) return 0;   /* another owner still reads it */
+    return esp_mqtt_client_unsubscribe(s_client, full);
+}
+
+int app_mqtt_subscribe(const char *topic, int qos)
+{
+    return app_mqtt_subscribe_as(APP_MQTT_OWNER_FW, topic, qos);
 }
 
 int app_mqtt_unsubscribe(const char *topic)
 {
-    if (!s_client) return -1;
-    char full[TOPIC_MAXLEN];
-    if (!make_topic(topic, full, sizeof(full))) return -1;
-    return esp_mqtt_client_unsubscribe(s_client, full);
+    return app_mqtt_unsubscribe_as(APP_MQTT_OWNER_FW, topic);
 }
 
 void app_mqtt_set_connected_callback(app_mqtt_connected_cb_t cb)

@@ -12,8 +12,8 @@ PORT ?= 15020
 
 # Every target below; GEN are the ones a gen_<name>_test.py writes as
 # test_<name>.c and builds into test_<name>.
-TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel mbmmatter canmatter pwmlevel canfmt rulesubs nulbytes
-GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel mbmmatter canmatter pwmlevel canfmt rulesubs nulbytes
+TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel mbmmatter canmatter pwmlevel canfmt rulesubs nulbytes mqttowner
+GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel mbmmatter canmatter pwmlevel canfmt rulesubs nulbytes mqttowner
 
 .PHONY: all clean $(TESTS)
 all: test_mb_pdu $(TESTS)
@@ -542,3 +542,11 @@ nulbytes: test_nulbytes
 test_nulbytes: gen_nulbytes_test.py ../../components/board/dout.c ../../components/board/json_exact.c ../../components/scripting/scripting.c qjs-obj/cJSON.o $(QJS_OBJ)
 	python3 gen_nulbytes_test.py
 	$(CC) -O1 -g -Wall -Wextra -Werror -Wno-unused-function -Wno-unused-parameter -fsanitize=address,undefined -I$(CJSON) -I$(QJS) test_nulbytes.c qjs-obj/cJSON.o $(QJS_OBJ) -lm -o $@
+
+# MQTT subscriptions shared by several owners, cut out of app_mqtt.c.
+mqttowner: test_mqttowner
+	./test_mqttowner
+
+test_mqttowner: gen_mqttowner_test.py $(MAIN)/app_mqtt.c $(MAIN)/app_mqtt.h
+	python3 gen_mqttowner_test.py
+	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter test_mqttowner.c -o $@

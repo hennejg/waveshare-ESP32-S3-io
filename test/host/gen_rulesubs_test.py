@@ -7,9 +7,14 @@ Cut out verbatim: the subscription list, sub_wanted(), sub_in(),
 update_rule_subscriptions() and scripting_on_mqtt_connected(). The MQTT
 client is a recorder.
 
-What it pins down, found by a review: only "rules/#" was subscribed, so a
+What it pins down, found by reviews: only "rules/#" was subscribed, so a
 rule on mqtt('sys/heartbeat') -- the documented watchdog example -- never
-got a message, and its watchdog fired with the other side alive. Now:
+got a message, and its watchdog fired with the other side alive; then a
+SUBSCRIBE the client refused counted as in place for the session, and
+loading the same rules again did not try again. Now:
+  - a refused subscription is tried again (every SUB_RETRY_MS while
+    connected, and on a reload of the same rules); a lost connection makes
+    every one not in place, and the connect handler subscribes them all;
   - the topics the loaded rules read are subscribed, and nothing else: not
     "$sys/mqtt", not wildcards, not what "rules/#" covers, not what the
     firmware delivers itself (modbus/...);
@@ -27,10 +32,17 @@ from cutter import Source
 src = Source.at("components/scripting/scripting.c")
 if "static void update_rule_subscriptions(JSContext *ctx)" not in src.text:
     sys.exit("FEHLER: update_rule_subscriptions() fehlt -- nur rules/# wird abonniert")
+if "static void subs_retry_due(void)" not in src.text:
+    sys.exit("FEHLER: subs_retry_due() fehlt -- ein verweigertes Abo gilt als eingerichtet")
 cuts = (src.defines("MAX_TOPIC_LEN", "RULES_TOPIC")
-        + src.span("#define MAX_RULE_SUBS 32", "static SemaphoreHandle_t s_subs_mux;")
+        + src.span("#define MAX_RULE_SUBS 33", "static volatile bool     s_subs_retry;      /* an entry is not ok */")
         + src.func("static bool sub_wanted(const char *t, size_t len)")
-        + src.func("static bool sub_in(char (*list)[MAX_TOPIC_LEN], int n, const char *t)")
+        + src.func("static int sub_find(const rule_sub_t *list, int n, const char *t)")
+        + src.func("static void sub_mark(const char *t, bool ok)")
+        + src.func("static bool sub_try(const char *t)")
+        + src.func("static void subs_apply(bool all)")
+        + src.func("static void subs_lost(void)")
+        + src.func("static void subs_retry_due(void)")
         + src.func("static void update_rule_subscriptions(JSContext *ctx)")
         + src.func("void scripting_on_mqtt_connected(void)"))
 
@@ -57,6 +69,11 @@ typedef int *SemaphoreHandle_t;
 static void xSemaphoreTake(SemaphoreHandle_t s, int t) { (void)s; (void)t; }
 static void xSemaphoreGive(SemaphoreHandle_t s) { (void)s; }
 static void budget_start(void) {}
+typedef uint32_t TickType_t;
+static TickType_t ticks = 1;
+static TickType_t xTaskGetTickCount(void) { return ticks; }
+#define pdMS_TO_TICKS(ms) ((TickType_t)(ms) / 10)
+static volatile bool s_mqtt_up = true;
 
 typedef struct {
     int  (*mqtt_subscribe)(const char *topic, int qos);
@@ -65,7 +82,9 @@ typedef struct {
 } scripting_io_t;
 
 static char subs[64][160], unsubs[64][160]; static int nsub, nunsub;
-static int rec_sub(const char *t, int q)   { (void)q; if (nsub < 64) snprintf(subs[nsub++], 160, "%s", t); return 0; }
+static char refuse[160];                  /* the client refuses this topic */
+static int rec_sub(const char *t, int q)
+{ (void)q; if (nsub < 64) snprintf(subs[nsub++], 160, "%s", t); return strcmp(t, refuse) ? 0 : -1; }
 static int rec_unsub(const char *t)        { if (nunsub < 64) snprintf(unsubs[nunsub++], 160, "%s", t); return 0; }
 static bool local(const char *t)           { return strncmp(t, "modbus/", 7) == 0; }
 static const scripting_io_t io = { rec_sub, rec_unsub, local };
@@ -128,8 +147,8 @@ int main(int argc, char **argv)
         "rule('x').when(mqtt('a/+/b')).then(function(){});"
         "rule('d').when(mqtt('cmd/blink')).then(function(){});");
     update_rule_subscriptions(a);
-    CHECK(nsub == 2 && has(subs, nsub, "sys/heartbeat") && has(subs, nsub, "cmd/blink"),
-          "geladen: %d Abos (%s, %s ...) statt sys/heartbeat und cmd/blink", nsub, nsub > 0 ? subs[0] : "-", nsub > 1 ? subs[1] : "-");
+    CHECK(nsub == 3 && has(subs, nsub, "rules/#") && has(subs, nsub, "sys/heartbeat") && has(subs, nsub, "cmd/blink"),
+          "geladen: %d Abos statt rules/#, sys/heartbeat und cmd/blink", nsub);
     CHECK(!has(subs, nsub, "rules/trigger") && !has(subs, nsub, "modbus/power") && !has(subs, nsub, "$sys/mqtt") && !has(subs, nsub, "a/+/b"),
           "abonniert, was rules/#, die Firmware oder niemand liefert");
 
@@ -137,6 +156,29 @@ int main(int argc, char **argv)
     scripting_on_mqtt_connected();
     CHECK(nsub == 3 && has(subs, nsub, "rules/#") && has(subs, nsub, "sys/heartbeat") && has(subs, nsub, "cmd/blink"),
           "Verbindung: %d Abos statt rules/# und die beiden Regel-Topics", nsub);
+
+    /* Refused by the client: not in place, tried again. */
+    strcpy(refuse, "sys/heartbeat");
+    subs_lost(); nsub = 0; scripting_on_mqtt_connected();
+    CHECK(!s_subs[sub_find(s_subs, s_nsubs, "sys/heartbeat")].ok && s_subs_retry, "verweigertes Abo gilt als eingerichtet");
+    refuse[0] = 0;
+    JSContext *a2 = load(rt, dsl,
+        "rule('w').when(input(0).isOn(), mqtt('sys/heartbeat').stale(90000)).then(function(){});"
+        "rule('c').when(mqtt('cmd/blink').once()).then(function(){});");
+    nsub = nunsub = 0;
+    update_rule_subscriptions(a2);           /* the same topics again */
+    CHECK(nsub == 1 && has(subs, nsub, "sys/heartbeat") && nunsub == 0,
+          "gleiche Regeln neu geladen: verweigertes Abo nicht erneut versucht (%d Abos, %d abbestellt)", nsub, nunsub);
+    strcpy(refuse, "cmd/blink");
+    subs_lost(); nsub = 0; scripting_on_mqtt_connected();
+    refuse[0] = 0;
+    nsub = 0; ticks += 100; subs_retry_due();   /* < 10 s since the last try: not yet */
+    int early = nsub;
+    ticks += 2000; subs_retry_due();
+    CHECK(early <= 1 && has(subs, nsub, "cmd/blink") && s_subs[sub_find(s_subs, s_nsubs, "cmd/blink")].ok,
+          "verweigertes Abo nicht nach Ablauf der Wartezeit wiederholt (%d frueh, %d gesamt)", early, nsub);
+    nsub = 0; ticks += 2000; subs_retry_due();
+    CHECK(nsub == 0, "eingerichtete Abos wiederholt (%d)", nsub);
 
     JSContext *b = load(rt, dsl,
         "rule('c').when(mqtt('cmd/blink').once()).then(function(){});"
@@ -150,7 +192,16 @@ int main(int argc, char **argv)
     scripting_on_mqtt_connected();
     CHECK(nsub == 3 && has(subs, nsub, "x/y") && !has(subs, nsub, "sys/heartbeat"), "Verbindung nach Neuladen: %d Abos", nsub);
 
-    if (!failures) printf("  gelesene Topics abonniert, Neuladen gleicht ab, Verbindung abonniert alle\n");
+    /* Not connected while loading: tried once the connection is up. */
+    subs_lost(); s_mqtt_up = false;
+    JSContext *c = load(rt, dsl, "rule('z').when(mqtt('z/1')).then(function(){});");
+    nsub = 0; update_rule_subscriptions(c);
+    CHECK(nsub == 0 && s_subs_retry, "ohne Verbindung abonniert oder nicht vorgemerkt (%d)", nsub);
+    s_mqtt_up = true; ticks += 2000; subs_retry_due();
+    CHECK(has(subs, nsub, "z/1") && has(subs, nsub, "rules/#"), "nach dem Verbinden nicht nachgeholt (%d)", nsub);
+    JS_FreeContext(a2); JS_FreeContext(c);
+
+    if (!failures) printf("  gelesene Topics abonniert, Neuladen gleicht ab, Verbindung abonniert alle, Verweigerte wiederholt\n");
     JS_FreeContext(a); JS_FreeContext(b); JS_FreeRuntime(rt);
     printf("%s\n", failures ? "FEHLER" : "alles in Ordnung");
     return failures ? 1 : 0;

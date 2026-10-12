@@ -129,3 +129,5 @@ test/host/test_rulesubs
 test/host/test_rulesubs.c
 test/host/test_nulbytes
 test/host/test_nulbytes.c
+test/host/test_mqttowner
+test/host/test_mqttowner.c

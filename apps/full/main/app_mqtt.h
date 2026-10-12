@@ -25,6 +25,19 @@ int app_mqtt_publish(const char *topic, const char *payload, int len,
 int app_mqtt_subscribe(const char *topic, int qos);
 int app_mqtt_unsubscribe(const char *topic);
 
+/* The same, for one owner of the subscription. A topic filter is one
+   subscription at the broker, whoever asked for it: the rule engine
+   unsubscribing a filter it no longer reads ("output/set" in a rule) took
+   it away from the module that switches the outputs. A filter is
+   unsubscribed only once no owner wants it any more. app_mqtt_subscribe()
+   and app_mqtt_unsubscribe() are the firmware modules' owner. The record
+   starts empty with every connection, as the subscriptions do. Returns 0
+   for an unsubscribe that is kept for another owner. */
+#define APP_MQTT_OWNER_FW    0x01
+#define APP_MQTT_OWNER_RULES 0x02
+int app_mqtt_subscribe_as(unsigned owner, const char *topic, int qos);
+int app_mqtt_unsubscribe_as(unsigned owner, const char *topic);
+
 void app_mqtt_set_connected_callback(app_mqtt_connected_cb_t cb);
 void app_mqtt_set_msg_callback(app_mqtt_msg_cb_t cb);
 

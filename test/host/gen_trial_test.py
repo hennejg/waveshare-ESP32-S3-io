@@ -66,7 +66,22 @@ if "#define MAX_RULE_SUBS" in sc.text:
              "#define MALLOC_CAP_SPIRAM 1\n#define MALLOC_CAP_8BIT 2\n"
              "#define heap_caps_malloc(n, c) malloc(n)\n#define heap_caps_free(p) free(p)\n")
     cuts += sc.defines("MAX_TOPIC_LEN") if "#define MAX_TOPIC_LEN" not in "".join(cuts) else ""
-    cuts += sc.span("#define MAX_RULE_SUBS 32", "static SemaphoreHandle_t s_subs_mux;")
+    if "static void subs_apply(bool all)" in sc.text:
+        # Wanted and in place apart: the connect handler subscribes through
+        # subs_apply(), which records each result.
+        cuts += ("typedef uint32_t TickType_t;\n"
+                 "#ifndef ESP_LOGW\n#define ESP_LOGW(...) ((void)0)\n#endif\n"
+                 "#ifndef ESP_LOGE\n#define ESP_LOGE(...) ((void)0)\n#endif\n")
+        cuts += sc.span("#define MAX_RULE_SUBS 33", "static volatile bool     s_subs_retry;      /* an entry is not ok */")
+        cuts += sc.func("static int sub_find(const rule_sub_t *list, int n, const char *t)")
+        cuts += sc.func("static void sub_mark(const char *t, bool ok)")
+        cuts += sc.func("static bool sub_try(const char *t)")
+        cuts += sc.func("static void subs_apply(bool all)")
+        # scripting_init() creates the lock; this test does not run it.
+        cuts += ("static int trial_mux_obj;\n"
+                 "__attribute__((constructor)) static void trial_mux(void) { s_subs_mux = (SemaphoreHandle_t)&trial_mux_obj; }\n")
+    else:
+        cuts += sc.span("#define MAX_RULE_SUBS 32", "static SemaphoreHandle_t s_subs_mux;")
 cuts += sc.func("void scripting_on_mqtt_connected(void)")
 cuts += bd.func("static int do_count(")
 if "static int chan_arg(" in bd.text:

@@ -94,6 +94,17 @@ static bool rules_mqtt_local(const char *topic)
     return strncmp(topic, "modbus/", 7) == 0;
 }
 
+/* The rule engine's subscriptions as its own owner: a filter a module
+   also holds ("output/set") stays when the rules stop reading it. */
+static int rules_mqtt_subscribe(const char *topic, int qos)
+{
+    return app_mqtt_subscribe_as(APP_MQTT_OWNER_RULES, topic, qos);
+}
+static int rules_mqtt_unsubscribe(const char *topic)
+{
+    return app_mqtt_unsubscribe_as(APP_MQTT_OWNER_RULES, topic);
+}
+
 static const scripting_io_t s_scripting_io = {
     .di_get         = di_get,
     .di_count       = APP_CFG_DI_COUNT,
@@ -106,8 +117,8 @@ static const scripting_io_t s_scripting_io = {
     .dout_get       = rules_out_get,
     .dout_toggle    = rules_out_toggle,
     .do_count       = APP_CFG_DO_COUNT + APP_CFG_DI_AUX_COUNT,
-    .mqtt_subscribe = app_mqtt_subscribe,
-    .mqtt_unsubscribe = app_mqtt_unsubscribe,
+    .mqtt_subscribe = rules_mqtt_subscribe,
+    .mqtt_unsubscribe = rules_mqtt_unsubscribe,
     .mqtt_local     = rules_mqtt_local,
     .mqtt_publish   = app_mqtt_publish,
     .led_set        = led_set_rgb,      /* effective in IO mode (no-op in status mode) */

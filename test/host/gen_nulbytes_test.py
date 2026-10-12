@@ -29,9 +29,13 @@ except Exception:
 types = (scr.defines("MAX_TOPIC_LEN", "MAX_PAYLOAD_LEN")
          + scr.span("typedef enum { EVT_MQTT, EVT_INPUT_CHANGE,", "} evt_type_t;")
          + scr.span("typedef struct {\n    evt_type_t type;", "} scripting_evt_t;"))
-body = (dout.func("bool dout_parse_state(const char *data, size_t len, bool *out)")
+body = (dout.defines("BULK_PAYLOAD_MAX", "NUM_DO")
+        + dout.func("bool dout_parse_state(const char *data, size_t len, bool *out)")
         + dout.func("bool dout_parse_toggle(const char *data, size_t len)")
+        + (jx.func("static bool escapes_nul(const char *d, size_t n)") if "static bool escapes_nul(" in jx.text else "")
         + jx.func("cJSON *json_parse_exact(const char *data, size_t n)")
+        + dout.func("static void apply_json_item(cJSON *item, uint8_t n,")
+        + dout.func("void dout_on_mqtt_message(const char *topic, size_t tlen,")
         + scr.func("void scripting_on_mqtt_message(const char *topic, size_t tlen,"))
 
 HARNESS = r"""
@@ -56,6 +60,19 @@ static int queue_obj; static void *s_queue = &queue_obj;
 __TYPES__
 
 static scripting_evt_t sent; static int nsent;
+
+/* The outputs: what one command asked for. */
+#define CONFIG_APP_MQTT_ENABLE 1
+typedef struct { struct { char name[21]; } dout[8]; } app_config_t;
+static app_config_t cfg;
+static const app_config_t *app_config_get(void) { return &cfg; }
+static uint8_t m_set, m_clr, m_tog; static int mods;
+static esp_err_t dout_modify(uint8_t s, uint8_t c, uint8_t t) { m_set = s; m_clr = c; m_tog = t; mods++; return 0; }
+static esp_err_t dout_publish_all(void) { return 0; }
+static esp_err_t dout_toggle(uint8_t n) { m_tog = (uint8_t)(1u << n); mods++; return 0; }
+static esp_err_t dout_set(uint8_t n, bool on) { if (on) m_set = (uint8_t)(1u << n); else m_clr = (uint8_t)(1u << n); mods++; return 0; }
+void dout_on_mqtt_message(const char *topic, size_t tlen, const char *data, size_t dlen);
+static void bulk(const char *d, size_t n) { m_set = m_clr = m_tog = 0; mods = 0; dout_on_mqtt_message("output/set", 10, d, n); }
 static BaseType_t evt_send(scripting_evt_t *ev) { sent = *ev; nsent++; return pdTRUE; }
 
 __CUT__
@@ -73,17 +90,34 @@ int main(void)
     CHECK(!dout_parse_state("1\0", 2, &v), "\"1\\0\" als Befehl angenommen");
     CHECK(dout_parse_toggle("toggle", 6) && !dout_parse_toggle("toggle\0x", 8), "toggle mit Nullbyte angenommen");
 
+    #define SL ((size_t)-1)   /* length by strlen(): no NUL byte in the text */
     static const struct { const char *d; size_t n; bool ok; const char *what; } js[] = {
         { "50", 2, true, "Zahl" },               { " {\"duty\":5}\n", 12, true, "Objekt mit Leerraum" },
         { "50\0xyz", 6, false, "Zahl+Nullbyte" }, { "50 off", 6, false, "Zahl+Text" },
         { "{\"duty\":5}garbage", 17, false, "Objekt+Anhang" }, { "", 0, false, "leer" },
         { "[1,2] [3]", 9, false, "zwei Werte" },
+        { "[\"on\\u0000off\"]", SL, false, "\\u0000 in einer Zeichenkette" },
+        { "{\"a\\u0000\":1}", SL, false, "\\u0000 in einem Schluessel" },
+        { "[\"a\\\\u0000\"]", SL, true, "Backslash + Text u0000 (kein NUL)" },
+        { "[\"\\u00001\"]", SL, false, "\\u0000 gefolgt von Ziffer" },
     };
     for (unsigned i = 0; i < sizeof js / sizeof js[0]; i++) {
-        cJSON *j = json_parse_exact(js[i].d, js[i].n);
+        cJSON *j = json_parse_exact(js[i].d, js[i].n == SL ? strlen(js[i].d) : js[i].n);
         CHECK((j != NULL) == js[i].ok, "JSON %s: %s", js[i].what, j ? "angenommen" : "abgelehnt");
         cJSON_Delete(j);
     }
+
+    /* The whole way, JSON to the output mask. */
+    static const char a1[] = "[\"on\\u0000off\"]";
+    bulk(a1, sizeof a1 - 1);
+    CHECK(mods == 0 && m_set == 0, "output/set %s schaltet (Maske gesetzt 0x%02X)", a1, m_set);
+    static const char a2[] = "[\"on\",false,\"toggle\"]";
+    bulk(a2, sizeof a2 - 1);
+    CHECK(mods == 1 && m_set == 0x01 && m_clr == 0x02 && m_tog == 0x04, "output/set %s: Masken %02X/%02X/%02X", a2, m_set, m_clr, m_tog);
+    bulk("on\0off", 6);
+    CHECK(mods == 0, "output/set \"on\\0off\" schaltet");
+    bulk("[1] x", 5);
+    CHECK(mods == 0, "output/set \"[1] x\" schaltet");
 
     scripting_on_mqtt_message("rules/cmd", 9, "ON\0OFF", 6);
     CHECK(nsent == 1 && sent.mqtt.plen == 6, "Nutzlast-Laenge nicht erhalten (%u)", (unsigned)sent.mqtt.plen);

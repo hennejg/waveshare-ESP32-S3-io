@@ -342,7 +342,9 @@ longer is, a reconnect subscribes them all again. A topic is matched as
 written: `+` and `#` in a condition match nothing and are not subscribed.
 `modbus/<name>` values come from the device's own poll table and need no
 subscription. A topic a rule publishes and also reads comes back from the
-broker like any other message.
+broker like any other message. A topic a rule shares with the device's own commands (`output/set`) stays
+subscribed when the rule goes. A subscription the client refuses is tried again every 10 s while
+connected, and on the next load of the rules.
 
 ```js
 var trig = mqtt('rules/trigger').is(function (m) { return m === 'ON'; });
