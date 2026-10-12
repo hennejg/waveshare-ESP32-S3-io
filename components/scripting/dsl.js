@@ -97,9 +97,9 @@ function _unschedule(id) {
     _retry_arms();
 }
 
-// Timers the full table refused. heldFor() tries again on its next matching
-// event, but every(), cron(), a watchdog and the later steps of .after() have
-// no next event of their own: refused once, an every() never ticked again, a
+// Timers the full table refused. every(), cron(), a watchdog, the later
+// steps of .after() -- and a heldFor() whose condition simply stays true --
+// have no next event of their own: refused once, an every() never ticked again, a
 // watchdog fed while the table was full never expired -- the case it exists
 // for -- and an .after() that switches an output off was dropped. They wait
 // here, in order, and are tried again when a slot may have freed (a timer
@@ -930,6 +930,10 @@ function _indexMqtt(conds) {
     }
 }
 
+// The topics the loaded rules read -- what the host subscribes at the broker
+// (besides "rules/#"). Called by the host after every load.
+function _mqtt_topics() { return Object.keys(_mqttIndex); }
+
 function _on_mqtt(topic, payload) {
     _retry_arms();                   // slots may have freed since (a reload, a clear)
     _resetCascade();                 // root event — fresh cascade budget (stale feeds may emit)
@@ -1012,6 +1016,7 @@ function _after_interrupt(resume) {
     if (h && h._timer == null && !h._fired) {
         print('[rule:' + h.name + '] time budget exceeded in the heldFor() check -- checked again after another ' + h.heldFor + ' ms');
         h._timer = _schedule(h.heldFor, _held_elapsed(h));
+        if (h._timer == null) _held_later(h);
     }
     if (resume === false) {
         if (_passes.length) print('[rules] time budget exceeded again -- the event is not passed on to the remaining rules');
@@ -1078,7 +1083,10 @@ function _apply_match(r, matched) {
         if (r.heldFor > 0) {
             // sustained gate: arm a timer once; fire only if still matching at
             // elapse; latch so it fires once per held period, not every event
-            if (r._timer == null && !r._fired) r._timer = _schedule(r.heldFor, _held_elapsed(r));
+            if (r._timer == null && !r._fired) {
+                r._timer = _schedule(r.heldFor, _held_elapsed(r));
+                if (r._timer == null) _held_later(r);
+            }
         } else {
             _run_action(r);
         }
@@ -1086,7 +1094,29 @@ function _apply_match(r, matched) {
         // conditions no longer hold — cancel a pending sustain timer and re-arm
         if (r._timer != null) { _unschedule(r._timer); r._timer = null; }
         r._fired = false;
+        r._heldWaiting = false;   // a queued arm (_held_later) is dropped when it comes up
     }
+}
+
+// A heldFor() the full table refused. Waiting for its next matching event was
+// not enough: an input that went HIGH and stays HIGH sends none, and the rule
+// never fired. Queued once, armed as soon as a slot frees -- the hold counts
+// from then, late rather than never -- and dropped if the condition has gone
+// in the meantime.
+function _held_later(r) {
+    if (r._heldWaiting) return;
+    r._heldWaiting = true;
+    _arm_later(function() {
+        if (!r._heldWaiting || r._timer != null || r._fired) { r._heldWaiting = false; return true; }
+        _heldCheck = r;
+        var m = _rule_matches(r);
+        _heldCheck = null;
+        if (!m) { r._heldWaiting = false; return true; }
+        r._timer = _schedule(r.heldFor, _held_elapsed(r));
+        if (r._timer == null) return false;          // still full: stays first in line
+        r._heldWaiting = false;
+        return true;
+    });
 }
 
 // factKey identifies the fact that changed (e.g. 'input:4', 'mqtt:rules/trigger').

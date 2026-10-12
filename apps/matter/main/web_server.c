@@ -2,6 +2,7 @@
 #include "app_config.h"
 #include "auth.h"
 #include "web_common.h"
+#include "json_exact.h"
 #include "net_budget.h"
 #include "mb_server.h"
 #include "mb_status_json.h"
@@ -151,7 +152,7 @@ static esp_err_t api_config_post(httpd_req_t *req)
         return ESP_OK;
     }
 
-    cJSON *root = cJSON_Parse(body);
+    cJSON *root = json_parse_exact(body, (size_t)received);
     free(body);
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
 
@@ -467,7 +468,7 @@ static esp_err_t api_io_output(httpd_req_t *req)
     int n = web_recv_body(req, body, sizeof(body) - 1);
     if (n < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
-    cJSON *root = cJSON_Parse(body);
+    cJSON *root = json_parse_exact(body, (size_t)n);
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
 
     /* 0-7 are DO1-DO8; 8-10 the header pads, while they are outputs. */
@@ -531,7 +532,7 @@ static esp_err_t api_io_led(httpd_req_t *req)
     int n = web_recv_body(req, body, sizeof(body) - 1);
     if (n < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
-    cJSON *root = cJSON_Parse(body);
+    cJSON *root = json_parse_exact(body, (size_t)n);
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
 
     uint8_t r = 0, g = 0, b = 0;

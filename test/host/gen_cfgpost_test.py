@@ -25,7 +25,7 @@ OLD=1 cuts web_server.c from git (OLDREV, default HEAD).
   make -C test/host cfgpost
 """
 import pathlib
-from cutter import Source
+from cutter import Source, json_exact_if_used
 
 src = Source.at("apps/full/main/web_server.c")
 new = "static bool cfg_uint(" in src.text
@@ -203,5 +203,5 @@ int main(void)
 }
 """
 out = pathlib.Path(__file__).with_name("test_cfgpost.c")
-out.write_text(HARNESS.replace("__CUT__", cuts))
+out.write_text(HARNESS.replace("__CUT__", json_exact_if_used(cuts) + cuts))
 print("erzeugt:", out.name)

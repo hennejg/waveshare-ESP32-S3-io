@@ -2,6 +2,7 @@
 #ifdef CONFIG_APP_MQTT_ENABLE
 int app_mqtt_subscribe(const char *topic, int qos);
 #include "cJSON.h"
+#include "json_exact.h"
 #endif
 
 #include <string.h>
@@ -182,7 +183,7 @@ void buzzer_on_mqtt_message(const char *topic, size_t tlen,
     /* Parsed in place: cJSON takes the length, no copy on the MQTT task's stack. */
     if (dlen == 0 || dlen >= BUZZER_PAYLOAD_MAX) return;
 
-    cJSON *root = cJSON_ParseWithLength(data, dlen);
+    cJSON *root = json_parse_exact(data, dlen);
     if (!root) { ESP_LOGW(TAG, "JSON parse failed"); return; }
 
     bseq_t seq = { .count = 0 };

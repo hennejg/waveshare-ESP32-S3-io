@@ -329,10 +329,20 @@ rule('alarm off')
 | `mqtt(topic).once()` | **edge** — matches only on each message arrival, not while held |
 | `mqtt(topic).value` | last received payload (read in `then()`) |
 
-`.is(fn)` receives the raw payload string. A message reaches the rules only
+`.is(fn)` receives the raw payload string, every byte of it -- a NUL byte
+included, so `"ON\0OFF"` is not `'ON'`. A message reaches the rules only
 whole: one whose topic (as seen by the rules, prefix removed) is longer than
 127 bytes or whose payload is longer than 255 bytes is dropped, with a warning
 in the device log, rather than shortened.
+
+**Which topics arrive.** The device subscribes `rules/#` and every topic the
+loaded rules read in a condition (`mqtt('sys/heartbeat')`, `.stale()`, ...),
+up to 32 of them; a reload subscribes what is new and unsubscribes what no
+longer is, a reconnect subscribes them all again. A topic is matched as
+written: `+` and `#` in a condition match nothing and are not subscribed.
+`modbus/<name>` values come from the device's own poll table and need no
+subscription. A topic a rule publishes and also reads comes back from the
+broker like any other message.
 
 ```js
 var trig = mqtt('rules/trigger').is(function (m) { return m === 'ON'; });

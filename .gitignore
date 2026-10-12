@@ -125,3 +125,7 @@ test/host/test_pwmlevel
 test/host/test_pwmlevel.cpp
 test/host/test_canfmt
 test/host/test_canfmt.c
+test/host/test_rulesubs
+test/host/test_rulesubs.c
+test/host/test_nulbytes
+test/host/test_nulbytes.c

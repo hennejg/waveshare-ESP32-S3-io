@@ -57,6 +57,16 @@ else:
     cuts += sc.func("static void dry_timers_free(JSContext *ctx)")
     cuts += sc.func("static JSValue js_dry_nop(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)")
 cuts += sc.func("static bool trial_load(const char *script, char *err, size_t errlen)")
+if "#define MAX_RULE_SUBS" in sc.text:
+    # Since the rules' own topics are subscribed too: their list, which the
+    # connect handler copies under a mutex. No list here -- none was loaded.
+    cuts += ("typedef int *SemaphoreHandle_t;\n#define portMAX_DELAY 0\n"
+             "static void xSemaphoreTake(SemaphoreHandle_t m, int t) { (void)m; (void)t; }\n"
+             "static void xSemaphoreGive(SemaphoreHandle_t m) { (void)m; }\n"
+             "#define MALLOC_CAP_SPIRAM 1\n#define MALLOC_CAP_8BIT 2\n"
+             "#define heap_caps_malloc(n, c) malloc(n)\n#define heap_caps_free(p) free(p)\n")
+    cuts += sc.defines("MAX_TOPIC_LEN") if "#define MAX_TOPIC_LEN" not in "".join(cuts) else ""
+    cuts += sc.span("#define MAX_RULE_SUBS 32", "static SemaphoreHandle_t s_subs_mux;")
 cuts += sc.func("void scripting_on_mqtt_connected(void)")
 cuts += bd.func("static int do_count(")
 if "static int chan_arg(" in bd.text:

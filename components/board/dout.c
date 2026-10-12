@@ -6,6 +6,7 @@ int  app_mqtt_publish(const char *topic, const char *payload, int len, int qos, 
 int  app_mqtt_subscribe(const char *topic, int qos);
 bool app_mqtt_is_connected(void);
 #include "cJSON.h"
+#include "json_exact.h"
 #endif
 #ifdef CONFIG_APP_MATTER_ENABLE
 #include "matter.h"
@@ -66,11 +67,14 @@ static inline void dout_unlock(void)
 /* ------------------------------------------------------------------ helpers */
 
 /* Accepted on-payloads: true 1 high on   (case-insensitive)
-   Accepted off-payloads: false 0 low off */
+   Accepted off-payloads: false 0 low off
+   The whole payload is the word: a NUL byte in it is refused. Copied and
+   compared as C strings, "on\0off" read as "on" -- six bytes that say
+   something else switched the output. */
 bool dout_parse_state(const char *data, size_t len, bool *out)
 {
     char buf[8];
-    if (len == 0 || len >= sizeof(buf)) return false;
+    if (len == 0 || len >= sizeof(buf) || memchr(data, '\0', len)) return false;
     memcpy(buf, data, len);
     buf[len] = '\0';
     for (size_t i = 0; i < len; i++) buf[i] = (char)tolower((unsigned char)buf[i]);
@@ -85,7 +89,7 @@ bool dout_parse_state(const char *data, size_t len, bool *out)
 bool dout_parse_toggle(const char *data, size_t len)
 {
     char buf[8];
-    if (len == 0 || len >= sizeof(buf)) return false;
+    if (len == 0 || len >= sizeof(buf) || memchr(data, '\0', len)) return false;   /* see above */
     memcpy(buf, data, len);
     buf[len] = '\0';
     for (size_t i = 0; i < len; i++) buf[i] = (char)tolower((unsigned char)buf[i]);
@@ -351,7 +355,7 @@ void dout_on_mqtt_message(const char *topic, size_t tlen,
         if (dlen == 0 || dlen >= BULK_PAYLOAD_MAX) return;
 
         if (data[0] == '[') {
-            cJSON *arr = cJSON_ParseWithLength(data, dlen);   /* in place, no stack copy */
+            cJSON *arr = json_parse_exact(data, dlen);   /* in place, no stack copy */
             if (!cJSON_IsArray(arr)) {
                 ESP_LOGW(TAG, "output/set: invalid JSON array");
                 cJSON_Delete(arr);

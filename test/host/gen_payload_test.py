@@ -19,7 +19,7 @@ only wasteful.
   make -C test/host payload
 """
 import pathlib
-from cutter import Source
+from cutter import Source, json_exact_if_used
 
 led = Source.at("components/board/led.c")
 buz = Source.at("components/board/buzzer.c")
@@ -146,5 +146,5 @@ int main(void)
 }
 """
 out = pathlib.Path(__file__).with_name("test_payload.c")
-out.write_text(HARNESS.replace("__LED__", led_cut).replace("__BUZ__", buz_cut))
+out.write_text(HARNESS.replace("__LED__", json_exact_if_used(led_cut + buz_cut) + led_cut).replace("__BUZ__", buz_cut))
 print("erzeugt:", out.name)

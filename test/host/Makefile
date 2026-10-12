@@ -12,8 +12,8 @@ PORT ?= 15020
 
 # Every target below; GEN are the ones a gen_<name>_test.py writes as
 # test_<name>.c and builds into test_<name>.
-TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel mbmmatter canmatter pwmlevel canfmt
-GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel mbmmatter canmatter pwmlevel canfmt
+TESTS := client poller master dns tz resync qjscron qjsint names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns uiauth timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel mbmmatter canmatter pwmlevel canfmt rulesubs nulbytes
+GEN   := tz resync names order di trial drain nvsread auth cfgnum resume auxwrite auxlock wifimon jobs authguard mqttlog timerid evict gwerr n2khb pwhash chan reseterr pwmfail wifiportal sntpapply capdns timeset mqtttopic cfgpost portalconn cantx mqttstate ledstatus i2clock sntprtc jsoncast rtuunwind caninit rtuerr mqttdrop portalurl payload mqttfrag padlevel mbmmatter canmatter pwmlevel canfmt rulesubs nulbytes
 
 .PHONY: all clean $(TESTS)
 all: test_mb_pdu $(TESTS)
@@ -524,3 +524,21 @@ canfmt: test_canfmt
 test_canfmt: gen_canfmt_test.py ../../components/can/can_server.c
 	python3 gen_canfmt_test.py
 	$(CC) $(CFLAGS) -Wno-unused-function -Wno-unused-parameter -Wno-unused-variable test_canfmt.c -o $@
+
+# The rule engine's broker subscriptions, cut out of scripting.c, with
+# QuickJS and the real dsl.js.
+rulesubs: test_rulesubs
+	./test_rulesubs
+
+test_rulesubs: gen_rulesubs_test.py ../../components/scripting/scripting.c ../../components/scripting/dsl.js $(QJS_OBJ)
+	python3 gen_rulesubs_test.py
+	$(CC) -O1 -g -Wall -Wextra -Werror -Wno-unused-function -Wno-unused-parameter -fsanitize=address,undefined -I$(QJS) test_rulesubs.c $(QJS_OBJ) -lm -o $@
+
+# NUL bytes and trailing data in commands, cut out of dout.c, json_exact.c
+# and scripting.c.
+nulbytes: test_nulbytes
+	./test_nulbytes
+
+test_nulbytes: gen_nulbytes_test.py ../../components/board/dout.c ../../components/board/json_exact.c ../../components/scripting/scripting.c qjs-obj/cJSON.o $(QJS_OBJ)
+	python3 gen_nulbytes_test.py
+	$(CC) -O1 -g -Wall -Wextra -Werror -Wno-unused-function -Wno-unused-parameter -fsanitize=address,undefined -I$(CJSON) -I$(QJS) test_nulbytes.c qjs-obj/cJSON.o $(QJS_OBJ) -lm -o $@

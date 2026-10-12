@@ -28,6 +28,38 @@ test('heldFor re-arms once the timer table frees up', () => {
   assert.equal(e.T.n, 1, 'the rule has to recover, not stay dead for the boot');
 });
 
+test('a refused heldFor arms when a slot frees, with no further event', () => {
+  // The one slot is taken by the .after() step; the input then goes HIGH and
+  // stays HIGH -- nothing else happens. When the step fires, its slot is the
+  // hold's: the rule fires a hold later.
+  const e = createEngine({ maxTimers: 1 });
+  e.load(`
+    rule('busy').when(input(1).isOn()).then(function(){}).after(2000).then(function(){ T.busy = true; });
+    rule('hold').when(input(0).isOn()).heldFor(1000).then(function(){ T.n = (T.n || 0) + 1; });`);
+  e.input(1, true);        // takes the slot for 2 s
+  e.input(0, true);        // refused: table full
+  e.advance(1500);
+  assert.equal(e.T.n, undefined, 'cannot have fired while the table was full');
+  e.advance(2000);         // slot free at 2 s, hold until 3 s
+  assert.equal(e.T.busy, true);
+  assert.equal(e.T.n, 1, 'the input stayed HIGH: the hold must arm once the slot is free');
+  e.advance(5000);
+  assert.equal(e.T.n, 1, 'once per held period');
+});
+
+test('a refused heldFor whose condition went away is dropped, not armed later', () => {
+  const e = createEngine({ maxTimers: 1 });
+  e.load(`
+    rule('busy').when(input(1).isOn()).then(function(){}).after(2000).then(function(){});
+    rule('hold').when(input(0).isOn()).heldFor(1000).then(function(){ T.n = (T.n || 0) + 1; });`);
+  e.input(1, true);
+  e.input(0, true);        // refused
+  e.input(0, false);       // condition gone while waiting
+  e.advance(6000);
+  assert.equal(e.T.n, undefined, 'a hold that no longer holds must not fire');
+  assert.equal(e.pendingTimers(), 0, 'and must not sit armed');
+});
+
 test('a refused timer does not disturb a later healthy one', () => {
   const e = createEngine({ maxTimers: 0 });
   e.load(`rule('a').when(input(0).isOn()).heldFor(500).then(function(){ T.a = true; });`);

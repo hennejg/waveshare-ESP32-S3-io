@@ -12,7 +12,7 @@ OLD=1 cuts web_server.c from git (OLDREV, default HEAD).
   make -C test/host reseterr
 """
 import pathlib
-from cutter import Source
+from cutter import Source, json_exact_if_used
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 src  = Source.at("apps/full/main/web_server.c")
@@ -111,5 +111,5 @@ int main(void)
 }
 """
 out = pathlib.Path(__file__).with_name("test_reseterr.c")
-out.write_text(HARNESS.replace("__CUT__", cuts))
+out.write_text(HARNESS.replace("__CUT__", json_exact_if_used(cuts) + cuts))
 print("erzeugt:", out.name)

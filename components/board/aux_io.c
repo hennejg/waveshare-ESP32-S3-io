@@ -21,6 +21,7 @@
 
 #ifdef CONFIG_APP_MQTT_ENABLE
 #include "cJSON.h"
+#include "json_exact.h"
 int  app_mqtt_publish(const char *topic, const char *payload, int len, int qos, bool retain);
 int  app_mqtt_subscribe(const char *topic, int qos);
 bool app_mqtt_is_connected(void);
@@ -810,7 +811,7 @@ void aux_io_on_mqtt_message(const char *topic, size_t tlen, const char *data, si
        there but wrong is refused, never read as "keep". */
     bool    has_duty = false, has_freq = false, bad = false;
     double  duty = 0, freq = 0;
-    cJSON  *j = cJSON_ParseWithLength(data, dlen);   /* in place, no stack copy */
+    cJSON  *j = json_parse_exact(data, dlen);   /* in place, no stack copy */
     if (cJSON_IsNumber(j)) {
         has_duty = true; duty = j->valuedouble;
     } else if (cJSON_IsObject(j)) {

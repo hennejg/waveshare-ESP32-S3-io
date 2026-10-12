@@ -116,3 +116,13 @@ def kconfig_default(rel, *names):
             raise SystemExit("cutter: %s has no default in %s" % (n, rel))
         out.append("#define CONFIG_%s %s\n" % (n, m.group(1)))
     return "".join(out)
+
+
+def json_exact_if_used(cut):
+    """json_parse_exact() (components/board/json_exact.c) when cut code calls
+    it -- the payload parsers take the whole payload or nothing since then --
+    and nothing for code from before it existed."""
+    if "json_parse_exact(" not in cut:
+        return ""
+    return ("#include <string.h>\n"
+            + Source.at("components/board/json_exact.c").func("cJSON *json_parse_exact(const char *data, size_t n)"))

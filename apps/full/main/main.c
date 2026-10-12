@@ -86,6 +86,14 @@ static esp_err_t rules_analog_get(uint8_t pad, int *mv)
 }
 #endif
 
+/* The poll table hands its values to the rules itself (on_modbus_value())
+   and publishes them: subscribed at the broker as well, each would reach a
+   rule twice. */
+static bool rules_mqtt_local(const char *topic)
+{
+    return strncmp(topic, "modbus/", 7) == 0;
+}
+
 static const scripting_io_t s_scripting_io = {
     .di_get         = di_get,
     .di_count       = APP_CFG_DI_COUNT,
@@ -99,6 +107,8 @@ static const scripting_io_t s_scripting_io = {
     .dout_toggle    = rules_out_toggle,
     .do_count       = APP_CFG_DO_COUNT + APP_CFG_DI_AUX_COUNT,
     .mqtt_subscribe = app_mqtt_subscribe,
+    .mqtt_unsubscribe = app_mqtt_unsubscribe,
+    .mqtt_local     = rules_mqtt_local,
     .mqtt_publish   = app_mqtt_publish,
     .led_set        = led_set_rgb,      /* effective in IO mode (no-op in status mode) */
     .buzzer_set     = buzzer_set_tone,

@@ -1,6 +1,6 @@
 set(SRCS
     "di.c" "dout.c" "eth.c" "led.c" "button.c" "buzzer.c"
-    "app_config.c" "auth.c" "rtc.c" "i2c_bus.c" "aux_io.c" "web_common.c" "app_time.c"
+    "app_config.c" "auth.c" "rtc.c" "i2c_bus.c" "aux_io.c" "web_common.c" "app_time.c" "json_exact.c"
 )
 
 if(CONFIG_APP_SNTP_ENABLE)

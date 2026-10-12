@@ -5,6 +5,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
+#include <freertos/semphr.h>
 #include <esp_log.h>
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
@@ -65,7 +66,7 @@ typedef struct {
     evt_type_t type;
     uint64_t   seq;     /* order of posting, see evt_send() */
     union {
-        struct { char topic[MAX_TOPIC_LEN]; char payload[MAX_PAYLOAD_LEN]; } mqtt;
+        struct { char topic[MAX_TOPIC_LEN]; char payload[MAX_PAYLOAD_LEN]; uint16_t plen; } mqtt;
         struct { uint8_t channel; bool state; } input;
         struct { char *script; uint32_t ticket;            // script heap-allocated; task frees after eval
                  char *store; scripting_store_fn_t store_fn; } reload;  // store: heap, NULL = not stored
@@ -860,6 +861,7 @@ static bool trial_load(const char *script, char *err, size_t errlen)
     if (dry.buzzer_set)  dry.buzzer_set  = dry_buzzer_set;
     if (dry.mqtt_publish)   dry.mqtt_publish   = dry_mqtt_publish;
     if (dry.mqtt_subscribe) dry.mqtt_subscribe = dry_mqtt_subscribe;
+    dry.mqtt_unsubscribe = NULL;
 
     dry_io_start(real);
 
@@ -934,6 +936,94 @@ static esp_err_t store_off_psram(scripting_store_fn_t fn, const char *arg)
 
 /* ── Scripting task ──────────────────────────────────────────────────────── */
 
+/* ── Broker subscriptions of the rules ──────────────────────────────────────
+   Only "rules/#" used to be subscribed, so mqtt('sys/heartbeat') -- the
+   documented watchdog example -- never received a message and its watchdog
+   fired with the other side alive. The topics the loaded rules read are
+   subscribed besides it, and the list follows every reload: what a new rule
+   set no longer reads is unsubscribed. Not subscribed: "$..." (the engine's
+   own '$sys/mqtt', and broker-reserved), wildcards (a rule's topic is a
+   name, matched as it is), what "rules/#" covers, and what the firmware
+   delivers itself (mqtt_local). */
+#define MAX_RULE_SUBS 32
+static char              s_subs[MAX_RULE_SUBS][MAX_TOPIC_LEN];
+static int               s_nsubs;
+static SemaphoreHandle_t s_subs_mux;
+
+static bool sub_wanted(const char *t, size_t len)
+{
+    if (len == 0 || len >= MAX_TOPIC_LEN || memchr(t, '\0', len)) return false;
+    if (t[0] == '$' || memchr(t, '+', len) || memchr(t, '#', len)) return false;
+    if (len >= 6 && !memcmp(t, "rules/", 6)) return false;
+    if (g_scripting_io->mqtt_local && g_scripting_io->mqtt_local(t)) return false;
+    return true;
+}
+
+static bool sub_in(char (*list)[MAX_TOPIC_LEN], int n, const char *t)
+{
+    for (int i = 0; i < n; i++) if (!strcmp(list[i], t)) return true;
+    return false;
+}
+
+/* After a load, on the engine task. */
+static void update_rule_subscriptions(JSContext *ctx)
+{
+    if (!g_scripting_io || !g_scripting_io->mqtt_subscribe || !s_subs_mux) return;
+    char (*want)[MAX_TOPIC_LEN] = heap_caps_calloc(2, sizeof(s_subs), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!want) { ESP_LOGE(TAG, "rule topics not updated: out of memory"); return; }
+    char (*old)[MAX_TOPIC_LEN] = want + MAX_RULE_SUBS;
+    int n = 0, skipped = 0;
+
+    JSValue g  = JS_GetGlobalObject(ctx);
+    JSValue fn = JS_GetPropertyStr(ctx, g, "_mqtt_topics");
+    budget_start();
+    JSValue arr = JS_IsFunction(ctx, fn) ? JS_Call(ctx, fn, g, 0, NULL) : JS_UNDEFINED;
+    if (JS_IsException(arr)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        ESP_LOGE(TAG, "rule topics could not be listed; subscriptions unchanged");
+        JS_FreeValue(ctx, fn); JS_FreeValue(ctx, g); heap_caps_free(want);
+        return;
+    }
+    uint32_t len = 0;
+    JSValue lv = JS_GetPropertyStr(ctx, arr, "length");
+    JS_ToUint32(ctx, &len, lv);
+    JS_FreeValue(ctx, lv);
+    for (uint32_t i = 0; i < len; i++) {
+        JSValue v = JS_GetPropertyUint32(ctx, arr, i);
+        size_t tl = 0;
+        const char *t = JS_ToCStringLen(ctx, &tl, v);
+        if (t && sub_wanted(t, tl)) {
+            if (n < MAX_RULE_SUBS) strcpy(want[n++], t);
+            else skipped++;
+        }
+        if (t) JS_FreeCString(ctx, t);
+        JS_FreeValue(ctx, v);
+    }
+    JS_FreeValue(ctx, arr); JS_FreeValue(ctx, fn); JS_FreeValue(ctx, g);
+    if (skipped)
+        ESP_LOGW(TAG, "rules read %d MQTT topics more than the %d subscribed: those receive nothing",
+                 skipped, MAX_RULE_SUBS);
+
+    xSemaphoreTake(s_subs_mux, portMAX_DELAY);
+    int nold = s_nsubs;
+    memcpy(old, s_subs, sizeof(s_subs));
+    memcpy(s_subs, want, sizeof(s_subs));
+    s_nsubs = n;
+    xSemaphoreGive(s_subs_mux);
+
+    /* Not connected, a call fails: the connect handler subscribes the list,
+       and a clean session forgot the old ones anyway. */
+    for (int i = 0; i < nold; i++)
+        if (!sub_in(want, n, old[i]) && g_scripting_io->mqtt_unsubscribe)
+            g_scripting_io->mqtt_unsubscribe(old[i]);
+    for (int i = 0; i < n; i++)
+        if (!sub_in(old, nold, want[i])) {
+            ESP_LOGI(TAG, "rules read MQTT topic '%s': subscribed", want[i]);
+            g_scripting_io->mqtt_subscribe(want[i], 0);
+        }
+    heap_caps_free(want);
+}
+
 static void scripting_task(void *arg)
 {
     JSRuntime *rt = JS_NewRuntime2(&s_psram_alloc, NULL);
@@ -955,6 +1045,7 @@ static void scripting_task(void *arg)
 
     JSValue on_mqtt, on_input, on_time_sync, on_activity;
     bind_handlers(ctx, &on_mqtt, &on_input, &on_time_sync, &on_activity);
+    update_rule_subscriptions(ctx);
 
     ESP_LOGI(TAG, "Rule engine ready. Free heap: %lu B  SPIRAM: %lu B",
              (unsigned long)esp_get_free_heap_size(),
@@ -983,9 +1074,11 @@ static void scripting_task(void *arg)
             budget_start();
             switch (ev.type) {
             case EVT_MQTT:
+                /* With its length: JS_NewString() ended the payload at a
+                   NUL byte, and a rule saw "ON" of "ON\0OFF". */
                 call2(ctx, on_mqtt,
                       JS_NewString(ctx, ev.mqtt.topic),
-                      JS_NewString(ctx, ev.mqtt.payload));
+                      JS_NewStringLen(ctx, ev.mqtt.payload, ev.mqtt.plen));
                 break;
             case EVT_INPUT_CHANGE:
                 /* Older than a resync of this channel: the resync already
@@ -1136,6 +1229,7 @@ static void scripting_task(void *arg)
                 ctx = nctx;
                 bind_handlers(ctx, &on_mqtt, &on_input, &on_time_sync, &on_activity);
                 ESP_LOGI(TAG, "Rules reloaded");
+                update_rule_subscriptions(ctx);
                 /* Stored here, before the verdict is published, and not by
                    the caller after it: the caller may have stopped waiting. */
                 bool      tried = ev.reload.store && ev.reload.store_fn;
@@ -1176,6 +1270,7 @@ esp_err_t scripting_init(const char *user_script, const scripting_io_t *io)
 {
     s_user_script  = user_script;
     g_scripting_io = io;
+    if (!s_subs_mux) s_subs_mux = xSemaphoreCreateMutex();
 
     s_reload_lock = xSemaphoreCreateMutex();
     if (!s_reload_lock) {
@@ -1214,8 +1309,20 @@ esp_err_t scripting_init(const char *user_script, const scripting_io_t *io)
 
 void scripting_on_mqtt_connected(void)
 {
-    if (g_scripting_io && g_scripting_io->mqtt_subscribe)
-        g_scripting_io->mqtt_subscribe(RULES_TOPIC, 0);
+    if (!g_scripting_io || !g_scripting_io->mqtt_subscribe) return;
+    g_scripting_io->mqtt_subscribe(RULES_TOPIC, 0);
+    /* Copied under the lock, subscribed outside it: a subscribe can wait on
+       the client, and the engine task updates the list meanwhile. A topic
+       it adds now is subscribed by it as well -- twice is harmless. */
+    if (!s_subs_mux) return;
+    char (*t)[MAX_TOPIC_LEN] = heap_caps_malloc(sizeof(s_subs), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!t) { ESP_LOGE(TAG, "rule topics not subscribed: out of memory"); return; }
+    xSemaphoreTake(s_subs_mux, portMAX_DELAY);
+    int n = s_nsubs;
+    memcpy(t, s_subs, sizeof(s_subs));
+    xSemaphoreGive(s_subs_mux);
+    for (int i = 0; i < n; i++) g_scripting_io->mqtt_subscribe(t[i], 0);
+    heap_caps_free(t);
 }
 
 void scripting_on_mqtt_state(bool up)
@@ -1240,8 +1347,16 @@ void scripting_on_mqtt_message(const char *topic, size_t tlen,
         return;
     }
 
+    /* A topic is a name: with a NUL byte in it, it would match the shorter
+       one in front of it. MQTT does not allow one; such a message is not
+       for any rule. */
+    if (memchr(topic, '\0', tlen)) {
+        ESP_LOGW(TAG, "MQTT message dropped: NUL byte in the topic");
+        return;
+    }
     memcpy(ev.mqtt.topic,   topic, tlen); ev.mqtt.topic[tlen]   = '\0';
     memcpy(ev.mqtt.payload, data,  dlen); ev.mqtt.payload[dlen] = '\0';
+    ev.mqtt.plen = (uint16_t)dlen;
 
     if (evt_send(&ev) != pdTRUE)
         ESP_LOGW(TAG, "Event queue full — MQTT message dropped");

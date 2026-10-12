@@ -6,6 +6,7 @@ int  app_mqtt_publish(const char *topic, const char *payload, int len, int qos, 
 int  app_mqtt_subscribe(const char *topic, int qos);
 bool app_mqtt_is_connected(void);
 #include "cJSON.h"
+#include "json_exact.h"
 #endif
 
 #include <string.h>
@@ -352,7 +353,7 @@ void led_on_mqtt_message(const char *topic, size_t tlen,
     }
 
     /* {"color":"#RRGGBB","duration":N} or [{...},{...}] — goes through task */
-    cJSON *root = cJSON_ParseWithLength(data, dlen);
+    cJSON *root = json_parse_exact(data, dlen);
     if (!root) { ESP_LOGW(TAG, "JSON parse failed"); return; }
 
     led_seq_t seq = { .count = 0 };

@@ -16,6 +16,11 @@ typedef esp_err_t (*scripting_aux_pwm_set_fn_t)(uint8_t pad, uint32_t freq_hz, u
 typedef bool      (*scripting_aux_pwm_get_fn_t)(uint8_t pad, uint32_t *freq_hz, uint16_t *duty_pm);
 typedef esp_err_t (*scripting_aux_analog_get_fn_t)(uint8_t pad, int *mv);
 typedef int       (*scripting_mqtt_subscribe_fn_t)(const char *topic, int qos);
+typedef int       (*scripting_mqtt_unsubscribe_fn_t)(const char *topic);
+/* Topics the firmware hands the engine itself (scripting_on_mqtt_message())
+   besides publishing them: never subscribed at the broker, which would
+   deliver each of them a second time. */
+typedef bool      (*scripting_mqtt_local_fn_t)(const char *topic);
 typedef int       (*scripting_mqtt_publish_fn_t)(const char *topic, const char *payload, int len, int qos, bool retain);
 typedef esp_err_t (*scripting_led_set_fn_t)(uint8_t r, uint8_t g, uint8_t b);
 typedef void      (*scripting_buzzer_set_fn_t)(uint32_t freq_hz);   /* 0 = off */
@@ -31,6 +36,8 @@ typedef struct {
     scripting_aux_pwm_get_fn_t    aux_pwm_get;
     scripting_aux_analog_get_fn_t aux_analog_get;
     scripting_mqtt_subscribe_fn_t mqtt_subscribe;
+    scripting_mqtt_unsubscribe_fn_t mqtt_unsubscribe;   /* optional */
+    scripting_mqtt_local_fn_t     mqtt_local;          /* optional */
     scripting_mqtt_publish_fn_t   mqtt_publish;
     scripting_led_set_fn_t        led_set;      /* drive the RGB LED (IO mode only) */
     scripting_buzzer_set_fn_t     buzzer_set;   /* continuous tone; 0 Hz = off */
@@ -41,7 +48,9 @@ typedef struct {
 // io must remain valid for the application lifetime.
 esp_err_t scripting_init(const char *user_script, const scripting_io_t *io);
 
-// Called from the MQTT connected callback — subscribes to the rules topic.
+// Called from the MQTT connected callback — subscribes to "rules/#" and to
+// every other topic the loaded rules read (mqtt('sys/heartbeat') ...); the
+// engine keeps that list current across reloads.
 void scripting_on_mqtt_connected(void);
 
 // Feed an incoming MQTT message into the rule engine.

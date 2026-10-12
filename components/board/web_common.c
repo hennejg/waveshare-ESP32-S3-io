@@ -3,6 +3,7 @@
    (the /api/auth/ endpoints). They were two copies, in apps/full and
    apps/matter, and a fix to one of them had to be remembered for the other. */
 #include "web_common.h"
+#include "json_exact.h"
 #include "app_config.h"
 #include "app_rtc.h"
 #include "auth.h"
@@ -259,7 +260,7 @@ esp_err_t web_api_auth_set_password(httpd_req_t *req)
     int n = web_recv_body(req, body, req->content_len);
     if (n < 0) { free(body); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
-    cJSON *root = cJSON_Parse(body);
+    cJSON *root = json_parse_exact(body, (size_t)n);
     free(body);
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
 
@@ -384,7 +385,7 @@ esp_err_t web_api_time_post(httpd_req_t *req)
         return ESP_OK;
     }
 
-    cJSON *root = cJSON_Parse(body);
+    cJSON *root = json_parse_exact(body, (size_t)received);
     free(body);
     if (!root) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
@@ -449,7 +450,7 @@ esp_err_t web_api_io_buzzer(httpd_req_t *req)
     int n = web_recv_body(req, body, sizeof(body) - 1);
     if (n < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
-    cJSON *root = cJSON_Parse(body);
+    cJSON *root = json_parse_exact(body, (size_t)n);
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
 
     uint32_t freq = 440, dur = 200;

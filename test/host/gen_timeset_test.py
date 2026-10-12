@@ -14,7 +14,7 @@ OLD=1 cuts web_server.c from git (OLDREV, default HEAD).
   make -C test/host timeset
 """
 import pathlib
-from cutter import Source
+from cutter import Source, json_exact_if_used
 
 src  = Source.at("apps/full/main/web_server.c")
 if "static esp_err_t api_time_post(httpd_req_t *req)" in src.text:
@@ -83,5 +83,5 @@ int main(void)
 }
 """
 out = pathlib.Path(__file__).with_name("test_timeset.c")
-out.write_text(HARNESS.replace("__CUT__", cuts))
+out.write_text(HARNESS.replace("__CUT__", json_exact_if_used(cuts) + cuts))
 print("erzeugt:", out.name)
