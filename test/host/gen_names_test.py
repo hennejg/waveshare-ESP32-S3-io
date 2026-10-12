@@ -36,9 +36,6 @@ typedef struct { bool invert; char name[APP_CFG_IO_NAME_MAX + 1]; } di_config_t;
 typedef struct { di_config_t di[APP_CFG_DI_COUNT], dout[APP_CFG_DO_COUNT], aux_out[3]; } app_config_t;
 #define ESP_LOGW(tag, ...) do { printf("    log: "); printf(__VA_ARGS__); printf("\n"); } while (0)
 #define TAG "t"
-static size_t strlcpy_(char *d, const char *s, size_t n)
-{ size_t l = strlen(s); if (n) { size_t k = l < n - 1 ? l : n - 1; memcpy(d, s, k); d[k] = 0; } return l; }
-#define strlcpy strlcpy_
 
 __CUT__
 

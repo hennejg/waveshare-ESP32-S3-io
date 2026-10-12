@@ -52,8 +52,6 @@ static void xSemaphoreGive(SemaphoreHandle_t m) { (void)m; }
 typedef struct { char mqtt_topic_prefix[64]; } app_config_t;
 static app_config_t cfg = { "dev" };
 static const app_config_t *app_config_get(void) { return &cfg; }
-#define strlcpy test_strlcpy
-static size_t test_strlcpy(char *d, const char *s, size_t n) { size_t l = strlen(s); if (n) { size_t c = l < n - 1 ? l : n - 1; memcpy(d, s, c); d[c] = 0; } return l; }
 
 typedef int *esp_mqtt_client_handle_t;
 static int client_obj; static esp_mqtt_client_handle_t s_client = &client_obj;

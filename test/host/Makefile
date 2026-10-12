@@ -6,7 +6,8 @@
 MAIN  := ../../apps/full/main
 MB    := ../../components/modbus
 CFLAGS := -std=c11 -Wall -Wextra -Werror -O1 -g \
-          -fsanitize=address,undefined -fno-omit-frame-pointer -I$(MAIN) -I$(MB)
+          -fsanitize=address,undefined -fno-omit-frame-pointer -I$(MAIN) -I$(MB) \
+          -include stubs/host_compat.h
 
 PORT ?= 15020
 
