@@ -32,7 +32,8 @@ cuts = (src.defines(*hb, "CAN_MODE_BASIC", "CAN_MODE_N2K", "TX_POLL_MS",
                     "N2K_ADDR_GLOBAL", "N2K_DI_INSTANCE", "N2K_DO_INSTANCE")
         + src.span("typedef enum { AC_UNINIT, AC_CLAIMING, AC_ACTIVE, AC_FAILED } ac_state_t;",
                    "static uint8_t    s_hb_seq;       /* heartbeat sequence */")
-        + (src.span("/* The output state last sent, in either mode.", "static uint8_t s_last_do = 0xFF;") if new else "")
+        + (src.span("/* The output state last sent, in either mode.",
+                     "static bool    s_do_sent;" if "static bool    s_do_sent;" in src.text else "static uint8_t s_last_do = 0xFF;") if new else "")
         + src.func("static uint32_t n2k_make_id(uint32_t pgn, uint8_t pri, uint8_t src, uint8_t dst)")
         + src.func("static uint32_t n2k_decode_id(uint32_t can_id, uint8_t *src, uint8_t *dst)")
         + src.func("static void n2k_send_address_claim(uint8_t addr)")

@@ -151,7 +151,9 @@ Manufacturer code `0x7FF` (bytes 0–1 of payload). Sub-function byte at offset 
 | `0x01` | RX + TX   | `[R][G][B]`                  | LED colour (IO mode only) |
 | `0x02` | RX        | `[freqLo][freqHi][dur×10ms]` | Buzzer beep               |
 
-Both fit in a single fast-packet frame (6 payload bytes in first frame).
+Both fit in a single fast-packet frame (6 payload bytes in first frame). The fast-packet length counts the
+manufacturer code, the sub-function and the arguments: LED 6, buzzer 6 -- or 5 without the duration byte, which
+then beeps 200 ms.
 
 ### Interaction with MQTT and Modbus
 
@@ -159,6 +161,8 @@ Both fit in a single fast-packet frame (6 payload bytes in first frame).
   published on `output/N` MQTT topics.
 - **DI state** (PGN 127501) is read from the same hardware state used by all three interfaces.
 - MQTT, Modbus, and CAN (either mode) operate simultaneously if all are configured.
+- Inputs and outputs are reported once as soon as CAN runs (Basic mode; NMEA 2000 once the address is claimed),
+  whatever their state -- also with a TX interval of 0, and also all eight high.
 - A status frame (inputs, outputs) the driver does not take -- queue full, bus-off -- counts as not sent and goes
   out again on the next pass of the worker (every 50 ms), also with a TX interval of 0.
 

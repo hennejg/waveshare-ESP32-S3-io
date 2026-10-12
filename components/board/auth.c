@@ -80,18 +80,24 @@ static void to_hex(const uint8_t *b, size_t n, char *out)
 }
 
 /* SHA-256(salt || password) using the classic mbedTLS MD API.
-   This avoids PSA-layer constructors that disrupted the I2C peripheral. */
-static void compute_hash(const uint8_t *salt, const char *pw, uint8_t out[32])
+   This avoids PSA-layer constructors that disrupted the I2C peripheral.
+   False when mbedTLS failed: mbedtls_md_setup() allocates, and after a
+   failed allocation it leaves the digest set but its context NULL, so the
+   next call dereferenced NULL in the middle of a login. out is then no hash
+   of anything, like derive()'s. */
+static bool compute_hash(const uint8_t *salt, const char *pw, uint8_t out[32])
 {
     mbedtls_md_context_t ctx;
     const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
     mbedtls_md_init(&ctx);
-    mbedtls_md_setup(&ctx, info, 0);   /* 0 = no HMAC */
-    mbedtls_md_starts(&ctx);
-    mbedtls_md_update(&ctx, salt, 16);
-    mbedtls_md_update(&ctx, (const uint8_t *)pw, strlen(pw));
-    mbedtls_md_finish(&ctx, out);
+    bool ok = info
+           && mbedtls_md_setup(&ctx, info, 0) == 0      /* 0 = no HMAC */
+           && mbedtls_md_starts(&ctx) == 0
+           && mbedtls_md_update(&ctx, salt, 16) == 0
+           && mbedtls_md_update(&ctx, (const uint8_t *)pw, strlen(pw)) == 0
+           && mbedtls_md_finish(&ctx, out) == 0;
     mbedtls_md_free(&ctx);
+    return ok;
 }
 
 /* False when mbedTLS failed (out of memory): out is then no hash of
@@ -108,11 +114,13 @@ static bool same(const uint8_t *a, const uint8_t *b, size_t n)
     return mbedtls_ct_memcmp(a, b, n) == 0;
 }
 
+/* The fast verifier counts only once it was computed: on failure there is
+   none, and the next login takes the full PBKDF2 path again. */
 static void remember_fast(const char *pw)
 {
+    s_fast_ok = false;
     esp_fill_random(s_fast_salt, sizeof(s_fast_salt));
-    compute_hash(s_fast_salt, pw, s_fast_hash);
-    s_fast_ok = true;
+    s_fast_ok = compute_hash(s_fast_salt, pw, s_fast_hash);
 }
 
 static esp_err_t token_init(void);
@@ -193,14 +201,13 @@ bool auth_check_password(const char *pw)
 {
     if (!s_pw_set) return false;      /* nothing to match against -- see auth.h */
     uint8_t test[32];
-    if (s_fast_ok) {
-        compute_hash(s_fast_salt, pw, test);
-        if (same(test, s_fast_hash, 32)) return true;
-    }
+    /* A hash that could not be computed matches nothing: the fast path
+       falls through to the full check, the old single-SHA entry fails. */
+    if (s_fast_ok && compute_hash(s_fast_salt, pw, test) && same(test, s_fast_hash, 32))
+        return true;
     bool ok;
     if (s_pw_v1) {
-        compute_hash(s_pw_salt, pw, test);
-        ok = same(test, s_pw_hash, 32);
+        ok = compute_hash(s_pw_salt, pw, test) && same(test, s_pw_hash, 32);
         /* Stored the old way: replace it now that the password is known
            (which also sets the fast verifier). A failed write keeps the old
            blob, which still works. */

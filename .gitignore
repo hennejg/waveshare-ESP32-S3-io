@@ -123,3 +123,5 @@ test/host/test_canmatter
 test/host/test_canmatter.c
 test/host/test_pwmlevel
 test/host/test_pwmlevel.cpp
+test/host/test_canfmt
+test/host/test_canfmt.c

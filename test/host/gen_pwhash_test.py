@@ -30,6 +30,7 @@ HARNESS = r"""
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#define MBEDTLS_ALLOW_PRIVATE_ACCESS   /* to leave a context as a failed setup does */
 #include "mbedtls/md.h"
 #include "mbedtls/pkcs5.h"
 #include "mbedtls/constant_time.h"
@@ -65,6 +66,19 @@ static int pbkdf2_maybe_fail(mbedtls_md_type_t t, const unsigned char *p, size_t
     return mbedtls_pkcs5_pbkdf2_hmac_ext(t, p, pl, s, sl, it, kl, out);
 }
 #define mbedtls_pkcs5_pbkdf2_hmac_ext pbkdf2_maybe_fail
+
+/* mbedtls_md_setup() out of memory, as md.c leaves it: the digest set, its
+   context NULL -- the next mbedtls_md_starts() dereferences that. Only the
+   calls in auth.c are redirected; PBKDF2 inside the library is not. */
+static int md_setup_fail;
+static int md_setup_maybe_fail(mbedtls_md_context_t *ctx, const mbedtls_md_info_t *info, int hmac)
+{
+    if (!md_setup_fail) return mbedtls_md_setup(ctx, info, hmac);
+    ctx->MBEDTLS_PRIVATE(md_info) = info;
+    ctx->MBEDTLS_PRIVATE(md_ctx)  = NULL;
+    return MBEDTLS_ERR_MD_ALLOC_FAILED;
+}
+#define mbedtls_md_setup md_setup_maybe_fail
 
 __CUT__
 
@@ -129,6 +143,26 @@ int main(void)
     CHECK(auth_check_password("NeuesPasswort!"), "nach fehlgeschlagener Ableitung und Neustart: bisheriges Passwort abgelehnt");
     CHECK(!auth_check_password("Kaputt#1"), "nach Neustart: nicht gespeichertes Passwort gilt");
     if (failures == f0) printf("  fehlgeschlagene Ableitung: Aenderung abgelehnt, altes Passwort gilt weiter\n");
+
+    /* SHA-256 cannot get its context (fast verifier, old entry). */
+    f0 = failures;
+    REBOOT();
+    CHECK(auth_check_password("NeuesPasswort!"), "Ausgangslage: Passwort abgelehnt");   /* sets the fast verifier */
+    md_setup_fail = 1;
+    CHECK(auth_check_password("NeuesPasswort!"), "SHA-Kontext fehlt: richtiges Passwort abgelehnt (PBKDF2 muss tragen)");
+    CHECK(!auth_check_password("falsch"), "SHA-Kontext fehlt: falsches Passwort angenommen");
+    CHECK(!s_fast_ok, "SHA-Kontext fehlt: schneller Pruefwert gilt als berechnet");
+    md_setup_fail = 0;
+    CHECK(!auth_check_password("falsch") && auth_check_password("NeuesPasswort!"),
+          "nach dem Speichermangel: Pruefung falsch");
+    CHECK(s_fast_ok, "nach dem Speichermangel: schneller Pruefwert nicht neu berechnet");
+    memcpy(blob, v1, 48); blob_len = 48; blob_set = 1;
+    REBOOT();
+    md_setup_fail = 1;
+    CHECK(!auth_check_password("geheim123") && blob_len == 48, "SHA-Kontext fehlt: alter Eintrag ohne Hash angenommen oder ersetzt");
+    md_setup_fail = 0;
+    CHECK(auth_check_password("geheim123"), "alter Eintrag nach dem Speichermangel abgelehnt");
+    if (failures == f0) printf("  SHA-256 ohne Speicher: kein Absturz, Pruefwert ungueltig, PBKDF2 traegt\n");
 
     printf("%s\n", failures ? "FEHLER" : "alles in Ordnung");
     return failures ? 1 : 0;

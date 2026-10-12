@@ -78,8 +78,12 @@ static uint16_t s_base;
 /* The output state last sent, in either mode. The senders set it, so a
    change the worker has not seen yet -- an output switched over Modbus,
    MQTT, a rule or the web page -- is told apart from one a CAN command
-   already answered. */
-static uint8_t s_last_do = 0xFF;
+   already answered. s_do_sent: whether it holds anything yet. A start value
+   of 0xFF instead was a state like any other -- with all eight outputs on
+   when CAN started (the Matter firmware starts it after commissioning) the
+   first report never went out. */
+static uint8_t s_last_do;
+static bool    s_do_sent;
 
 /* The driver does not copy a frame: it keeps a pointer to the twai_frame_t and
    to its buffer in p_curr_tx and in tx_mount_queue until the transmission
@@ -187,7 +191,7 @@ static bool basic_tx_di(uint8_t bits) { return basic_send(s_base + 1, &bits, 1);
 static void basic_tx_do(void)
 {
     uint8_t f[2] = {0, dout_get_all()};
-    if (basic_send(s_base + 2, f, 2)) s_last_do = f[1];
+    if (basic_send(s_base + 2, f, 2)) { s_last_do = f[1]; s_do_sent = true; }
 }
 
 /* DO opcodes: 0=WRITE, 1=SET, 2=CLEAR, 3=TOGGLE */
@@ -406,7 +410,7 @@ static void n2k_tx_do_bank(void)
     uint8_t data[8];
     encode_switch_bank(data, N2K_DO_INSTANCE, bitmask);
     if (n2k_send_frame(n2k_make_id(N2K_PGN_SW_STATUS, 3, s_addr, N2K_ADDR_GLOBAL), data, 8))
-        s_last_do = bitmask;   /* see basic_tx_do() */
+        { s_last_do = bitmask; s_do_sent = true; }   /* see basic_tx_do() */
 }
 
 /* Proprietary fast-packet for LED or buzzer. */
@@ -524,10 +528,10 @@ static void n2k_handle_rx(const rx_msg_t *m)
     }
 
     if (pgn == N2K_PGN_PROPRIETARY && m->dlc == 8) {
-        /* Only single-frame fast-packet messages are supported.
-         * LED (3 bytes) and buzzer (4 bytes) both fit in frame 0
-         * (6 payload bytes available). Multi-frame messages are
-         * silently discarded. */
+        /* Only single-frame fast-packet messages are supported. The length
+         * counts the manufacturer code (2), the sub-function (1) and the
+         * arguments: LED 3 -> 6, buzzer 2 or 3 -> 5 or 6. Both fit in frame
+         * 0 (6 payload bytes). Multi-frame messages are discarded. */
         uint8_t fp_frame = m->data[0] & 0x1F;
         if (fp_frame != 0) return;   /* only first frame */
         /* data[1]=total len, data[2]=mfr_lo, data[3]=mfr_hi, data[4]=sub_fn ... */
@@ -539,9 +543,12 @@ static void n2k_handle_rx(const rx_msg_t *m)
         if (sub_fn == 0x01 && m->data[1] >= 6) {          /* LED */
             led_set_rgb(m->data[5], m->data[6], m->data[7]);
             command_seen();
-        } else if (sub_fn == 0x02 && m->data[1] >= 6) {   /* Buzzer */
+        } else if (sub_fn == 0x02 && m->data[1] >= 5) {   /* Buzzer */
+            /* The duration is the third argument, length 6. It was read
+               only from 7 on, so every documented command beeped 200 ms,
+               and one without the duration (length 5) was dropped. */
             uint16_t freq = (uint16_t)m->data[5] | ((uint16_t)m->data[6] << 8);
-            uint32_t dur  = (m->data[1] >= 7) ? (uint32_t)m->data[7] * 10u : 200u;
+            uint32_t dur  = (m->data[1] >= 6) ? (uint32_t)m->data[7] * 10u : 200u;
             if (freq > 0) buzzer_beep_once(freq, dur);
             command_seen();
         }
@@ -589,7 +596,10 @@ static void can_check_bus_off(void)
    Modbus, MQTT, a rule or the web page stayed at its old state on the bus. */
 static void can_tick(TickType_t now)
 {
-    static uint8_t    last_di  = 0xFF;
+    /* di_sent as s_do_sent: 0xFF is eight inputs high, not "nothing sent",
+       and with no periodic interval that state was never reported. */
+    static uint8_t    last_di;
+    static bool       di_sent;
     static TickType_t last_hb  = 0;
     static TickType_t last_per = 0;
     /* At least one tick: at 100 Hz, 1..9 ms is 0 ticks, and every pass of
@@ -610,8 +620,8 @@ static void can_tick(TickType_t now)
         /* A report the driver did not take stays due: last_di and
            s_last_do move only with a frame that went out, so the next tick
            tries again (every TX_POLL_MS; tx_failed() keeps the log quiet). */
-        if ((di != last_di || due) && basic_tx_di(di)) last_di = di;
-        if (dout_get_all() != s_last_do || due) basic_tx_do();
+        if ((!di_sent || di != last_di || due) && basic_tx_di(di)) { last_di = di; di_sent = true; }
+        if (!s_do_sent || dout_get_all() != s_last_do || due) basic_tx_do();
         if (due) last_per = now;
     }
 
@@ -623,9 +633,9 @@ static void can_tick(TickType_t now)
             s_ac_state = AC_ACTIVE;
             ESP_LOGI(TAG, "N2k address %u claimed", s_addr);
             n2k_tx_heartbeat();
-            bool di_sent = n2k_tx_di_bank();
+            bool sent = n2k_tx_di_bank();
             n2k_tx_do_bank();
-            if (di_sent) last_di = di;
+            if (sent) { last_di = di; di_sent = true; }
             last_hb = last_per = now;
             due = false;
         }
@@ -634,8 +644,8 @@ static void can_tick(TickType_t now)
             if ((now - last_hb) >= pdMS_TO_TICKS(N2K_HB_PERIOD_MS)) {
                 n2k_tx_heartbeat(); last_hb = now;
             }
-            if ((di != last_di || due) && n2k_tx_di_bank()) last_di = di;
-            if (dout_get_all() != s_last_do || due) n2k_tx_do_bank();
+            if ((!di_sent || di != last_di || due) && n2k_tx_di_bank()) { last_di = di; di_sent = true; }
+            if (!s_do_sent || dout_get_all() != s_last_do || due) n2k_tx_do_bank();
             if (due) last_per = now;
         }
     }
