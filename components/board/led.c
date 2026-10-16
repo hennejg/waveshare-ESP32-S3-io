@@ -6,6 +6,7 @@ int  app_mqtt_publish(const char *topic, const char *payload, int len, int qos, 
 int  app_mqtt_subscribe(const char *topic, int qos);
 bool app_mqtt_is_connected(void);
 #include "cJSON.h"
+#include "json_exact.h"
 #endif
 
 #include <string.h>
@@ -14,11 +15,13 @@ bool app_mqtt_is_connected(void);
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_check.h"
 #include "esp_log.h"
 
 #define TAG         "led"
+#define LED_PAYLOAD_MAX 1024   /* led/set payloads at or above this are ignored */
 #define LED_GPIO    GPIO_NUM_38
 #define SEQ_MAX     16
 #define DUR_MAX_MS  30000u
@@ -32,29 +35,43 @@ typedef struct {
 typedef struct {
     led_step_t steps[SEQ_MAX];
     int        count;
+    uint32_t   gen;      /* s_gen when it was queued */
 } led_seq_t;
 
 static led_strip_handle_t s_strip;
 static uint8_t            s_r, s_g, s_b;
 static QueueHandle_t      s_queue;
 static bool               s_status_mode;
+/* IO mode. An instant colour (MQTT "#RRGGBB", led_set_rgb() from Modbus,
+   CAN, rules or the web page) is meant to stay; a sequence running at the
+   time used to put its next step over it. Every new command bumps s_gen,
+   and a sequence queued before it stops. s_io_lock makes "still current?"
+   and the write of a step one step: an instant colour cannot land between
+   them and be overwritten by the step after all. */
+static SemaphoreHandle_t  s_io_lock;
+static volatile uint32_t  s_gen;
+static TaskHandle_t       s_led_task;
 
 /* ------------------------------------------------------------------ helpers */
 
-static uint8_t hex_digit(char c)
+static int hex_digit(char c)
 {
-    if (c >= '0' && c <= '9') return (uint8_t)(c - '0');
-    if (c >= 'a' && c <= 'f') return (uint8_t)(c - 'a' + 10);
-    if (c >= 'A' && c <= 'F') return (uint8_t)(c - 'A' + 10);
-    return 0;
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
 }
 
+/* Exactly "#RRGGBB". It took anything from 7 characters on and a non-hex
+   digit as 0: "#ff0000xyz" was red, "#zzzzzz" black. */
 static bool parse_hex(const char *s, uint8_t *r, uint8_t *g, uint8_t *b)
 {
-    if (!s || s[0] != '#' || strlen(s) < 7) return false;
-    *r = (hex_digit(s[1]) << 4) | hex_digit(s[2]);
-    *g = (hex_digit(s[3]) << 4) | hex_digit(s[4]);
-    *b = (hex_digit(s[5]) << 4) | hex_digit(s[6]);
+    if (!s || s[0] != '#' || strlen(s) != 7) return false;
+    int d[6];
+    for (int i = 0; i < 6; i++) if ((d[i] = hex_digit(s[1 + i])) < 0) return false;
+    *r = (uint8_t)(d[0] << 4 | d[1]);
+    *g = (uint8_t)(d[2] << 4 | d[3]);
+    *b = (uint8_t)(d[4] << 4 | d[5]);
     return true;
 }
 
@@ -66,20 +83,30 @@ static bool parse_step(cJSON *obj, led_step_t *s)
     cJSON *col = cJSON_GetObjectItem(obj, "color");
     cJSON *dur = cJSON_GetObjectItem(obj, "duration");
     if (!cJSON_IsString(col) || !cJSON_IsNumber(dur)) return false;
-    uint32_t d = (uint32_t)dur->valuedouble;
-    if (d == 0 || d > DUR_MAX_MS) return false;
+    /* Checked as the double: a negative or huge one converted to uint32_t
+       is undefined behaviour, not a refused step. */
+    if (!(dur->valuedouble >= 1 && dur->valuedouble <= DUR_MAX_MS)) return false;
     if (!parse_hex(col->valuestring, &s->r, &s->g, &s->b)) return false;
-    s->duration_ms = d;
+    s->duration_ms = (uint32_t)dur->valuedouble;
     return true;
 }
 #endif
 
+static void hw_write(uint8_t r, uint8_t g, uint8_t b)
+{
+    if (!s_strip) return;               /* before led_init(): nothing to drive yet */
+    /* The strip configuration handles the wire order. */
+    led_strip_set_pixel(s_strip, 0, r, g, b);
+    led_strip_refresh(s_strip);
+}
+
+/* The colour the LED should show, as its owner set it. A forced colour
+   (led_force_set) goes to the hardware only, so led_force_release() has
+   something to go back to. */
 static void hw_apply(uint8_t r, uint8_t g, uint8_t b)
 {
     s_r = r; s_g = g; s_b = b;
-    /* WS2812 wire order is GRB — swap red and green at the call site. */
-    led_strip_set_pixel(s_strip, 0, g, r, b);
-    led_strip_refresh(s_strip);
+    hw_write(r, g, b);
 }
 
 #ifdef CONFIG_APP_MQTT_ENABLE
@@ -93,17 +120,44 @@ static void publish_color(void)
 
 /* -------------------------------------------------------------------- task */
 
+/* An instant colour: it stays, a running sequence stops (see s_gen). */
+static void io_instant(uint8_t r, uint8_t g, uint8_t b)
+{
+    xSemaphoreTake(s_io_lock, portMAX_DELAY);
+    s_gen++;
+    hw_apply(r, g, b);
+    xTaskNotifyGive(s_led_task);   /* serialized with the next sequence's drain */
+    xSemaphoreGive(s_io_lock);
+}
+
+/* The steps of one sequence, until it ends, an instant colour comes, or a
+   newer sequence is queued. */
+static void run_sequence(const led_seq_t *seq)
+{
+    /* A notification that arrived while we waited on the queue belongs to
+       the command before this run, not to its first step. Producers notify
+       under this lock, so draining cannot swallow a newer command's wake. */
+    xSemaphoreTake(s_io_lock, portMAX_DELAY);
+    ulTaskNotifyTake(pdTRUE, 0);
+    xSemaphoreGive(s_io_lock);
+    for (int i = 0; i < seq->count; i++) {
+        xSemaphoreTake(s_io_lock, portMAX_DELAY);
+        bool current = seq->gen == s_gen;
+        if (current) hw_apply(seq->steps[i].r, seq->steps[i].g, seq->steps[i].b);
+        xSemaphoreGive(s_io_lock);
+        if (!current) return;
+        /* Woken early by an instant colour or a newer sequence. */
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(seq->steps[i].duration_ms));
+        if (uxQueueMessagesWaiting(s_queue) || seq->gen != s_gen) return;
+    }
+}
+
 static void led_task(void *arg)
 {
     led_seq_t seq;
     for (;;) {
         xQueueReceive(s_queue, &seq, portMAX_DELAY);
-        for (int i = 0; i < seq.count; i++) {
-            hw_apply(seq.steps[i].r, seq.steps[i].g, seq.steps[i].b);
-            vTaskDelay(pdMS_TO_TICKS(seq.steps[i].duration_ms));
-            /* Preempt remaining steps if a newer sequence has arrived. */
-            if (uxQueueMessagesWaiting(s_queue)) break;
-        }
+        run_sequence(&seq);
 #ifdef CONFIG_APP_MQTT_ENABLE
         if (app_mqtt_is_connected()) publish_color();
 #endif
@@ -137,7 +191,7 @@ typedef struct { uint8_t r, g, b; } flash_t;
 
 static uint8_t            s_bg_r, s_bg_g, s_bg_b;
 static uint8_t            s_net_level;
-static int                s_net_count;
+static bool               s_net_up;
 static QueueHandle_t      s_flash_q;
 static bool               s_ap_mode      = false;
 static bool               s_ap_blink_on  = false;
@@ -197,29 +251,24 @@ void led_status_set_ap_mode(bool up)
     }
 }
 
+/* up: some interface has an address; false only once none has (main.c
+   decides that). A level, not a count: the callers report "up" once per
+   address an interface gets -- twice for two interfaces, again on a DHCP
+   renewal -- but "down" once when the last one is gone, so the count never
+   came back to zero and the LED stayed green with no network at all. */
 void led_status_set_network(bool up)
 {
     if (!s_status_mode) return;
 
-    bool do_ap_down = false;
+    if (up) led_status_set_ap_mode(false);   /* AP done once we have an IP */
+
     bool do_refresh = false;
+    taskENTER_CRITICAL(&s_mux);
+    s_net_up = up;
+    if (up && s_net_level < 1)  { s_net_level = 1; do_refresh = true; }
+    if (!up && s_net_level > 0) { s_net_level = 0; do_refresh = true; }
+    taskEXIT_CRITICAL(&s_mux);
 
-    if (up) {
-        led_status_set_ap_mode(false);   /* AP done once we have an IP */
-        taskENTER_CRITICAL(&s_mux);
-        s_net_count++;
-        if (s_net_level < 1) { s_net_level = 1; do_refresh = true; }
-        taskEXIT_CRITICAL(&s_mux);
-    } else {
-        taskENTER_CRITICAL(&s_mux);
-        if (--s_net_count <= 0) {
-            s_net_count = 0;
-            if (s_net_level > 0) { s_net_level = 0; do_refresh = true; }
-        }
-        taskEXIT_CRITICAL(&s_mux);
-    }
-
-    (void)do_ap_down;
     if (do_refresh) refresh_status();
 }
 
@@ -231,7 +280,7 @@ void led_status_set_mqtt(bool up)
     if (up) {
         s_net_level = 2;
     } else {
-        s_net_level = (s_net_count > 0) ? 1 : 0;
+        s_net_level = s_net_up ? 1 : 0;
     }
     taskEXIT_CRITICAL(&s_mux);
 
@@ -253,13 +302,28 @@ void led_status_flash_tx(void) { do_flash(STA_TX_R, STA_TX_G, STA_TX_B); }
 esp_err_t led_set_rgb(uint8_t r, uint8_t g, uint8_t b)
 {
     if (s_status_mode) return ESP_OK;   /* ignore in status mode */
-    hw_apply(r, g, b);
+    if (!s_io_lock) return ESP_ERR_INVALID_STATE;   /* led_init() has not run, or failed */
+    io_instant(r, g, b);
     return ESP_OK;
 }
 
 void led_force_set(uint8_t r, uint8_t g, uint8_t b)
 {
-    hw_apply(r, g, b);   /* always applies, regardless of mode */
+    hw_write(r, g, b);   /* always applies, regardless of mode */
+}
+
+void led_force_release(void)
+{
+    if (s_status_mode) {
+        bool ap;
+        taskENTER_CRITICAL(&s_mux);
+        ap = s_ap_mode;
+        taskEXIT_CRITICAL(&s_mux);
+        if (ap) return;                  /* the AP blink takes over on its next tick */
+        hw_write(s_bg_r, s_bg_g, s_bg_b);
+    } else {
+        hw_write(s_r, s_g, s_b);
+    }
 }
 
 esp_err_t led_init(void)
@@ -267,6 +331,9 @@ esp_err_t led_init(void)
     led_strip_config_t strip_cfg = {
         .strip_gpio_num = LED_GPIO,
         .max_leds       = 1,
+        /* Preserve the existing RGB wire bytes (formerly produced by
+           swapping R/G at the default-GRB driver's call site). */
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_RGB,
     };
     led_strip_rmt_config_t rmt_cfg = {
         .resolution_hz  = 10 * 1000 * 1000,
@@ -281,17 +348,35 @@ esp_err_t led_init(void)
 
     s_status_mode = (app_config_get()->led_mode == LED_MODE_STATUS);
 
+    /* Each result looked at: a task started on a NULL queue stopped the
+       device on its first receive, and a task that was never created left
+       commands queued for nobody while led_init() said ok. On failure what
+       was made is freed again and the caller hears of it. */
     if (s_status_mode) {
         s_flash_q = xQueueCreate(1, sizeof(flash_t));
-        xTaskCreate(flash_task, "led_flash", 3072, NULL, 6, NULL);
+        if (!s_flash_q || xTaskCreate(flash_task, "led_flash", 3072, NULL, 6, NULL) != pdPASS)
+            goto no_mem;
         refresh_status();   /* boot = 50% yellow */
         ESP_LOGI(TAG, "WS2812 on GPIO%d — Status mode", LED_GPIO);
     } else {
-        s_queue = xQueueCreate(1, sizeof(led_seq_t));
-        xTaskCreate(led_task, "led", 3072, NULL, 5, NULL);
+        s_queue   = xQueueCreate(1, sizeof(led_seq_t));
+        s_io_lock = xSemaphoreCreateMutex();
+        if (!s_queue || !s_io_lock ||
+            xTaskCreate(led_task, "led", 3072, NULL, 5, &s_led_task) != pdPASS)
+            goto no_mem;
         ESP_LOGI(TAG, "WS2812 on GPIO%d — IO mode", LED_GPIO);
     }
     return ESP_OK;
+
+no_mem:
+    ESP_LOGE(TAG, "out of memory for the LED task");
+    if (s_flash_q) { vQueueDelete(s_flash_q); s_flash_q = NULL; }
+    if (s_queue)   { vQueueDelete(s_queue);   s_queue   = NULL; }
+    if (s_io_lock) { vSemaphoreDelete(s_io_lock); s_io_lock = NULL; }
+    s_led_task = NULL;
+    led_strip_del(s_strip);
+    s_strip = NULL;
+    return ESP_ERR_NO_MEM;
 }
 
 void led_on_mqtt_connected(void)
@@ -307,30 +392,32 @@ void led_on_mqtt_message(const char *topic, size_t tlen,
                           const char *data,  size_t dlen)
 {
 #ifdef CONFIG_APP_MQTT_ENABLE
-    if (s_status_mode) return;   /* status mode ignores MQTT LED commands */
-    static const char SUFFIX[] = "led/set";
-    const size_t sl = sizeof(SUFFIX) - 1;
-    if (tlen < sl || memcmp(topic + tlen - sl, SUFFIX, sl) != 0) return;
+    if (s_status_mode || !s_io_lock) return;   /* status mode ignores MQTT LED commands */
+    /* Relative topic, compared whole -- see dout_on_mqtt_message(). */
+    static const char TOPIC[] = "led/set";
+    const size_t sl = sizeof(TOPIC) - 1;
+    if (tlen != sl || memcmp(topic, TOPIC, sl) != 0) return;
 
-    char buf[1024];
-    if (dlen == 0 || dlen >= sizeof(buf)) return;
-    memcpy(buf, data, dlen);
-    buf[dlen] = '\0';
+    /* Parsed in place -- cJSON takes the length, so the payload needs no
+       NUL-terminated copy on the MQTT task's stack. */
+    if (dlen == 0 || dlen >= LED_PAYLOAD_MAX) return;
 
-    /* "#RRGGBB" — instant set, no queue */
-    if (buf[0] == '#') {
+    /* "#RRGGBB" — instant set, no queue; the whole payload, nothing after it */
+    if (data[0] == '#') {
+        char hex[8];
         uint8_t r, g, b;
-        if (parse_hex(buf, &r, &g, &b)) {
-            hw_apply(r, g, b);
+        if (dlen == 7) { memcpy(hex, data, 7); hex[7] = '\0'; }
+        if (dlen == 7 && parse_hex(hex, &r, &g, &b)) {
+            io_instant(r, g, b);
             if (app_mqtt_is_connected()) publish_color();
         } else {
-            ESP_LOGW(TAG, "Invalid colour: %s", buf);
+            ESP_LOGW(TAG, "Invalid colour: %.*s", (int)dlen, data);
         }
         return;
     }
 
     /* {"color":"#RRGGBB","duration":N} or [{...},{...}] — goes through task */
-    cJSON *root = cJSON_Parse(buf);
+    cJSON *root = json_parse_exact(data, dlen);
     if (!root) { ESP_LOGW(TAG, "JSON parse failed"); return; }
 
     led_seq_t seq = { .count = 0 };
@@ -351,7 +438,11 @@ void led_on_mqtt_message(const char *topic, size_t tlen,
     cJSON_Delete(root);
 
     if (seq.count > 0) {
+        xSemaphoreTake(s_io_lock, portMAX_DELAY);
+        seq.gen = ++s_gen;
         xQueueOverwrite(s_queue, &seq);
+        xTaskNotifyGive(s_led_task);   /* the running one stops at once */
+        xSemaphoreGive(s_io_lock);
     } else {
         ESP_LOGW(TAG, "No valid steps in LED command");
     }

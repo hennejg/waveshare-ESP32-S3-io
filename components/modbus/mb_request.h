@@ -1,0 +1,113 @@
+#pragma once
+
+/* One Modbus request, already taken apart.
+ *
+ * The framing differs between TCP and RTU, and the two things that can answer
+ * a request -- this board's own I/Os and a device on the RS-485 segment --
+ * have nothing else in common. Parsing once and handing the pieces to whoever
+ * answers keeps the function-code arithmetic in a single place.
+ *
+ * Addresses are zero-based, as they are on the wire.
+ */
+
+#include <stdint.h>
+
+typedef struct {
+    uint8_t        fc;        /* function code                                 */
+    uint16_t       addr;      /* first coil or register, zero-based            */
+    uint16_t       count;     /* how many; 1 for FC05 and FC06                 */
+    const uint8_t *data;      /* write payload: packed bits, or big-endian
+                                 registers, or the two value bytes of FC05/06  */
+    uint16_t       data_len;
+    uint32_t       local_ip;  /* the board's address the request arrived on,
+                                 network order; 0 on RS-485. Set by the
+                                 transport after parsing.                       */
+} mb_request_t;
+
+/* What a handler returns: 0 for success, otherwise the Modbus exception code
+   to put on the wire. On a read it fills resp with the data bytes alone --
+   packed bits or big-endian registers -- and sets *resp_len to their count;
+   the function code and byte count are the framing's business. A write
+   produces no data, and its echo is built from the request.
+
+   On a non-zero return *resp_len is zero and resp has not been written: an
+   exception response carries no data, and framing one anyway would put
+   whatever was on the caller's stack onto the wire. */
+typedef uint8_t (*mb_handler_fn)(const mb_request_t *req,
+                                 uint8_t *resp, uint16_t *resp_len);
+
+/* Modbus exception codes, named where the stack's own enum is not in scope. */
+#define MB_EXC_NONE             0x00
+#define MB_EXC_ILLEGAL_FUNC     0x01
+#define MB_EXC_ILLEGAL_ADDR     0x02
+#define MB_EXC_ILLEGAL_VALUE    0x03
+#define MB_EXC_DEVICE_FAILURE   0x04
+#define MB_EXC_DEVICE_BUSY      0x06
+#define MB_EXC_GW_PATH          0x0A   /* no route to the target            */
+#define MB_EXC_GW_TARGET        0x0B   /* target did not answer             */
+
+/* Function codes. Numerically the same as the component's own enumerators,
+   under names of their own so the two can be included side by side -- and so
+   that the framing can be built and tested without the component at all. */
+#define MB_FC_READ_COILS        0x01
+#define MB_FC_READ_DISCRETE     0x02
+#define MB_FC_READ_HOLDING      0x03
+#define MB_FC_READ_INPUT        0x04
+#define MB_FC_WRITE_COIL        0x05
+#define MB_FC_WRITE_REGISTER    0x06
+#define MB_FC_WRITE_COILS       0x0F
+#define MB_FC_WRITE_REGISTERS   0x10
+#define MB_FC_DEVICE_ID         0x2B   /* Encapsulated Interface Transport */
+
+/* FC 43 carries sub-protocols selected by the MEI type; the only one this
+   firmware speaks is 14, Read Device Identification (Modbus Application
+   Protocol V1.1b3 section 6.21). The request is four bytes: function code,
+   MEI type, read code, object id. mb_parse_pdu() puts the read code into
+   req->count and the object id into req->addr, so a handler sees the same
+   two fields a register read would give it. */
+#define MB_MEI_DEVICE_ID        0x0E
+#define MB_DEVID_BASIC          0x01   /* stream: VendorName..MajorMinorRevision */
+#define MB_DEVID_REGULAR        0x02   /* stream: VendorUrl..UserApplicationName */
+#define MB_DEVID_EXTENDED       0x03   /* stream: the private objects 0x80..0xFF */
+#define MB_DEVID_INDIVIDUAL     0x04   /* one object, any category */
+
+/* The standard object ids. 0x00..0x02 are mandatory for every device. */
+#define MB_DEVID_OBJ_VENDOR_NAME       0x00
+#define MB_DEVID_OBJ_PRODUCT_CODE      0x01
+#define MB_DEVID_OBJ_REVISION          0x02
+#define MB_DEVID_OBJ_VENDOR_URL        0x03
+#define MB_DEVID_OBJ_PRODUCT_NAME      0x04
+#define MB_DEVID_OBJ_MODEL_NAME        0x05
+#define MB_DEVID_OBJ_USER_APP_NAME     0x06
+#define MB_DEVID_OBJ_PRIVATE_FIRST     0x80
+
+/* One identification object: an id and an ASCII value. The value may be up
+   to 255 bytes on the wire, but one that does not fit a PDU together with
+   the response header can never be delivered, so the encoder refuses to
+   build a table containing one -- see mb_devid_encode(). */
+typedef struct {
+    uint8_t     id;
+    const char *value;
+} mb_devid_obj_t;
+
+/* Coils travel packed, eight to a byte, with the last byte padded. Both the
+   request count and the response length are derived from this, in enough
+   places that writing it out each time invites one of them to be written out
+   differently. */
+#define MB_BIT_BYTES(n)         (((n) + 7u) / 8u)
+
+/* How a register pair is to be read. Meters disagree about this more than
+   about anything else in the protocol, so it is per value, not per device.
+   A 32-bit quantity occupies two registers; "word swapped" is the CDAB order
+   some devices use, where the two registers are the other way round while the
+   bytes inside each stay big endian. */
+#define MB_VAL_U16   0
+#define MB_VAL_S16   1
+#define MB_VAL_U32   2
+#define MB_VAL_S32   3
+#define MB_VAL_F32   4
+#define MB_VAL_COUNT 5
+
+/* The largest PDU the protocol allows, and the largest data part inside one. */
+#define MB_PDU_MAX              253
+#define MB_DATA_MAX             250

@@ -111,26 +111,32 @@ static void sdk_wifi_station_set_auto_connect(bool en) {
         safe_set_auto_connect(en);
 }
 
-static void sysparam_init(void) {
+/* Retried on the next use when the namespace could not be opened, rather
+   than going on with a handle that every read and write then fails on. */
+static esp_err_t sysparam_init(void) {
         static bool initialized = false;
         if (!initialized) {
                 nvs_flash_init();
-                nvs_open("wifi_cfg", NVS_READWRITE, &wifi_cfg_handle);
+                esp_err_t r = nvs_open("wifi_cfg", NVS_READWRITE, &wifi_cfg_handle);
+                if (r != ESP_OK) return r;
                 initialized = true;
         }
+        return ESP_OK;
 }
 
-static void sysparam_set_string(const char *key, const char *value) {
-        sysparam_init();
+static esp_err_t sysparam_set_string(const char *key, const char *value) {
+        esp_err_t r = sysparam_init();
+        if (r != ESP_OK) return r;
         if (!value) value = "";
-        nvs_set_str(wifi_cfg_handle, key, value);
-        nvs_commit(wifi_cfg_handle);
+        r = nvs_set_str(wifi_cfg_handle, key, value);
+        if (r == ESP_OK) r = nvs_commit(wifi_cfg_handle);
+        return r;
 }
 
 static void sysparam_get_string(const char *key, char **value) {
-        sysparam_init();
         size_t required = 0;
-        if (nvs_get_str(wifi_cfg_handle, key, NULL, &required) == ESP_OK && required > 0) {
+        if (sysparam_init() == ESP_OK &&
+            nvs_get_str(wifi_cfg_handle, key, NULL, &required) == ESP_OK && required > 0) {
                 *value = malloc(required);
                 nvs_get_str(wifi_cfg_handle, key, *value, &required);
         } else {
@@ -151,7 +157,8 @@ static int sdk_wifi_station_get_connect_status(void) {
         return sta_got_ip ? STATION_GOT_IP : 0;
 }
 
-static bool s_ap_disabled = false;
+/* Set from another task (Matter, once commissioned); the monitor reads it. */
+static volatile bool s_ap_disabled = false;
 void wifi_config_disable_ap(void) { s_ap_disabled = true; }
 
 static void wifi_config_init_wifi(void) {
@@ -231,7 +238,6 @@ void wifi_config_set_eth_available_fn(bool (*fn)(void)) { s_eth_available_fn = f
 typedef struct {
         char *ssid_prefix;
         char *password;
-        char *custom_html;
         void (*on_wifi_ready)(); // deprecated
         void (*on_event)(wifi_config_event_t);
 
@@ -284,27 +290,6 @@ static void client_free(client_t *client) {
 static void client_send(client_t *client, const char *payload, size_t payload_size) {
         lwip_write(client->fd, payload, payload_size);
 }
-static void client_send_index(client_t *client) {
-        ESP_LOGI("wifi_config", "Serving captive portal response");
-        extern const uint8_t index_html_start[] asm ("_binary_index_html_start");
-        extern const uint8_t index_html_end[] asm ("_binary_index_html_end");
-
-        const char *header =
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: text/html\r\n"
-                "Cache-Control: no-cache\r\n"
-                "Connection: close\r\n"
-                "\r\n";
-
-        client_send(client, header, strlen(header));
-        client_send(client, (const char *)index_html_start, index_html_end - index_html_start);
-}
-
-
-
-
-
-
 static void client_send_chunk(client_t *client, const char *payload) {
         int len = strlen(payload);
         char buffer[10];
@@ -402,6 +387,35 @@ static void wifi_scan_task(void *arg)
 
 #include "index.html.h"
 
+/* Writes the first max_in bytes of in to out as HTML text. SSIDs come from
+   whatever access point is in range and are put into the setup page: as
+   they are, a 21-character SSID like <svg/onload=...> is markup, and runs
+   script on the page the WiFi password is typed into. out is always
+   terminated; what does not fit whole is left off. */
+static void html_escape(char *out, size_t cap, const char *in, size_t max_in) {
+        size_t o = 0;
+        for (size_t i = 0; i < max_in && in[i]; i++) {
+                const char *e;
+                char one[2] = { in[i], 0 };
+                switch (in[i]) {
+                case '&':  e = "&amp;";  break;
+                case '<':  e = "&lt;";   break;
+                case '>':  e = "&gt;";   break;
+                case '"':  e = "&quot;"; break;
+                case '\'': e = "&#39;";  break;
+                default:   e = one;      break;
+                }
+                size_t n = strlen(e);
+                if (o + n >= cap) break;
+                memcpy(out + o, e, n);
+                o += n;
+        }
+        out[o] = 0;
+}
+
+/* An SSID is at most 32 bytes, each at most 6 once escaped. */
+#define SSID_HTML_MAX (32 * 6 + 1)
+
 static void wifi_config_server_on_settings(client_t *client) {
         static const char http_prologue[] =
                 "HTTP/1.1 200 \r\n"
@@ -414,24 +428,18 @@ static void wifi_config_server_on_settings(client_t *client) {
         client_send(client, http_prologue, sizeof(http_prologue)-1);
         client_send_chunk(client, html_settings_header);
 
-        if (context->custom_html != NULL && context->custom_html[0] > 0) {
-                uint8_t buffer_size = strlen(html_settings_custom_html) + strlen(context->custom_html);
-                char* buffer = (char*) calloc(buffer_size, sizeof(char)); //fill up the buffer with zeros
-                snprintf(buffer, buffer_size, html_settings_custom_html, context->custom_html); //fill in template with the custom_html content
-                client_send_chunk(client, buffer);
-                free(buffer);
-        }
-
         client_send_chunk(client, html_settings_body);
 
         if (xSemaphoreTake(wifi_networks_mutex, 5000 / portTICK_PERIOD_MS)) {
-                char buffer[64];
+                char ssid[SSID_HTML_MAX];
+                char buffer[SSID_HTML_MAX + 64];
                 wifi_network_info_t *net = wifi_networks;
                 while (net) {
+                        html_escape(ssid, sizeof(ssid), net->ssid, sizeof(net->ssid));
                         snprintf(
                                 buffer, sizeof(buffer),
                                 html_network_item,
-                                net->secure ? "secure" : "unsecure", net->ssid
+                                net->secure ? "secure" : "unsecure", ssid
                                 );
                         client_send_chunk(client, buffer);
 
@@ -448,9 +456,10 @@ static void wifi_config_server_on_settings(client_t *client) {
                         "<div style='margin-top:1.5rem;border-top:1px solid #ccc;padding-top:1rem;"
                         "font-family:sans-serif;font-size:.9rem;color:#555;text-align:center'>"
                         "<p>Ethernet is connected. You can skip WiFi entirely.</p>"
-                        "<a href='/eth-only' style='display:inline-block;padding:.4rem 1rem;"
-                        "background:#1a73e8;color:#fff;border-radius:4px;text-decoration:none'>"
-                        "ETH only &mdash; disable WiFi &rarr;</a>"
+                        "<form method='post' action='/eth-only' style='margin:0'>"
+                        "<button type='submit' style='padding:.4rem 1rem;border:0;"
+                        "background:#1a73e8;color:#fff;border-radius:4px;font-size:1rem'>"
+                        "ETH only &mdash; disable WiFi &rarr;</button></form>"
                         "<p style='margin-top:.8rem;color:#999;font-size:.8rem'>"
                         "To return to WiFi setup: hold the BOOT button for &ge;&nbsp;5&nbsp;s.</p>"
                         "</div>";
@@ -461,8 +470,23 @@ static void wifi_config_server_on_settings(client_t *client) {
 }
 
 
+/* Two NVS keys cannot be written as one. The SSID is cleared first and set
+   last, so a write that fails part way leaves no SSID -- which brings the
+   setup AP back -- instead of the new password next to the old network. */
+static esp_err_t store_credentials(const char *ssid, const char *password) {
+        esp_err_t r = sysparam_set_string("wifi_ssid", "");
+        if (r == ESP_OK) r = sysparam_set_string("wifi_password", password);
+        if (r == ESP_OK) r = sysparam_set_string("wifi_ssid", ssid);
+        if (r != ESP_OK) ERROR("Storing the WiFi credentials failed: %s", esp_err_to_name(r));
+        return r;
+}
+
 static void wifi_config_server_on_settings_update(client_t *client) {
-        DEBUG("Update settings, body = %s", client->body);
+        /* A POST without a body (Content-Length: 0) never allocates one. */
+        if (!client->body) {
+                client_send_redirect(client, 302, "/settings");
+                return;
+        }
 
         form_param_t *form = form_params_parse((char *)client->body);
         if (!form) {
@@ -473,23 +497,43 @@ static void wifi_config_server_on_settings_update(client_t *client) {
 
         form_param_t *ssid_param     = form_params_find(form, "ssid");
         form_param_t *password_param = form_params_find(form, "password");
-        if (!ssid_param) {
+        /* What the station can take: an SSID of 1..32 bytes, a passphrase
+           of up to 64. Anything else was stored and confirmed before, and
+           then never connected -- with the AP off for good, as credentials
+           were stored. */
+        if (!ssid_param || !ssid_param->value || strlen(ssid_param->value) > 32 ||
+            (password_param && password_param->value && strlen(password_param->value) > 64)) {
                 DEBUG("Invalid form data, redirecting to /settings");
                 form_params_free(form);
                 client_send_redirect(client, 302, "/settings");
                 return;
         }
 
-        DEBUG("Setting wifi_ssid param = %s", ssid_param->value);
-        DEBUG("Setting wifi_password param = %s", password_param ? password_param->value : "(none)");
+        char ssid[SSID_HTML_MAX];
+        html_escape(ssid, sizeof(ssid), ssid_param->value, 32);
+        esp_err_t stored = store_credentials(ssid_param->value, password_param ? password_param->value : "");
+        form_params_free(form);
 
-        sysparam_set_string("wifi_ssid", ssid_param->value);
-        sysparam_set_string("wifi_password", password_param ? password_param->value : "");
+        if (stored != ESP_OK) {
+                /* No reboot: nothing new to boot into, and the page stays
+                   where the user can try again. */
+                static const char failed[] =
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
+                        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                        "<title>Not saved</title></head>"
+                        "<body style='font-family:sans-serif;text-align:center;padding:2rem'>"
+                        "<h2>Credentials could not be saved</h2>"
+                        "<p><a href='/settings'>Try again</a></p>"
+                        "</body></html>";
+                write(client->fd, failed, sizeof(failed) - 1);
+                return;
+        }
 
         /* Send a confirmation page before rebooting so the user sees feedback.
          * Reboot is cleaner than a live APSTA→STA transition: avoids mode-change
          * errors and ensures WiFi starts fresh in STA-only mode. */
-        char html[768];
+        char html[768 + SSID_HTML_MAX];
         snprintf(html, sizeof(html),
                  "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
                  "<!DOCTYPE html><html><head>"
@@ -498,12 +542,11 @@ static void wifi_config_server_on_settings_update(client_t *client) {
                  "<title>Connecting</title></head>"
                  "<body style='font-family:sans-serif;text-align:center;padding:2rem'>"
                  "<h2>Credentials saved</h2>"
-                 "<p>Rebooting &mdash; will connect to <strong>%.32s</strong>.</p>"
+                 "<p>Rebooting &mdash; will connect to <strong>%s</strong>.</p>"
                  "<p style='color:#888;font-size:.85rem'>"
                  "To change WiFi: hold the BOOT button for &ge;&nbsp;5&nbsp;s.</p>"
                  "</body></html>",
-                 ssid_param->value);
-        form_params_free(form);
+                 ssid);
 
         write(client->fd, html, strlen(html));
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -511,21 +554,30 @@ static void wifi_config_server_on_settings_update(client_t *client) {
 }
 
 
+/* The whole URL, not a prefix of it: strncmp() bounded by the request's
+   length matched any start of the path -- "POST /" was a settings update and
+   "POST /e" switched WiFi off. */
+static bool url_is(const char *data, size_t length, const char *path) {
+        return length == strlen(path) && !memcmp(data, path, length);
+}
+
 static int wifi_config_server_on_url(http_parser *parser, const char *data, size_t length) {
         client_t *client = (client_t*) parser->data;
 
         client->endpoint = ENDPOINT_UNKNOWN;
         if (parser->method == HTTP_GET) {
-                if (!strncmp(data, "/settings", length)) {
+                if (url_is(data, length, "/settings")) {
                         client->endpoint = ENDPOINT_SETTINGS;
-                } else if (!strncmp(data, "/", length)) {
+                } else if (url_is(data, length, "/")) {
                         client->endpoint = ENDPOINT_INDEX;
-                } else if (!strncmp(data, "/eth-only", length)) {
-                        client->endpoint = ENDPOINT_ETH_ONLY;
                 }
         } else if (parser->method == HTTP_POST) {
-                if (!strncmp(data, "/settings", length)) {
+                /* Switching WiFi off is a POST, so a plain link or an <img>
+                 * on some other page cannot do it; GET only ever shows pages. */
+                if (url_is(data, length, "/settings")) {
                         client->endpoint = ENDPOINT_SETTINGS_UPDATE;
+                } else if (url_is(data, length, "/eth-only")) {
+                        client->endpoint = ENDPOINT_ETH_ONLY;
                 }
         }
 
@@ -539,9 +591,25 @@ static int wifi_config_server_on_url(http_parser *parser, const char *data, size
 }
 
 
+/* The largest body the settings form can produce: an SSID of 32 and a
+   passphrase of 63 characters, every one percent-encoded, plus the field
+   names. Anything beyond it is not a settings form, and a body with no
+   limit let any client on the open setup network grow the allocation until
+   the heap was gone. */
+#define WIFI_CONFIG_MAX_BODY 512
+
 static int wifi_config_server_on_body(http_parser *parser, const char *data, size_t length) {
         client_t *client = parser->data;
-        client->body = realloc(client->body, client->body_length + length + 1);
+        if (length > WIFI_CONFIG_MAX_BODY || client->body_length > WIFI_CONFIG_MAX_BODY - length) {
+                client->disconnected = true;
+                return 1;                       /* stops the parser; the read loop ends */
+        }
+        uint8_t *grown = realloc(client->body, client->body_length + length + 1);
+        if (!grown) {
+                client->disconnected = true;    /* the old buffer is still ours and is freed with the client */
+                return 1;
+        }
+        client->body = grown;
         memcpy(client->body + client->body_length, data, length);
         client->body_length += length;
         client->body[client->body_length] = 0;
@@ -637,22 +705,6 @@ static bool handle_get_request(client_t *client, const char *data, int len) {
         if (strcmp(url, "/settings") == 0) {
                 INFO("GET /settings");
                 wifi_config_server_on_settings(client);
-        } else if (strcmp(url, "/eth-only") == 0) {
-                static const char html[] =
-                        "HTTP/1.1 200 \r\nContent-Type: text/html\r\nConnection: close\r\n\r\n"
-                        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-                        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                        "<title>Ethernet-only mode</title></head>"
-                        "<body style='font-family:sans-serif;text-align:center;padding:2rem'>"
-                        "<h2>Switching to Ethernet-only mode</h2>"
-                        "<p>Rebooting now &mdash; connect via Ethernet cable.</p>"
-                        "<p style='color:#888;font-size:.85rem'>"
-                        "To return to WiFi setup: hold the BOOT button for &ge;&nbsp;5&nbsp;s.</p>"
-                        "</body></html>";
-                write(client->fd, html, sizeof(html) - 1);
-                if (s_eth_only_cb) s_eth_only_cb();
-                vTaskDelay(pdMS_TO_TICKS(400));
-                esp_restart();
         } else if (strcmp(url, "/captive-portal") == 0) {
                 /* RFC 8910 Captive Portal API endpoint — advertised via DHCP option 114.
                  * RFC 8910 clients probe this with Accept: application/captive+json.
@@ -710,6 +762,50 @@ static http_parser_settings wifi_config_http_parser_settings = {
 };
 
 
+/* One connection, start to close. The server takes one client at a time,
+   so a client must not be able to keep it: SO_RCVTIMEO only bounds each
+   read, and a client sending a byte every few seconds -- or anything the
+   parser cannot read, such as a TLS hello on port 80, which left the loop
+   reading on -- kept the setup page from everyone else for as long as it
+   liked. Now the whole connection has a deadline, and a parse error ends it. */
+#define WIFI_CONFIG_CLIENT_DEADLINE_MS 10000
+
+static void serve_client(int fd) {
+        const struct timeval client_to = { 5, 0 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &client_to, sizeof(client_to));
+
+        client_t *client = client_new();
+        client->fd = fd;
+        char data[256];
+        const TickType_t start = xTaskGetTickCount();
+
+        while (xTaskGetTickCount() - start < pdMS_TO_TICKS(WIFI_CONFIG_CLIENT_DEADLINE_MS)) {
+                int len = lwip_read(fd, data, sizeof(data) - 1);
+                if (len <= 0) {
+                        /* len==0: client closed (ACKed our response); len<0: timeout/error */
+                        INFO("HTTP rx fd=%d close len=%d errno=%d", fd, len, errno);
+                        break;
+                }
+                data[len] = '\0';
+                /* Only the length: the data is the setup form, WiFi password included. */
+                INFO("HTTP rx fd=%d len=%d", fd, len);
+                if (!handle_get_request(client, data, len)) {
+                        /* Not a complete GET — run http_parser (handles POST body) */
+                        size_t nparsed = http_parser_execute(&client->parser, &wifi_config_http_parser_settings, data, len);
+                        if ((int)nparsed != len || HTTP_PARSER_ERRNO(&client->parser) != HPE_OK) {
+                                INFO("HTTP parser: consumed %d/%d errno=%s", (int)nparsed, len,
+                                     http_errno_name(HTTP_PARSER_ERRNO(&client->parser)));
+                                break;
+                        }
+                }
+                if (client->disconnected)
+                        break;
+        }
+
+        lwip_close(fd);
+        client_free(client);
+}
+
 static void http_task(void *arg) {
         INFO("Starting HTTP server");
 
@@ -751,8 +847,6 @@ static void http_task(void *arg) {
                 return;
         }
 
-        char data[256];
-
         while (true) {
                 uint32_t task_value = 0;
                 if (xTaskNotifyWait(0, 1, &task_value, 0) == pdTRUE && task_value)
@@ -763,38 +857,7 @@ static void http_task(void *arg) {
                         continue;   /* timeout (EAGAIN) or error — recheck stop notification */
 
                 INFO("HTTP: client connected, fd=%d", fd);
-
-                const struct timeval client_to = { 5, 0 };
-                setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &client_to, sizeof(client_to));
-
-                client_t *client = client_new();
-                client->fd = fd;
-
-                while (true) {
-                        int len = lwip_read(fd, data, sizeof(data) - 1);
-                        if (len > 0) {
-                                data[len] = '\0';
-                                INFO("HTTP rx fd=%d len=%d [%.*s]", fd, len, len, data);
-                                if (!client->disconnected) {
-                                        if (!handle_get_request(client, data, len)) {
-                                                /* Not a complete GET — run http_parser (handles POST body) */
-                                                size_t nparsed = http_parser_execute(&client->parser, &wifi_config_http_parser_settings, data, len);
-                                                if ((int)nparsed != len || HTTP_PARSER_ERRNO(&client->parser) != HPE_OK)
-                                                        INFO("HTTP parser: consumed %d/%d errno=%s", (int)nparsed, len,
-                                                             http_errno_name(HTTP_PARSER_ERRNO(&client->parser)));
-                                        }
-                                }
-                                if (client->disconnected)
-                                        break;
-                        } else {
-                                /* len==0: client closed (ACKed our response); len<0: timeout/error */
-                                INFO("HTTP rx fd=%d close len=%d errno=%d", fd, len, errno);
-                                break;
-                        }
-                }
-
-                lwip_close(fd);
-                client_free(client);
+                serve_client(fd);
         }
 
         INFO("Stopping HTTP server");
@@ -817,12 +880,73 @@ static void http_stop() {
 }
 
 
+/* Turns the query in buf (len bytes received, cap the buffer size) into the
+   reply in place: every A or ANY question is answered with ip, anything else
+   with an empty NOERROR. Returns the reply's length, or 0 for a datagram
+   that is dropped.
+
+   Everything is read within len. The QNAME used to be measured with strlen()
+   on a buffer that is not terminated and still holds an earlier, longer
+   datagram: anyone on the open setup AP could send 512 non-zero bytes and
+   then a short query, and the reply was written and sent from past the end
+   of the stack buffer. */
+static size_t dns_build_reply(uint8_t *buf, size_t len, size_t cap, const uint8_t ip[4]) {
+        if (len < 12 || (buf[2] & 0x80))               /* header; a response, not a query */
+                return 0;
+        if (buf[4] != 0 || buf[5] != 1)                /* exactly one question */
+                return 0;
+
+        size_t i = 12;
+        while (i < len && buf[i]) {
+                if (buf[i] > 63)                       /* compression or extended label */
+                        return 0;
+                i += 1 + buf[i];
+        }
+        if (i >= len || i - 12 + 1 > 255)              /* no terminator, or name too long */
+                return 0;
+        size_t qname_len = i - 12 + 1;
+        if (12 + qname_len + 4 > len)                  /* QTYPE and QCLASS */
+                return 0;
+
+        uint8_t qtype_hi = buf[12 + qname_len];
+        uint8_t qtype_lo = buf[12 + qname_len + 1];
+        /* Answer with an A record for A (0x0001) and ANY (0x00FF) queries */
+        int send_a = (qtype_hi == 0x00 && (qtype_lo == 0x01 || qtype_lo == 0xFF));
+        size_t reply_len = 12 + qname_len + 4 + (send_a ? 16 : 0);
+        if (reply_len > cap)
+                return 0;
+
+        /* QR=1, copy RD from query, AA/TC=0; RA=1, RCODE=0 */
+        buf[2] = (uint8_t)(0x80 | (buf[2] & 0x01));
+        buf[3] = 0x80;
+        buf[6] = 0x00; buf[7] = send_a ? 0x01 : 0x00;  /* ANCOUNT */
+        buf[8] = buf[9] = buf[10] = buf[11] = 0x00;    /* NSCOUNT, ARCOUNT */
+        /* The question stays as it came, QCLASS set to IN. */
+        uint8_t *head = buf + 12 + qname_len + 2;
+        *head++ = 0x00;
+        *head++ = 0x01;
+
+        if (send_a) {
+                static const uint8_t answer[12] = {
+                        0xC0, 0x0C,                    /* name = pointer to offset 12 */
+                        0x00, 0x01,                    /* TYPE A */
+                        0x00, 0x01,                    /* CLASS IN */
+                        0x00, 0x00, 0x00, 0x78,        /* TTL = 120 s */
+                        0x00, 0x04,                    /* RDLENGTH = 4 */
+                };
+                memcpy(head, answer, sizeof(answer));
+                memcpy(head + sizeof(answer), ip, 4);
+        }
+        DEBUG("DNS query type=0x%02X -> %s", qtype_lo, send_a ? "A 192.168.4.1" : "NOERROR/empty");
+        return reply_len;
+}
+
+
 static void dns_task(void *arg)
 {
         INFO("Starting DNS server");
 
-        ip4_addr_t server_addr;
-        IP4_ADDR(&server_addr, 192, 168, 4, 1);
+        static const uint8_t ip[4] = { 192, 168, 4, 1 };
 
         struct sockaddr_in serv_addr;
         int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -834,7 +958,11 @@ static void dns_task(void *arg)
 
         memset(&serv_addr, 0, sizeof(serv_addr));
         serv_addr.sin_family = AF_INET;
-        serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        /* The AP address only, as the HTTP server does: bound to every
+         * interface, it answered DNS queries arriving over Ethernet or the
+         * station link too, with 192.168.4.1 for every name -- to any host
+         * on the network that asked it. */
+        memcpy(&serv_addr.sin_addr.s_addr, ip, 4);
         serv_addr.sin_port = htons(53);
         if (bind(fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
                 ERROR("DNS bind() failed — port 53 in use?");
@@ -848,76 +976,15 @@ static void dns_task(void *arg)
 
         for (;;) {
                 /* 512 bytes: enough for EDNS queries (OPT record appended by Android 8+) */
-                char buffer[512];
+                uint8_t buffer[512];
                 struct sockaddr src_addr;
                 socklen_t src_addr_len = sizeof(src_addr);
-                size_t count = recvfrom(fd, buffer, sizeof(buffer), 0, (struct sockaddr*)&src_addr, &src_addr_len);
+                int recvd = recvfrom(fd, buffer, sizeof(buffer), 0, (struct sockaddr*)&src_addr, &src_addr_len);
 
-                /* Drop messages that are too small or too large to build a valid response */
-                if (count > 12 && count <= sizeof(buffer) - 16 && src_addr.sa_family == AF_INET) {
-                        size_t qname_len = strlen(buffer + 12) + 1;
-
-                        /* Read QTYPE before overwriting the buffer */
-                        uint8_t qtype_hi = (uint8_t)buffer[12 + qname_len];
-                        uint8_t qtype_lo = (uint8_t)buffer[12 + qname_len + 1];
-                        /* Answer with an A record for A (0x0001) and ANY (0x00FF) queries */
-                        int send_a = (qtype_hi == 0x00 && (qtype_lo == 0x01 || qtype_lo == 0xFF));
-
-                        char *head = buffer + 2;
-                        /* QR=1, copy RD from query, AA/TC=0 */
-                        *head++ = (char)(0x80 | (buffer[2] & 0x01));
-                        /* RA=1, RCODE=0 */
-                        *head++ = (char)0x80;
-                        *head++ = 0x00; /* QDCOUNT = 1 */
-                        *head++ = 0x01;
-                        *head++ = 0x00; /* ANCOUNT */
-                        *head++ = send_a ? 0x01 : 0x00;
-                        *head++ = 0x00; /* NSCOUNT = 0 */
-                        *head++ = 0x00;
-                        *head++ = 0x00; /* ARCOUNT = 0 */
-                        *head++ = 0x00;
-                        head += qname_len; /* skip QNAME (kept verbatim) */
-                        /* Echo original QTYPE and QCLASS in the question section */
-                        *head++ = qtype_hi;
-                        *head++ = qtype_lo;
-                        *head++ = 0x00; /* QCLASS IN */
-                        *head++ = 0x01;
-
-                        uint32_t reply_len = 2 + 10 + qname_len + 4;
-
-                        if (send_a) {
-                                *head++ = 0xC0; /* name = pointer to offset 12 */
-                                *head++ = 0x0C;
-                                *head++ = 0x00; /* TYPE A */
-                                *head++ = 0x01;
-                                *head++ = 0x00; /* CLASS IN */
-                                *head++ = 0x01;
-                                *head++ = 0x00; /* TTL = 120 s */
-                                *head++ = 0x00;
-                                *head++ = 0x00;
-                                *head++ = 0x78;
-                                *head++ = 0x00; /* RDLENGTH = 4 */
-                                *head++ = 0x04;
-                                *head++ = ip4_addr1(&server_addr);
-                                *head++ = ip4_addr2(&server_addr);
-                                *head++ = ip4_addr3(&server_addr);
-                                *head++ = ip4_addr4(&server_addr);
-                                reply_len += 16;
-                        }
-
-                        /* Decode DNS label-encoded QNAME for diagnostics */
-                        char domain[128] = "";
-                        const char *p = buffer + 12;
-                        int dlen = 0;
-                        while (*p && dlen < (int)sizeof(domain) - 2) {
-                                int llen = (unsigned char)*p++;
-                                if (dlen) domain[dlen++] = '.';
-                                while (llen-- && dlen < (int)sizeof(domain) - 1)
-                                        domain[dlen++] = *p++;
-                        }
-                        domain[dlen] = '\0';
-                        INFO("DNS query: %s type=0x%02X -> %s", domain, qtype_lo, send_a ? "A 192.168.4.1" : "NOERROR/empty");
-                        sendto(fd, buffer, reply_len, 0, &src_addr, src_addr_len);
+                if (recvd > 0 && src_addr.sa_family == AF_INET) {
+                        size_t reply_len = dns_build_reply(buffer, (size_t)recvd, sizeof(buffer), ip);
+                        if (reply_len)
+                                sendto(fd, buffer, reply_len, 0, &src_addr, src_addr_len);
                 }
 
                 uint32_t task_value = 0;
@@ -1015,10 +1082,22 @@ static void wifi_config_softap_stop() {
 }
 
 
+/* Set when the monitor has seen the station lose its link. With credentials
+ * stored the setup AP stays off during an outage, so the mode is still plain
+ * STATION when the link comes back -- this, not the mode, is what says the
+ * application must be told again (it stopped its services on the loss). */
+static bool s_link_lost;
+
 static void wifi_config_monitor_callback(TimerHandle_t xTimer) {
+        /* Disabled while it was up: taken down here, on the task that
+           starts and stops it. */
+        if (s_ap_disabled && sdk_wifi_get_opmode() != STATION_MODE)
+                wifi_config_softap_stop();
+
         if (sdk_wifi_station_get_connect_status() == STATION_GOT_IP) {
-                if (sdk_wifi_get_opmode() == STATION_MODE && !context->first_time)
+                if (sdk_wifi_get_opmode() == STATION_MODE && !context->first_time && !s_link_lost)
                         return;
+                s_link_lost = false;
 
                 // Connected to station, all is dandy
                 INFO("Connected to WiFi network");
@@ -1045,6 +1124,8 @@ static void wifi_config_monitor_callback(TimerHandle_t xTimer) {
                         return;
 
                 INFO("Disconnected from WiFi network");
+                if (!context->first_time)
+                        s_link_lost = true;
 
                 if (!context->first_time && context->on_event)
                         context->on_event(WIFI_CONFIG_DISCONNECTED);
@@ -1054,7 +1135,13 @@ static void wifi_config_monitor_callback(TimerHandle_t xTimer) {
                         context->network_monitor_timer,
                         pdMS_TO_TICKS(WIFI_CONFIG_DISCONNECTED_MONITOR_INTERVAL), 0);
 
-                if (!s_ap_disabled)
+                /* The open setup AP only while there is nothing to connect
+                 * to. With credentials stored, a lost link is an outage, not
+                 * a setup: keep retrying the station and leave the AP off, so
+                 * jamming the real network cannot bring up an open AP that
+                 * takes new credentials from anyone in range. A long press of
+                 * BOOT clears the credentials and brings the AP back. */
+                if (!s_ap_disabled && !wifi_config_has_configuration())
                         wifi_config_softap_start();
         }
 }
@@ -1094,8 +1181,9 @@ static int wifi_config_station_connect() {
 
         wifi_config_t sta_config;
         memset(&sta_config, 0, sizeof(sta_config));
+        /* Both fields are fixed-length, not strings: a 32-byte SSID and a
+           64-digit hex key fill them with no terminator. */
         strncpy((char *)sta_config.sta.ssid, wifi_ssid, sizeof(sta_config.sta.ssid));
-        sta_config.sta.ssid[sizeof(sta_config.sta.ssid)-1] = 0;
         if (wifi_password)
                 strncpy((char *)sta_config.sta.password, wifi_password, sizeof(sta_config.sta.password));
 
@@ -1198,9 +1286,20 @@ void wifi_config_init2(const char *ssid_prefix, const char *password,
 }
 
 
-void wifi_config_reset() {
-        sysparam_set_string("wifi_ssid", "");
-        sysparam_set_string("wifi_password", "");
+bool wifi_config_reset_requested(void) {
+        /* wifi_config_reset() leaves the key, empty; a device that never had
+           credentials through this component has no key at all. */
+        size_t required = 0;
+        return sysparam_init() == ESP_OK &&
+               nvs_get_str(wifi_cfg_handle, "wifi_ssid", NULL, &required) == ESP_OK &&
+               required <= 1;
+}
+
+
+esp_err_t wifi_config_reset() {
+        esp_err_t r = sysparam_set_string("wifi_ssid", "");     /* the one that counts */
+        esp_err_t p = sysparam_set_string("wifi_password", "");
+        return r != ESP_OK ? r : p;
 }
 
 
@@ -1213,19 +1312,7 @@ void wifi_config_get(char **ssid, char **password) {
 }
 
 
-void wifi_config_set(const char *ssid, const char *password) {
-        sysparam_set_string("wifi_ssid", ssid);
-        sysparam_set_string("wifi_password", password);
+esp_err_t wifi_config_set(const char *ssid, const char *password) {
+        return store_credentials(ssid, password);
 }
 
-void wifi_config_set_custom_html(char *html) {
-        if (context == NULL) {
-                ERROR("Cannot set custom html content, WiFi configuration not initialised yet");
-                return;
-        }
-
-        context->custom_html = html;
-}
-
-
-__attribute__((used)) static void *linker_keep_client_send_index = (void *)&client_send_index;

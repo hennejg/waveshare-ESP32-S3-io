@@ -58,3 +58,24 @@ test('reload clears the rule set and cancels pending timers', () => {
   e.advance(9000);
   assert.equal(e.T.off, undefined);              // the stale follow-up step never ran
 });
+
+test('a rule throwing a Symbol leaves no stale pass and later rules still run', () => {
+  const { createEngine } = require('./harness');
+  const e = createEngine();
+  e.load(`
+    rule('bad').when(function(){ throw Symbol('x'); }).then(function(){});
+    rule('later').when(input(0).isOn()).then(function(){ T.n = (T.n || 0) + 1; });
+    rule('loud').when(input(1).isOn()).noLoop().then(function(){ T.l = (T.l || 0) + 1; throw { toString: function(){ throw new Error('no'); } }; });`);
+  for (let i = 0; i < 5; i++) { e.input(0, true); e.input(0, false); }
+  assert.equal(e.evalIn('_passes.length'), 0, 'every pass taken off the stack');
+  assert.equal(e.T.n, 5, 'the rules after the throwing one see every event');
+  e.input(1, true); e.input(1, false); e.input(1, true);
+  assert.equal(e.T.l, 2, 'a noLoop rule whose error cannot be printed runs again');
+});
+
+test('channel numbers far out of range are refused, not wrapped', () => {
+  const { createEngine } = require('./harness');
+  const e = createEngine();
+  assert.throws(() => e.load(`output(4294967296).on();`), /out of range/);
+  assert.throws(() => e.load(`rule('x').when(input(-1).isOn()).then(function(){});`), /out of range/);
+});

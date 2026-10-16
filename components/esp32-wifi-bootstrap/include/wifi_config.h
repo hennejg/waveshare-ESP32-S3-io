@@ -1,5 +1,12 @@
 #pragma once
 
+#include <stdbool.h>
+#include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef enum {
         WIFI_CONFIG_CONNECTED = 1,
         WIFI_CONFIG_DISCONNECTED = 2,
@@ -8,11 +15,16 @@ typedef enum {
 void wifi_config_init(const char *ssid_prefix, const char *password, void (*on_wifi_ready)());
 void wifi_config_init2(const char *ssid_prefix, const char *password, void (*on_event)(wifi_config_event_t));
 
-void wifi_config_reset();
+/* Both return what NVS said; on an error the stored credentials may be the
+   old ones, or none (wifi_config_set clears the SSID first). */
+esp_err_t wifi_config_reset();
+/* True when the credentials were cleared by wifi_config_reset() (the BOOT
+   long press) and nothing has been stored since -- the one time a device
+   that is otherwise set up (e.g. Matter-commissioned) should open the
+   setup AP again. False when no credentials were ever stored here. */
+bool wifi_config_reset_requested(void);
 void wifi_config_get(char **ssid, char **password);
-void wifi_config_set(const char *ssid, const char *password);
-
-void wifi_config_set_custom_html(char *html);
+esp_err_t wifi_config_set(const char *ssid, const char *password);
 
 /* Register a one-shot callback invoked when the user taps "Use Ethernet only"
    in the provisioning portal. Use it to persist the preference before reboot. */
@@ -26,8 +38,13 @@ void wifi_config_set_eth_available_fn(bool (*fn)(void));
 
 esp_err_t safe_set_auto_connect(bool enable);
 
-/** Disable SoftAP mode entirely.  Must be called BEFORE wifi_config_init().
- *  Use when an out-of-band commissioning mechanism (e.g. Matter CHIPoBLE)
+/** Disable SoftAP mode entirely.  Called before wifi_config_init(), the AP
+ *  is never created; called later, a running AP is taken down by the network
+ *  monitor at its next check and not started again.  Use when an out-of-band commissioning mechanism (e.g. Matter CHIPoBLE)
  *  handles WiFi credential delivery, so the captive-portal AP is unneeded and
  *  would consume DMA that BLE and the WiFi driver both need. */
 void wifi_config_disable_ap(void);
+
+#ifdef __cplusplus
+}
+#endif

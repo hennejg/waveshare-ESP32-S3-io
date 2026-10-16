@@ -7,6 +7,10 @@ Interface: ESP32-S3 TWAI peripheral — GPIO2 (TX), GPIO3 (RX)
 
 Three modes are available, selected in the web UI (CAN Bus section). Changes take effect after reboot.
 
+Both firmwares have CAN. In the Matter firmware it starts only once the device is commissioned, outputs switched
+over CAN are reported to the Matter controllers, and the Basic-mode heartbeat status stays `0x01` (no MQTT
+broker there); see `docs/matter.md`.
+
 | Mode         | Frame format    | Bit rate           | Description             |
 |--------------|-----------------|--------------------|-------------------------|
 | **Off**      | —               | —                  | CAN peripheral disabled |
@@ -19,7 +23,7 @@ Three modes are available, selected in the web UI (CAN Bus section). Changes tak
 
 | Field       | Applies to | Description                                    | Default |
 |-------------|------------|------------------------------------------------|---------|
-| TX interval | Both       | Periodic DI transmit in ms; 0 = on-change only | 1000 ms |
+| TX interval | Both       | Periodic DI/DO transmit in ms; 0 = on-change only | 1000 ms |
 
 ---
 
@@ -29,7 +33,7 @@ Three modes are available, selected in the web UI (CAN Bus section). Changes tak
 
 | Field       | Description                       | Default    |
 |-------------|-----------------------------------|------------|
-| Base CAN ID | 11-bit base address (0x000–0x7FF) | `0x100`    |
+| Base CAN ID | 11-bit base address (0x000–0x7FA, so that base + 5 stays ≤ 0x7FF; other values are ignored) | `0x100`    |
 | Bit rate    | 125 / 250 / 500 / 1000 kbit/s     | 250 kbit/s |
 
 ### Frame Map
@@ -48,7 +52,9 @@ interval, and on read request. Invert flags applied.
 
 **base+2 — Digital outputs (RX + TX):**
 
-Two bytes: `[opcode][bitmask]` on receive; `[0x00][state]` echo on transmit.
+Two bytes: `[opcode][bitmask]` on receive; `[0x00][state]` echo on transmit. The state is sent after each command,
+whenever an output changes for any other reason (Modbus, MQTT, a rule, the web page), periodically at TX interval, and
+on read request.
 
 | Opcode     | Operation        | Effect                                    |
 |------------|------------------|-------------------------------------------|
@@ -87,7 +93,7 @@ Bit rate is always 250 kbit/s (NMEA2000 standard).
 | Device class              | 0x19 — Sensor Bus                  |
 | Device function           | 0x80 — I/O Gateway                 |
 | Manufacturer code         | 0x7FF (development / unregistered) |
-| Identity number           | Derived from ESP32 base MAC        |
+| Identity number           | The low 21 bits of the ESP32 base MAC |
 | Arbitrary address capable | Yes                                |
 
 ### Address Claiming (PGN 60928)
@@ -96,7 +102,8 @@ On startup the device transmits an ISO Address Claim for its preferred source ad
 with no challenge, the address is considered claimed.
 
 If another node claims the same address with a numerically lower NAME, the device automatically tries the next address,
-repeating until it succeeds (up to address 251).
+repeating until it succeeds (up to address 251). If no address is left, it sends one "cannot claim" (an address claim
+from the null address 254), answers address-claim requests the same way, and sends nothing else.
 
 ### PGN Summary
 
@@ -104,7 +111,7 @@ repeating until it succeeds (up to address 251).
 |--------|-----------|---------------------------------------------------------------------|
 | 60928  | TX        | ISO Address Claim — on startup and in response to ISO Request       |
 | 59904  | RX        | ISO Request — device responds with claim or bank status             |
-| 126993 | TX        | Heartbeat — fast-packet, 1 s interval                               |
+| 126993 | TX        | Heartbeat — single frame, 60 s interval (field 1 = 60000 ms)        |
 | 127501 | TX        | Binary Switch Bank Status — DI bank (inst. 0) and DO bank (inst. 1) |
 | 127502 | RX        | Switch Bank Control — commands DO bank (inst. 1)                    |
 | 126720 | RX + TX   | Manufacturer Proprietary Fast-Packet — LED and buzzer               |
@@ -144,7 +151,10 @@ Manufacturer code `0x7FF` (bytes 0–1 of payload). Sub-function byte at offset 
 | `0x01` | RX + TX   | `[R][G][B]`                  | LED colour (IO mode only) |
 | `0x02` | RX        | `[freqLo][freqHi][dur×10ms]` | Buzzer beep               |
 
-Both fit in a single fast-packet frame (6 payload bytes in first frame).
+Both fit in a single fast-packet frame (6 payload bytes in first frame). The fast-packet length counts the
+manufacturer code, the sub-function and the arguments: LED 6, buzzer 6 -- or 5 without the duration byte, which
+then beeps 200 ms. Any other length is not carried out: a first frame announcing more is part of a multi-frame
+message, which is not supported.
 
 ### Interaction with MQTT and Modbus
 
@@ -152,6 +162,10 @@ Both fit in a single fast-packet frame (6 payload bytes in first frame).
   published on `output/N` MQTT topics.
 - **DI state** (PGN 127501) is read from the same hardware state used by all three interfaces.
 - MQTT, Modbus, and CAN (either mode) operate simultaneously if all are configured.
+- Inputs and outputs are reported once as soon as CAN runs (Basic mode; NMEA 2000 once the address is claimed),
+  whatever their state -- also with a TX interval of 0, and also all eight high.
+- A status frame (inputs, outputs) the driver does not take -- queue full, bus-off -- counts as not sent and goes
+  out again on the next pass of the worker (every 50 ms), also with a TX interval of 0.
 
 ---
 

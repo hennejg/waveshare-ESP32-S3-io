@@ -3,6 +3,10 @@
  * Device model:
  *   Endpoints 1–8  : On/Off Plug-in Unit (DO1–DO8, logical output state)
  *   Endpoints 9–16 : Contact Sensor       (DI1–DI8, logical input state)
+ *   Endpoints 17.. : the header pads IO1/RXD/TXD, one each by the mode it has
+ *                    at boot -- input: Contact Sensor, output: On/Off Plug-in
+ *                    Unit, PWM: Dimmable Plug-in Unit (level = duty cycle).
+ *                    Standard and analog pads have none.
  *
  * Commissioning: Bluetooth LE PASE (standard Matter over Wi-Fi).
  * The existing Wi-Fi / Ethernet provisioning runs in parallel; Matter
@@ -10,12 +14,16 @@
  */
 
 #include "matter.h"
+#include "matter_mbm.h"
 
 extern "C" {
 #include "dout.h"
+#include "di.h"
 #include "app_config.h"
 #include "eth.h"
+#include "wifi_config.h"
 #include "led.h"
+#include "aux_io.h"
 #include <esp_timer.h>
 }
 
@@ -42,7 +50,7 @@ extern "C" void esp_matter_set_ethernet_commissioning(bool use_eth);
 /* Stored after matter_init() succeeds — read-only from web_server task */
 static char s_qr_code[128];
 static char s_manual_code[32];
-static bool s_commissioned;
+static volatile bool s_commissioned;   /* written on the CHIP task, read by HTTP */
 
 extern "C" {
 const char *matter_get_qr_code(void)     { return s_qr_code; }
@@ -76,6 +84,74 @@ static esp_err_t boolean_state_set_value(chip::EndpointId endpoint_id, bool valu
 static uint16_t s_do_ep[NUM_CHANNELS];
 static uint16_t s_di_ep[NUM_CHANNELS];
 
+/* The header pads: endpoint (0 = none) and the mode it was created for.
+   The endpoint set is fixed once the stack runs, so a pad switched to
+   another mode afterwards keeps its old endpoint, unanswered, until the
+   next boot -- the mode is checked before every use. */
+static uint16_t   s_aux_ep[AUX_PAD_COUNT];
+static aux_mode_t s_aux_ep_mode[AUX_PAD_COUNT];
+/* A PWM pad as a dimmable unit: off is duty 0, on runs the level last set
+   (1..254, scaled to the duty cycle). */
+static uint8_t    s_pwm_level[AUX_PAD_COUNT];
+static bool       s_pwm_on[AUX_PAD_COUNT];
+static volatile bool s_started;   /* esp_matter::start() succeeded */
+
+static uint16_t level_to_duty(uint8_t level)
+{
+    return (uint16_t)(((uint32_t)level * AUX_PWM_DUTY_MAX + 127) / 254);
+}
+
+static uint8_t duty_to_level(uint16_t duty_pm)
+{
+    uint32_t l = ((uint32_t)duty_pm * 254 + AUX_PWM_DUTY_MAX / 2) / AUX_PWM_DUTY_MAX;
+    return (uint8_t)(l < 1 ? 1 : l > 254 ? 254 : l);
+}
+
+static int aux_pad_of(uint16_t endpoint_id)
+{
+    for (int a = 0; a < AUX_PAD_COUNT; a++)
+        if (s_aux_ep[a] && s_aux_ep[a] == endpoint_id) return a;
+    return -1;
+}
+
+/* A controller's write to a pad endpoint. The error goes back to the
+   stack, which then refuses the write. */
+static esp_err_t aux_attr_update(int a, uint32_t cluster_id, uint32_t attribute_id,
+                                 esp_matter_attr_val_t *val)
+{
+    if (aux_io_mode((uint8_t)a) != s_aux_ep_mode[a]) {
+        ESP_LOGW(TAG, "AUX%d: mode changed since boot, endpoint inactive until reboot", a + 1);
+        return ESP_ERR_INVALID_STATE;
+    }
+    bool on_off = cluster_id == OnOff::Id && attribute_id == OnOff::Attributes::OnOff::Id;
+    bool level  = cluster_id == LevelControl::Id &&
+                  attribute_id == LevelControl::Attributes::CurrentLevel::Id;
+    if (s_aux_ep_mode[a] == AUX_MODE_OUTPUT && on_off) {
+        ESP_LOGI(TAG, "Matter → AUX%d = %s", a + 1, val->val.b ? "ON" : "OFF");
+        return aux_io_out_set((uint8_t)a, val->val.b);
+    }
+    if (s_aux_ep_mode[a] != AUX_MODE_PWM) return ESP_OK;
+    if (on_off) {
+        esp_err_t r = aux_io_pwm_set((uint8_t)a, 0, val->val.b ? level_to_duty(s_pwm_level[a]) : 0);
+        if (r == ESP_OK) s_pwm_on[a] = val->val.b;
+        ESP_LOGI(TAG, "Matter → AUX%d PWM %s", a + 1, val->val.b ? "on" : "off");
+        return r;
+    }
+    if (level) {
+        if (val->type == ESP_MATTER_VAL_TYPE_NULLABLE_UINT8 && chip::app::NumericAttributeTraits<uint8_t>::IsNullValue(val->val.u8))
+            return ESP_OK;
+        uint8_t l = val->val.u8 < 1 ? 1 : val->val.u8 > 254 ? 254 : val->val.u8;
+        if (!s_pwm_on[a]) { s_pwm_level[a] = l; return ESP_OK; }   /* kept for the next "on" */
+        ESP_LOGI(TAG, "Matter → AUX%d PWM level %u (duty %.1f %%)", a + 1, l, level_to_duty(l) / 10.0);
+        /* Remembered only once the pad took it: a refused level must not be
+           what the next "on" switches to. */
+        esp_err_t r = aux_io_pwm_set((uint8_t)a, 0, level_to_duty(l));
+        if (r == ESP_OK) s_pwm_level[a] = l;
+        return r;
+    }
+    return ESP_OK;
+}
+
 /* Called by Matter stack when a controller writes an attribute (e.g. toggling a DO). */
 static esp_err_t attr_update_cb(attribute::callback_type_t type,
                                 uint16_t endpoint_id,
@@ -86,14 +162,23 @@ static esp_err_t attr_update_cb(attribute::callback_type_t type,
 {
     if (type != PRE_UPDATE) return ESP_OK;
 
+    int pad = aux_pad_of(endpoint_id);
+    if (pad >= 0) return aux_attr_update(pad, cluster_id, attribute_id, val);
+
     if (cluster_id == OnOff::Id && attribute_id == OnOff::Attributes::OnOff::Id) {
         /* Find which DO channel this endpoint corresponds to */
         for (int i = 0; i < NUM_CHANNELS; i++) {
             if (s_do_ep[i] == endpoint_id) {
                 bool new_state = val->val.b;
                 ESP_LOGI(TAG, "Matter → DO%d = %s", i + 1, new_state ? "ON" : "OFF");
-                dout_set((uint8_t)i, new_state);
-                return ESP_OK;
+                /* The error goes back to the stack, which then refuses the
+                   attribute write: a port that did not move must not be
+                   shown as moved. */
+                esp_err_t r = dout_set((uint8_t)i, new_state);
+                if (r != ESP_OK)
+                    ESP_LOGW(TAG, "DO%d: write failed (%s), attribute change refused",
+                             i + 1, esp_err_to_name(r));
+                return r;
             }
         }
     }
@@ -126,7 +211,7 @@ static esp_err_t identification_cb(identification::callback_type_t type,
         esp_timer_start_periodic(s_identify_timer, 500 * 1000);
     } else {
         if (s_identify_timer) esp_timer_stop(s_identify_timer);
-        led_force_set(0, 0, 0);
+        led_force_release();
     }
     ESP_LOGI(TAG, "Identify %s on endpoint %u",
              type == identification::callback_type_t::START ? "start" : "stop", endpoint_id);
@@ -136,11 +221,26 @@ static esp_err_t identification_cb(identification::callback_type_t type,
 static void event_cb(const ChipDeviceEvent *event, intptr_t arg)
 {
     switch (event->Type) {
+    /* s_commissioned was set once, after start(); a device paired after
+       that kept reporting "not commissioned" until its next reboot, and
+       refused to decommission on the strength of it. */
     case chip::DeviceLayer::DeviceEventType::kCommissioningComplete:
         ESP_LOGI(TAG, "Matter commissioning complete");
+        s_commissioned = chip::Server::GetInstance().GetFabricTable().FabricCount() > 0;
+        if (s_commissioned) {
+            wifi_config_disable_ap();   /* no open setup AP from here on */
+            /* A few seconds on, once BLE and the setup AP have handed their
+               memory back: at this event internal RAM is at its lowest (about
+               4 KB measured), too little for what main.c starts. On the CHIP
+               task, from its timer -- no task of our own to create here. */
+            chip::DeviceLayer::SystemLayer().StartTimer(
+                chip::System::Clock::Seconds32(5),
+                [](chip::System::Layer *, void *) { matter_on_commissioned(); }, nullptr);
+        }
         break;
     case chip::DeviceLayer::DeviceEventType::kFabricRemoved:
-        if (chip::Server::GetInstance().GetFabricTable().FabricCount() == 0) {
+        s_commissioned = chip::Server::GetInstance().GetFabricTable().FabricCount() > 0;
+        if (!s_commissioned) {
             ESP_LOGW(TAG, "Last Matter fabric removed — rebooting to clean state");
             esp_restart();
         }
@@ -179,13 +279,20 @@ static bool passcode_is_forbidden(uint32_t code)
  */
 static esp_err_t matter_provision_if_needed(void)
 {
-    /* Already provisioned? */
+    /* Already provisioned? All four keys, not only pin-code: the provider
+       falls back to the public test values for any key that is absent, so a
+       set left half written by a failed first boot must be written again,
+       not taken as done. pin-code is also written last, as the marker. */
     {
         nvs_handle_t h;
         bool done = false;
         if (nvs_open_from_partition("nvs", "chip-factory", NVS_READONLY, &h) == ESP_OK) {
             uint32_t v;
-            done = (nvs_get_u32(h, "pin-code", &v) == ESP_OK);
+            size_t len = 0;
+            done = nvs_get_u32(h, "pin-code", &v) == ESP_OK &&
+                   nvs_get_u32(h, "discriminator", &v) == ESP_OK &&
+                   nvs_get_str(h, "salt", NULL, &len) == ESP_OK &&
+                   nvs_get_str(h, "verifier", NULL, &len) == ESP_OK;
             nvs_close(h);
         }
         if (done) {
@@ -243,15 +350,18 @@ static esp_err_t matter_provision_if_needed(void)
         return err;
     }
 
-    if ((err = nvs_set_u32(h, "pin-code",     passcode))      != ESP_OK ||
-        (err = nvs_set_u32(h, "discriminator", discriminator)) != ESP_OK ||
+    if ((err = nvs_set_u32(h, "discriminator", discriminator)) != ESP_OK ||
         (err = nvs_set_str(h, "salt",          salt_b64))      != ESP_OK ||
         (err = nvs_set_str(h, "verifier",      ver_b64))       != ESP_OK ||
+        (err = nvs_set_u32(h, "pin-code",     passcode))      != ESP_OK ||   /* last: the marker */
         (err = nvs_commit(h))                                   != ESP_OK) {
         ESP_LOGE(TAG, "Failed to write Matter credentials: %s", esp_err_to_name(err));
     } else {
-        ESP_LOGI(TAG, "Matter: generated passcode=%" PRIu32 " discriminator=0x%03" PRIx32,
-                 passcode, discriminator);
+        /* The passcode is the commissioning secret: not on the console at
+           INFO. It is shown behind the password on /api/matter/pairing. */
+        ESP_LOGI(TAG, "Matter: commissioning credentials generated, discriminator=0x%03" PRIx32,
+                 discriminator);
+        ESP_LOGD(TAG, "Matter: passcode=%" PRIu32, passcode);
     }
 
     nvs_close(h);
@@ -260,9 +370,14 @@ static esp_err_t matter_provision_if_needed(void)
 
 esp_err_t matter_init(void)
 {
-    /* Provision unique credentials on first boot before starting the stack */
+    /* Provision unique credentials on first boot, before the stack starts.
+       Fail closed. Started anyway, the stack would come up with the public
+       test passcode (20202021), and anyone in range could commission the
+       device. Without Matter the board still runs; the next boot tries the
+       provisioning again. */
     if (matter_provision_if_needed() != ESP_OK) {
-        ESP_LOGW(TAG, "Provisioning failed — falling back to default test credentials");
+        ESP_LOGE(TAG, "Provisioning failed — Matter not started (no fallback to the public test credentials)");
+        return ESP_FAIL;
     }
 
     const app_config_t *cfg = app_config_get();
@@ -325,6 +440,51 @@ esp_err_t matter_init(void)
                  cfg->di[i].name[0] ? cfg->di[i].name : "-");
     }
 
+    /* The header pads, by the mode each has now (aux_io_init() ran before). */
+    for (int a = 0; a < AUX_PAD_COUNT; a++) {
+        aux_mode_t m = aux_io_mode((uint8_t)a);
+        endpoint_t *ep = nullptr;
+        if (m == AUX_MODE_INPUT) {
+            contact_sensor::config_t c = {};
+            ep = contact_sensor::create(node, &c, ENDPOINT_FLAG_NONE, nullptr);
+        } else if (m == AUX_MODE_OUTPUT) {
+            on_off_plug_in_unit::config_t c = {};
+            bool on = false;
+            aux_io_out_get((uint8_t)a, &on);
+            c.on_off.on_off = on;
+            ep = on_off_plug_in_unit::create(node, &c, ENDPOINT_FLAG_NONE, nullptr);
+        } else if (m == AUX_MODE_PWM) {
+            dimmable_plug_in_unit::config_t c = {};
+            uint16_t duty = 0;
+            aux_io_pwm_info((uint8_t)a, nullptr, &duty, nullptr);
+            s_pwm_on[a]    = duty > 0;
+            s_pwm_level[a] = duty > 0 ? duty_to_level(duty) : 254;
+            c.on_off.on_off = s_pwm_on[a];
+            c.level_control.current_level = s_pwm_level[a];
+            c.level_control.on_level      = nullable<uint8_t>();
+            /* Null: the stack keeps the state at start-up. The defaults (0)
+               made it switch the unit off at every boot -- through the
+               attribute callback, so a PWM output configured at 25 % ran
+               at 0 %. The pad's own configuration decides what it starts
+               with. */
+            c.on_off_lighting.start_up_on_off              = nullable<uint8_t>();
+            c.level_control_lighting.start_up_current_level = nullable<uint8_t>();
+            ep = dimmable_plug_in_unit::create(node, &c, ENDPOINT_FLAG_NONE, nullptr);
+        } else {
+            continue;   /* standard: not ours; analog: no device type home apps show */
+        }
+        if (!ep) {
+            ESP_LOGE(TAG, "Failed to create AUX%d endpoint", a + 1);
+            return ESP_FAIL;
+        }
+        s_aux_ep[a]      = endpoint::get_id(ep);
+        s_aux_ep_mode[a] = m;
+        ESP_LOGI(TAG, "AUX%d (%s) endpoint_id=%u", a + 1, aux_mode_name(m), s_aux_ep[a]);
+    }
+
+    /* Values the poll table reads from devices on RS-485 */
+    if (matter_mbm_create(node) != ESP_OK) return ESP_FAIL;
+
     /* Start the Matter stack */
     esp_err_t err = esp_matter::start(event_cb);
     if (err != ESP_OK) {
@@ -333,6 +493,20 @@ esp_err_t matter_init(void)
     }
 
     ESP_LOGI(TAG, "Matter stack started — %d DO + %d DI endpoints", NUM_CHANNELS, NUM_CHANNELS);
+    s_started = true;   /* matter_do_changed() may schedule work from here on */
+
+    /* The BooleanState cluster starts at false whatever the endpoint config
+       said -- the value only reaches the attribute store, not the cluster
+       the SDK creates on registration. Push the inputs as they are now, or
+       one that is active at boot and then stays put is shown wrong until
+       its next edge. */
+    for (int i = 0; i < NUM_CHANNELS + AUX_PAD_COUNT; i++)
+        matter_di_update((uint8_t)i, di_get((uint8_t)i));
+    /* The pad outputs too: OnOff and CurrentLevel are kept in NVS by the
+       stack and come back from there, which need not be what the pad was
+       configured to start with. */
+    for (int a = 0; a < AUX_PAD_COUNT; a++)
+        matter_aux_update((uint8_t)a);
 
     s_commissioned = chip::Server::GetInstance().GetFabricTable().FabricCount() > 0;
     if (s_commissioned) {
@@ -353,16 +527,24 @@ esp_err_t matter_init(void)
         s_manual_code[man_span.size()] = '\0';
     }
 
-    PrintOnboardingCodes(rvFlags);
+    /* Not PrintOnboardingCodes(): both codes carry the setup passcode, and
+       that would put them on the console of every boot. They are shown in
+       the web UI, behind its password. */
+    ESP_LOGI(TAG, "Pairing codes: web UI, Matter tab");
 
     return ESP_OK;
 }
 
 void matter_di_update(uint8_t channel, bool active)
 {
-    if (channel >= NUM_CHANNELS) return;
-    uint16_t ep_id = s_di_ep[channel];
-    if (ep_id == 0) return;  /* not initialised yet */
+    uint16_t ep_id = 0;
+    if (channel < NUM_CHANNELS) {
+        ep_id = s_di_ep[channel];
+    } else if (channel < NUM_CHANNELS + AUX_PAD_COUNT) {
+        int a = channel - NUM_CHANNELS;          /* AUX1..3 are DI channels 8..10 */
+        if (s_aux_ep_mode[a] == AUX_MODE_INPUT) ep_id = s_aux_ep[a];
+    }
+    if (ep_id == 0) return;  /* not initialised yet, or no input endpoint */
 
     esp_err_t err = boolean_state_set_value(ep_id, active);
     if (err != ESP_OK) {
@@ -412,11 +594,52 @@ void matter_do_update(uint8_t channel, bool state)
     uint16_t ep_id = s_do_ep[channel];
     if (ep_id == 0) return;
 
+    /* report(), not update(): update() runs the attribute callbacks, and
+       attr_update_cb would write the output a second time on the way. The
+       hardware already holds this state; only the controllers have to
+       hear of it. */
     esp_matter_attr_val_t val = esp_matter_bool(state);
-    attribute::update(ep_id,
+    attribute::report(ep_id,
                       OnOff::Id,
                       OnOff::Attributes::OnOff::Id,
                       &val);
+}
+
+/* Outputs switched by anyone (dout_modify()) are reported here. Collected
+   into one mask and handed to the CHIP task once: a burst of changes is one
+   piece of work, and the report reads what the port holds when it runs, so
+   the last report is the last state. A change Matter made itself is reported
+   back with the value it already has -- harmless. */
+static volatile uint8_t s_do_dirty;
+
+void matter_do_changed(uint8_t mask)
+{
+    if (!mask || !s_started) return;
+    if (__atomic_fetch_or(&s_do_dirty, mask, __ATOMIC_RELAXED)) return;   /* already scheduled */
+    CHIP_ERROR err = chip::DeviceLayer::PlatformMgr().ScheduleWork([](intptr_t) {
+        uint8_t d = __atomic_exchange_n(&s_do_dirty, 0, __ATOMIC_RELAXED);
+        for (uint8_t i = 0; i < NUM_CHANNELS; i++)
+            if (d & (1u << i)) matter_do_update(i, dout_get(i));
+    });
+    /* Not scheduled: clear the mask, or no later change would schedule again. */
+    if (err != CHIP_NO_ERROR) __atomic_store_n(&s_do_dirty, 0, __ATOMIC_RELAXED);
+}
+
+/* The same for the header pads: matter_aux_update() also refreshes the
+   cached PWM state, which aux_attr_update() uses on the CHIP task -- so it
+   runs there too, never on the pad task. */
+static volatile uint8_t s_aux_dirty;
+
+void matter_aux_changed(uint8_t mask)
+{
+    if (!mask || !s_started) return;
+    if (__atomic_fetch_or(&s_aux_dirty, mask, __ATOMIC_RELAXED)) return;   /* already scheduled */
+    CHIP_ERROR err = chip::DeviceLayer::PlatformMgr().ScheduleWork([](intptr_t) {
+        uint8_t d = __atomic_exchange_n(&s_aux_dirty, 0, __ATOMIC_RELAXED);
+        for (uint8_t a = 0; a < AUX_PAD_COUNT; a++)
+            if (d & (1u << a)) matter_aux_update(a);
+    });
+    if (err != CHIP_NO_ERROR) __atomic_store_n(&s_aux_dirty, 0, __ATOMIC_RELAXED);
 }
 
 /* Buffer is static so the lambda can capture it by pointer across the ScheduleWork call. */
@@ -434,4 +657,25 @@ extern "C" void matter_set_node_label(const char *name)
                           &val);
         ESP_LOGI(TAG, "NodeLabel updated to \"%s\"", s_pending_node_label);
     });
+}
+
+void matter_aux_update(uint8_t a)
+{
+    if (a >= AUX_PAD_COUNT || !s_aux_ep[a]) return;
+    aux_status_t st;
+    aux_io_status(a, &st);
+    if (st.mode != s_aux_ep_mode[a]) return;   /* endpoint stale until reboot */
+    /* report(), not update(): the pad already holds the state -- see
+       matter_do_update(). */
+    if (st.mode == AUX_MODE_OUTPUT) {
+        esp_matter_attr_val_t v = esp_matter_bool(st.out);
+        attribute::report(s_aux_ep[a], OnOff::Id, OnOff::Attributes::OnOff::Id, &v);
+    } else if (st.mode == AUX_MODE_PWM) {
+        s_pwm_on[a] = st.duty_pm > 0;
+        if (st.duty_pm > 0) s_pwm_level[a] = duty_to_level(st.duty_pm);
+        esp_matter_attr_val_t on = esp_matter_bool(s_pwm_on[a]);
+        attribute::report(s_aux_ep[a], OnOff::Id, OnOff::Attributes::OnOff::Id, &on);
+        esp_matter_attr_val_t lv = esp_matter_nullable_uint8(s_pwm_level[a]);
+        attribute::report(s_aux_ep[a], LevelControl::Id, LevelControl::Attributes::CurrentLevel::Id, &lv);
+    }
 }

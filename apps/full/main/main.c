@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <string.h>
 #include <nvs_flash.h>
 #include <esp_heap_caps.h>
@@ -20,18 +21,21 @@
 #include "buzzer.h"
 #include "di.h"
 #include "dout.h"
+#include "aux_io.h"
 #include "eth.h"
 #include "led.h"
 #include "can_server.h"
 #include "mb_server.h"
+#include "mb_tcp_master.h"
 #include "web_server.h"
 #ifdef CONFIG_APP_MATTER_ENABLE
 #include "matter.h"
 #endif
 #include "scripting.h"
-#include "app_rtc.h"
 #include "sntp_sync.h"
 #include <sys/time.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #define TAG          "main"
 
@@ -47,11 +51,75 @@ const char DEMO_SCRIPT[] =
     "    output(0).set(true);\n"
     "  });\n";
 
+/* output(0..7) is DO1-DO8, output(8..10) a header pad set to output -- the
+   rule engine sees one row of outputs, as it sees one row of inputs. */
+static esp_err_t rules_out_set(uint8_t ch, bool on)
+{
+    return ch < APP_CFG_DO_COUNT ? dout_set(ch, on) : aux_io_out_set((uint8_t)(ch - APP_CFG_DO_COUNT), on);
+}
+static bool rules_out_get(uint8_t ch)
+{
+    bool on = false;
+    if (ch < APP_CFG_DO_COUNT) return dout_get(ch);
+    aux_io_out_get((uint8_t)(ch - APP_CFG_DO_COUNT), &on);
+    return on;
+}
+static esp_err_t rules_out_toggle(uint8_t ch)
+{
+    return ch < APP_CFG_DO_COUNT ? dout_toggle(ch) : aux_io_out_toggle((uint8_t)(ch - APP_CFG_DO_COUNT));
+}
+
+#if CONFIG_APP_AUX_DI_ENABLE
+/* The rule engine numbers the pads 1..3, like AUX1..AUX3; aux_io 0..2. */
+static esp_err_t rules_pwm_set(uint8_t pad, uint32_t freq_hz, uint16_t duty_pm)
+{
+    return (pad >= 1 && pad <= 3) ? aux_io_pwm_set((uint8_t)(pad - 1), freq_hz, duty_pm)
+                                  : ESP_ERR_INVALID_ARG;
+}
+static bool rules_pwm_get(uint8_t pad, uint32_t *freq_hz, uint16_t *duty_pm)
+{
+    return pad >= 1 && pad <= 3 && aux_io_pwm_info((uint8_t)(pad - 1), freq_hz, duty_pm, NULL);
+}
+static esp_err_t rules_analog_get(uint8_t pad, int *mv)
+{
+    return (pad >= 1 && pad <= 3) ? aux_io_analog_mv((uint8_t)(pad - 1), mv) : ESP_ERR_INVALID_ARG;
+}
+#endif
+
+/* The poll table hands its values to the rules itself (on_modbus_value())
+   and publishes them: subscribed at the broker as well, each would reach a
+   rule twice. */
+static bool rules_mqtt_local(const char *topic)
+{
+    return strncmp(topic, "modbus/", 7) == 0;
+}
+
+/* The rule engine's subscriptions as its own owner: a filter a module
+   also holds ("output/set") stays when the rules stop reading it. */
+static int rules_mqtt_subscribe(const char *topic, int qos)
+{
+    return app_mqtt_subscribe_as(APP_MQTT_OWNER_RULES, topic, qos);
+}
+static int rules_mqtt_unsubscribe(const char *topic)
+{
+    return app_mqtt_unsubscribe_as(APP_MQTT_OWNER_RULES, topic);
+}
+
 static const scripting_io_t s_scripting_io = {
     .di_get         = di_get,
-    .dout_set       = dout_set,
-    .dout_get       = dout_get,
-    .mqtt_subscribe = app_mqtt_subscribe,
+    .di_count       = APP_CFG_DI_COUNT,
+#if CONFIG_APP_AUX_DI_ENABLE
+    .aux_pwm_set    = rules_pwm_set,
+    .aux_pwm_get    = rules_pwm_get,
+    .aux_analog_get = rules_analog_get,
+#endif
+    .dout_set       = rules_out_set,
+    .dout_get       = rules_out_get,
+    .dout_toggle    = rules_out_toggle,
+    .do_count       = APP_CFG_DO_COUNT + APP_CFG_DI_AUX_COUNT,
+    .mqtt_subscribe = rules_mqtt_subscribe,
+    .mqtt_unsubscribe = rules_mqtt_unsubscribe,
+    .mqtt_local     = rules_mqtt_local,
     .mqtt_publish   = app_mqtt_publish,
     .led_set        = led_set_rgb,      /* effective in IO mode (no-op in status mode) */
     .buzzer_set     = buzzer_set_tone,
@@ -86,11 +154,12 @@ static void set_eth_only(bool on)
 /* --------------------------------------------------------- MQTT callbacks */
 
 /* Feed the rule engine the broker connection state as an internal '$sys/mqtt'
- * message ("up"/"down"), so rules can gate on mqttConnected()/mqttDown(). Injected
- * locally via the normal message path — never published to or read from the broker. */
+ * message ("up"/"down"), so rules can gate on mqttConnected()/mqttDown(). Local
+ * only -- never published to or read from the broker -- and kept as state by the
+ * engine, so a full event queue cannot lose it. */
 static void scripting_feed_mqtt_state(const char *state)
 {
-    scripting_on_mqtt_message("$sys/mqtt", 9, state, strlen(state));
+    scripting_on_mqtt_state(!strcmp(state, "up"));
 }
 
 static void on_mqtt_connected(void)
@@ -98,6 +167,7 @@ static void on_mqtt_connected(void)
     led_status_set_mqtt(true);
     di_on_mqtt_connected();
     dout_on_mqtt_connected();
+    aux_io_on_mqtt_connected();
     led_on_mqtt_connected();
     buzzer_on_mqtt_connected();
     scripting_on_mqtt_connected();
@@ -116,6 +186,7 @@ static void on_mqtt_message(const char *topic, size_t tlen,
     led_status_flash_rx();
     di_on_mqtt_message(topic, tlen, data, dlen);
     dout_on_mqtt_message(topic, tlen, data, dlen);
+    aux_io_on_mqtt_message(topic, tlen, data, dlen);
     led_on_mqtt_message(topic, tlen, data, dlen);
     buzzer_on_mqtt_message(topic, tlen, data, dlen);
     scripting_on_mqtt_message(topic, tlen, data, dlen);
@@ -123,15 +194,55 @@ static void on_mqtt_message(const char *topic, size_t tlen,
 
 static void on_mqtt_publish(void) { led_status_flash_tx(); }
 
+/* A value the poll table has read: on MQTT as modbus/<name>, and straight to
+   the rule engine under the same topic rather than round the broker -- a
+   rule must work on a board with no broker configured, and the broker does
+   not echo our own publishes back to us anyway. */
+static void on_modbus_value(uint8_t index, const mbm_poll_t *e, double value)
+{
+    (void)index;
+    char topic[8 + APP_CFG_MBM_NAME_LEN + 1];
+    snprintf(topic, sizeof(topic), "modbus/%s", e->name);
+
+    char payload[32];
+    /* Six significant digits turn a 32-bit counter into 4.29497e+09, which
+       reads back as 4294970000 -- the status API and the published value then
+       disagree about the same reading. Ten covers u32 and s32 exactly without
+       printing noise from below a float32's precision. */
+    int len = snprintf(payload, sizeof(payload), "%.10g", value);
+    if (len < 0) return;
+    if (len >= (int)sizeof(payload)) len = (int)sizeof(payload) - 1;
+
+    app_mqtt_publish(topic, payload, len, 0, false);
+    scripting_on_mqtt_message(topic, strlen(topic), payload, (size_t)len);
+}
+
 /* ------------------------------------------------- network callbacks */
+
+/* on_network_ready() runs once per interface, and the two arrive on
+   different tasks: WiFi from the wifi-bootstrap timer, Ethernet from the
+   event loop. Every start function below checks "already running" and then
+   starts, which only holds if no second caller can get between the two --
+   with both links coming up together at boot, two Modbus TCP pollers ran on
+   one set of slots. Serialised here, once, for all of them. */
+static SemaphoreHandle_t s_net_ready_mux;
 
 static void on_network_ready(const char *iface)
 {
+    if (s_net_ready_mux) xSemaphoreTake(s_net_ready_mux, portMAX_DELAY);
     ESP_LOGI(TAG, "%s connected — starting services", iface);
     led_status_set_network(true);
     esp_err_t ws_ret = web_server_start();
     if (ws_ret != ESP_OK)
         ESP_LOGW(TAG, "Web server start failed: %s", esp_err_to_name(ws_ret));
+    /* Modbus TCP opens a listening socket, so it cannot be started from
+       app_main() with the rest of Modbus -- lwIP is not up at that point. */
+    esp_err_t mbn_ret = mb_server_net_start();
+    if (mbn_ret != ESP_OK)
+        ESP_LOGE(TAG, "Modbus TCP start failed: %s", esp_err_to_name(mbn_ret));
+    esp_err_t mbm_ret = mb_tcp_master_start();
+    if (mbm_ret != ESP_OK)
+        ESP_LOGE(TAG, "Modbus TCP master start failed: %s", esp_err_to_name(mbm_ret));
     app_mqtt_set_connected_callback(on_mqtt_connected);
     app_mqtt_set_disconnected_callback(on_mqtt_disconnected);
     app_mqtt_set_msg_callback(on_mqtt_message);
@@ -140,6 +251,7 @@ static void on_network_ready(const char *iface)
     if (mqtt_ret != ESP_OK)
         ESP_LOGE(TAG, "MQTT start failed: %s", esp_err_to_name(mqtt_ret));
     sntp_sync_apply();   /* start NTP sync now that the network is up */
+    if (s_net_ready_mux) xSemaphoreGive(s_net_ready_mux);
 }
 
 static bool s_eth_connected  = false;
@@ -191,21 +303,6 @@ static void on_eth_only_requested(void)
     ESP_LOGI(TAG, "ETH-only mode saved — rebooting");
 }
 
-/* Days-from-civil (UTC) → epoch seconds — dependency-free (avoids relying on timegm). */
-static time_t utc_tm_to_epoch(const struct tm *t)
-{
-    int      y   = t->tm_year + 1900;
-    int      m   = t->tm_mon + 1;
-    int      d   = t->tm_mday;
-    y -= (m <= 2);
-    int      era = (y >= 0 ? y : y - 399) / 400;
-    unsigned yoe = (unsigned)(y - era * 400);
-    unsigned doy = (153u * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
-    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    long     days = (long)era * 146097 + (long)doe - 719468;
-    return (time_t)days * 86400 + t->tm_hour * 3600 + t->tm_min * 60 + t->tm_sec;
-}
-
 /* ------------------------------------------------------------ app_main */
 
 #ifdef CONFIG_APP_MATTER_ENABLE
@@ -221,6 +318,10 @@ static void on_matter_wifi_got_ip(void *arg, esp_event_base_t base,
 
 void app_main(void)
 {
+    /* Before anything that can bring a network interface up. */
+    s_net_ready_mux = xSemaphoreCreateMutex();
+    if (!s_net_ready_mux) ESP_LOGE(TAG, "network start mutex: out of memory");
+    sntp_sync_init();
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -233,45 +334,38 @@ void app_main(void)
     ESP_ERROR_CHECK(auth_init());
     button_init();
     ESP_ERROR_CHECK(di_init());
+    /* After di_init(): a pad set to input joins the input path. Not fatal --
+       a pad that cannot take its mode is left in its standard function. */
+    esp_err_t aux_ret = aux_io_init();
+    if (aux_ret != ESP_OK)
+        ESP_LOGE(TAG, "IO1/RXD/TXD pads: %s", esp_err_to_name(aux_ret));
     ESP_ERROR_CHECK(dout_init());
 
     /* RTC: seed the system clock from the battery-backed PCF85063 if its stored time
      * is valid (i.e. set by a previous SNTP sync). SNTP will refine/correct it once the
-     * network is up; with no valid RTC time we simply wait for SNTP. Non-fatal — a
-     * missing/failed RTC must not stop the device from booting. */
-    if (rtc_dev_init() == ESP_OK) {
-        struct tm rt;
-        bool valid = false;
-        if (rtc_dev_read(&rt, &valid) == ESP_OK && valid) {
-            struct timeval tv = { .tv_sec = utc_tm_to_epoch(&rt), .tv_usec = 0 };
-            settimeofday(&tv, NULL);
-            ESP_LOGI(TAG, "System clock seeded from RTC: %04d-%02d-%02d %02d:%02d:%02d UTC",
-                     rt.tm_year + 1900, rt.tm_mon + 1, rt.tm_mday,
-                     rt.tm_hour, rt.tm_min, rt.tm_sec);
-            /* Real time available before the engine starts → cron may arm at load. */
-            scripting_set_time_valid();
-        } else {
-            ESP_LOGW(TAG, "RTC time not valid yet — waiting for SNTP");
-        }
-    } else {
-        ESP_LOGW(TAG, "RTC not available");
-    }
+     * network is up. Real time available before the engine starts → cron may arm at load. */
+    if (app_time_seed_from_rtc()) scripting_set_time_valid();
 
     /* Load user script from NVS; fall back to built-in demo if none stored. */
     const char *startup_script = DEMO_SCRIPT;
-    static char s_nvs_script_buf[4096];
     {
-        nvs_handle_t h;
-        size_t len = sizeof(s_nvs_script_buf);
-        if (nvs_open("scripting", NVS_READONLY, &h) == ESP_OK) {
-            if (nvs_get_str(h, "script", s_nvs_script_buf, &len) == ESP_OK)
-                startup_script = s_nvs_script_buf;
-            nvs_close(h);
-        }
+        char *stored = NULL;   /* kept for good: scripting_init() wants it for life */
+        esp_err_t err = rules_nvs_read(&stored);
+        if (err == ESP_OK)
+            startup_script = stored;
+        else if (err != ESP_ERR_NVS_NOT_FOUND)
+            /* Not quietly: the demo runs in place of the user's rules. */
+            ESP_LOGE(TAG, "stored rules unreadable (%s) - running the demo", esp_err_to_name(err));
     }
-    ESP_ERROR_CHECK(scripting_init(startup_script, &s_scripting_io));
+    /* The script task runs at a higher priority than app_main and evaluates
+       the stored script the moment it exists, so everything a top-level
+       statement can reach has to be there first: buzzer().off() outside a
+       rule hit the buzzer's queue before buzzer_init() had created it, and
+       the assert in xQueueOverwrite() rebooted the device -- at every boot,
+       because the script is stored. */
     ESP_ERROR_CHECK(led_init());
     ESP_ERROR_CHECK(buzzer_init());
+    ESP_ERROR_CHECK(scripting_init(startup_script, &s_scripting_io));
     /* Not fatal: both take a stored baudrate/bitrate, and eth_init() runs much
        further down. Aborting here would leave the unit with no network and no
        web UI to correct the value with — an endless boot loop recoverable only
@@ -280,7 +374,17 @@ void app_main(void)
     if (mb_ret != ESP_OK)
         ESP_LOGE(TAG, "Modbus server init failed: %s — continuing without Modbus",
                  esp_err_to_name(mb_ret));
-    esp_err_t can_ret = can_server_init();
+    esp_err_t mbm_init_ret = mb_tcp_master_init(on_modbus_value, false);
+    if (mbm_init_ret != ESP_OK)
+        ESP_LOGE(TAG, "Modbus TCP master init failed: %s — continuing without it",
+                 esp_err_to_name(mbm_init_ret));
+    /* Heartbeat status: the broker; control frames feed the rule engine's
+       CAN command-health check. */
+    const can_server_hooks_t can_hooks = {
+        .online     = app_mqtt_is_connected,
+        .on_command = scripting_on_can_activity,
+    };
+    esp_err_t can_ret = can_server_init(&can_hooks);
     if (can_ret != ESP_OK)
         ESP_LOGE(TAG, "CAN server init failed: %s — continuing without CAN",
                  esp_err_to_name(can_ret));
@@ -320,32 +424,34 @@ void app_main(void)
      * is intentionally NOT pre-created: CHIPoBLE handles commissioning, so the
      * captive-portal AP is unnecessary and its beacon buffer (752 B DMA) would
      * crash after BLE has consumed the main free block. */
-    if (!eth_only) {
-        esp_netif_init();
-        esp_event_loop_create_default();
+    /* The IP stack and Ethernet in either case: in ETH-only mode this path
+       used to skip them along with WiFi and Matter, and the board came up
+       with no network at all. */
+    esp_netif_init();
+    esp_event_loop_create_default();
+    if (!eth_only)
         esp_netif_create_default_wifi_sta();
-    }
 
 #ifdef CONFIG_BT_ENABLED
     /* Release classic-BT memory (only relevant when BT stack is compiled in). */
     esp_bt_mem_release(ESP_BT_MODE_CLASSIC_BT);
 #endif
 
-    if (!eth_only) {
-        /* Ethernet init first — lets matter_init() detect the link state. */
-        esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, on_ip_lost, NULL);
-        esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_LOST_IP, on_ip_lost, NULL);
-        esp_err_t eth_ret = eth_init(on_eth_ready);
-        if (eth_ret != ESP_OK)
-            ESP_LOGW(TAG, "Ethernet init failed: %s", esp_err_to_name(eth_ret));
-        else {
-            /* Wait up to 500 ms for physical link detection (W5500 auto-neg). */
-            for (int i = 0; i < 10 && !eth_link_is_up(); i++)
-                vTaskDelay(pdMS_TO_TICKS(50));
-            ESP_LOGI(TAG, "ETH link %s before matter_init",
-                     eth_link_is_up() ? "UP" : "down");
-        }
+    /* Ethernet init first — lets matter_init() detect the link state. */
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, on_ip_lost, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_LOST_IP, on_ip_lost, NULL);
+    esp_err_t eth_ret = eth_init(on_eth_ready);
+    if (eth_ret != ESP_OK)
+        ESP_LOGW(TAG, "Ethernet init failed: %s", esp_err_to_name(eth_ret));
+    else {
+        /* Wait up to 500 ms for physical link detection (W5500 auto-neg). */
+        for (int i = 0; i < 10 && !eth_link_is_up(); i++)
+            vTaskDelay(pdMS_TO_TICKS(50));
+        ESP_LOGI(TAG, "ETH link %s before matter_init",
+                 eth_link_is_up() ? "UP" : "down");
+    }
 
+    if (!eth_only) {
         esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
 
         ESP_LOGI(TAG, "heap before matter_init: free=%u DMA_free=%u DMA_largest=%u",
@@ -374,6 +480,22 @@ void app_main(void)
         ESP_LOGW(TAG, "Ethernet init failed: %s", esp_err_to_name(eth_ret));
 #endif
 
+    /* RS-485 rows of the poll table need no network: a board with neither an
+       Ethernet link nor WiFi still reads the devices on its own segment, and
+       rules get their values. Started here, once the IP stack exists -- the
+       poller's network rows only fail until a link comes up, and
+       on_network_ready()'s start is then a no-op. */
+    if (mb_tcp_master_has_rtu()) {
+        /* Under the same lock as on_network_ready(): eth_init() above has
+           started the link, and a quick DHCP can bring Got-IP -- and its
+           start of the same poller -- in between. */
+        if (s_net_ready_mux) xSemaphoreTake(s_net_ready_mux, portMAX_DELAY);
+        esp_err_t mbm_ret = mb_tcp_master_start();
+        if (s_net_ready_mux) xSemaphoreGive(s_net_ready_mux);
+        if (mbm_ret != ESP_OK)
+            ESP_LOGE(TAG, "Modbus master start failed: %s", esp_err_to_name(mbm_ret));
+    }
+
     if (!eth_only) {
 #ifdef CONFIG_APP_MATTER_ENABLE
         /* Do NOT call wifi_config_init when BLE is active (uncommissioned state):
@@ -391,16 +513,15 @@ void app_main(void)
             esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_START, on_wifi_ap, NULL);
             wifi_config_set_eth_only_callback(on_eth_only_requested);
             wifi_config_set_eth_available_fn(is_eth_connected);
-            /* If credentials are already stored, suppress the captive portal entirely.
-             * Without this, wifi_config's monitor fires on any brief disconnect and
-             * calls wifi_config_softap_start() → esp_wifi_scan_start(NULL, true) — a
-             * blocking all-channel scan that holds the radio for several seconds every
-             * 10 s, starving STA traffic of ACKs and causing send() EAGAIN on the httpd. */
-            char *ssid = NULL;
-            wifi_config_get(&ssid, NULL);
-            if (ssid && ssid[0])
+            /* Commissioned: no captive portal, unless the BOOT long press
+             * asked for it. Suppressing it only when wifi_cfg held an SSID
+             * left it open on a board commissioned over Ethernet or Matter
+             * WiFi (whose credentials are not in wifi_cfg) -- an open AP
+             * taking an SSID from anyone in range. It also costs: the
+             * monitor's AP start runs a blocking all-channel scan every
+             * 10 s that starves STA traffic. */
+            if (!wifi_config_reset_requested())
                 wifi_config_disable_ap();
-            free(ssid);
             wifi_config_init("Waveshare (192.168.4.1)", NULL, NULL);
         }
 #else

@@ -43,31 +43,34 @@ char *url_unescape(const char *buffer, size_t size) {
                         return c - 'A' + 10;
         }
 
+        /* One rule for both passes: a '%' followed by two hex digits is one
+           byte and uses three characters, anything else is one byte for one
+           character. The sizing pass used to take every '%' as three
+           characters while the copy pass kept an invalid one as a literal
+           and went on with the next two -- so "%GG" was sized as one byte
+           and written as three, past the end of the allocation. */
+        int escaped(int i) {
+                return buffer[i] == '%' && i + 2 < size &&
+                       ishex(buffer[i+1]) && ishex(buffer[i+2]);
+        }
+
         int i = 0, j;
         while (i < size) {
                 len++;
-                if (buffer[i] == '%') {
-                        i += 3;
-                } else {
-                        i++;
-                }
+                i += escaped(i) ? 3 : 1;
         }
 
         char *result = malloc(len+1);
+        if (!result)
+                return NULL;
         i = j = 0;
         while (i < size) {
-                if (buffer[i] == '+') {
-                        result[j++] = ' ';
-                        i++;
-                } else if (buffer[i] != '%') {
-                        result[j++] = buffer[i++];
+                if (escaped(i)) {
+                        result[j++] = hexvalue(buffer[i+1])*16 + hexvalue(buffer[i+2]);
+                        i += 3;
                 } else {
-                        if (i+2 < size && ishex(buffer[i+1]) && ishex(buffer[i+2])) {
-                                result[j++] = hexvalue(buffer[i+1])*16 + hexvalue(buffer[i+2]);
-                                i += 3;
-                        } else {
-                                result[j++] = buffer[i++];
-                        }
+                        result[j++] = (buffer[i] == '+') ? ' ' : buffer[i];
+                        i++;
                 }
         }
         result[j] = 0;
@@ -77,9 +80,13 @@ char *url_unescape(const char *buffer, size_t size) {
 
 form_param_t *form_params_parse(const char *s) {
         form_param_t *params = NULL;
+        if (!s) return NULL;
 
         int i = 0;
-        while (1) {
+        while (s[i]) {
+                /* The end is checked before an empty field is skipped: with a
+                   trailing '&' the skip used to step over the terminator and
+                   the scan went on past the end of the string. */
                 int pos = i;
                 while (s[i] && s[i] != '=' && s[i] != '&') i++;
                 if (i == pos) {
@@ -102,8 +109,6 @@ form_param_t *form_params_parse(const char *s) {
                         }
                 }
 
-                if (!s[i])
-                        break;
         }
 
         return params;

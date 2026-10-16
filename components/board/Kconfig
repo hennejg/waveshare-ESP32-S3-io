@@ -16,45 +16,60 @@ config APP_SNTP_ENABLE
         accurate local time (e.g. Matter-only builds).
 
 config APP_AUX_DI_ENABLE
-    bool "Three extra NON-ISOLATED digital inputs (GPIO1, GPIO44, GPIO43)"
-    depends on !APP_MATTER_ENABLE
-    default n
+    bool "Offer GPIO1, GPIO44 and GPIO43 as NON-ISOLATED inputs, PWM and analog"
+    default y
     help
-        Adds three more inputs on GPIO1, GPIO44 and GPIO43 for boards that
-        need more than the eight on-board ones.  They are shown as AUX1, AUX2
-        and AUX3 in the web UI and occupy channels 8..10 of the DI array,
-        behind the eight isolated ones.
+        Lets each of the three header pins IO1, RXD and TXD (GPIO1, GPIO44,
+        GPIO43) be switched, per pin, in the web UI (Device tab) or with "aux"
+        in /api/config: standard function, digital input, digital output, or
+        PWM output with its own frequency (5 Hz .. 1 MHz) and duty cycle;
+        GPIO1 also as analog input (ADC1 channel 0, 0..3.1 V).  The change takes effect on saving;
+        no reboot.  Every pin starts in its standard function.  One thing does
+        change with the option on: the input table in NVS has eleven entries,
+        which an eight-input firmware (older releases) cannot read
+        back -- going back loses the input names (README).
+
+        Standard function: GPIO1 is high-impedance (this firmware does not use
+        it); GPIO44 and GPIO43 are UART0 RX and TX, which is where the console is.
+        In any other mode the pin is taken off UART0 -- the console keeps
+        running on USB-Serial/JTAG, and on UART0 it simply no longer reaches
+        the pin.
+
+        The channels are AUX1, AUX2 and AUX3, channels 8..10 of the DI array
+        behind the eight isolated ones.  A channel in its standard function
+        reads false and is not published.
 
         These three pins run straight to the ESP32-S3: no optocoupler, no
         series resistor, no reverse protection.  They need external protection
         and must never see more than 3.3 V or less than 0 V.
 
-        GPIO43/44 are UART0 TX/RX and carry the default console, so the console
-        has to be moved to USB-Serial/JTAG only (Component config -> ESP System
-        Settings -> Channel for console output -> USB Serial/JTAG Controller).
-        Building with the console still on UART0 fails with an #error.
+        GPIO43 (TXD) is U0TXD.  The console stays on UART0, so the ROM
+        bootloader, the second-stage bootloader and the early application log
+        drive it as a push-pull output from every reset until the pads are set
+        up -- and indefinitely in UART download mode (esptool, BOOT button).
+        As an input it needs a series resistor of at least 1 kOhm; as a PWM
+        output its load sees that traffic at every reset.  GPIO43 is
+        deliberately the LAST channel, so a board that needs only two extra
+        inputs can leave it unwired.  GPIO44 (RXD) is an input at reset;
+        GPIO1 is unused by this firmware.
 
-        Moving the console is not enough for GPIO43 (AUX3).  It is U0TXD, and the
-        ROM bootloader drives it as a push-pull output from every reset until
-        the second-stage bootloader releases it — and indefinitely while the
-        chip sits in UART download mode (esptool, BOOT button).  A contact
-        wired straight from GPIO43 to ground therefore shorts that driver on
-        every boot and during every flash.  Put a series resistor of at least
-        1 kOhm in that line.  GPIO43 is deliberately the LAST channel, so a
-        board that needs only two extra inputs can leave it unwired.
-        GPIO44 (AUX2) is U0RXD, an input, and has no such
-        problem; GPIO1 is unaffected and otherwise unused by this firmware.
+        A PWM output is under control only while the firmware runs: switching
+        a PWM pad to another mode pulls it high (input pull-up, UART idle
+        level), so a load is switched off with duty 0, and a driver input
+        wants an external pull-down for the time before the pads are set up.
 
-        The extra inputs are reported over the web UI, the REST API and MQTT.
-        They are NOT carried over CAN or Modbus: both pack the input states
-        into a single byte (can_server.c, mb_server.c), which has room for
-        eight.  The scripting engine does not see them either: its di/do
-        bindings reject channels above 7 with a RangeError.
+        Inputs, PWM and the analog reading are available over the web UI, the
+        REST API, MQTT (aux/...), Modbus (discrete inputs 10009-10011, holding
+        registers 40003-40011, input registers 30101-30104, coils 9-11) and
+        the rule engine (input(8..10), output(8..10), pwm(), analog()).  Not over CAN, which packs the
+        input states into a single byte.
 
-        Not offered in a Matter build.  The Matter app exposes exactly eight
-        Contact Sensor endpoints and its own web UI builds eight input rows, so
-        the extra channels would be invisible there — better unavailable than
-        half working.
+        In the Matter firmware a pad becomes an endpoint by its mode at
+        boot: input a Contact Sensor, output an On/Off Plug-in Unit, PWM a
+        Dimmable Plug-in Unit (level = duty cycle).  An analog input has no
+        Matter device type that home apps show; it is in the web UI only.
+        A mode change there takes effect on the pad at once and on the
+        Matter endpoints after a reboot.
 
 config APP_SCRIPTING_ENABLE
     bool "Enable scripting engine callbacks"

@@ -167,7 +167,9 @@ an **actuator**: call `.publish()` in `then()` to send a message to the broker.
 
 ### `input(ch)` — digital input
 
-`ch` is the channel number (0–7).
+`ch` is the channel number: 0–7 for DI1–DI8, and 8–10 for the header pads IO1, RXD and TXD when the firmware offers
+them. A pad that is not set to *digital input* reads `false`. Likewise `output(8)`–`output(10)` are the pads set to
+*digital output*; writing one that is not an output throws.
 
 | Form | Meaning |
 |------|---------|
@@ -243,9 +245,45 @@ rule('DO1 follows DO0')
 
 > **Feedback loops are bounded.** Because outputs are written *by* rules, output→output
 > chains can feed back on themselves. The engine caps the cascade at **16 hops per
-> triggering event**; if exceeded it logs a warning and stops, so a runaway loop can't
+> triggering event** (and, against wide fan-out, 256 changes in all); if exceeded it
+> logs a warning and stops, so a runaway loop can't
 > wedge the engine (or trip the device watchdog). Writing an output to the value it
 > already holds is a no-op and emits no event.
+
+### `pwm(pad)` and `analog(pad)` — header pads IO1 / RXD / TXD
+
+The three header pads are numbered **1 to 3** (IO1, RXD, TXD). What each one does is set on the web UI's Device tab;
+these act only on a pad in that mode. A pad set to *digital input* is `input(8)`, `input(9)` or `input(10)`.
+
+| Expression | Meaning |
+|---|---|
+| `pwm(pad).set(duty)` | duty cycle in % (0–100, 0.1 steps); throws if the pad is not a PWM output |
+| `pwm(pad).set(duty, freq)` | also the frequency, 5–1000000 Hz |
+| `pwm(pad).off()` | duty 0 |
+| `pwm(pad).duty` / `.freq` / `.get()` | as it runs; `null` / `{duty, freq}` or `null` when not PWM |
+| `analog(1)` | **bare pattern** — matches every new reading (one per 20 mV of change) |
+| `analog(1).above(mV)` / `.below(mV)` / `.between(lo, hi)` | a band, bounds exclusive |
+| `analog(1).value` / `.get()` | live reading in mV, `null` when the pad is not analog |
+
+A rule gated on an analog **band** fires when its conditions start to hold — the reading enters the band, or another
+condition of the rule becomes true while the reading is inside — and not again on readings inside the band until the
+conditions have stopped holding. A bare `analog(1)` fires on every reading. When the pad leaves analog mode, its last
+reading is forgotten: bands no longer match and `.value` is `null`.
+
+A pad switched to another mode does not switch a load off — set the duty cycle to 0. See the README for what a PWM
+pad does while the firmware is not running.
+
+```js
+// fan speed follows the temperature sensor on IO1 (0–3.3 V)
+rule('fan').when(analog(1)).then(function () {
+  pwm(2).set(Math.min(100, analog(1).value / 33));
+});
+
+// alarm when the level sensor passes 2.5 V, once per crossing
+rule('high level').when(analog(1).above(2500)).then(function () { output(7).on(); });
+```
+
+A duty cycle set from a rule is not stored: after a reboot the pad starts with the configured values.
 
 ### `led()` and `buzzer()` — LED and buzzer actuators
 
@@ -291,7 +329,22 @@ rule('alarm off')
 | `mqtt(topic).once()` | **edge** — matches only on each message arrival, not while held |
 | `mqtt(topic).value` | last received payload (read in `then()`) |
 
-`.is(fn)` receives the raw payload string:
+`.is(fn)` receives the raw payload string, every byte of it -- a NUL byte
+included, so `"ON\0OFF"` is not `'ON'`. A message reaches the rules only
+whole: one whose topic (as seen by the rules, prefix removed) is longer than
+127 bytes or whose payload is longer than 255 bytes is dropped, with a warning
+in the device log, rather than shortened.
+
+**Which topics arrive.** The device subscribes `rules/#` and every topic the
+loaded rules read in a condition (`mqtt('sys/heartbeat')`, `.stale()`, ...),
+up to 32 of them; a reload subscribes what is new and unsubscribes what no
+longer is, a reconnect subscribes them all again. A topic is matched as
+written: `+` and `#` in a condition match nothing and are not subscribed.
+`modbus/<name>` values come from the device's own poll table and need no
+subscription. A topic a rule publishes and also reads comes back from the
+broker like any other message. A topic a rule shares with the device's own commands (`output/set`) stays
+subscribed when the rule goes. A subscription the client refuses is tried again every 10 s while
+connected, and on the next load of the rules.
 
 ```js
 var trig = mqtt('rules/trigger').is(function (m) { return m === 'ON'; });
@@ -336,7 +389,10 @@ In `then()` bodies, `mqtt(topic)` can also **send** a message to the broker:
 | `mqtt(topic).publish(payload, {qos: n, retain: bool})` | explicit QoS and retained |
 
 `payload` is coerced to a string. Returns the broker message-id (`>= 0`) on success,
-or `-1` if the broker is not connected. The configured topic prefix is prepended
+or `-1` if the broker is not connected or prefix and topic together exceed 255
+bytes. A topic that is empty or contains `+` or `#` throws a `RangeError`:
+wildcards are for subscribing, and a broker closes the connection of a client
+that publishes to one. The configured topic prefix is prepended
 automatically (a topic starting with `/` bypasses the prefix, same as all other MQTT
 operations).
 
@@ -459,7 +515,7 @@ goes away. These primitives detect that absence and let you gate fallback behavi
 | `mqtt(topic).stale(ms)` | a watchdog **auto-fed** by messages on `topic` — matches when no message for `ms` |
 | `mqttConnected()` / `mqttDown()` | the broker connection state (fed by the firmware) |
 | `modbus(ms)` | upstream **MODBUS** command health: a watchdog auto-fed by each inbound coil/holding-register write |
-| `can(ms)` | upstream **CAN/NMEA2000** command health: a watchdog auto-fed by each inbound control write |
+| `can(ms)` | upstream **CAN/NMEA2000** command health: a watchdog auto-fed by each control command carried out (an unknown opcode, a buzzer at 0 Hz or an incomplete message does not feed it) |
 
 A watchdog **starts alive with a grace period** (the timeout is armed when a rule using
 it registers), so a healthy system has `ms` after boot to check in before fallback kicks
@@ -526,6 +582,8 @@ happens, the engine only re-evaluates the rules that reference the *changed* fac
 - An **MQTT message** on `topic` re-evaluates only rules referencing `mqtt(topic)`.
 - Writing **DO0** to a new level re-evaluates only rules referencing `output(0)`.
 - An **`every`/`cron` tick** re-evaluates only the rules using that specific trigger.
+- An **analog reading** of pad `n` (one per 20 mV of change) re-evaluates the rules referencing
+  `analog(n)`. A rule with a band (`above`/`below`/`between`) fires only on entering it.
 
 This is why toggling one input never accidentally fires a rule about another input.
 
@@ -538,7 +596,9 @@ bounds the chain so a feedback loop can't run away — see
 **Wildcard rules.** If a rule has an *opaque* condition — a predicate function or a bare
 value — the engine cannot tell which facts it depends on, so the rule is treated as
 **wildcard** and re-evaluated on *every* event. Prefer `input()` / `output()` / `mqtt()`
-conditions when you want the targeted behavior.
+conditions when you want the targeted behavior. Analog readings are the exception: they
+arrive several times a second, so a wildcard rule fires on one only when its predicate has
+just become true, not on every reading while it holds.
 
 ---
 
@@ -557,6 +617,10 @@ Place it **before** `.then()`. The action fires only if the `when()` conditions 
 true continuously for `ms` milliseconds. If they break first, the timer is cancelled.
 It fires **once per sustained period** (it re-arms after the conditions drop and rise
 again).
+
+`heldFor()` needs conditions that *stay* true. An edge — `mqtt(topic).once()`,
+`every()`, `cron()` — is true only for the instant it fires, never when the held period
+ends, so combining them throws an error when the rule is built.
 
 ```js
 // DO5 turns on only after DI5 has been high continuously for 5 seconds.
@@ -768,9 +832,25 @@ print(…)                  // log to the console (args joined by space)
   `after` fires regardless. Don't swap them.
 - **Edges can be missed.** A `.once()` edge fires only if the rule's other conditions
   are met at the instant the message arrives; it is not queued.
+- **48 timers at a time.** Every pending `.after()` step, `.heldFor()`, `every()`, `cron()`
+  and watchdog holds one of 48 slots on the device. When they are all taken, a timer that
+  is refused waits and is armed as soon as a slot frees -- late, not never: an `every()`
+  skips ticks, an `.after()` step runs later than asked. `every()`, `cron()` and watchdogs
+  go ahead of waiting `.after()` steps; at most 256 steps wait, further ones are dropped
+  with a log line. A rule that fires faster than its `.after()` delay can fill the table
+  on its own.
 - **Reload resets everything.** Reloading the rule set (device `EVT_RELOAD`, simulator
   "Apply Rules") clears all rules and cancels any pending `.after()` / `.heldFor()`
   timers.
+- **Promise chains are not cancelled by a reload.** Promise jobs (`.then()` on a
+  Promise, `async` functions) that are still queued when the rules are reloaded keep
+  running against the old script. A chain that re-queues itself forever --
+  `function spin() { Promise.resolve().then(spin); }` started from a rule, or an
+  endless `async` loop -- survives every reload: each later event pays the full
+  2 s budget, and the old code keeps switching outputs. Only a reboot stops it. The
+  check before a reload does not catch it, because nothing starts the chain while the
+  script loads. Don't build self-repeating Promise chains; use `every()` or `.after()`
+  for anything that repeats.
 
 > **Simulator note:** the simulator loads the engine (`dsl.js`) once at page load.
 > Editing your *script* and clicking **Apply Rules** re-runs the script, but editing the

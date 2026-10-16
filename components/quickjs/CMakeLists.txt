@@ -16,8 +16,12 @@ endif()
 
 # The submodule is pinned to pristine upstream; ESP-IDF/newlib adaptations live as
 # patches here and are applied (idempotently) at configure time. Currently:
-#   0001-getTimezoneOffset-portable.patch — use the portable gmtime/localtime path
-#   where struct tm has no tm_gmtoff (newlib), instead of the glibc tm_gmtoff branch.
+#   0001-getTimezoneOffset-portable.patch — where struct tm has no tm_gmtoff (newlib),
+#   take the offset from the difference of the local and UTC broken-down times; tested
+#   by test/host (make tz).
+#   0002-set_date_fields-dst.patch — local date fields to UTC with the offset of the
+#   resulting instant, not of the fields read as UTC: an hour off after a DST switch
+#   otherwise; tested by test/host (make qjscron).
 file(GLOB QJS_PATCHES "${CMAKE_CURRENT_LIST_DIR}/patches/*.patch")
 list(SORT QJS_PATCHES)
 foreach(patch ${QJS_PATCHES})

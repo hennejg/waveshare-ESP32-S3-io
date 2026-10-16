@@ -1,11 +1,9 @@
 #include "can_server.h"
 #include "app_config.h"
-#include "app_mqtt.h"
 #include "di.h"
 #include "dout.h"
 #include "led.h"
 #include "buzzer.h"
-#include "scripting.h"
 
 #include <string.h>
 #include <inttypes.h>
@@ -19,6 +17,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "freertos/idf_additions.h"
 
 #define TAG          "can"
 #define CAN_TX_GPIO  GPIO_NUM_2
@@ -28,7 +27,10 @@
 /* Do not repeat the bus-off warning more often than this. A node alone on the
    bus cycles through bus-off indefinitely; the log must stay readable. */
 #define BUS_OFF_LOG_MS 10000
-#define HB_PERIOD_MS 1000
+#define HB_PERIOD_MS 1000        /* Basic mode heartbeat */
+/* PGN 126993 goes out every 60 s, the NMEA 2000 output period (vendor PGN
+   references give 60000 ms); every 1 s was 60 times that. */
+#define N2K_HB_PERIOD_MS 60000u
 #define RX_QUEUE_DEPTH 32
 
 #define CAN_MODE_BASIC  1
@@ -39,6 +41,14 @@
 static twai_node_handle_t s_node = NULL;
 static uint8_t            s_mode;
 static QueueHandle_t      s_rx_q;
+static can_server_hooks_t s_hooks;   /* what the firmware lets CAN tell it */
+
+/* A control frame was acted on: the rule engine's command-health feed in
+   the full firmware. */
+static void command_seen(void)
+{
+    if (s_hooks.on_command) s_hooks.on_command();
+}
 
 typedef struct { uint32_t id; uint8_t ide; uint8_t dlc; uint8_t data[8]; } rx_msg_t;
 
@@ -64,6 +74,16 @@ static IRAM_ATTR bool rx_done_cb(twai_node_handle_t node,
 /* ================================================================ BASIC MODE */
 
 static uint16_t s_base;
+
+/* The output state last sent, in either mode. The senders set it, so a
+   change the worker has not seen yet -- an output switched over Modbus,
+   MQTT, a rule or the web page -- is told apart from one a CAN command
+   already answered. s_do_sent: whether it holds anything yet. A start value
+   of 0xFF instead was a state like any other -- with all eight outputs on
+   when CAN started (the Matter firmware starts it after commissioning) the
+   first report never went out. */
+static uint8_t s_last_do;
+static bool    s_do_sent;
 
 /* The driver does not copy a frame: it keeps a pointer to the twai_frame_t and
    to its buffer in p_curr_tx and in tx_mount_queue until the transmission
@@ -142,36 +162,41 @@ static void tx_failed(uint32_t id, esp_err_t err)
     }
 }
 
-static void basic_send(uint16_t id, const uint8_t *data, uint8_t dlc)
+/* Whether the driver took the frame. A state report that was not taken is
+   sent again on the next tick -- see can_tick(). */
+static bool basic_send(uint16_t id, const uint8_t *data, uint8_t dlc)
 {
     if (dlc > 8) dlc = 8;
     twai_frame_t *f = tx_claim(data, dlc, 0x00);
-    if (!f) { tx_failed(id, ESP_ERR_NO_MEM); return; }
+    if (!f) { tx_failed(id, ESP_ERR_NO_MEM); return false; }
     /* buffer_len must describe the payload, not the buffer: the driver rejects
        the frame unless header.dlc == twaifd_len2dlc(buffer_len). */
     f->header = (twai_frame_header_t){ .id = id, .dlc = dlc, .ide = 0, .rtr = 0 };
     f->buffer_len = dlc;
     esp_err_t r = twai_node_transmit(s_node, f, 5);
-    if (r != ESP_OK) { tx_release(f); tx_failed(id, r); }
+    if (r != ESP_OK) { tx_release(f); tx_failed(id, r); return false; }
+    return true;
 }
 
 static void basic_tx_heartbeat(void)
 {
-    uint8_t s = app_mqtt_is_connected() ? 0x03 : 0x01;
+    uint8_t s = (s_hooks.online && s_hooks.online()) ? 0x03 : 0x01;
     basic_send(s_base + 0, &s, 1);
 }
 
-static void basic_tx_di(uint8_t bits) { basic_send(s_base + 1, &bits, 1); }
+static bool basic_tx_di(uint8_t bits) { return basic_send(s_base + 1, &bits, 1); }
 
+/* s_last_do only once the frame is taken: set before, a failed send counted
+   as sent and, without a periodic interval, the new state never went out. */
 static void basic_tx_do(void)
 {
-    uint8_t f[2] = {0, 0};
-    f[1] = dout_get_all();
-    basic_send(s_base + 2, f, 2);
+    uint8_t f[2] = {0, dout_get_all()};
+    if (basic_send(s_base + 2, f, 2)) { s_last_do = f[1]; s_do_sent = true; }
 }
 
-/* DO opcodes: 0=WRITE, 1=SET, 2=CLEAR, 3=TOGGLE */
-static void basic_apply_do(uint8_t op, uint8_t mask)
+/* DO opcodes: 0=WRITE, 1=SET, 2=CLEAR, 3=TOGGLE. False for any other:
+   nothing done, and not a command -- see basic_handle_rx(). */
+static bool basic_apply_do(uint8_t op, uint8_t mask)
 {
     /* One atomic change rather than a read followed by eight single-bit
        writes: dout_set() rewrites the whole port each time, so the outputs
@@ -184,25 +209,28 @@ static void basic_apply_do(uint8_t op, uint8_t mask)
     case 1: ret = dout_modify(mask, 0u, 0u);             break;   /* SET    */
     case 2: ret = dout_modify(0u, mask, 0u);             break;   /* CLEAR  */
     case 3: ret = dout_modify(0u, 0u, mask);             break;   /* TOGGLE */
-    default: return;
+    default: return false;
     }
     if (ret != ESP_OK) ESP_LOGW(TAG, "DO command failed: %s", esp_err_to_name(ret));
     basic_tx_do();
+    return true;
 }
 
+/* command_seen() only for a frame that was a command and was carried out:
+   it feeds the rules' can(ms) watchdog, and a stream of frames with an
+   unknown opcode kept a fallback from ever starting although no command
+   was being executed. */
 static void basic_handle_rx(const rx_msg_t *m)
 {
     if (m->id == (uint16_t)(s_base + 2) && m->dlc == 2) {
-        basic_apply_do(m->data[0], m->data[1]);
-        scripting_on_can_activity();   /* upstream control write → CAN command-health feed */
+        if (basic_apply_do(m->data[0], m->data[1])) command_seen();
     } else if (m->id == (uint16_t)(s_base + 3) && m->dlc == 3) {
         led_set_rgb(m->data[0], m->data[1], m->data[2]);
-        scripting_on_can_activity();
-    } else if (m->id == (uint16_t)(s_base + 4) && m->dlc >= 2) {
+        command_seen();
+    } else if (m->id == (uint16_t)(s_base + 4) && (m->dlc == 2 || m->dlc == 3)) {
         uint16_t f = (uint16_t)(m->data[0] | (m->data[1] << 8));
-        uint32_t d = (m->dlc >= 3) ? (uint32_t)m->data[2] * 10u : 200u;
-        if (f > 0) buzzer_beep_once(f, d);
-        scripting_on_can_activity();
+        uint32_t d = (m->dlc == 3) ? (uint32_t)m->data[2] * 10u : 200u;
+        if (f > 0) { buzzer_beep_once(f, d); command_seen(); }
     } else if (m->id == (uint16_t)(s_base + 5) && m->dlc == 0) {
         uint8_t di = 0;
         for (int i = 0; i < 8; i++) if (di_get(i)) di |= (uint8_t)(1u << i);
@@ -215,7 +243,7 @@ static void basic_handle_rx(const rx_msg_t *m)
 /* ---- PGN constants ---- */
 #define N2K_PGN_ADDRESS_CLAIM  60928UL  /* 0x0EE00 — PDU1 */
 #define N2K_PGN_ISO_REQUEST    59904UL  /* 0x0EA00 — PDU1 */
-#define N2K_PGN_HEARTBEAT     126993UL  /* 0x1F011 — PDU2, fast-packet */
+#define N2K_PGN_HEARTBEAT     126993UL  /* 0x1F011 — PDU2, single-frame */
 #define N2K_PGN_SW_STATUS     127501UL  /* 0x1F20D — PDU2, single-frame */
 #define N2K_PGN_SW_CONTROL    127502UL  /* 0x1F20E — PDU2, single-frame */
 #define N2K_PGN_PROPRIETARY   126720UL  /* 0x1EF00 — PDU1 broadcast, fast-packet */
@@ -267,15 +295,16 @@ static uint32_t n2k_decode_id(uint32_t can_id, uint8_t *src, uint8_t *dst)
 
 /* ---- Frame send ---- */
 
-static void n2k_send_frame(uint32_t can_id, const uint8_t *data, uint8_t dlc)
+static bool n2k_send_frame(uint32_t can_id, const uint8_t *data, uint8_t dlc)
 {
     if (dlc > 8) dlc = 8;
     twai_frame_t *f = tx_claim(data, dlc, 0xFF);   /* see basic_send() */
-    if (!f) { tx_failed(can_id, ESP_ERR_NO_MEM); return; }
+    if (!f) { tx_failed(can_id, ESP_ERR_NO_MEM); return false; }
     f->header = (twai_frame_header_t){ .id = can_id, .dlc = dlc, .ide = 1, .rtr = 0 };
     f->buffer_len = dlc;
     esp_err_t r = twai_node_transmit(s_node, f, 5);
-    if (r != ESP_OK) { tx_release(f); tx_failed(can_id, r); }
+    if (r != ESP_OK) { tx_release(f); tx_failed(can_id, r); return false; }
+    return true;
 }
 
 /* Fast-packet sender: handles messages > 8 bytes. */
@@ -304,11 +333,14 @@ static void n2k_send_fp(uint32_t pgn, uint8_t pri, uint8_t dst,
 
 static void n2k_build_name(uint8_t name[8])
 {
-    /* Use last 21 bits of base MAC as identity number. */
+    /* The low 21 bits of the base MAC as identity number. The OUI and the
+       top bits are what a batch shares; the low bits are what tells chips
+       apart -- Espressif hands each chip a block of four addresses, so
+       neighbours differ in exactly those. An earlier derivation dropped the
+       three lowest bits and gave such neighbours the same NAME. */
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_BASE);
-    uint32_t identity = ((uint32_t)mac[3] << 13) | ((uint32_t)mac[4] << 5) | (mac[5] >> 3);
-    identity &= 0x1FFFFF;
+    uint32_t identity = (((uint32_t)mac[3] << 16) | ((uint32_t)mac[4] << 8) | mac[5]) & 0x1FFFFF;
 
     uint16_t mfr = N2K_MFR_CODE & 0x7FF;
     /* Byte 0-1: identity[15:0] */
@@ -336,15 +368,21 @@ static void n2k_send_address_claim(uint8_t addr)
     n2k_send_frame(id, s_name, 8);
 }
 
+/* PGN 126993 is a single 8-byte frame (canboat: PACKET_SINGLE; the NMEA 2000
+   heartbeat corrigendum): transmit interval in ms, sequence counter, then
+   controller/equipment state bits and reserved. It went out as a 9-byte
+   fast-packet with the interval in 0.01 s, so receivers read the fast-packet
+   header as the interval -- and even unpacked, 100 meant 100 ms, not 1 s. */
 static void n2k_tx_heartbeat(void)
 {
-    uint8_t payload[9];
-    uint16_t rate_cs = 100;           /* 1.00 s in 0.01 s units */
-    payload[0] = rate_cs & 0xFF;
-    payload[1] = (rate_cs >> 8) & 0xFF;
-    payload[2] = s_hb_seq++;
-    memset(payload + 3, 0xFF, 6);     /* reserved / not available */
-    n2k_send_fp(N2K_PGN_HEARTBEAT, 7, N2K_ADDR_GLOBAL, payload, sizeof(payload));
+    uint8_t payload[8];
+    uint16_t interval_ms = N2K_HB_PERIOD_MS;
+    payload[0] = interval_ms & 0xFF;
+    payload[1] = (interval_ms >> 8) & 0xFF;
+    payload[2] = s_hb_seq;
+    s_hb_seq = s_hb_seq >= 252 ? 0 : s_hb_seq + 1;   /* 253..255: reserved, error, n/a */
+    memset(payload + 3, 0xFF, 5);     /* controller/equipment state n/a, reserved */
+    n2k_send_frame(n2k_make_id(N2K_PGN_HEARTBEAT, 7, s_addr, N2K_ADDR_GLOBAL), payload, sizeof(payload));
 }
 
 /* Encode 8 switch states (bitmask) into PGN 127501/127502 data. */
@@ -361,22 +399,22 @@ static void encode_switch_bank(uint8_t data[8], uint8_t instance, uint8_t bitmas
     memset(data + 3, 0xFF, 5);    /* switches 9-28: not available */
 }
 
-static void n2k_tx_di_bank(void)
+static bool n2k_tx_di_bank(void)
 {
     uint8_t bitmask = 0;
     for (int i = 0; i < 8; i++) if (di_get(i)) bitmask |= (uint8_t)(1u << i);
     uint8_t data[8];
     encode_switch_bank(data, N2K_DI_INSTANCE, bitmask);
-    n2k_send_frame(n2k_make_id(N2K_PGN_SW_STATUS, 3, s_addr, N2K_ADDR_GLOBAL), data, 8);
+    return n2k_send_frame(n2k_make_id(N2K_PGN_SW_STATUS, 3, s_addr, N2K_ADDR_GLOBAL), data, 8);
 }
 
 static void n2k_tx_do_bank(void)
 {
-    uint8_t bitmask = 0;
-    bitmask = dout_get_all();
+    uint8_t bitmask = dout_get_all();
     uint8_t data[8];
     encode_switch_bank(data, N2K_DO_INSTANCE, bitmask);
-    n2k_send_frame(n2k_make_id(N2K_PGN_SW_STATUS, 3, s_addr, N2K_ADDR_GLOBAL), data, 8);
+    if (n2k_send_frame(n2k_make_id(N2K_PGN_SW_STATUS, 3, s_addr, N2K_ADDR_GLOBAL), data, 8))
+        { s_last_do = bitmask; s_do_sent = true; }   /* see basic_tx_do() */
 }
 
 /* Proprietary fast-packet for LED or buzzer. */
@@ -415,12 +453,20 @@ static void n2k_handle_rx(const rx_msg_t *m)
         memcpy(&their_name, m->data, 8);
         memcpy(&our_name,   s_name,  8);
 
-        /* ISO 11783-5: the lower NAME wins the address. */
-        if (our_name > their_name) {
+        /* ISO 11783-5: the lower NAME wins the address. An equal NAME has no
+           winner, and two devices that both re-assert never settle; moving is
+           the one way out of that. */
+        if (our_name >= their_name) {
             s_addr++;
             if (s_addr > 251) {
+                /* ISO 11783-5: a node that cannot claim says so once, as an
+                   address claim from the null address, and from then on
+                   sends nothing else. It used to stay on 252 and answer
+                   requests from there. */
+                s_addr     = N2K_ADDR_NULL;
                 s_ac_state = AC_FAILED;
                 ESP_LOGW(TAG, "N2k: no free address left, giving up");
+                n2k_send_address_claim(N2K_ADDR_NULL);
                 return;
             }
             s_ac_state   = AC_CLAIMING;
@@ -445,9 +491,12 @@ static void n2k_handle_rx(const rx_msg_t *m)
         uint32_t requested = (uint32_t)m->data[0]
                            | ((uint32_t)m->data[1] << 8)
                            | ((uint32_t)m->data[2] << 16);
+        /* A claim is answered in any state: from 254 once claiming failed
+           ("cannot claim"). Data only with an address of our own -- not
+           while the claim is still open, and not after it failed. */
         if (requested == N2K_PGN_ADDRESS_CLAIM)
             n2k_send_address_claim(s_addr);
-        else if (requested == N2K_PGN_SW_STATUS) {
+        else if (requested == N2K_PGN_SW_STATUS && s_ac_state == AC_ACTIVE) {
             n2k_tx_di_bank();
             n2k_tx_do_bank();
         }
@@ -478,29 +527,35 @@ static void n2k_handle_rx(const rx_msg_t *m)
                 ESP_LOGW(TAG, "N2k switch control failed: %s", esp_err_to_name(ret));
         }
         n2k_tx_do_bank();
-        scripting_on_can_activity();   /* upstream DO control → CAN command-health feed */
+        command_seen();
         return;
     }
 
     if (pgn == N2K_PGN_PROPRIETARY && m->dlc == 8) {
-        /* Only single-frame fast-packet messages are supported.
-         * LED (3 bytes) and buzzer (4 bytes) both fit in frame 0
-         * (6 payload bytes available). Multi-frame messages are
-         * silently discarded. */
+        /* Only single-frame fast-packet messages are supported. The length
+         * counts the manufacturer code (2), the sub-function (1) and the
+         * arguments: LED 3 -> 6, buzzer 2 or 3 -> 5 or 6. Both fit in frame
+         * 0 (6 payload bytes). Exactly those lengths: a first frame that
+         * announces more (100) is part of a multi-frame message, and its LED
+         * bytes were carried out although the message was never whole. */
         uint8_t fp_frame = m->data[0] & 0x1F;
         if (fp_frame != 0) return;   /* only first frame */
         /* data[1]=total len, data[2]=mfr_lo, data[3]=mfr_hi, data[4]=sub_fn ... */
         uint16_t mfr = (uint16_t)m->data[2] | ((uint16_t)m->data[3] << 8);
-        if (mfr != N2K_MFR_CODE) return;
+        /* manufacturer code (11 bits), reserved (2), industry group (3):
+           a standard stack sends the reserved bits set and industry 4. */
+        if ((mfr & 0x7FF) != N2K_MFR_CODE) return;
         uint8_t sub_fn = m->data[4];
-        if (sub_fn == 0x01 && m->data[1] >= 6) {          /* LED */
+        if (sub_fn == 0x01 && m->data[1] == 6) {          /* LED */
             led_set_rgb(m->data[5], m->data[6], m->data[7]);
-            scripting_on_can_activity();
-        } else if (sub_fn == 0x02 && m->data[1] >= 6) {   /* Buzzer */
+            command_seen();
+        } else if (sub_fn == 0x02 && (m->data[1] == 5 || m->data[1] == 6)) {   /* Buzzer */
+            /* The duration is the third argument, length 6. It was read
+               only from 7 on, so every documented command beeped 200 ms,
+               and one without the duration (length 5) was dropped. */
             uint16_t freq = (uint16_t)m->data[5] | ((uint16_t)m->data[6] << 8);
-            uint32_t dur  = (m->data[1] >= 7) ? (uint32_t)m->data[7] * 10u : 200u;
-            if (freq > 0) buzzer_beep_once(freq, dur);
-            scripting_on_can_activity();
+            uint32_t dur  = (m->data[1] == 6) ? (uint32_t)m->data[7] * 10u : 200u;
+            if (freq > 0) { buzzer_beep_once(freq, dur); command_seen(); }
         }
     }
 }
@@ -540,13 +595,69 @@ static void can_check_bus_off(void)
     if (twai_node_recover(s_node) == ESP_OK) recovering = true;
 }
 
+/* The periodic part of the worker: heartbeat, address-claim timeout, and
+   inputs and outputs sent on change and every tx_interval_ms. Outputs used
+   to go out only after a CAN command or a request: one switched over
+   Modbus, MQTT, a rule or the web page stayed at its old state on the bus. */
+static void can_tick(TickType_t now)
+{
+    /* di_sent as s_do_sent: 0xFF is eight inputs high, not "nothing sent",
+       and with no periodic interval that state was never reported. */
+    static uint8_t    last_di;
+    static bool       di_sent;
+    static TickType_t last_hb  = 0;
+    static TickType_t last_per = 0;
+    /* At least one tick: at 100 Hz, 1..9 ms is 0 ticks, and every pass of
+       the loop -- one per received frame -- sent the inputs again. */
+    const uint16_t   interval = app_config_get()->can.tx_interval_ms;
+    const TickType_t period   = interval == 0 ? 0
+                              : (pdMS_TO_TICKS(interval) ? pdMS_TO_TICKS(interval) : 1);
+
+    uint8_t di = 0;
+    for (int i = 0; i < 8; i++) if (di_get(i)) di |= (uint8_t)(1u << i);
+    bool due = period && (now - last_per) >= period;
+
+    /* ---- Basic mode ---- */
+    if (s_mode == CAN_MODE_BASIC) {
+        if ((now - last_hb) >= pdMS_TO_TICKS(HB_PERIOD_MS)) {
+            basic_tx_heartbeat(); last_hb = now;
+        }
+        /* A report the driver did not take stays due: last_di and
+           s_last_do move only with a frame that went out, so the next tick
+           tries again (every TX_POLL_MS; tx_failed() keeps the log quiet). */
+        if ((!di_sent || di != last_di || due) && basic_tx_di(di)) { last_di = di; di_sent = true; }
+        if (!s_do_sent || dout_get_all() != s_last_do || due) basic_tx_do();
+        if (due) last_per = now;
+    }
+
+    /* ---- NMEA2000 mode ---- */
+    if (s_mode == CAN_MODE_N2K) {
+        /* Address claiming */
+        if (s_ac_state == AC_CLAIMING &&
+            (now - s_claim_tick) >= pdMS_TO_TICKS(250)) {
+            s_ac_state = AC_ACTIVE;
+            ESP_LOGI(TAG, "N2k address %u claimed", s_addr);
+            n2k_tx_heartbeat();
+            bool sent = n2k_tx_di_bank();
+            n2k_tx_do_bank();
+            if (sent) { last_di = di; di_sent = true; }
+            last_hb = last_per = now;
+            due = false;
+        }
+
+        if (s_ac_state == AC_ACTIVE) {
+            if ((now - last_hb) >= pdMS_TO_TICKS(N2K_HB_PERIOD_MS)) {
+                n2k_tx_heartbeat(); last_hb = now;
+            }
+            if ((!di_sent || di != last_di || due) && n2k_tx_di_bank()) { last_di = di; di_sent = true; }
+            if (!s_do_sent || dout_get_all() != s_last_do || due) n2k_tx_do_bank();
+            if (due) last_per = now;
+        }
+    }
+}
+
 static void can_worker_task(void *arg)
 {
-    uint8_t    last_di  = 0xFF;
-    TickType_t last_hb  = 0;
-    TickType_t last_per = 0;
-    uint16_t   interval = app_config_get()->can.tx_interval_ms;
-
     for (;;) {
         rx_msg_t m;
         if (xQueueReceive(s_rx_q, &m, pdMS_TO_TICKS(TX_POLL_MS)) == pdTRUE) {
@@ -555,53 +666,21 @@ static void can_worker_task(void *arg)
         }
 
         can_check_bus_off();
-
-        TickType_t now = xTaskGetTickCount();
-
-        /* ---- Basic mode ---- */
-        if (s_mode == CAN_MODE_BASIC) {
-            if ((now - last_hb) >= pdMS_TO_TICKS(HB_PERIOD_MS)) {
-                basic_tx_heartbeat(); last_hb = now;
-            }
-            uint8_t di = 0;
-            for (int i = 0; i < 8; i++) if (di_get(i)) di |= (uint8_t)(1u << i);
-            if (di != last_di) { basic_tx_di(di); last_di = di; }
-            if (interval > 0 && (now - last_per) >= pdMS_TO_TICKS(interval)) {
-                basic_tx_di(di); last_per = now;
-            }
-        }
-
-        /* ---- NMEA2000 mode ---- */
-        if (s_mode == CAN_MODE_N2K) {
-            /* Address claiming */
-            if (s_ac_state == AC_CLAIMING &&
-                (now - s_claim_tick) >= pdMS_TO_TICKS(250)) {
-                s_ac_state = AC_ACTIVE;
-                ESP_LOGI(TAG, "N2k address %u claimed", s_addr);
-                n2k_tx_heartbeat(); n2k_tx_di_bank(); n2k_tx_do_bank();
-                last_hb = last_per = now;
-            }
-
-            if (s_ac_state == AC_ACTIVE) {
-                if ((now - last_hb) >= pdMS_TO_TICKS(HB_PERIOD_MS)) {
-                    n2k_tx_heartbeat(); last_hb = now;
-                }
-                uint8_t di = 0;
-                for (int i = 0; i < 8; i++) if (di_get(i)) di |= (uint8_t)(1u << i);
-                if (di != last_di) { n2k_tx_di_bank(); last_di = di; }
-                if (interval > 0 && (now - last_per) >= pdMS_TO_TICKS(interval)) {
-                    n2k_tx_di_bank(); last_per = now;
-                }
-            }
-        }
+        can_tick(xTaskGetTickCount());
     }
 }
 
 /* ================================================================ public */
 
-esp_err_t can_server_init(void)
+bool can_server_running(void)
+{
+    return s_node != NULL;
+}
+
+esp_err_t can_server_init(const can_server_hooks_t *hooks)
 {
     const app_config_t *cfg = app_config_get();
+    if (hooks) s_hooks = *hooks;
     s_mode = cfg->can.mode;
     if (s_mode == 0) { ESP_LOGI(TAG, "CAN disabled"); return ESP_OK; }
 
@@ -622,13 +701,26 @@ esp_err_t can_server_init(void)
            sender here looks at the return value to notice. */
         .fail_retry_cnt         = -1,
     };
+    /* Before the node: the receive callback posts here from the ISR, and a
+       NULL queue would have been found by the first frame on the bus. */
+    if (!s_rx_q) s_rx_q = xQueueCreate(RX_QUEUE_DEPTH, sizeof(rx_msg_t));
+    ESP_RETURN_ON_FALSE(s_rx_q, ESP_ERR_NO_MEM, TAG, "rx queue");
     ESP_RETURN_ON_ERROR(twai_new_node_onchip(&node_cfg, &s_node), TAG, "new node");
 
-    s_rx_q = xQueueCreate(RX_QUEUE_DEPTH, sizeof(rx_msg_t));
+    /* From here on a failure deletes the node again: left behind, it held
+       the controller and its pins, and an enabled node with no worker task
+       to empty the queue answered nothing. */
+    esp_err_t err;
+    const char *step;
     twai_event_callbacks_t cbs = { .on_rx_done = rx_done_cb, .on_tx_done = tx_done_cb };
-    ESP_RETURN_ON_ERROR(twai_node_register_event_callbacks(s_node, &cbs, NULL),
-                        TAG, "register cbs");
-    ESP_RETURN_ON_ERROR(twai_node_enable(s_node), TAG, "enable");
+    if ((err = twai_node_register_event_callbacks(s_node, &cbs, NULL)) != ESP_OK) {
+        step = "register cbs";
+        goto fail;
+    }
+    if ((err = twai_node_enable(s_node)) != ESP_OK) {
+        step = "enable";
+        goto fail;
+    }
 
     if (s_mode == CAN_MODE_BASIC) {
         s_base = cfg->can.base_id;
@@ -642,6 +734,21 @@ esp_err_t can_server_init(void)
         ESP_LOGI(TAG, "N2k mode — preferred addr=0x%02x mfr=0x%03x", s_addr, N2K_MFR_CODE);
     }
 
-    xTaskCreate(can_worker_task, "can", 4096, NULL, 5, NULL);
+    /* The worker touches neither the flash nor an ISR path, so its stack can
+       live in PSRAM where the firmware is short of internal RAM. */
+    BaseType_t ok = s_hooks.psram_stack
+        ? xTaskCreateWithCaps(can_worker_task, "can", 4096, NULL, 5, NULL, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+        : xTaskCreate(can_worker_task, "can", 4096, NULL, 5, NULL);
+    if (ok != pdPASS) {
+        err = ESP_ERR_NO_MEM; step = "worker task";
+        twai_node_disable(s_node);
+        goto fail;
+    }
     return ESP_OK;
+
+fail:
+    ESP_LOGE(TAG, "%s: %s", step, esp_err_to_name(err));
+    twai_node_delete(s_node);
+    s_node = NULL;
+    return err;
 }

@@ -2,38 +2,82 @@
 #include "quickjs.h"
 #include <esp_log.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
 
 #define TAG "js"
+
+static int do_count(JSContext *ctx)
+{
+    const scripting_io_t *io = scripting_io_of(ctx);
+    return (io && io->do_count) ? io->do_count : 8;
+}
+
+static int di_count(JSContext *ctx)
+{
+    const scripting_io_t *io = scripting_io_of(ctx);
+    return (io && io->di_count) ? io->di_count : 8;
+}
+
+/* A whole number in [lo, hi], checked as the double it arrives as: JS_ToInt32
+   wraps modulo 2^32, so output(4294967296) drove DO1 and 7.9 was DO8.
+   Throws RangeError(msg) otherwise. */
+static int int_arg(JSContext *ctx, JSValue v, int32_t lo, int32_t hi, const char *msg, int32_t *out)
+{
+    double d;
+    if (JS_ToFloat64(ctx, &d, v) < 0) return -1;
+    if (!(d >= lo && d <= hi) || d != (double)(int32_t)d) {
+        JS_ThrowRangeError(ctx, "%s", msg);
+        return -1;
+    }
+    *out = (int32_t)d;
+    return 0;
+}
+
+static int chan_arg(JSContext *ctx, JSValue v, int count, const char *what, int32_t *ch)
+{
+    char msg[40];
+    snprintf(msg, sizeof(msg), "%s channel must be 0-%d", what, count - 1);
+    return int_arg(ctx, v, 0, count - 1, msg, ch);
+}
 
 static JSValue js_di_get(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
 {
     int32_t ch;
-    if (JS_ToInt32(ctx, &ch, argv[0]) < 0) return JS_EXCEPTION;
-    if (ch < 0 || ch > 7)
-        return JS_ThrowRangeError(ctx, "input channel must be 0-7");
-    return JS_NewBool(ctx, g_scripting_io->di_get((uint8_t)ch));
+    if (chan_arg(ctx, argv[0], di_count(ctx), "input", &ch) < 0) return JS_EXCEPTION;
+    return JS_NewBool(ctx, scripting_io_of(ctx)->di_get((uint8_t)ch));
 }
 
 static JSValue js_dout_set(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
 {
     int32_t ch;
-    if (JS_ToInt32(ctx, &ch, argv[0]) < 0) return JS_EXCEPTION;
-    if (ch < 0 || ch > 7)
-        return JS_ThrowRangeError(ctx, "output channel must be 0-7");
+    if (chan_arg(ctx, argv[0], do_count(ctx), "output", &ch) < 0) return JS_EXCEPTION;
     bool state = JS_ToBool(ctx, argv[1]);
-    esp_err_t err = g_scripting_io->dout_set((uint8_t)ch, state);
+    esp_err_t err = scripting_io_of(ctx)->dout_set((uint8_t)ch, state);
+    if (err == ESP_ERR_INVALID_STATE)
+        return JS_ThrowInternalError(ctx, "output %d is a header pad that is not set to output", (int)ch);
     if (err != ESP_OK)
         return JS_ThrowInternalError(ctx, "dout_set failed: %d", (int)err);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_dout_toggle(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
+{
+    int32_t ch;
+    if (chan_arg(ctx, argv[0], do_count(ctx), "output", &ch) < 0) return JS_EXCEPTION;
+    esp_err_t err = scripting_io_of(ctx)->dout_toggle((uint8_t)ch);
+    if (err == ESP_ERR_INVALID_STATE)
+        return JS_ThrowInternalError(ctx, "output %d is a header pad that is not set to output", (int)ch);
+    if (err != ESP_OK)
+        return JS_ThrowInternalError(ctx, "dout_toggle failed: %d", (int)err);
     return JS_UNDEFINED;
 }
 
 static JSValue js_dout_get(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
 {
     int32_t ch;
-    if (JS_ToInt32(ctx, &ch, argv[0]) < 0) return JS_EXCEPTION;
-    if (ch < 0 || ch > 7)
-        return JS_ThrowRangeError(ctx, "output channel must be 0-7");
-    return JS_NewBool(ctx, g_scripting_io->dout_get((uint8_t)ch));
+    if (chan_arg(ctx, argv[0], do_count(ctx), "output", &ch) < 0) return JS_EXCEPTION;
+    return JS_NewBool(ctx, scripting_io_of(ctx)->dout_get((uint8_t)ch));
 }
 
 static JSValue js_print(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
@@ -61,30 +105,36 @@ static bool to_u8(JSContext *ctx, JSValue v, uint8_t *out)
 
 static JSValue js_led_set(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
 {
-    if (!g_scripting_io->led_set) return JS_UNDEFINED;
+    if (!scripting_io_of(ctx)->led_set) return JS_UNDEFINED;
     uint8_t r, g, b;
     if (!to_u8(ctx, argv[0], &r) || !to_u8(ctx, argv[1], &g) || !to_u8(ctx, argv[2], &b))
         return JS_EXCEPTION;
-    g_scripting_io->led_set(r, g, b);
+    scripting_io_of(ctx)->led_set(r, g, b);
     return JS_UNDEFINED;
 }
 
 static JSValue js_buzzer_set(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
 {
-    if (!g_scripting_io->buzzer_set) return JS_UNDEFINED;
+    if (!scripting_io_of(ctx)->buzzer_set) return JS_UNDEFINED;
     int32_t freq = 0;
     if (JS_ToInt32(ctx, &freq, argv[0]) < 0) return JS_EXCEPTION;
     if (freq < 0) freq = 0;
-    g_scripting_io->buzzer_set((uint32_t)freq);
+    scripting_io_of(ctx)->buzzer_set((uint32_t)freq);
     return JS_UNDEFINED;
 }
 
 static JSValue js_mqtt_publish(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
 {
-    if (!g_scripting_io->mqtt_publish) return JS_NewInt32(ctx, -1);
+    if (!scripting_io_of(ctx)->mqtt_publish) return JS_NewInt32(ctx, -1);
 
     const char *topic = JS_ToCString(ctx, argv[0]);
     if (!topic) return JS_EXCEPTION;
+    /* Said to the script, not just a -1: the broker would drop the
+       connection over it (MQTT 3.1.1, 3.3.2.1). */
+    if (!topic[0] || strpbrk(topic, "+#")) {
+        JS_FreeCString(ctx, topic);
+        return JS_ThrowRangeError(ctx, "publish topic must not be empty or contain + or #");
+    }
 
     /* ToCStringLen, not strlen: a payload containing a NUL would otherwise be
        cut off there. */
@@ -105,11 +155,55 @@ static JSValue js_mqtt_publish(JSContext *ctx, JSValue this_val, int argc, JSVal
     if (argc > 3 && !JS_IsUndefined(argv[3]))
         retain = (bool)JS_ToBool(ctx, argv[3]);
 
-    int msg_id = g_scripting_io->mqtt_publish(topic, payload, (int)payload_len,
+    int msg_id = scripting_io_of(ctx)->mqtt_publish(topic, payload, (int)payload_len,
                                               (int)qos, retain);
     JS_FreeCString(ctx, topic);
     JS_FreeCString(ctx, payload);
     return JS_NewInt32(ctx, msg_id);
+}
+
+/* _aux_pwm_set(pad, duty%, freq) -- pad 1..3; freq undefined or 0 keeps it.
+   The ranges are aux_io.h's AUX_PWM_*; this component cannot include it. */
+static JSValue js_aux_pwm_set(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
+{
+    if (!scripting_io_of(ctx)->aux_pwm_set) return JS_ThrowInternalError(ctx, "no PWM pads on this board");
+    int32_t pad;
+    double duty, freq = 0;
+    if (int_arg(ctx, argv[0], 1, 3, "pad must be 1, 2 or 3", &pad) < 0) return JS_EXCEPTION;
+    if (JS_ToFloat64(ctx, &duty, argv[1]) < 0) return JS_EXCEPTION;
+    if (argc > 2 && !JS_IsUndefined(argv[2]) && JS_ToFloat64(ctx, &freq, argv[2]) < 0) return JS_EXCEPTION;
+    if (!(duty >= 0.0 && duty <= 100.0)) return JS_ThrowRangeError(ctx, "pwm duty must be 0-100 (%%)");
+    if (freq != 0 && (!(freq >= 5 && freq <= 1000000) || freq != (double)(uint32_t)freq))
+        return JS_ThrowRangeError(ctx, "pwm freq must be a whole number of Hz from 5 to 1000000");
+    esp_err_t err = scripting_io_of(ctx)->aux_pwm_set((uint8_t)pad, (uint32_t)freq, (uint16_t)(duty * 10.0 + 0.5));
+    if (err == ESP_ERR_INVALID_STATE)
+        return JS_ThrowInternalError(ctx, "pad %d is not set to PWM output", (int)pad);
+    if (err != ESP_OK) return JS_ThrowInternalError(ctx, "pwm set failed: %d", (int)err);
+    return JS_UNDEFINED;
+}
+
+/* _aux_pwm_get(pad) -> {duty, freq} or null when the pad is not a PWM output. */
+static JSValue js_aux_pwm_get(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
+{
+    int32_t pad;
+    if (int_arg(ctx, argv[0], 1, 3, "pad must be 1, 2 or 3", &pad) < 0) return JS_EXCEPTION;
+    uint32_t f; uint16_t d;
+    if (!scripting_io_of(ctx)->aux_pwm_get || !scripting_io_of(ctx)->aux_pwm_get((uint8_t)pad, &f, &d)) return JS_NULL;
+    JSValue o = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, o, "duty", JS_NewFloat64(ctx, d / 10.0));
+    JS_SetPropertyStr(ctx, o, "freq", JS_NewInt64(ctx, f));
+    return o;
+}
+
+/* _aux_analog_get(pad) -> millivolts, or null when the pad is not analog. */
+static JSValue js_aux_analog_get(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
+{
+    int32_t pad;
+    if (int_arg(ctx, argv[0], 1, 3, "pad must be 1, 2 or 3", &pad) < 0) return JS_EXCEPTION;
+    int mv;
+    if (!scripting_io_of(ctx)->aux_analog_get || scripting_io_of(ctx)->aux_analog_get((uint8_t)pad, &mv) != ESP_OK)
+        return JS_NULL;
+    return JS_NewInt32(ctx, mv);
 }
 
 void scripting_register_bindings(JSContext *ctx)
@@ -118,6 +212,10 @@ void scripting_register_bindings(JSContext *ctx)
     JS_SetPropertyStr(ctx, g, "_di_get",       JS_NewCFunction(ctx, js_di_get,       "_di_get",       1));
     JS_SetPropertyStr(ctx, g, "_dout_set",     JS_NewCFunction(ctx, js_dout_set,     "_dout_set",     2));
     JS_SetPropertyStr(ctx, g, "_dout_get",     JS_NewCFunction(ctx, js_dout_get,     "_dout_get",     1));
+    JS_SetPropertyStr(ctx, g, "_dout_toggle",  JS_NewCFunction(ctx, js_dout_toggle,  "_dout_toggle",  1));
+    JS_SetPropertyStr(ctx, g, "_aux_pwm_set",  JS_NewCFunction(ctx, js_aux_pwm_set,  "_aux_pwm_set",  3));
+    JS_SetPropertyStr(ctx, g, "_aux_pwm_get",  JS_NewCFunction(ctx, js_aux_pwm_get,  "_aux_pwm_get",  1));
+    JS_SetPropertyStr(ctx, g, "_aux_analog_get", JS_NewCFunction(ctx, js_aux_analog_get, "_aux_analog_get", 1));
     JS_SetPropertyStr(ctx, g, "_led_set",      JS_NewCFunction(ctx, js_led_set,      "_led_set",      3));
     JS_SetPropertyStr(ctx, g, "_buzzer_set",   JS_NewCFunction(ctx, js_buzzer_set,   "_buzzer_set",   1));
     JS_SetPropertyStr(ctx, g, "_mqtt_publish", JS_NewCFunction(ctx, js_mqtt_publish, "_mqtt_publish", 4));

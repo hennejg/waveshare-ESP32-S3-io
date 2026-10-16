@@ -6,6 +6,10 @@ int  app_mqtt_publish(const char *topic, const char *payload, int len, int qos, 
 int  app_mqtt_subscribe(const char *topic, int qos);
 bool app_mqtt_is_connected(void);
 #include "cJSON.h"
+#include "json_exact.h"
+#endif
+#ifdef CONFIG_APP_MATTER_ENABLE
+#include "matter.h"
 #endif
 
 #include <string.h>
@@ -16,9 +20,11 @@ bool app_mqtt_is_connected(void);
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "i2c_bus.h"
 
 #define TAG          "dout"
+#define BULK_PAYLOAD_MAX 256   /* output/set payloads at or above this are ignored */
 #define NUM_DO       8
 #define TCA9554_ADDR 0x20
 
@@ -29,6 +35,14 @@ bool app_mqtt_is_connected(void);
 static i2c_master_bus_handle_t s_bus = NULL;
 static i2c_master_dev_handle_t s_dev = NULL;
 static bool                    s_state[NUM_DO];  /* logical state */
+/* The same state as one byte, bit n = output n, stored only once the expander
+   has taken it (or refused it, in which case it is what it was). Readers take
+   this without the lock: dout_modify() holds the lock across the I2C write,
+   with its 10 ms timeout and a bus-recovery retry, and the Modbus TCP poller
+   reads the coils on the task that owns every connection -- it must not wait
+   on a stuck bus. A byte store is atomic here, and a reader sees either the
+   state before a change or the state after it, never the hope in between. */
+static volatile uint8_t        s_port;
 
 /* Guards s_state[] together with the TCA9554 write it feeds. Setting one
    output is a read-modify-write of the whole port byte, and it is driven from
@@ -52,13 +66,15 @@ static inline void dout_unlock(void)
 
 /* ------------------------------------------------------------------ helpers */
 
-#ifdef CONFIG_APP_MQTT_ENABLE
 /* Accepted on-payloads: true 1 high on   (case-insensitive)
-   Accepted off-payloads: false 0 low off */
-static bool parse_payload(const char *data, size_t len, bool *out)
+   Accepted off-payloads: false 0 low off
+   The whole payload is the word: a NUL byte in it is refused. Copied and
+   compared as C strings, "on\0off" read as "on" -- six bytes that say
+   something else switched the output. */
+bool dout_parse_state(const char *data, size_t len, bool *out)
 {
     char buf[8];
-    if (len == 0 || len >= sizeof(buf)) return false;
+    if (len == 0 || len >= sizeof(buf) || memchr(data, '\0', len)) return false;
     memcpy(buf, data, len);
     buf[len] = '\0';
     for (size_t i = 0; i < len; i++) buf[i] = (char)tolower((unsigned char)buf[i]);
@@ -70,16 +86,17 @@ static bool parse_payload(const char *data, size_t len, bool *out)
     return false;
 }
 
-static bool parse_toggle(const char *data, size_t len)
+bool dout_parse_toggle(const char *data, size_t len)
 {
     char buf[8];
-    if (len == 0 || len >= sizeof(buf)) return false;
+    if (len == 0 || len >= sizeof(buf) || memchr(data, '\0', len)) return false;   /* see above */
     memcpy(buf, data, len);
     buf[len] = '\0';
     for (size_t i = 0; i < len; i++) buf[i] = (char)tolower((unsigned char)buf[i]);
     return !strcmp(buf, "toggle");
 }
 
+#ifdef CONFIG_APP_MQTT_ENABLE
 /* Apply a single cJSON item (bool / number / string) to output n.
    Strings use the same vocabulary as individual output commands. */
 /* Collect what one array element asks for into the masks, rather than editing
@@ -97,23 +114,27 @@ static void apply_json_item(cJSON *item, uint8_t n,
         const char *s = item->valuestring;
         size_t slen   = strlen(s);
         bool state;
-        if (parse_toggle(s, slen))               *toggle |= bit;
-        else if (parse_payload(s, slen, &state)) { if (state) *set |= bit; else *clear |= bit; }
+        if (dout_parse_toggle(s, slen))               *toggle |= bit;
+        else if (dout_parse_state(s, slen, &state)) { if (state) *set |= bit; else *clear |= bit; }
     }
 }
 #endif /* CONFIG_APP_MQTT_ENABLE */
 
 /* i2c_master_transmit wrapper: on ESP_ERR_INVALID_STATE (bus stuck) clocks
  * 9 SCL pulses to release SDA and retries once.  Handles both a mid-reset
- * stuck bus and the TCA9554 power-on edge case on a never-flashed device. */
+ * stuck bus and the TCA9554 power-on edge case on a never-flashed device.
+ * Under the bus lock: the reset is not serialised by the driver and would
+ * cut into an RTC transfer under way on another task. */
 static esp_err_t i2c_transmit_safe(const uint8_t *buf, size_t len)
 {
+    i2c_bus_lock();
     esp_err_t ret = i2c_master_transmit(s_dev, buf, len, 10);
     if (ret == ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG, "I2C bus stuck — recovering");
         i2c_master_bus_reset(s_bus);
         ret = i2c_master_transmit(s_dev, buf, len, 10);
     }
+    i2c_bus_unlock();
     return ret;
 }
 
@@ -132,13 +153,47 @@ static esp_err_t write_outputs(void)
 }
 
 #ifdef CONFIG_APP_MQTT_ENABLE
+/* Only confirmed states are published, and only by one task.
+
+   s_state[] is the working copy dout_modify() changes before the I2C
+   transfer and puts back when it fails; read from there, a publish could
+   announce a state the relays never reached and that no later publish
+   corrected. s_port holds what the expander confirmed. And publishing
+   happens on a task of its own rather than in the caller: under the output
+   lock it would deadlock against the MQTT task, which calls in here while
+   holding its client's lock, and outside it two callers could publish their
+   states in the opposite order of the writes. The one publisher reads the
+   current confirmed state whenever it runs, so the last thing it publishes is
+   the last thing the relays did. */
+static TaskHandle_t     s_pub_task;
+static volatile uint8_t s_pub_dirty;      /* bit n: publish output n */
+
 static void publish_one(uint8_t n)
 {
     const char *name = app_config_get()->dout[n].name;
     char topic[32];
     if (name[0]) snprintf(topic, sizeof(topic), "output/%.20s",   name);
     else         snprintf(topic, sizeof(topic), "output/%u",    n + 1);
-    app_mqtt_publish(topic, s_state[n] ? "true" : "false", -1, 0, false);
+    app_mqtt_publish(topic, ((s_port >> n) & 1u) ? "true" : "false", -1, 0, false);
+}
+
+static void mark_publish(uint8_t mask)
+{
+    if (!mask) return;
+    __atomic_fetch_or(&s_pub_dirty, mask, __ATOMIC_RELAXED);
+    if (s_pub_task) xTaskNotifyGive(s_pub_task);
+}
+
+static void publish_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        uint8_t dirty = __atomic_exchange_n(&s_pub_dirty, 0, __ATOMIC_RELAXED);
+        if (!app_mqtt_is_connected()) continue;   /* reconnect publishes all */
+        for (uint8_t i = 0; i < NUM_DO; i++)
+            if (dirty & (1u << i)) publish_one(i);
+    }
 }
 #endif
 
@@ -161,28 +216,37 @@ esp_err_t dout_init(void)
     ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(s_bus, &dev_cfg, &s_dev),
                         TAG, "TCA9554 device add");
 
-    /* Configure all 8 pins as outputs, then drive them all off.
+    /* Load the output register BEFORE enabling the drivers. It powers up as
+     * 0xFF, so configuring the pins as outputs first drove every one of them
+     * high for the length of one I2C frame, at every power-on. A write to the
+     * output register has no effect while the pins are still inputs, which is
+     * what makes this order safe. The expander has no reset pin and keeps its
+     * registers across an ESP reset, so only a power-on has this window.
      * i2c_transmit_safe recovers from a stuck bus on either write. */
+    ESP_RETURN_ON_ERROR(write_outputs(), TAG, "initial write");
     uint8_t cfg_cmd[2] = {REG_CONFIG, 0x00};
     ESP_RETURN_ON_ERROR(i2c_transmit_safe(cfg_cmd, sizeof(cfg_cmd)), TAG, "TCA9554 config");
-    ESP_RETURN_ON_ERROR(write_outputs(), TAG, "initial write");
 
+#ifdef CONFIG_APP_MQTT_ENABLE
+    /* The publish runs the MQTT transport write on this stack. Measured on
+       the board with an mqtts:// broker under load: about 2 kB used, 1 kB of
+       3072 left -- 4096 leaves room for the error paths' logging too. The
+       broker's "stack_free" in the health message shows it. */
+    if (!s_pub_task && xTaskCreate(publish_task, "dout_pub", 4096, NULL, 4, &s_pub_task) != pdPASS)
+        ESP_LOGE(TAG, "publish task: out of memory -- output states are not published");
+#endif
     ESP_LOGI(TAG, "Initialized %d outputs via TCA9554 (I2C addr 0x%02X)", NUM_DO, TCA9554_ADDR);
     return ESP_OK;
 }
 
 bool dout_get(uint8_t n)
 {
-    return (n < NUM_DO) ? s_state[n] : false;
+    return (n < NUM_DO) ? ((s_port >> n) & 1u) != 0 : false;
 }
 
 uint8_t dout_get_all(void)
 {
-    uint8_t v = 0;
-    dout_lock();
-    for (uint8_t i = 0; i < NUM_DO; i++) if (s_state[i]) v |= (uint8_t)(1u << i);
-    dout_unlock();
-    return v;
+    return s_port;          /* lock-free, see s_port */
 }
 
 esp_err_t dout_modify(uint8_t set, uint8_t clear, uint8_t toggle)
@@ -206,15 +270,18 @@ esp_err_t dout_modify(uint8_t set, uint8_t clear, uint8_t toggle)
         ESP_LOGW(TAG, "outputs: write failed (%s), nothing changed",
                  esp_err_to_name(ret));
     }
+    s_port = after;         /* what the relays are now doing, in one store */
     dout_unlock();
 
-    /* Only publish channels that actually moved — avoids an echo loop from our
-       own confirmations coming back off the broker. */
+    /* Only channels that actually moved, as confirmed -- avoids an echo loop
+       from our own confirmations coming back off the broker. */
 #ifdef CONFIG_APP_MQTT_ENABLE
-    uint8_t changed = (uint8_t)(before ^ after);
-    if (changed && app_mqtt_is_connected())
-        for (uint8_t i = 0; i < NUM_DO; i++)
-            if (changed & (1u << i)) publish_one(i);
+    mark_publish((uint8_t)(before ^ after));
+#endif
+#ifdef CONFIG_APP_MATTER_ENABLE
+    /* Whoever switched it -- Modbus, CAN, the web page or Matter itself --
+       the controllers hear of it. */
+    matter_do_changed((uint8_t)(before ^ after));
 #endif
     return ret;
 }
@@ -226,15 +293,29 @@ esp_err_t dout_set(uint8_t n, bool state)
     return dout_modify(state ? bit : 0u, state ? 0u : bit, 0u);
 }
 
+esp_err_t dout_toggle(uint8_t n)
+{
+    if (n >= NUM_DO) return ESP_ERR_INVALID_ARG;
+    return dout_modify(0u, 0u, (uint8_t)(1u << n));
+}
+
 esp_err_t dout_publish_all(void)
 {
-    dout_lock();
-    esp_err_t ret = write_outputs();   /* re-apply — picks up invert changes */
-    dout_unlock();
+    /* Re-apply -- picks up invert changes. A transient I2C error used to
+       leave the relays on the old invert until some unrelated output change
+       happened to write the byte again, flipping channels nobody touched. */
+    esp_err_t ret = ESP_FAIL;
+    for (int i = 0; i < 3 && ret != ESP_OK; i++) {
+        if (i) vTaskDelay(pdMS_TO_TICKS(20));
+        dout_lock();
+        ret = write_outputs();
+        dout_unlock();
+    }
     if (ret != ESP_OK)
-        ESP_LOGW(TAG, "outputs: re-apply failed (%s)", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "outputs: re-apply failed three times (%s) -- relays still on the old invert setting",
+                 esp_err_to_name(ret));
 #ifdef CONFIG_APP_MQTT_ENABLE
-    for (uint8_t i = 0; i < NUM_DO; i++) publish_one(i);
+    mark_publish(0xFFu);
 #endif
     return ret;
 }
@@ -260,19 +341,21 @@ void dout_on_mqtt_message(const char *topic, size_t tlen,
                            const char *data,  size_t dlen)
 {
 #ifdef CONFIG_APP_MQTT_ENABLE
-    /* Match suffix "output/set" — bulk set all outputs at once.
+    /* The topic arrives relative, without the prefix (app_mqtt strips it),
+       and is compared whole: a suffix match used to let "rules/output/set"
+       -- delivered through the rule engine's "rules/#" subscription -- pass
+       for the bulk command and switch every output.
+
+       "output/set" — bulk set all outputs at once.
        Single value: apply same state/toggle to every output.
        JSON array:   apply each element to the corresponding output (1-indexed). */
-    static const char BULK_SUFFIX[] = "output/set";
-    const size_t bs = sizeof(BULK_SUFFIX) - 1;
-    if (tlen >= bs && memcmp(topic + tlen - bs, BULK_SUFFIX, bs) == 0) {
-        char buf[256];
-        if (dlen == 0 || dlen >= sizeof(buf)) return;
-        memcpy(buf, data, dlen);
-        buf[dlen] = '\0';
+    static const char BULK_TOPIC[] = "output/set";
+    const size_t bs = sizeof(BULK_TOPIC) - 1;
+    if (tlen == bs && memcmp(topic, BULK_TOPIC, bs) == 0) {
+        if (dlen == 0 || dlen >= BULK_PAYLOAD_MAX) return;
 
-        if (buf[0] == '[') {
-            cJSON *arr = cJSON_Parse(buf);
+        if (data[0] == '[') {
+            cJSON *arr = json_parse_exact(data, dlen);   /* in place, no stack copy */
             if (!cJSON_IsArray(arr)) {
                 ESP_LOGW(TAG, "output/set: invalid JSON array");
                 cJSON_Delete(arr);
@@ -288,9 +371,9 @@ void dout_on_mqtt_message(const char *topic, size_t tlen,
             dout_modify(set, clear, toggle);
         } else {
             bool state;
-            if (parse_toggle(data, dlen)) {
+            if (dout_parse_toggle(data, dlen)) {
                 dout_modify(0u, 0u, 0xFFu);
-            } else if (parse_payload(data, dlen, &state)) {
+            } else if (dout_parse_state(data, dlen, &state)) {
                 dout_modify(state ? 0xFFu : 0u, state ? 0u : 0xFFu, 0u);
             } else {
                 ESP_LOGW(TAG, "output/set: unrecognised payload");
@@ -300,10 +383,9 @@ void dout_on_mqtt_message(const char *topic, size_t tlen,
         return;   /* dout_modify() publishes the channels that moved */
     }
 
-    /* Match suffix "output/read" */
-    static const char READ_SUFFIX[] = "output/read";
-    const size_t rs = sizeof(READ_SUFFIX) - 1;
-    if (tlen >= rs && memcmp(topic + tlen - rs, READ_SUFFIX, rs) == 0) {
+    static const char READ_TOPIC[] = "output/read";
+    const size_t rs = sizeof(READ_TOPIC) - 1;
+    if (tlen == rs && memcmp(topic, READ_TOPIC, rs) == 0) {
         dout_publish_all();
         return;
     }
@@ -317,10 +399,10 @@ void dout_on_mqtt_message(const char *topic, size_t tlen,
             if (name[0]) snprintf(cmd, sizeof(cmd), "output/%.20s/set",   name);
             else         snprintf(cmd, sizeof(cmd), "output/%u/set",    i + 1);
             size_t clen = strlen(cmd);
-            if (tlen >= clen && memcmp(topic + tlen - clen, cmd, clen) == 0) {
+            if (tlen == clen && memcmp(topic, cmd, clen) == 0) {
                 bool state;
-                if (parse_toggle(data, dlen))              dout_set(i, !dout_get(i));
-                else if (parse_payload(data, dlen, &state)) dout_set(i, state);
+                if (dout_parse_toggle(data, dlen))              dout_toggle(i);
+                else if (dout_parse_state(data, dlen, &state)) dout_set(i, state);
                 else ESP_LOGW(TAG, "Unrecognised payload for %s", cmd);
                 return;
             }

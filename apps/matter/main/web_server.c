@@ -1,6 +1,16 @@
 #include "web_server.h"
 #include "app_config.h"
 #include "auth.h"
+#include "web_common.h"
+#include "json_exact.h"
+#include "net_budget.h"
+#include "mb_server.h"
+#include "mb_status_json.h"
+#include "can_server.h"
+#include "matter_mbm.h"
+#include "app_time.h"
+#include "aux_io.h"
+#include "sntp_sync.h"
 #include "di.h"
 #include "dout.h"
 #include "led.h"
@@ -13,6 +23,7 @@
 #include <lwip/sockets.h>
 
 #include <esp_app_desc.h>
+#include <esp_heap_caps.h>
 #include <esp_http_server.h>
 #include <esp_log.h>
 #include <esp_system.h>
@@ -20,7 +31,6 @@
 #include <nvs_flash.h>
 #include <nvs.h>
 #include "cJSON.h"
-#include "mbedtls/base64.h"
 
 #define TAG        "web_server"
 #define WWW_BASE   "/www"
@@ -31,21 +41,7 @@ static httpd_handle_t s_server = NULL;
 
 /* ------------------------------------------------------------------ helpers */
 
-static const char *mime_type(const char *path)
-{
-    const char *ext = strrchr(path, '.');
-    if (!ext) return "application/octet-stream";
-    if (!strcmp(ext, ".html")) return "text/html";
-    if (!strcmp(ext, ".js"))   return "application/javascript";
-    if (!strcmp(ext, ".css"))  return "text/css";
-    if (!strcmp(ext, ".json")) return "application/json";
-    if (!strcmp(ext, ".ico"))  return "image/x-icon";
-    if (!strcmp(ext, ".png"))  return "image/png";
-    if (!strcmp(ext, ".svg"))  return "image/svg+xml";
-    return "application/octet-stream";
-}
-
-static void parse_invert_array(cJSON *arr, di_config_t *out, int max)
+static void parse_invert_array(cJSON *arr, di_config_t *out, int max, bool *too_long)
 {
     if (!cJSON_IsArray(arr)) return;
     int n = cJSON_GetArraySize(arr);
@@ -56,186 +52,63 @@ static void parse_invert_array(cJSON *arr, di_config_t *out, int max)
         cJSON *inv  = cJSON_GetObjectItem(item, "invert");
         cJSON *name = cJSON_GetObjectItem(item, "name");
         if (cJSON_IsBool(inv))    out[i].invert = cJSON_IsTrue(inv);
-        if (cJSON_IsString(name)) strlcpy(out[i].name, name->valuestring, sizeof(out[i].name));
+        /* Whole or not at all: cut at 20 bytes, a name could end inside a
+           character, and Matter labels must be UTF-8. */
+        if (cJSON_IsString(name)) {
+            if (strlen(name->valuestring) >= sizeof(out[i].name)) { *too_long = true; continue; }
+            strlcpy(out[i].name, name->valuestring, sizeof(out[i].name));
+        }
     }
 }
 
-static bool validate_names(const di_config_t *arr, int count, const char **err_msg)
+/* A text field of the configuration: only when sent; false if it is not
+   text, not UTF-8 or does not fit. */
+static bool str_field(const cJSON *obj, const char *key, char *dst, size_t cap)
 {
-    for (int i = 0; i < count; i++) {
-        if (!arr[i].name[0]) continue;
-        if (strchr(arr[i].name, '/')) {
-            *err_msg = "name must not contain '/'";
-            return false;
-        }
-        for (int j = i + 1; j < count; j++) {
-            if (arr[j].name[0] && strcmp(arr[i].name, arr[j].name) == 0) {
-                *err_msg = "names must be unique";
-                return false;
-            }
-        }
-    }
+    const cJSON *v = cJSON_GetObjectItem(obj, key);
+    if (!v || cJSON_IsNull(v)) return true;
+    if (!cJSON_IsString(v) || strlen(v->valuestring) >= cap || !app_config_utf8_ok(v->valuestring))
+        return false;
+    strlcpy(dst, v->valuestring, cap);
     return true;
-}
-
-/* ------------------------------------------------------------------ auth check */
-
-static bool check_auth(httpd_req_t *req)
-{
-    if (!auth_is_password_set()) return true;
-
-    char hdr[160] = "";
-    httpd_req_get_hdr_value_str(req, "Authorization", hdr, sizeof(hdr));
-    if (strncmp(hdr, "Basic ", 6) != 0) return false;
-
-    unsigned char decoded[128];
-    size_t decoded_len = 0;
-    if (mbedtls_base64_decode(decoded, sizeof(decoded) - 1, &decoded_len,
-                              (const unsigned char *)(hdr + 6),
-                              strlen(hdr + 6)) != 0) return false;
-    decoded[decoded_len] = '\0';
-
-    const char *pw = (const char *)decoded;
-    const char *colon = (const char *)memchr(decoded, ':', decoded_len);
-    if (colon) pw = colon + 1;
-
-    bool ok = auth_check_password(pw);
-    memset(decoded, 0, sizeof(decoded));
-    return ok;
-}
-
-static esp_err_t send_401(httpd_req_t *req)
-{
-    httpd_resp_set_status(req, "401 Unauthorized");
-    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"Device\"");
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"error\":\"unauthorized\"}");
-    return ESP_OK;
-}
-
-/* ------------------------------------------------------------------ auth endpoints */
-
-static esp_err_t api_auth_status(httpd_req_t *req)
-{
-    char json[32];
-    snprintf(json, sizeof(json), "{\"password_set\":%s}",
-             auth_is_password_set() ? "true" : "false");
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, json);
-    return ESP_OK;
-}
-
-static esp_err_t api_auth_begin(httpd_req_t *req)
-{
-    char session[9];
-    esp_err_t r = auth_token_begin(session);
-    if (r == ESP_ERR_INVALID_STATE) {
-        httpd_resp_set_status(req, "409 Conflict");
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, "{\"error\":\"already_pending\"}");
-        return ESP_OK;
-    }
-    if (r != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Internal error");
-        return ESP_OK;
-    }
-    char json[48];
-    snprintf(json, sizeof(json), "{\"session\":\"%.8s\"}", session);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, json);
-    return ESP_OK;
-}
-
-static esp_err_t api_auth_token(httpd_req_t *req)
-{
-    char query[16] = "";
-    httpd_req_get_url_query_str(req, query, sizeof(query));
-    char param[9] = "";
-    httpd_query_key_value(query, "s", param, sizeof(param));
-
-    char token[33] = "";
-    auth_tok_state_t state = auth_token_status(param, token);
-    httpd_resp_set_type(req, "application/json");
-    switch (state) {
-    case AUTH_TOK_WAITING:
-        httpd_resp_sendstr(req, "{\"status\":\"waiting\"}");
-        break;
-    case AUTH_TOK_READY: {
-        char json[64];
-        snprintf(json, sizeof(json), "{\"status\":\"ready\",\"token\":\"%.32s\"}", token);
-        httpd_resp_sendstr(req, json);
-        break;
-    }
-    case AUTH_TOK_TIMEOUT:
-        httpd_resp_set_status(req, "408 Request Timeout");
-        httpd_resp_sendstr(req, "{\"status\":\"timeout\"}");
-        break;
-    default:
-        httpd_resp_set_status(req, "404 Not Found");
-        httpd_resp_sendstr(req, "{\"status\":\"idle\"}");
-        break;
-    }
-    return ESP_OK;
-}
-
-static esp_err_t api_auth_set_password(httpd_req_t *req)
-{
-    if (req->content_len > 256) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body too large");
-        return ESP_OK;
-    }
-    char *body = malloc(req->content_len + 1);
-    if (!body) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_OK; }
-    int n = httpd_req_recv(req, body, req->content_len);
-    if (n <= 0) { free(body); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
-    body[n] = '\0';
-
-    cJSON *root = cJSON_Parse(body);
-    free(body);
-    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
-
-    cJSON *token_j = cJSON_GetObjectItem(root, "token");
-    cJSON *pw_j    = cJSON_GetObjectItem(root, "password");
-
-    if (!cJSON_IsString(token_j) || !cJSON_IsString(pw_j)) {
-        cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing fields");
-        return ESP_OK;
-    }
-
-    if (!auth_token_consume(token_j->valuestring)) {
-        cJSON_Delete(root);
-        httpd_resp_set_status(req, "403 Forbidden");
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, "{\"error\":\"invalid_token\"}");
-        return ESP_OK;
-    }
-
-    if (strlen(pw_j->valuestring) < 8) {
-        cJSON_Delete(root);
-        httpd_resp_set_status(req, "400 Bad Request");
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, "{\"error\":\"password_too_short\"}");
-        return ESP_OK;
-    }
-
-    auth_set_password(pw_j->valuestring);
-    cJSON_Delete(root);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
-    return ESP_OK;
 }
 
 /* ----------------------------------------------------------------- /api/config */
 
 static esp_err_t api_config_get(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_401(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
     const app_config_t *cfg = app_config_get();
 
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "device_name", cfg->device_name);
     cJSON_AddNumberToObject(root, "led_mode",    cfg->led_mode);
+    cJSON_AddNumberToObject(root, "di_isolated", APP_CFG_DI_ISOLATED_COUNT);
+
+    cJSON *sntp = cJSON_AddObjectToObject(root, "sntp");
+    cJSON_AddBoolToObject  (sntp, "enable", cfg->sntp.enable);
+    cJSON_AddStringToObject(sntp, "server", cfg->sntp.server);
+    cJSON_AddStringToObject(root, "tz", cfg->tz);
+#if APP_CFG_DI_AUX_COUNT
+    web_aux_config_json(root, cfg);
+#endif
+
+    /* Modbus: RTU slave or RS-485 master (poll table, RS-485 rows), and the
+       Modbus TCP server; no gateway. It runs on a commissioned device
+       ("running"); changes to these settings apply after a reboot. */
+    cJSON *mb = cJSON_AddObjectToObject(root, "modbus");
+    cJSON_AddBoolToObject  (mb, "enable",        cfg->modbus.enable);
+    cJSON_AddNumberToObject(mb, "address",       cfg->modbus.address);
+    cJSON_AddNumberToObject(mb, "baudrate",      cfg->modbus.baudrate);
+    cJSON_AddStringToObject(mb, "rs485_role",
+                            cfg->modbus.rs485_role == MB_ROLE_MASTER ? "master" : "slave");
+    cJSON_AddNumberToObject(mb, "rs485_tout_ms", cfg->modbus.rs485_tout_ms);
+    cJSON_AddBoolToObject  (mb, "tcp_server",    cfg->modbus.tcp_server);
+    cJSON_AddNumberToObject(mb, "tcp_uid",       cfg->modbus.tcp_uid);
+    cJSON_AddBoolToObject  (mb, "running",       mb_server_running());
+    web_mbm_config_json(root, cfg);
+    web_can_config_json(root, cfg);
+    cJSON_AddBoolToObject(cJSON_GetObjectItem(root, "can"), "running", can_server_running());
 
     cJSON *di = cJSON_AddArrayToObject(root, "di");
     for (int i = 0; i < APP_CFG_DI_COUNT; i++) {
@@ -263,7 +136,7 @@ static esp_err_t api_config_get(httpd_req_t *req)
 
 static esp_err_t api_config_post(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_401(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
     if (req->content_len > BODY_MAX) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body too large");
         return ESP_OK;
@@ -272,47 +145,170 @@ static esp_err_t api_config_post(httpd_req_t *req)
     char *body = malloc(req->content_len + 1);
     if (!body) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_OK; }
 
-    int received = httpd_req_recv(req, body, req->content_len);
-    if (received <= 0) {
+    int received = web_recv_body(req, body, req->content_len);
+    if (received < 0) {
         free(body);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv failed");
         return ESP_OK;
     }
-    body[received] = '\0';
 
-    cJSON *root = cJSON_Parse(body);
+    cJSON *root = json_parse_exact(body, (size_t)received);
     free(body);
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
 
     app_config_t cfg;
     memcpy(&cfg, app_config_get(), sizeof(cfg));
 
+    bool too_long = false;
     cJSON *dn = cJSON_GetObjectItem(root, "device_name");
-    if (cJSON_IsString(dn)) strlcpy(cfg.device_name, dn->valuestring, sizeof(cfg.device_name));
+    if (cJSON_IsString(dn)) {
+        if (strlen(dn->valuestring) >= sizeof(cfg.device_name)) too_long = true;
+        else strlcpy(cfg.device_name, dn->valuestring, sizeof(cfg.device_name));
+    }
 
-    cJSON *led_mode_v = cJSON_GetObjectItem(root, "led_mode");
-    if (cJSON_IsNumber(led_mode_v)) cfg.led_mode = (uint8_t)led_mode_v->valuedouble;
+    uint32_t n;
+    if (web_json_uint(cJSON_GetObjectItem(root, "led_mode"), LED_MODE_IO, LED_MODE_STATUS, &n))
+        cfg.led_mode = (uint8_t)n;
 
-    parse_invert_array(cJSON_GetObjectItem(root, "di"),   cfg.di,   APP_CFG_DI_COUNT);
-    parse_invert_array(cJSON_GetObjectItem(root, "dout"), cfg.dout, APP_CFG_DO_COUNT);
+    parse_invert_array(cJSON_GetObjectItem(root, "di"),   cfg.di,   APP_CFG_DI_COUNT, &too_long);
+    parse_invert_array(cJSON_GetObjectItem(root, "dout"), cfg.dout, APP_CFG_DO_COUNT, &too_long);
+
+    const char *bad = NULL;
+    char bad_buf[128];
+    cJSON *sntp_j = cJSON_GetObjectItem(root, "sntp");
+    if (cJSON_IsObject(sntp_j)) {
+        cJSON *v;
+        if ((v = cJSON_GetObjectItem(sntp_j, "enable")) && cJSON_IsBool(v))
+            cfg.sntp.enable = cJSON_IsTrue(v) ? 1 : 0;
+        if (!str_field(sntp_j, "server", cfg.sntp.server, sizeof(cfg.sntp.server)))
+            bad = "invalid value for sntp.server (wrong type or too long)";
+    }
+    if (!bad && !str_field(root, "tz", cfg.tz, sizeof(cfg.tz)))
+        bad = "invalid value for tz (wrong type or too long)";
+#if APP_CFG_DI_AUX_COUNT
+    if (!bad) bad = web_aux_config_parse(root, &cfg);
+#endif
+    bool mb_changed = false;
+    cJSON *mb = cJSON_GetObjectItem(root, "modbus");
+    if (!bad && cJSON_IsObject(mb)) {
+        cJSON *v;
+        uint32_t u;
+        if ((v = cJSON_GetObjectItem(mb, "enable")) && cJSON_IsBool(v))
+            cfg.modbus.enable = cJSON_IsTrue(v) ? 1 : 0;
+        if ((v = cJSON_GetObjectItem(mb, "tcp_server")) && cJSON_IsBool(v))
+            cfg.modbus.tcp_server = cJSON_IsTrue(v) ? 1 : 0;
+        if ((v = cJSON_GetObjectItem(mb, "address"))) {
+            if (web_json_uint(v, 1, 247, &u)) cfg.modbus.address = (uint8_t)u;
+            else bad = "modbus.address must be 1-247";
+        }
+        if (!bad && (v = cJSON_GetObjectItem(mb, "baudrate"))) {
+            if (web_json_uint(v, 1200, 921600, &u)) cfg.modbus.baudrate = u;
+            else bad = "modbus.baudrate must be 1200-921600";
+        }
+        if (!bad && (v = cJSON_GetObjectItem(mb, "tcp_uid"))) {
+            if (web_json_uint(v, 1, 247, &u)) cfg.modbus.tcp_uid = (uint8_t)u;
+            else bad = "modbus.tcp_uid must be 1-247";
+        }
+        if (!bad && (v = cJSON_GetObjectItem(mb, "rs485_role"))) {
+            if (cJSON_IsString(v) && !strcmp(v->valuestring, "slave"))       cfg.modbus.rs485_role = MB_ROLE_SLAVE;
+            else if (cJSON_IsString(v) && !strcmp(v->valuestring, "master")) cfg.modbus.rs485_role = MB_ROLE_MASTER;
+            else bad = "modbus.rs485_role must be \"slave\" or \"master\"";
+        }
+        if (!bad && (v = cJSON_GetObjectItem(mb, "rs485_tout_ms"))) {
+            if (web_json_uint(v, MB_RS485_TOUT_MIN_MS, MB_RS485_TOUT_MAX_MS, &u)) cfg.modbus.rs485_tout_ms = (uint16_t)u;
+            else bad = "modbus.rs485_tout_ms out of range";
+        }
+        /* No gateway in this firmware; one stored by the other firmware is
+           cleared on the first save here. */
+        cfg.modbus.gateway = 0;
+        mb_changed = memcmp(&cfg.modbus, &app_config_get()->modbus, sizeof(cfg.modbus)) != 0;
+    }
+    /* The poll table: RS-485 rows only, each optionally a Matter sensor. */
+    cJSON *mbm_j = cJSON_GetObjectItem(root, "mbm");
+    bool mbm_changed = false;
+    if (!bad && cJSON_IsArray(mbm_j)) {
+        web_cfg_err_t fb = { "" };
+        bad = web_mbm_config_parse(mbm_j, &cfg, false, &fb);
+        if (!bad && fb.field[0]) {
+            snprintf(bad_buf, sizeof(bad_buf), "invalid value for %s (wrong type, out of range or too long)", fb.field);
+            bad = bad_buf;
+        }
+        mbm_changed = memcmp(cfg.mbm, app_config_get()->mbm, sizeof(cfg.mbm)) != 0;
+    }
+
+    /* CAN, set up once at start like Modbus. */
+    bool can_changed = false;
+    if (!bad) {
+        web_cfg_err_t fb = { "" };
+        web_can_config_parse(cJSON_GetObjectItem(root, "can"), &cfg, &fb);
+        if (fb.field[0]) {
+            snprintf(bad_buf, sizeof(bad_buf), "invalid value for %s (wrong type or out of range)", fb.field);
+            bad = bad_buf;
+        }
+        can_changed = memcmp(&cfg.can, &app_config_get()->can, sizeof(cfg.can)) != 0;
+    }
 
     cJSON_Delete(root);
 
-    const char *err = NULL;
-    if (!validate_names(cfg.di,   APP_CFG_DI_COUNT, &err) ||
-        !validate_names(cfg.dout, APP_CFG_DO_COUNT, &err)) {
-        char msg[64];
-        snprintf(msg, sizeof(msg), "{\"status\":\"error\",\"message\":\"%s\"}", err);
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, msg);
+    if (bad) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, bad);
         return ESP_OK;
     }
 
-    app_config_update(&cfg);
+    if (too_long) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "a name is too long (at most 20 bytes as UTF-8)");
+        return ESP_OK;
+    }
+
+    /* The rules the loader applies at boot (io_names_normalize): checked
+       here with the same function, a name accepted now would otherwise be
+       dropped silently by the next boot -- "2" for DO1 clashes with DO2's
+       number, "set" and "read" are reserved, '+' and '#' are MQTT wildcards. */
+    const char *err = NULL;
+    if (!app_config_io_names_ok(&cfg, &err)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, err);
+        return ESP_OK;
+    }
+
+    /* The sensor endpoints were made at boot from the table as it was. */
+    bool ep_changed = matter_mbm_endpoints_differ(&cfg, app_config_get());
+
+    if (app_config_update(&cfg) != ESP_OK) {
+        return web_send_json(req, "500 Internal Server Error", "{\"error\":\"configuration could not be stored\"}");
+    }
     matter_set_node_label(cfg.device_name);
+    /* Rows that keep their endpoint read the new register at once. */
+    if (mbm_changed) app_modbus_table_changed();
+
+    /* The pads switch now; their Matter endpoints were made at boot for the
+       mode each had then, so a changed mode reaches Matter after a reboot. */
+    bool reboot = mb_changed || can_changed || ep_changed;   /* Modbus and CAN are set up once, at start */
+#if APP_CFG_DI_AUX_COUNT
+    for (int a = 0; a < APP_CFG_DI_AUX_COUNT; a++)
+        if (cfg.aux_mode[a] != (uint8_t)aux_io_mode((uint8_t)a)) reboot = true;
+#endif
+    esp_err_t aux_ret = aux_io_apply();
+    app_time_apply_tz();  /* timezone first, so a sync that follows computes in it */
+    sntp_sync_apply();
+    /* A changed invert: the inputs read again and reported, the relays
+       written with it now -- not at the next output command, which would
+       flip channels nobody touched. Same as the full firmware. */
+    di_publish_all();
+    esp_err_t dout_ret = dout_publish_all();
+    if (dout_ret != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+            "Saved, but the outputs could not be re-applied and may still use the old invert setting (see the device log)");
+        return ESP_OK;
+    }
+    if (aux_ret != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+            "Saved, but a header pad could not be switched and is in its standard function (see the device log)");
+        return ESP_OK;
+    }
 
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+    httpd_resp_sendstr(req, reboot ? "{\"status\":\"ok\",\"reboot_required\":true}"
+                                   : "{\"status\":\"ok\"}");
     return ESP_OK;
 }
 
@@ -360,7 +356,7 @@ static esp_err_t file_get(httpd_req_t *req)
         return ESP_OK;
     }
 
-    httpd_resp_set_type(req, mime_type(file));
+    httpd_resp_set_type(req, web_mime_type(file));
 
     if (strcmp(file, "/index.html") == 0)
         httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -397,17 +393,14 @@ static esp_err_t file_get(httpd_req_t *req)
 
 static esp_err_t api_matter_pairing(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_401(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
 
     const char *qr  = matter_get_qr_code();
     const char *man = matter_get_manual_code();
     bool commissioned = matter_is_commissioned();
 
     if ((!qr || !qr[0]) && !commissioned) {
-        httpd_resp_set_status(req, "404 Not Found");
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, "{\"error\":\"matter_not_active\"}");
-        return ESP_OK;
+        return web_send_json(req, "404 Not Found", "{\"error\":\"matter_not_active\"}");
     }
 
     cJSON *root = cJSON_CreateObject();
@@ -427,13 +420,10 @@ static esp_err_t api_matter_pairing(httpd_req_t *req)
 
 static esp_err_t api_matter_decommission(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_401(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
 
     if (!matter_is_commissioned()) {
-        httpd_resp_set_status(req, "409 Conflict");
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, "{\"error\":\"not_commissioned\"}");
-        return ESP_OK;
+        return web_send_json(req, "409 Conflict", "{\"error\":\"not_commissioned\"}");
     }
 
     httpd_resp_set_type(req, "application/json");
@@ -447,15 +437,18 @@ static esp_err_t api_matter_decommission(httpd_req_t *req)
 
 static esp_err_t api_io_state(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_401(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
 
     cJSON *root = cJSON_CreateObject();
     cJSON *di   = cJSON_AddArrayToObject(root, "di");
     cJSON *dout = cJSON_AddArrayToObject(root, "dout");
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < APP_CFG_DI_COUNT; i++)
         cJSON_AddItemToArray(di,   cJSON_CreateBool(di_get((uint8_t)i)));
+    for (int i = 0; i < APP_CFG_DO_COUNT; i++)
         cJSON_AddItemToArray(dout, cJSON_CreateBool(dout_get((uint8_t)i)));
-    }
+#if APP_CFG_DI_AUX_COUNT
+    web_aux_state_json(root);
+#endif
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     httpd_resp_set_type(req, "application/json");
@@ -466,42 +459,63 @@ static esp_err_t api_io_state(httpd_req_t *req)
 
 static esp_err_t api_io_output(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_401(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
     if (req->content_len == 0 || req->content_len > 64) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad body");
         return ESP_OK;
     }
     char body[65];
-    int n = httpd_req_recv(req, body, req->content_len);
-    if (n <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
-    body[n] = '\0';
+    int n = web_recv_body(req, body, sizeof(body) - 1);
+    if (n < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
-    cJSON *root = cJSON_Parse(body);
+    cJSON *root = json_parse_exact(body, (size_t)n);
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
 
+    /* 0-7 are DO1-DO8; 8-10 the header pads, while they are outputs. */
+    const int last = APP_CFG_DO_COUNT - 1 + APP_CFG_DI_AUX_COUNT;
     cJSON *ch_j = cJSON_GetObjectItem(root, "channel");
-    if (!cJSON_IsNumber(ch_j) || (int)ch_j->valuedouble < 0 || (int)ch_j->valuedouble > 7) {
+    if (!cJSON_IsNumber(ch_j) || ch_j->valuedouble < 0 || ch_j->valuedouble > last ||
+        ch_j->valuedouble != (int)ch_j->valuedouble) {
         cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "channel 0-7 required");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            last > 7 ? "channel 0-10 required" : "channel 0-7 required");
         return ESP_OK;
     }
     uint8_t ch = (uint8_t)ch_j->valuedouble;
 
-    bool new_val;
+#if APP_CFG_DI_AUX_COUNT
+    if (ch >= APP_CFG_DO_COUNT) {
+        uint8_t a = (uint8_t)(ch - APP_CFG_DO_COUNT);
+        esp_err_t r = web_aux_output(req, a, root);   /* Matter hears of it from aux_io */
+        cJSON_Delete(root);
+        return r;
+    }
+#endif
+
+    /* A toggle is one dout_toggle() call, under the output lock: reading
+       and setting the opposite lost one of two toggles arriving together. */
+    esp_err_t set_ret;
     cJSON *tog = cJSON_GetObjectItem(root, "toggle");
     cJSON *val = cJSON_GetObjectItem(root, "value");
     if (cJSON_IsTrue(tog)) {
-        new_val = !dout_get(ch);
+        cJSON_Delete(root);
+        set_ret = dout_toggle(ch);
     } else if (cJSON_IsBool(val)) {
-        new_val = cJSON_IsTrue(val);
+        bool new_val = cJSON_IsTrue(val);
+        cJSON_Delete(root);
+        set_ret = dout_set(ch, new_val);
     } else {
         cJSON_Delete(root);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "value or toggle required");
         return ESP_OK;
     }
-    cJSON_Delete(root);
 
-    dout_set(ch, new_val);
+    /* The Matter side hears of the change from dout_modify(). */
+    if (set_ret != ESP_OK) {
+        ESP_LOGW(TAG, "output %d: set failed: %s", ch + 1, esp_err_to_name(set_ret));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "output write failed");
+        return ESP_OK;
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
     return ESP_OK;
@@ -509,33 +523,24 @@ static esp_err_t api_io_output(httpd_req_t *req)
 
 static esp_err_t api_io_led(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_401(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
     if (req->content_len == 0 || req->content_len > 64) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad body");
         return ESP_OK;
     }
     char body[65];
-    int n = httpd_req_recv(req, body, req->content_len);
-    if (n <= 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
-    body[n] = '\0';
+    int n = web_recv_body(req, body, sizeof(body) - 1);
+    if (n < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
-    cJSON *root = cJSON_Parse(body);
+    cJSON *root = json_parse_exact(body, (size_t)n);
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
 
-    uint8_t r = 0, g = 0, b = 0;
-    cJSON *color_j = cJSON_GetObjectItem(root, "color");
-    if (cJSON_IsString(color_j) && color_j->valuestring[0] == '#') {
-        unsigned int ri = 0, gi = 0, bi = 0;
-        if (sscanf(color_j->valuestring + 1, "%02x%02x%02x", &ri, &gi, &bi) == 3) {
-            r = (uint8_t)ri; g = (uint8_t)gi; b = (uint8_t)bi;
-        }
-    } else {
-        cJSON *rj = cJSON_GetObjectItem(root, "r");
-        cJSON *gj = cJSON_GetObjectItem(root, "g");
-        cJSON *bj = cJSON_GetObjectItem(root, "b");
-        if (cJSON_IsNumber(rj)) r = (uint8_t)(int)rj->valuedouble;
-        if (cJSON_IsNumber(gj)) g = (uint8_t)(int)gj->valuedouble;
-        if (cJSON_IsNumber(bj)) b = (uint8_t)(int)bj->valuedouble;
+    uint8_t r, g, b;
+    if (!web_led_color_parse(root, &r, &g, &b)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "Expected color #RRGGBB or integer r, g, b in 0-255");
+        return ESP_OK;
     }
     cJSON_Delete(root);
 
@@ -545,15 +550,47 @@ static esp_err_t api_io_led(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* -------------------------------------------------------- /api/modbus/status */
+
+static esp_err_t api_modbus_status(httpd_req_t *req)
+{
+    if (!web_check_auth(req)) return web_send_denied(req);
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_OK;
+    }
+    mb_status_json(root);
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json ? json : "{}");
+    cJSON_free(json);
+    return ESP_OK;
+}
+
 /* -------------------------------------------------------------- /api/version */
 
 static esp_err_t api_version(httpd_req_t *req)
 {
+    /* Firmware and IDF version, build date and the last reset reason tell an
+       attacker which known bugs apply and when the device crashed: behind the
+       password like everything else outside the setup flow. */
+    if (!web_check_auth(req)) return web_send_denied(req);
     const esp_app_desc_t *d = esp_app_get_description();
-    char json[160];
+    /* Internal RAM is what Matter runs short of (README): free now, the
+       lowest it has been since boot, and the largest block left. */
+    const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    char json[320];
     snprintf(json, sizeof(json),
-             "{\"version\":\"%s\",\"idf\":\"%s\",\"date\":\"%s\",\"time\":\"%s\"}",
-             d->version, d->idf_ver, d->date, d->time);
+             "{\"variant\":\"matter\",\"version\":\"%s\",\"idf\":\"%s\",\"date\":\"%s\",\"time\":\"%s\","
+             "\"heap_internal_free\":%u,\"heap_internal_min\":%u,\"heap_internal_largest\":%u,"
+             "\"heap_dma_free\":%u}",
+             d->version, d->idf_ver, d->date, d->time,
+             (unsigned)heap_caps_get_free_size(caps),
+             (unsigned)heap_caps_get_minimum_free_size(caps),
+             (unsigned)heap_caps_get_largest_free_block(caps),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, json);
     return ESP_OK;
@@ -565,11 +602,16 @@ static void do_restart(void *arg) { esp_restart(); }
 
 static esp_err_t api_factory_reset(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_401(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
+    /* Erased first, answered after: "resetting" over a failed erase rebooted
+       into the old configuration and password. */
+    esp_err_t err = nvs_flash_erase();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "factory reset: erase failed: %s", esp_err_to_name(err));
+        return web_send_json(req, "500 Internal Server Error", "{\"error\":\"erase failed, nothing reset\"}");
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"resetting\"}");
-
-    nvs_flash_erase();
 
     esp_timer_handle_t t;
     esp_timer_create(&(esp_timer_create_args_t){
@@ -581,6 +623,9 @@ static esp_err_t api_factory_reset(httpd_req_t *req)
 
 static esp_err_t api_reboot(httpd_req_t *req)
 {
+    /* Was open: anyone on the network -- or any web page the user had open,
+       by a cross-site form post -- could reboot the device, in a loop. */
+    if (!web_check_auth(req)) return web_send_denied(req);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"rebooting\"}");
 
@@ -595,19 +640,23 @@ static esp_err_t api_reboot(httpd_req_t *req)
 /* -------------------------------------------------------------- start / stop */
 
 static const httpd_uri_t s_handlers[] = {
-    { .uri = "/api/auth/status",          .method = HTTP_GET,  .handler = api_auth_status       },
-    { .uri = "/api/auth/begin",           .method = HTTP_POST, .handler = api_auth_begin        },
-    { .uri = "/api/auth/token",           .method = HTTP_GET,  .handler = api_auth_token        },
-    { .uri = "/api/auth/set-password",    .method = HTTP_POST, .handler = api_auth_set_password },
+    { .uri = "/api/auth/status",          .method = HTTP_GET,  .handler = web_api_auth_status       },
+    { .uri = "/api/auth/begin",           .method = HTTP_POST, .handler = web_api_auth_begin        },
+    { .uri = "/api/auth/token",           .method = HTTP_GET,  .handler = web_api_auth_token        },
+    { .uri = "/api/auth/set-password",    .method = HTTP_POST, .handler = web_api_auth_set_password },
     { .uri = "/api/config",               .method = HTTP_GET,  .handler = api_config_get        },
     { .uri = "/api/config",               .method = HTTP_POST, .handler = api_config_post       },
     { .uri = "/api/io/state",             .method = HTTP_GET,  .handler = api_io_state          },
     { .uri = "/api/io/output",            .method = HTTP_POST, .handler = api_io_output         },
     { .uri = "/api/io/led",               .method = HTTP_POST, .handler = api_io_led            },
+    { .uri = "/api/io/buzzer",            .method = HTTP_POST, .handler = web_api_io_buzzer     },
+    { .uri = "/api/time",                 .method = HTTP_GET,  .handler = web_api_time_get      },
+    { .uri = "/api/time",                 .method = HTTP_POST, .handler = web_api_time_post     },
     { .uri = "/api/matter/pairing",       .method = HTTP_GET,  .handler = api_matter_pairing    },
     { .uri = "/api/matter/decommission",  .method = HTTP_POST, .handler = api_matter_decommission },
     { .uri = "/api/reboot",               .method = HTTP_POST, .handler = api_reboot            },
     { .uri = "/api/factory-reset",        .method = HTTP_POST, .handler = api_factory_reset     },
+    { .uri = "/api/modbus/status",        .method = HTTP_GET,  .handler = api_modbus_status     },
     { .uri = "/api/version",              .method = HTTP_GET,  .handler = api_version           },
     { .uri = "/*",                        .method = HTTP_GET,  .handler = file_get              },
 };
@@ -617,12 +666,17 @@ esp_err_t web_server_start(void)
     if (s_server) return ESP_OK;
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.max_open_sockets = NET_SOCK_HTTPD_CLIENTS;   /* the share net_budget.h allots */
     cfg.uri_match_fn     = httpd_uri_match_wildcard;
     cfg.max_uri_handlers = sizeof(s_handlers) / sizeof(s_handlers[0]);
     /* Keep the httpd task stack in internal DMA-capable RAM — PSRAM stacks fail
      * the esp_ptr_in_dram() check inside the SPI-flash driver before NVS writes. */
     cfg.task_caps        = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
     cfg.send_wait_timeout = 10;
+    /* HTTPD_DEFAULT_CONFIG gives 4096; api_config_post holds a whole
+       app_config_t (1.8 kB) plus cJSON's working set and goes down into NVS
+       from there. The full app raised it for the same reason. */
+    cfg.stack_size        = 6144;
 
     esp_err_t ret = httpd_start(&s_server, &cfg);
     if (ret != ESP_OK) {

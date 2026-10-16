@@ -1,0 +1,73 @@
+#pragma once
+
+/* The RS-485 half of the Modbus TCP gateway.
+ *
+ * Requests that are not for this board belong to a device on the segment.
+ * This module owns the RTU master that talks to it, turns a parsed request
+ * into an RTU transaction and the answer back into response data.
+ */
+
+#include <stdbool.h>
+#include <stdint.h>
+#include "driver/uart.h"
+#include "esp_err.h"
+#include "mb_request.h"
+#include "sdkconfig.h"
+
+#if CONFIG_MB_RS485_MASTER
+
+/* Creates and starts the RTU master on the given UART. The caller owns the
+   decision that the port is free: the RTU slave and this master cannot both
+   have it. */
+esp_err_t mb_gateway_start(uart_port_t uart, uint32_t baudrate,
+                           int tx_gpio, int rx_gpio, int rts_gpio,
+                           uint16_t response_tout_ms);
+
+bool mb_gateway_is_running(void);
+
+/* Whether Modbus TCP requests for other unit IDs are forwarded to the
+   segment. Separate from running: the master also serves the poll table
+   (mb_tcp_master.c) with forwarding off. Set once at boot. */
+void mb_gateway_set_forwarding(bool on);
+bool mb_gateway_forwarding(void);
+
+/* Not a Modbus exception and never put on the wire: the segment stayed
+   taken by other transactions for longer than a request waits for it.
+   Only mb_gateway_read_regs() returns it, so the poll table can say "RS-485
+   busy" instead of blaming the device; a forwarded request gets 0x06. */
+#define MB_GW_BUS_BUSY 0xFF
+
+/* Reads count holding (fc 3) or input (fc 4) registers from uid on the
+   segment for the poll table, into host-order regs. Serialised with the
+   forwarded requests. Returns 0 or the exception code: the device's own,
+   0x0B when it stayed silent or answered garbled, 0x0A when the master is not
+   running, MB_GW_BUS_BUSY when the segment never came free. */
+uint8_t mb_gateway_read_regs(uint8_t uid, uint8_t fc, uint16_t addr,
+                             uint16_t count, uint16_t *regs);
+
+/* Forwards one request to uid and waits for the answer. Safe to call from
+   several tasks at once -- the segment carries one transaction at a time, so
+   they are serialised here, each waiting its turn.
+
+   Returns 0 with resp filled, or the exception code that belongs on the wire:
+   the device's own where it sent one, 0x0B where it stayed silent, 0x0A where
+   the gateway could not even try. */
+uint8_t mb_gateway_handle(uint8_t uid, const mb_request_t *req,
+                          uint8_t *resp, uint16_t *resp_len);
+
+#else /* no RS-485 master in this firmware: never running, never forwarding */
+
+#define MB_GW_BUS_BUSY 0xFF
+static inline esp_err_t mb_gateway_start(uart_port_t u, uint32_t b, int tx, int rx, int rts, uint16_t t)
+{ (void)u; (void)b; (void)tx; (void)rx; (void)rts; (void)t; return ESP_ERR_NOT_SUPPORTED; }
+static inline bool    mb_gateway_is_running(void)        { return false; }
+static inline void    mb_gateway_set_forwarding(bool on) { (void)on; }
+static inline bool    mb_gateway_forwarding(void)        { return false; }
+static inline uint8_t mb_gateway_read_regs(uint8_t uid, uint8_t fc, uint16_t addr,
+                                           uint16_t count, uint16_t *regs)
+{ (void)uid; (void)fc; (void)addr; (void)count; (void)regs; return 0x0A; }
+static inline uint8_t mb_gateway_handle(uint8_t uid, const mb_request_t *req,
+                                        uint8_t *resp, uint16_t *resp_len)
+{ (void)uid; (void)req; (void)resp; (void)resp_len; return 0x0A; }
+
+#endif

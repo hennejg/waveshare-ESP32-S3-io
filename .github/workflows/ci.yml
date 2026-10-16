@@ -18,13 +18,12 @@ jobs:
           - config: default
             label: ''
             sdkconfig: ''
-          # APP_AUX_DI_ENABLE compiles code the default build never sees: the
-          # UART-console #error, the 11-entry DI arrays, the AUX rows in the UI.
-          - config: aux-di
-            label: ', APP_AUX_DI_ENABLE'
+          # APP_AUX_DI_ENABLE is on by default; this compiles the eight-input
+          # build the default never sees: 8-entry DI arrays, no header pads.
+          - config: no-aux-di
+            label: ', without APP_AUX_DI_ENABLE'
             sdkconfig: |
-              CONFIG_APP_AUX_DI_ENABLE=y
-              CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+              CONFIG_APP_AUX_DI_ENABLE=n
 
     steps:
       - name: Checkout
@@ -45,7 +44,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: apps/full/managed_components
-          key: managed-full-${{ matrix.config }}-${{ hashFiles('apps/full/main/idf_component.yml', 'components/board/idf_component.yml') }}
+          key: managed-full-${{ matrix.config }}-${{ hashFiles('apps/full/main/idf_component.yml', 'components/board/idf_component.yml', 'components/modbus/idf_component.yml') }}
           restore-keys: managed-full-
 
       - name: Append the extra sdkconfig options
@@ -60,7 +59,7 @@ jobs:
           idf.py -C apps/full set-target esp32s3
           idf.py -C apps/full build
 
-      # Only the default configuration ships; the option-on leg is a compile check.
+      # Only the default configuration ships; the no-aux-di leg is a compile check.
       - name: Upload build artifacts
         if: matrix.config == 'default'
         uses: actions/upload-artifact@v7
@@ -127,7 +126,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: apps/matter/managed_components
-          key: managed-matter-${{ hashFiles('apps/matter/main/idf_component.yml', 'components/board/idf_component.yml') }}
+          key: managed-matter-${{ hashFiles('apps/matter/main/idf_component.yml', 'components/board/idf_component.yml', 'components/modbus/idf_component.yml') }}
           restore-keys: managed-matter-
 
       - name: Build
@@ -148,6 +147,41 @@ jobs:
             apps/matter/build/bootloader/bootloader.bin
             apps/matter/build/partition_table/partition-table.bin
             apps/matter/build/flash_args
+
+  host-tests:
+    name: Host tests (test/host)
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.5.4   # cJSON and mbedtls come from its IDF, as on a developer machine
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: false   # the esp-idf submodule is replaced by the container's IDF below
+
+      - name: Fix git safe directory (Docker container runs as root)
+        run: git config --global --add safe.directory '*'
+
+      - name: Check out the QuickJS submodule
+        run: git submodule update --init components/quickjs/extern/quickjs
+
+      # The Makefile reaches cJSON and mbedtls through ../../esp-idf.
+      - name: Point esp-idf at the container's IDF
+        run: rm -rf esp-idf && ln -s "$IDF_PATH" esp-idf
+
+      - name: Install a host compiler with the sanitizers
+        run: apt-get update && apt-get install -y --no-install-recommends build-essential
+
+      # make uiauth runs the web UIs' Basic-Auth code (btoa, TextEncoder).
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '20'
+
+      # Every generator cuts the firmware source it tests, so a test that no
+      # longer matches the code it guards stops here.
+      - name: Build and run the host tests
+        run: make -k -C test/host   # -k: every failing test in one run, the job still fails
 
   rule-engine-tests:
     name: Rule engine tests

@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""Builds a host test for the rule engine's trial load (scripting.c): before
+a reload takes over, the script is loaded once the way a boot loads it, at
+the boot's heap limit, with writes going nowhere.
+
+Cut out of scripting.c and bindings.c verbatim: trial_load() itself with
+its outputs, PWM pads and timer table, the output bindings, and the MQTT
+connect callback. QuickJS with the firmware's patches and the real dsl.js.
+Each script is loaded twice under the same limit -- by trial_load(), and as
+the boot (timers that hold their callbacks, outputs on the hardware) -- and
+both must come to the same verdict.
+
+What it pins down, found by an outside review:
+  - the trial's timers dropped their callbacks at once: twelve watchdogs'
+    closures were collected, the trial fitted, the boot ran out of memory --
+    a script stored that did not load at the next boot;
+  - the trial read the outputs from the hardware while its writes went
+    nowhere: `if (!output(0).on()) throw ...` failed in the trial only, and
+    a valid script was refused;
+  - trial_load() swapped the global I/O for the dry set, and the MQTT connect
+    callback on another task subscribed rules/# through it: a reconnect
+    during a trial subscribed nothing, and MQTT rules went deaf.
+OLD=1 cuts scripting.c, bindings.c and scripting_priv.h as they were at
+OLDREV (default HEAD); OLDREV=dd92b51~1 shows the first two failures too.
+
+  make -C test/host trial
+"""
+import os, pathlib, subprocess
+from cutter import Source
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+sc   = Source(ROOT / "components/scripting/scripting.c")
+bd   = Source(ROOT / "components/scripting/bindings.c")
+pv   = Source(ROOT / "components/scripting/scripting_priv.h")
+if os.environ.get("OLD") == "1":
+    rev = os.environ.get("OLDREV", "HEAD")
+    for s_, f in ((sc, "scripting.c"), (bd, "bindings.c"), (pv, "scripting_priv.h")):
+        s_.text = subprocess.run(["git", "show", rev + ":components/scripting/" + f],
+                                 cwd=ROOT, capture_output=True, text=True, check=True).stdout
+
+cuts  = sc.defines("JS_HEAP_LIMIT", "MAX_TIMERS", "RULES_TOPIC")
+if "scripting_io_of" in pv.text:
+    cuts += pv.func("static inline const scripting_io_t *scripting_io_of(JSContext *ctx)")
+cuts += sc.func("static bool drain_jobs(JSRuntime *rt)" if "static bool drain_jobs(JSRuntime *rt)" in sc.text
+                else "static void drain_jobs(JSRuntime *rt)")
+cuts += sc.func("static bool eval_check(JSContext *ctx, const char *src, const char *name,")
+if "#define DRY_OUTPUTS" not in sc.text:
+    # Before the dry outputs and timer table (dd92b51~1).
+    cuts += sc.span("static esp_err_t dry_dout_set(uint8_t ch, bool on)", "{ (void)t; (void)q; return 0; }")
+    cuts += sc.func("static JSValue js_dry_set_timer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)")
+    cuts += sc.func("static JSValue js_dry_nop(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)")
+else:
+    cuts += sc.span("#define DRY_OUTPUTS 32", "static int       dry_mqtt_subscribe(const char *t, int q)          { (void)t; (void)q; return 0; }")
+    cuts += sc.func("static void dry_io_start(const scripting_io_t *real)")
+    cuts += sc.func("static JSValue js_dry_set_timer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)")
+    cuts += sc.func("static JSValue js_dry_clear_timer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)")
+    cuts += sc.func("static void dry_timers_free(JSContext *ctx)")
+    cuts += sc.func("static JSValue js_dry_nop(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)")
+cuts += sc.func("static bool trial_load(const char *script, char *err, size_t errlen)")
+if "#define MAX_RULE_SUBS" in sc.text:
+    # Since the rules' own topics are subscribed too: their list, which the
+    # connect handler copies under a mutex. No list here -- none was loaded.
+    cuts += ("typedef int *SemaphoreHandle_t;\n#define portMAX_DELAY 0\n"
+             "static void xSemaphoreTake(SemaphoreHandle_t m, int t) { (void)m; (void)t; }\n"
+             "static void xSemaphoreGive(SemaphoreHandle_t m) { (void)m; }\n"
+             "#define MALLOC_CAP_SPIRAM 1\n#define MALLOC_CAP_8BIT 2\n"
+             "#define heap_caps_malloc(n, c) malloc(n)\n#define heap_caps_free(p) free(p)\n")
+    cuts += sc.defines("MAX_TOPIC_LEN") if "#define MAX_TOPIC_LEN" not in "".join(cuts) else ""
+    if "static void subs_apply(bool all)" in sc.text:
+        # Wanted and in place apart: the connect handler subscribes through
+        # subs_apply(), which records each result.
+        cuts += ("typedef uint32_t TickType_t;\n"
+                 "#ifndef ESP_LOGW\n#define ESP_LOGW(...) ((void)0)\n#endif\n"
+                 "#ifndef ESP_LOGE\n#define ESP_LOGE(...) ((void)0)\n#endif\n")
+        cuts += sc.span("#define MAX_RULE_SUBS 33", "static volatile bool     s_subs_retry;      /* an entry is not ok */")
+        cuts += sc.func("static int sub_find(const rule_sub_t *list, int n, const char *t)")
+        cuts += sc.func("static void sub_mark(const char *t, bool ok)")
+        cuts += sc.func("static bool sub_try(const char *t)")
+        cuts += sc.func("static void subs_apply(bool all)")
+        # scripting_init() creates the lock; this test does not run it.
+        cuts += ("static int trial_mux_obj;\n"
+                 "__attribute__((constructor)) static void trial_mux(void) { s_subs_mux = (SemaphoreHandle_t)&trial_mux_obj; }\n")
+    else:
+        cuts += sc.span("#define MAX_RULE_SUBS 32", "static SemaphoreHandle_t s_subs_mux;")
+cuts += sc.func("void scripting_on_mqtt_connected(void)")
+cuts += bd.func("static int do_count(")
+if "static int chan_arg(" in bd.text:
+    if "static int int_arg(" in bd.text:
+        cuts += bd.func("static int int_arg(JSContext *ctx, JSValue v, int32_t lo, int32_t hi, const char *msg, int32_t *out)")
+    cuts += bd.func("static int chan_arg(JSContext *ctx, JSValue v, int count, const char *what, int32_t *ch)")
+cuts += bd.func("static JSValue js_dout_set(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)")
+cuts += bd.func("static JSValue js_dout_toggle(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)")
+cuts += bd.func("static JSValue js_dout_get(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)")
+
+HARNESS = r"""
+/* GENERATED by gen_trial_test.py -- do not edit; edit scripting.c. */
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "quickjs.h"
+#include "esp_err.h"
+#include "scripting.h"
+
+static const scripting_io_t *g_scripting_io;
+static bool hw_out[8];
+static bool hw_get(uint8_t ch) { return ch < 8 && hw_out[ch]; }
+static esp_err_t hw_set(uint8_t ch, bool on) { if (ch < 8) hw_out[ch] = on; return ESP_OK; }
+static esp_err_t hw_toggle(uint8_t ch) { if (ch < 8) hw_out[ch] = !hw_out[ch]; return ESP_OK; }
+static int hw_writes;
+static esp_err_t hw_set_counted(uint8_t ch, bool on) { hw_writes++; return hw_set(ch, on); }
+static esp_err_t hw_toggle_counted(uint8_t ch) { hw_writes++; return hw_toggle(ch); }
+/* The broker: rules/# subscriptions that reached it. */
+static int subs;
+static int hw_subscribe(const char *t, int q) { (void)q; if (strcmp(t, "rules/#") == 0) subs++; return 0; }
+static const scripting_io_t s_hw = { .dout_set = hw_set_counted, .dout_get = hw_get,
+                                     .dout_toggle = hw_toggle_counted, .do_count = 8,
+                                     .mqtt_subscribe = hw_subscribe };
+
+/* What trial_load() calls around the cut code. */
+#define TAG "t"
+#define ESP_LOGE(tag, ...) do { (void)(tag); } while (0)
+#define ESP_LOGW ESP_LOGE
+#define JS_STACK_LIMIT 0          /* a 64-bit host's frames are larger: no limit */
+static int s_psram_alloc;
+#define JS_NewRuntime2(alloc, op) ((void)(alloc), (void)(op), JS_NewRuntime())
+static bool s_interrupted;
+static int js_interrupt(JSRuntime *rt, void *op) { (void)rt; (void)op; return 0; }
+static void budget_start(void) {}
+static const char *dsl_js_start;
+static void scripting_register_bindings(JSContext *ctx);
+static void register_timer_bindings(JSContext *ctx) { (void)ctx; }
+
+__CUT__
+
+/* The MQTT task, reconnecting while the trial runs the script's top level. */
+static JSValue js_reconnect(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
+{ (void)ctx; (void)this_val; (void)argc; (void)argv; scripting_on_mqtt_connected(); return JS_UNDEFINED; }
+
+static void scripting_register_bindings(JSContext *ctx)
+{
+    JSValue g = JS_GetGlobalObject(ctx);
+    JS_SetPropertyStr(ctx, g, "_dout_set",    JS_NewCFunction(ctx, js_dout_set,    "_dout_set",    2));
+    JS_SetPropertyStr(ctx, g, "_dout_get",    JS_NewCFunction(ctx, js_dout_get,    "_dout_get",    1));
+    JS_SetPropertyStr(ctx, g, "_dout_toggle", JS_NewCFunction(ctx, js_dout_toggle, "_dout_toggle", 1));
+    JS_SetPropertyStr(ctx, g, "_reconnect",   JS_NewCFunction(ctx, js_reconnect,   "_reconnect",   0));
+    JS_FreeValue(ctx, g);
+}
+
+/* The boot's timers: held until cleared, as s_timers holds them. */
+static struct { bool used; JSValue fn; } boot_timers[MAX_TIMERS];
+static JSValue js_boot_set_timer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
+{
+    (void)this_val; (void)argc;
+    for (int i = 0; i < MAX_TIMERS; i++) if (!boot_timers[i].used) {
+        boot_timers[i].used = true; boot_timers[i].fn = JS_DupValue(ctx, argv[1]);
+        return JS_NewInt32(ctx, i + 1);
+    }
+    return JS_NewInt32(ctx, -1);
+}
+static JSValue js_boot_clear_timer(JSContext *ctx, JSValue this_val, int argc, JSValue *argv)
+{
+    (void)this_val; (void)argc;
+    int32_t id; JS_ToInt32(ctx, &id, argv[0]);
+    if (id >= 1 && id <= MAX_TIMERS && boot_timers[id - 1].used) {
+        JS_FreeValue(ctx, boot_timers[id - 1].fn); boot_timers[id - 1].used = false;
+    }
+    return JS_UNDEFINED;
+}
+
+static char why[160];
+
+/* As the boot loads it, at the boot's limit: the hardware, timers held. */
+static bool boot_load(const char *script)
+{
+    JSRuntime *rt = JS_NewRuntime();
+    JS_SetMemoryLimit(rt, JS_HEAP_LIMIT);
+    JSContext *ctx = JS_NewContext(rt);
+    scripting_register_bindings(ctx);
+    JSValue g = JS_GetGlobalObject(ctx);
+    JS_SetPropertyStr(ctx, g, "print",        JS_NewCFunction(ctx, js_dry_nop,          "print",        1));
+    JS_SetPropertyStr(ctx, g, "_set_timer",   JS_NewCFunction(ctx, js_boot_set_timer,   "_set_timer",   2));
+    JS_SetPropertyStr(ctx, g, "_clear_timer", JS_NewCFunction(ctx, js_boot_clear_timer, "_clear_timer", 1));
+    JS_FreeValue(ctx, g);
+    bool ok = true;
+    const char *src[2] = { dsl_js_start, script };
+    for (int k = 0; k < 2 && ok; k++) {
+        JSValue r = JS_Eval(ctx, src[k], strlen(src[k]), k ? "<user>" : "<dsl>", JS_EVAL_TYPE_GLOBAL);
+        if (JS_IsException(r)) {
+            ok = false;
+            JSValue e = JS_GetException(ctx);
+            const char *m = JS_ToCString(ctx, e);
+            snprintf(why, sizeof(why), "%s", m ? m : "?");
+            JS_FreeCString(ctx, m); JS_FreeValue(ctx, e);
+        }
+        JS_FreeValue(ctx, r);
+    }
+    if (ok) {   /* the boot's timers fire later; the closures stay until then */
+        JS_RunGC(rt);
+        static const char probe[] = "var __probe = new Array(1000).fill(0); 1";
+        JSValue r = JS_Eval(ctx, probe, strlen(probe), "<probe>", JS_EVAL_TYPE_GLOBAL);
+        if (JS_IsException(r)) { ok = false; snprintf(why, sizeof(why), "out of memory after load"); JS_FreeValue(ctx, JS_GetException(ctx)); }
+        JS_FreeValue(ctx, r);
+    }
+    for (int i = 0; i < MAX_TIMERS; i++)
+        if (boot_timers[i].used) { JS_FreeValue(ctx, boot_timers[i].fn); boot_timers[i].used = false; }
+    JS_FreeContext(ctx); JS_FreeRuntime(rt);
+    return ok;
+}
+
+static bool load(const char *script, bool trial)
+{
+    if (!trial) return boot_load(script);
+    return trial_load(script, why, sizeof(why));
+}
+
+static int failures;
+static void both(const char *what, const char *script, bool expect)
+{
+    int w0 = hw_writes;
+    bool t = load(script, true);
+    char twhy[160]; snprintf(twhy, sizeof(twhy), "%s", t ? "" : why);
+    int tw = hw_writes - w0;
+    bool b = load(script, false);
+    printf("  %-44s Probelauf %-10s Boot %s%s%s\n", what, t ? "geladen" : "ABGELEHNT",
+           b ? "geladen" : "scheitert", t ? "" : "  -- ", twhy);
+    if (t != b) { failures++; printf("  FEHLER: Probelauf und Boot urteilen verschieden\n"); }
+    if (b != expect) { failures++; printf("  FEHLER: Boot %s erwartet\n", expect ? "laedt" : "scheitert"); }
+    if (tw) { failures++; printf("  FEHLER: Probelauf schrieb %d x auf die Hardware\n", tw); }
+}
+
+static char *slurp(const char *path)
+{
+    FILE *f = fopen(path, "rb"); if (!f) { perror(path); exit(2); }
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    char *b = malloc((size_t)n + 1); if (fread(b, 1, (size_t)n, f) != (size_t)n) exit(2); b[n] = 0; fclose(f);
+    return b;
+}
+
+#define WATCHDOGS(n) \
+    "for (var i = 0; i < " #n "; i++) (function (buf) {" \
+    "  _schedule(60000, function () { print(buf.length); });" \
+    "})(new Array(8000).fill(i));"
+
+int main(int argc, char **argv)
+{
+    dsl_js_start = slurp(argc > 1 ? argv[1] : "../../components/scripting/dsl.js");
+    g_scripting_io = &s_hw;            /* as scripting_init() sets it, for good */
+    (void)dry_led_set; (void)dry_buzzer_set; (void)dry_mqtt_publish; (void)dry_mqtt_subscribe; (void)dry_pwm_set;
+#ifdef DRY_PADS
+    (void)dry_pwm_get;
+#endif
+
+    both("12 Timer mit je ~128 KiB im Callback", WATCHDOGS(12), false);
+    both("3 Timer mit je ~128 KiB im Callback",  WATCHDOGS(3),  true);
+    both("Timer gestellt und wieder geloescht",
+         "for (var i = 0; i < 12; i++) _unschedule((function (buf) {"
+         "  return _schedule(60000, function () { print(buf.length); });"
+         "})(new Array(8000).fill(i)));", true);
+
+    hw_out[0] = false;
+    both("output(0).on() und Pruefung, Ausgang aus",
+         "if (!output(0).on()) throw new Error('Schalten fehlgeschlagen');", true);
+    hw_out[1] = true;
+    both("output(1).toggle() zweimal, Ausgang an",
+         "output(1).toggle(); if (output(1).get()) throw new Error('aus erwartet');"
+         "output(1).toggle(); if (!output(1).get()) throw new Error('an erwartet');", true);
+
+    subs = 0;
+    both("MQTT-Reconnect waehrend des Probelaufs", "_reconnect();", true);
+    printf("  rules/# am Broker angemeldet: %d x (erwartet 2: Probelauf und Boot)\n", subs);
+    if (subs != 2) { failures++; printf("  FEHLER: der Reconnect im Probelauf meldete rules/# nicht an\n"); }
+
+    printf(failures ? "trial: %d FEHLER\n" : "trial: alles OK\n", failures);
+    return failures ? 1 : 0;
+}
+"""
+out = pathlib.Path(__file__).with_name("test_trial.c")
+out.write_text(HARNESS.replace("__CUT__", cuts))

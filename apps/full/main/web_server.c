@@ -1,25 +1,40 @@
 #include "web_server.h"
+#include "net_budget.h"
 #include "app_config.h"
 #include "app_time.h"
 #include "auth.h"
-#include "buzzer.h"
+#include "web_common.h"
+#include "json_exact.h"
 #include "di.h"
 #include "dout.h"
+#include "aux_io.h"
+#include "app_mqtt.h"
+#include "esp_system.h"
 #include "led.h"
 #ifdef CONFIG_APP_MATTER_ENABLE
 #include "matter.h"
 #endif
-#include "app_rtc.h"
+#include "mb_tcp_server.h"
+#include "mb_tcp_master.h"
+#include "mb_status_json.h"
 #include "scripting.h"
 #include "sntp_sync.h"
 
-#include <time.h>
-#include <sys/time.h>
-
 extern const char DEMO_SCRIPT[];
 
-#define RULES_NVS_NS  "scripting"
-#define RULES_NVS_KEY "script"
+#define RULES_NVS_NS   "scripting"
+/* A blob, which NVS spreads over pages. A string has to fit in one page next
+   to whatever else is on it: after a garbage collection moved a few entries
+   onto the free page, a script of 3840 bytes no longer went in
+   (ESP_ERR_NVS_NOT_ENOUGH_SPACE) -- below RULES_MAX_LEN, and depending on
+   the state of the flash. The string key is what older firmware stored; it
+   is still read, and removed once a blob has been stored. */
+#define RULES_NVS_BLOB "script_b"
+#define RULES_NVS_KEY  "script"
+/* In bytes of UTF-8, not characters: what NVS stores and the boot's buffer
+   (main.c, 4096) holds. Checked on the script itself -- the request body is
+   JSON, longer by its escapes, and a limit on the body alone let a script of
+   3942 bytes through that GET then could not read back. */
 #define RULES_MAX_LEN 3900
 
 #include <stdio.h>
@@ -37,17 +52,8 @@ extern const char DEMO_SCRIPT[];
 #include <nvs.h>
 #include <esp_netif.h>
 #include "cJSON.h"
-#include "mbedtls/base64.h"
 
 #define TAG        "web_server"
-
-/* Longest password whose HTTP Basic header still fits check_auth()'s 160-byte
-   buffer: "Basic " + base64(":" + password) must stay within 159 characters,
-   which 113 does at 158 and 114 exceeds at 162. */
-#define APP_CFG_PASSWORD_MAX 113
-
-/* Total time a request body may take to arrive. */
-#define BODY_RECV_TIMEOUT_MS 5000
 
 /* How long POST /api/rules waits for the rule engine to accept or refuse the
    script. Handlers run on the server task, so this caps how long one request
@@ -55,7 +61,11 @@ extern const char DEMO_SCRIPT[];
 #define RULES_APPLY_TIMEOUT_MS 1000
 #define WWW_BASE   "/www"
 #define CHUNK_SIZE  4096
-#define BODY_MAX    2048  /* names add ~768 bytes to the di/dout arrays */
+/* The whole configuration travels in one body. The di and dout names add
+   about 768 bytes; the eight Modbus master rows add up to another 1850 at
+   their maximum name and host lengths, measured at 2868 bytes for a full
+   table. At 2048 a table of five rows could be displayed but never saved. */
+#define BODY_MAX    4096
 
 #define NVS_ETH_NS  "app_config"
 #define NVS_ETH_KEY "eth_only"
@@ -64,22 +74,8 @@ static httpd_handle_t s_server = NULL;
 
 /* ------------------------------------------------------------------ helpers */
 
-static const char *mime_type(const char *path)
-{
-    const char *ext = strrchr(path, '.');
-    if (!ext) return "application/octet-stream";
-    if (!strcmp(ext, ".html")) return "text/html";
-    if (!strcmp(ext, ".js"))   return "application/javascript";
-    if (!strcmp(ext, ".css"))  return "text/css";
-    if (!strcmp(ext, ".json")) return "application/json";
-    if (!strcmp(ext, ".ico"))  return "image/x-icon";
-    if (!strcmp(ext, ".png"))  return "image/png";
-    if (!strcmp(ext, ".svg"))  return "image/svg+xml";
-    return "application/octet-stream";
-}
-
 /* Parse a cJSON array of {invert, name} objects into a di_config_t array. */
-static void parse_invert_array(cJSON *arr, di_config_t *out, int max)
+static void parse_invert_array(cJSON *arr, di_config_t *out, int max, const char *where, web_cfg_err_t *bad)
 {
     if (!cJSON_IsArray(arr)) return;
     int n = cJSON_GetArraySize(arr);
@@ -88,239 +84,21 @@ static void parse_invert_array(cJSON *arr, di_config_t *out, int max)
         cJSON *item = cJSON_GetArrayItem(arr, i);
         if (!item) continue;
         cJSON *inv  = cJSON_GetObjectItem(item, "invert");
-        cJSON *name = cJSON_GetObjectItem(item, "name");
-        if (cJSON_IsBool(inv))    out[i].invert = cJSON_IsTrue(inv);
-        if (cJSON_IsString(name)) strlcpy(out[i].name, name->valuestring, sizeof(out[i].name));
+        if (cJSON_IsBool(inv)) out[i].invert = cJSON_IsTrue(inv);
+        char w[16];
+        snprintf(w, sizeof(w), "%s%d.", where, i + 1);
+        web_cfg_str(item, w, "name", out[i].name, sizeof(out[i].name), bad);
     }
-}
-
-/* Validate names: no '/', unique within the array (empty names ignored). */
-static bool validate_names(const di_config_t *arr, int count, const char **err_msg)
-{
-    for (int i = 0; i < count; i++) {
-        if (!arr[i].name[0]) continue;
-        if (strchr(arr[i].name, '/')) {
-            *err_msg = "name must not contain '/'";
-            return false;
-        }
-        for (int j = i + 1; j < count; j++) {
-            if (arr[j].name[0] && strcmp(arr[i].name, arr[j].name) == 0) {
-                *err_msg = "names must be unique";
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-/* httpd_req_recv() returns what a single socket read yielded. The loop in
-   httpd_recv_with_opt() only repeats for HTTPD_RECV_OPT_BLOCKING, and
-   httpd_recv() passes HTTPD_RECV_OPT_NONE, so one call can return far less
-   than content_len. Measured on an ESP32-S3-POE-ETH-8DI-8DO with a 2895-byte
-   rule script: a single call returned 1440 bytes when the body was sent in one
-   go, 724 over four segments and 145 over twenty -- all three then failed to
-   parse and answered 400 Invalid JSON.
-
-   buf must hold content_len + 1 bytes. Returns the length read, or -1. */
-static int recv_body(httpd_req_t *req, char *buf, size_t cap)
-{
-    size_t want = req->content_len;
-    if (want > cap) return -1;
-
-    /* The deadline is absolute, not per read: a client that dribbles one byte
-       at a time must not be able to hold the handler open indefinitely. The
-       server processes handlers on its own task, so a stalled body would block
-       every other request -- and /api/auth/set-password reads its body before
-       the token is checked, so this is reachable without credentials. */
-    const int64_t deadline = esp_timer_get_time() + (int64_t)BODY_RECV_TIMEOUT_MS * 1000;
-    size_t got = 0;
-    while (got < want) {
-        int r = httpd_req_recv(req, buf + got, want - got);
-        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
-            if (esp_timer_get_time() >= deadline) return -1;
-            continue;
-        }
-        if (r <= 0) return -1;
-        got += (size_t)r;
-        if (esp_timer_get_time() >= deadline && got < want) return -1;
-    }
-    buf[got] = '\0';
-    return (int)got;
-}
-
-/* ------------------------------------------------------------------ auth check */
-
-/* Returns true if the request carries a valid password (or no password is set). */
-static bool check_auth(httpd_req_t *req)
-{
-    if (!auth_is_password_set()) return true;
-
-    char hdr[160] = "";
-    httpd_req_get_hdr_value_str(req, "Authorization", hdr, sizeof(hdr));
-    if (strncmp(hdr, "Basic ", 6) != 0) return false;
-
-    unsigned char decoded[128];
-    size_t decoded_len = 0;
-    if (mbedtls_base64_decode(decoded, sizeof(decoded) - 1, &decoded_len,
-                              (const unsigned char *)(hdr + 6),
-                              strlen(hdr + 6)) != 0) return false;
-    decoded[decoded_len] = '\0';
-
-    // HTTP Basic format is "user:password"; accept any username, check password only.
-    const char *pw = (const char *)decoded;
-    const char *colon = (const char *)memchr(decoded, ':', decoded_len);
-    if (colon) pw = colon + 1;
-
-    bool ok = auth_check_password(pw);
-    memset(decoded, 0, sizeof(decoded));
-    return ok;
-}
-
-static esp_err_t send_401(httpd_req_t *req)
-{
-    httpd_resp_set_status(req, "401 Unauthorized");
-    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"Device\"");
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"error\":\"unauthorized\"}");
-    return ESP_OK;
-}
-
-/* ------------------------------------------------------------------ auth endpoints */
-
-/* GET /api/auth/status — no auth required */
-static esp_err_t api_auth_status(httpd_req_t *req)
-{
-    char json[32];
-    snprintf(json, sizeof(json), "{\"password_set\":%s}",
-             auth_is_password_set() ? "true" : "false");
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, json);
-    return ESP_OK;
-}
-
-/* POST /api/auth/begin — start token flow; no auth required */
-static esp_err_t api_auth_begin(httpd_req_t *req)
-{
-    char session[9];
-    esp_err_t r = auth_token_begin(session);
-    if (r == ESP_ERR_INVALID_STATE) {
-        httpd_resp_set_status(req, "409 Conflict");
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, "{\"error\":\"already_pending\"}");
-        return ESP_OK;
-    }
-    if (r != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Internal error");
-        return ESP_OK;
-    }
-    char json[48];
-    snprintf(json, sizeof(json), "{\"session\":\"%.8s\"}", session);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, json);
-    return ESP_OK;
-}
-
-/* GET /api/auth/token?s=<session> — poll for token; no auth required */
-static esp_err_t api_auth_token(httpd_req_t *req)
-{
-    char query[16] = "";
-    httpd_req_get_url_query_str(req, query, sizeof(query));
-    char param[9] = "";
-    httpd_query_key_value(query, "s", param, sizeof(param));
-
-    char token[33] = "";
-    auth_tok_state_t state = auth_token_status(param, token);
-    httpd_resp_set_type(req, "application/json");
-    switch (state) {
-    case AUTH_TOK_WAITING:
-        httpd_resp_sendstr(req, "{\"status\":\"waiting\"}");
-        break;
-    case AUTH_TOK_READY: {
-        char json[64];
-        snprintf(json, sizeof(json), "{\"status\":\"ready\",\"token\":\"%.32s\"}", token);
-        httpd_resp_sendstr(req, json);
-        break;
-    }
-    case AUTH_TOK_TIMEOUT:
-        httpd_resp_set_status(req, "408 Request Timeout");
-        httpd_resp_sendstr(req, "{\"status\":\"timeout\"}");
-        break;
-    default:
-        httpd_resp_set_status(req, "404 Not Found");
-        httpd_resp_sendstr(req, "{\"status\":\"idle\"}");
-        break;
-    }
-    return ESP_OK;
-}
-
-/* POST /api/auth/set-password — set/change password using token; no prior auth needed */
-static esp_err_t api_auth_set_password(httpd_req_t *req)
-{
-    if (req->content_len > 256) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body too large");
-        return ESP_OK;
-    }
-    char *body = malloc(req->content_len + 1);
-    if (!body) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_OK; }
-    int n = recv_body(req, body, req->content_len);
-    if (n < 0) { free(body); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
-
-    cJSON *root = cJSON_Parse(body);
-    free(body);
-    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
-
-    cJSON *token_j = cJSON_GetObjectItem(root, "token");
-    cJSON *pw_j    = cJSON_GetObjectItem(root, "password");
-
-    if (!cJSON_IsString(token_j) || !cJSON_IsString(pw_j)) {
-        cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing fields");
-        return ESP_OK;
-    }
-
-    /* Check the password before spending the token. It is single use and only
-       obtainable by pressing the button on the device, so rejecting the input
-       afterwards would send the user back to the hardware for a typo.
-
-       The Basic-auth parser reads the header into a 160-byte buffer, so a
-       password that cannot fit there could be set and would then lock the user
-       out of the very API that set it. "Basic " plus base64 of ":" + password
-       must stay within that buffer -- see APP_CFG_PASSWORD_MAX. */
-    if (strlen(pw_j->valuestring) > APP_CFG_PASSWORD_MAX) {
-        cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                            "password too long (max 113 characters)");
-        return ESP_OK;
-    }
-    if (strlen(pw_j->valuestring) < 8) {
-        cJSON_Delete(root);
-        httpd_resp_set_status(req, "400 Bad Request");
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, "{\"error\":\"password_too_short\"}");
-        return ESP_OK;
-    }
-
-    if (!auth_token_consume(token_j->valuestring)) {
-        cJSON_Delete(root);
-        httpd_resp_set_status(req, "403 Forbidden");
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, "{\"error\":\"invalid_token\"}");
-        return ESP_OK;
-    }
-
-    auth_set_password(pw_j->valuestring);
-    cJSON_Delete(root);
-
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
-    return ESP_OK;
 }
 
 /* ----------------------------------------------------------------- /api/config */
 
+/* The value types and the two readable function codes travel as names rather
+   than numbers: a configuration is read by people, and "f32" says what 4 does
+   not. */
 static esp_err_t api_config_get(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_401(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
     const app_config_t *cfg = app_config_get();
 
     cJSON *root = cJSON_CreateObject();
@@ -332,17 +110,20 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON_AddStringToObject(root, "mqtt_topic_prefix", cfg->mqtt_topic_prefix);
     cJSON_AddNumberToObject(root, "led_mode",          cfg->led_mode);
 
-    cJSON *can = cJSON_AddObjectToObject(root, "can");
-    cJSON_AddNumberToObject(can, "mode",           cfg->can.mode);
-    cJSON_AddNumberToObject(can, "n2k_addr",       cfg->can.n2k_addr);
-    cJSON_AddNumberToObject(can, "base_id",        cfg->can.base_id);
-    cJSON_AddNumberToObject(can, "bitrate",        cfg->can.bitrate);
-    cJSON_AddNumberToObject(can, "tx_interval_ms", cfg->can.tx_interval_ms);
+    web_can_config_json(root, cfg);
 
     cJSON *mb = cJSON_AddObjectToObject(root, "modbus");
     cJSON_AddBoolToObject  (mb, "enable",   cfg->modbus.enable);
     cJSON_AddNumberToObject(mb, "address",  cfg->modbus.address);
     cJSON_AddNumberToObject(mb, "baudrate", cfg->modbus.baudrate);
+    cJSON_AddStringToObject(mb, "rs485_role",
+                            cfg->modbus.rs485_role == MB_ROLE_MASTER ? "master" : "slave");
+    cJSON_AddBoolToObject  (mb, "tcp_server", cfg->modbus.tcp_server);
+    cJSON_AddBoolToObject  (mb, "gateway",    cfg->modbus.gateway);
+    cJSON_AddNumberToObject(mb, "tcp_uid",     cfg->modbus.tcp_uid);
+    web_mbm_config_json(root, cfg);
+
+    cJSON_AddNumberToObject(mb, "rs485_tout_ms", cfg->modbus.rs485_tout_ms);
 
     cJSON *sntp = cJSON_AddObjectToObject(root, "sntp");
     cJSON_AddBoolToObject  (sntp, "enable", cfg->sntp.enable);
@@ -359,6 +140,9 @@ static esp_err_t api_config_get(httpd_req_t *req)
     }
     /* Inputs from this index on are not optocoupler-isolated. */
     cJSON_AddNumberToObject(root, "di_isolated", APP_CFG_DI_ISOLATED_COUNT);
+#if APP_CFG_DI_AUX_COUNT
+    web_aux_config_json(root, cfg);
+#endif
 
     cJSON *dout = cJSON_AddArrayToObject(root, "dout");
     for (int i = 0; i < APP_CFG_DO_COUNT; i++) {
@@ -391,7 +175,7 @@ static esp_err_t api_config_get(httpd_req_t *req)
 
 static esp_err_t api_config_post(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_401(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
     if (req->content_len > BODY_MAX) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body too large");
         return ESP_OK;
@@ -403,14 +187,14 @@ static esp_err_t api_config_post(httpd_req_t *req)
         return ESP_OK;
     }
 
-    int received = recv_body(req, body, req->content_len);
+    int received = web_recv_body(req, body, req->content_len);
     if (received < 0) {
         free(body);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv failed");
         return ESP_OK;
     }
 
-    cJSON *root = cJSON_Parse(body);
+    cJSON *root = json_parse_exact(body, (size_t)received);
     free(body);
 
     if (!root) {
@@ -420,16 +204,11 @@ static esp_err_t api_config_post(httpd_req_t *req)
 
     app_config_t cfg;
     memcpy(&cfg, app_config_get(), sizeof(cfg));
+    web_cfg_err_t bad = { "" };
 
-    /* String fields — macro to keep it terse */
-    #define STR(key, dst) do { \
-        cJSON *_v = cJSON_GetObjectItem(root, key); \
-        if (cJSON_IsString(_v)) strlcpy(dst, _v->valuestring, sizeof(dst)); \
-    } while (0)
-
-    STR("device_name",      cfg.device_name);
-    STR("mqtt_url",         cfg.mqtt_url);
-    STR("mqtt_user",        cfg.mqtt_user);
+    web_cfg_str(root, "", "device_name", cfg.device_name, sizeof(cfg.device_name), &bad);
+    web_cfg_str(root, "", "mqtt_url",    cfg.mqtt_url,    sizeof(cfg.mqtt_url),    &bad);
+    web_cfg_str(root, "", "mqtt_user",   cfg.mqtt_user,   sizeof(cfg.mqtt_user),   &bad);
     /* The prefix is used verbatim as a publish topic and as the last-will
        topic. '#' and '+' are illegal there (MQTT 3.1.1 3.3.2.1 / 4.7) and a
        conforming broker closes the connection on CONNECT, after which MQTT
@@ -447,62 +226,89 @@ static esp_err_t api_config_post(httpd_req_t *req)
                                     "or start or end with '/'");
                 return ESP_OK;
             }
-            strlcpy(cfg.mqtt_topic_prefix, pfx, sizeof(cfg.mqtt_topic_prefix));
+            web_cfg_str(root, "", "mqtt_topic_prefix", cfg.mqtt_topic_prefix, sizeof(cfg.mqtt_topic_prefix), &bad);
         }
     }
-    #undef STR
 
     /* Password: only update when a non-empty value is sent */
     cJSON *pass = cJSON_GetObjectItem(root, "mqtt_password");
     if (cJSON_IsString(pass) && pass->valuestring[0])
-        strlcpy(cfg.mqtt_password, pass->valuestring, sizeof(cfg.mqtt_password));
+        web_cfg_str(root, "", "mqtt_password", cfg.mqtt_password, sizeof(cfg.mqtt_password), &bad);
 
-    parse_invert_array(cJSON_GetObjectItem(root, "di"),   cfg.di,   APP_CFG_DI_COUNT);
-    parse_invert_array(cJSON_GetObjectItem(root, "dout"), cfg.dout, APP_CFG_DO_COUNT);
-
-    cJSON *led_mode_v = cJSON_GetObjectItem(root, "led_mode");
-    if (cJSON_IsNumber(led_mode_v))
-        cfg.led_mode = (uint8_t)led_mode_v->valuedouble;
-
-    cJSON *can_j = cJSON_GetObjectItem(root, "can");
-    if (cJSON_IsObject(can_j)) {
-        cJSON *v;
-        if ((v = cJSON_GetObjectItem(can_j, "mode")) && cJSON_IsNumber(v)) {
-            uint8_t m = (uint8_t)v->valuedouble;
-            if (m <= 2) cfg.can.mode = m;
-        }
-        if ((v = cJSON_GetObjectItem(can_j, "n2k_addr")) && cJSON_IsNumber(v)) {
-            uint8_t a = (uint8_t)v->valuedouble;
-            if (a >= 1 && a <= 251) cfg.can.n2k_addr = a;
-        }
-        if ((v = cJSON_GetObjectItem(can_j, "base_id")) && cJSON_IsNumber(v)) {
-            uint32_t id = (uint32_t)v->valuedouble;
-            /* base_id + 1 .. base_id + 5 are used for TX and RX matching, so
-               the whole block has to fit in the 11-bit standard range. */
-            if (id + 5 <= 0x7FF) cfg.can.base_id = (uint16_t)id;
-        }
-        if ((v = cJSON_GetObjectItem(can_j, "bitrate")) && cJSON_IsNumber(v)) {
-            uint32_t br = (uint32_t)v->valuedouble;
-            /* Outside this range twai_new_node_onchip() refuses the value and
-               can_server_init() fails — see the boot-order note in main.c. */
-            if (br >= 10000 && br <= 1000000) cfg.can.bitrate = br;
-        }
-        if ((v = cJSON_GetObjectItem(can_j, "tx_interval_ms")) && cJSON_IsNumber(v))
-            cfg.can.tx_interval_ms = (uint16_t)v->valuedouble;
+    parse_invert_array(cJSON_GetObjectItem(root, "di"), cfg.di, APP_CFG_DI_COUNT, "di.", &bad);
+#if APP_CFG_DI_AUX_COUNT
+    const char *aux_err = web_aux_config_parse(root, &cfg);
+    if (aux_err) {
+        /* Plain text, like every other refusal of this handler: the page
+           shows the body as it is. */
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, aux_err);
+        return ESP_OK;
     }
+#endif
+    parse_invert_array(cJSON_GetObjectItem(root, "dout"), cfg.dout, APP_CFG_DO_COUNT, "dout.", &bad);
+
+    uint32_t n;
+    if (web_cfg_uint(root, "", "led_mode", LED_MODE_IO, LED_MODE_STATUS, &n, &bad))
+        cfg.led_mode = (uint8_t)n;
+
+    web_can_config_parse(cJSON_GetObjectItem(root, "can"), &cfg, &bad);
 
     cJSON *mb = cJSON_GetObjectItem(root, "modbus");
     if (cJSON_IsObject(mb)) {
         cJSON *v;
         if ((v = cJSON_GetObjectItem(mb, "enable"))   && cJSON_IsBool(v))
             cfg.modbus.enable = cJSON_IsTrue(v) ? 1 : 0;
-        if ((v = cJSON_GetObjectItem(mb, "address"))  && cJSON_IsNumber(v)) {
-            uint32_t a = (uint32_t)v->valuedouble;
-            if (a >= 1 && a <= 247) cfg.modbus.address = (uint8_t)a;
+        if (web_cfg_uint(mb, "modbus.", "address", 1, 247, &n, &bad))
+            cfg.modbus.address = (uint8_t)n;
+        if (web_cfg_uint(mb, "modbus.", "baudrate", 1200, 921600, &n, &bad))
+            cfg.modbus.baudrate = n;
+        if ((v = cJSON_GetObjectItem(mb, "rs485_role")) && cJSON_IsString(v)) {
+            if      (!strcmp(v->valuestring, "slave"))  cfg.modbus.rs485_role = MB_ROLE_SLAVE;
+            else if (!strcmp(v->valuestring, "master")) cfg.modbus.rs485_role = MB_ROLE_MASTER;
         }
-        if ((v = cJSON_GetObjectItem(mb, "baudrate")) && cJSON_IsNumber(v)) {
-            uint32_t bd = (uint32_t)v->valuedouble;
-            if (bd >= 1200 && bd <= 921600) cfg.modbus.baudrate = bd;
+        if ((v = cJSON_GetObjectItem(mb, "tcp_server")) && cJSON_IsBool(v))
+            cfg.modbus.tcp_server = cJSON_IsTrue(v) ? 1 : 0;
+        if ((v = cJSON_GetObjectItem(mb, "gateway")) && cJSON_IsBool(v))
+            cfg.modbus.gateway = cJSON_IsTrue(v) ? 1 : 0;
+        if (web_cfg_uint(mb, "modbus.", "tcp_uid", 1, 247, &n, &bad))
+            cfg.modbus.tcp_uid = (uint8_t)n;
+        if (web_cfg_uint(mb, "modbus.", "rs485_tout_ms", MB_RS485_TOUT_MIN_MS, MB_RS485_TOUT_MAX_MS, &n, &bad))
+            cfg.modbus.rs485_tout_ms = (uint16_t)n;
+
+        /* Two combinations are worth refusing rather than quietly accepting.
+           A master with no TCP server has nobody to act for, and a local unit
+           ID in the range the gateway forwards would shadow the device that
+           really has that address -- a request meant for it would be answered
+           by this board's own two registers instead. */
+        /* The gateway forwards Modbus TCP requests to the segment, so it
+           needs both: the segment's master, and the TCP server. The master on
+           its own is fine -- it reads the RS-485 rows of the poll table. The
+           unit ID is the user's to choose with the gateway on as well; the
+           page says that a device with that address on the segment is then
+           unreachable through it. */
+        if (cfg.modbus.enable && cfg.modbus.gateway) {
+            const char *why = NULL;
+            if (cfg.modbus.rs485_role != MB_ROLE_MASTER)
+                why = "the gateway needs RS-485 set to master";
+            else if (!cfg.modbus.tcp_server)
+                why = "the gateway needs the Modbus TCP server enabled";
+            if (why) {
+                cJSON_Delete(root);
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, why);
+                return ESP_OK;
+            }
+        }
+    }
+
+    cJSON *mbm_j = cJSON_GetObjectItem(root, "mbm");
+    bool mbm_present = cJSON_IsArray(mbm_j);
+    if (mbm_present) {
+        const char *why = web_mbm_config_parse(mbm_j, &cfg, true, &bad);
+        if (why) {
+            cJSON_Delete(root);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, why);
+            return ESP_OK;
         }
     }
 
@@ -511,34 +317,76 @@ static esp_err_t api_config_post(httpd_req_t *req)
         cJSON *v;
         if ((v = cJSON_GetObjectItem(sntp_j, "enable")) && cJSON_IsBool(v))
             cfg.sntp.enable = cJSON_IsTrue(v) ? 1 : 0;
-        if ((v = cJSON_GetObjectItem(sntp_j, "server")) && cJSON_IsString(v))
-            strlcpy(cfg.sntp.server, v->valuestring, sizeof(cfg.sntp.server));
+        web_cfg_str(sntp_j, "sntp.", "server", cfg.sntp.server, sizeof(cfg.sntp.server), &bad);
     }
 
-    cJSON *tz_j = cJSON_GetObjectItem(root, "tz");
-    if (cJSON_IsString(tz_j))
-        strlcpy(cfg.tz, tz_j->valuestring, sizeof(cfg.tz));
+    web_cfg_str(root, "", "tz", cfg.tz, sizeof(cfg.tz), &bad);
 
     cJSON_Delete(root);
 
-    /* Validate names before saving */
-    const char *err = NULL;
-    if (!validate_names(cfg.di,   APP_CFG_DI_COUNT, &err) ||
-        !validate_names(cfg.dout, APP_CFG_DO_COUNT, &err)) {
-        char msg[64];
-        snprintf(msg, sizeof(msg), "{\"status\":\"error\",\"message\":\"%s\"}", err);
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, msg);
+    if (bad.field[0]) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "invalid value for %s (wrong type, out of range or too long)", bad.field);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
         return ESP_OK;
     }
 
-    app_config_update(&cfg);
+    /* Validate names before saving -- a 400 in plain text, like every other
+       refusal here (it was a 200 with a JSON error). */
+    const char *err = NULL;
+    if (!app_config_io_names_ok(&cfg, &err)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, err);
+        return ESP_OK;
+    }
+
+    /* The page always sends the table; whether it changed is what counts. */
+    bool mbm_changed = mbm_present && memcmp(cfg.mbm, app_config_get()->mbm, sizeof(cfg.mbm)) != 0;
+
+    esp_err_t upd = app_config_update(&cfg);
+    if (upd != ESP_OK) {
+        /* Nothing below is applied: the live configuration is still the old
+           one, and that is what the device keeps running. */
+        return web_send_json(req, "500 Internal Server Error", "{\"error\":\"configuration could not be stored\"}");
+    }
+
+    /* Only when the table changed. Reloading clears the master's counters and
+       drops its connections to every meter, so doing it for a request that
+       merely renamed an input or changed the NTP server would throw away
+       readings nobody asked to lose. The page sends the table with every
+       save, so "the request carried it" was every time.
+
+       The master re-reads the table on its own, but the task only exists once
+       something is enabled, and what it knew about the old entries no longer
+       describes the new ones. Everything else on this page needs a reboot,
+       which is what the form says; this one does not have to. */
+    if (mbm_changed) mb_tcp_master_reload();
+    /* Before di_publish_all() below. A pad that cannot take its mode is left
+       in its standard function; the save itself has happened. */
+    esp_err_t aux_ret = aux_io_apply();
+    app_time_apply_tz();  /* timezone first, so a sync that follows computes in it */
     sntp_sync_apply();    /* apply any SNTP server / enable change immediately */
-    app_time_apply_tz();  /* apply any timezone change to localtime + cron */
     di_publish_all();
+    /* The relays take a changed invert here, with or without MQTT: before,
+       only dout_on_mqtt_connected() re-applied them, and it is empty in a
+       build without MQTT -- the save said ok and the next unrelated output
+       write flipped them. */
+    esp_err_t dout_ret = dout_publish_all();
     /* Re-subscribe with potentially new names, then publish all DO states. */
     dout_on_mqtt_connected();
+    if (app_mqtt_is_connected()) aux_io_on_mqtt_connected();
 
+    if (dout_ret != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+            "Saved, but the outputs could not be re-applied and may still use the old invert setting (see the device log)");
+        return ESP_OK;
+    }
+    if (aux_ret != ESP_OK) {
+        /* Stored, but not in effect: say so, rather than "ok" next to a mode
+           the Device tab shows and the pad does not have. */
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+            "Saved, but a header pad could not be switched and is in its standard function (see the device log)");
+        return ESP_OK;
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
     return ESP_OK;
@@ -547,117 +395,6 @@ static esp_err_t api_config_post(httpd_req_t *req)
 /* ----------------------------------------------------------------- time / RTC */
 
 /* Format a UTC epoch as ISO-8601 "YYYY-MM-DDTHH:MM:SSZ" into buf (>= 21 bytes). */
-static void iso8601_utc(time_t t, char *buf, size_t len)
-{
-    struct tm tm_utc;
-    gmtime_r(&t, &tm_utc);
-    strftime(buf, len, "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
-}
-
-/* GET /api/time — report the system clock and the battery-backed RTC.
- * All times are UTC. "rtc_valid" is false when the RTC reports an oscillator
- * stop (i.e. it lost power and its time is meaningless). */
-static esp_err_t api_time_get(httpd_req_t *req)
-{
-    time_t now = time(NULL);
-
-    struct tm rtc_tm;
-    bool rtc_valid = false;
-    bool rtc_ok    = (rtc_dev_read(&rtc_tm, &rtc_valid) == ESP_OK);
-
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddNumberToObject(root, "epoch", (double)now);
-    char iso[24];
-    iso8601_utc(now, iso, sizeof(iso));
-    cJSON_AddStringToObject(root, "utc", iso);
-
-    cJSON_AddBoolToObject(root, "rtc_present", rtc_ok);
-    cJSON_AddBoolToObject(root, "rtc_valid",   rtc_ok && rtc_valid);
-    if (rtc_ok && rtc_valid) {
-        /* struct tm from the RTC is UTC; turn it back into an epoch for display. */
-        char riso[24];
-        strftime(riso, sizeof(riso), "%Y-%m-%dT%H:%M:%SZ", &rtc_tm);
-        cJSON_AddStringToObject(root, "rtc_utc", riso);
-    }
-
-    /* Local time and the configured zone (TZ is applied process-wide via tzset). */
-    struct tm local_tm;
-    localtime_r(&now, &local_tm);
-    char local[32];
-    strftime(local, sizeof(local), "%Y-%m-%d %H:%M:%S", &local_tm);
-    cJSON_AddStringToObject(root, "local", local);
-    cJSON_AddStringToObject(root, "tz", app_config_get()->tz);
-
-    char *json = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, json ? json : "{}");
-    cJSON_free(json);
-    return ESP_OK;
-}
-
-/* POST /api/time {"epoch": <unix seconds, UTC>} — set the system clock and
- * mirror it to the RTC. Used to set the time manually from the browser. */
-static esp_err_t api_time_post(httpd_req_t *req)
-{
-    if (!check_auth(req)) return send_401(req);
-    if (req->content_len > BODY_MAX) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body too large");
-        return ESP_OK;
-    }
-
-    char *body = malloc(req->content_len + 1);
-    if (!body) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
-        return ESP_OK;
-    }
-    int received = recv_body(req, body, req->content_len);
-    if (received < 0) {
-        free(body);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv failed");
-        return ESP_OK;
-    }
-
-    cJSON *root = cJSON_Parse(body);
-    free(body);
-    if (!root) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
-        return ESP_OK;
-    }
-
-    cJSON *epoch = cJSON_GetObjectItem(root, "epoch");
-    if (!cJSON_IsNumber(epoch) || epoch->valuedouble < 1000000000.0) {
-        cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing/invalid epoch");
-        return ESP_OK;
-    }
-    time_t t = (time_t)epoch->valuedouble;
-    cJSON_Delete(root);
-
-    struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
-    settimeofday(&tv, NULL);
-
-    struct tm utc;
-    gmtime_r(&t, &utc);
-    esp_err_t rtc_ret = rtc_dev_set(&utc);
-
-    char iso[24];
-    iso8601_utc(t, iso, sizeof(iso));
-    ESP_LOGI(TAG, "time set from UI: %s (RTC %s)", iso,
-             rtc_ret == ESP_OK ? "updated" : "unavailable");
-
-    cJSON *resp = cJSON_CreateObject();
-    cJSON_AddStringToObject(resp, "status", "ok");
-    cJSON_AddStringToObject(resp, "utc", iso);
-    cJSON_AddBoolToObject(resp, "rtc_updated", rtc_ret == ESP_OK);
-    char *json = cJSON_PrintUnformatted(resp);
-    cJSON_Delete(resp);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, json ? json : "{\"status\":\"ok\"}");
-    cJSON_free(json);
-    return ESP_OK;
-}
-
 /* ----------------------------------------------------------------- static files */
 
 static esp_err_t file_get(httpd_req_t *req)
@@ -711,7 +448,7 @@ static esp_err_t file_get(httpd_req_t *req)
     }
 
     /* MIME type is determined by the logical file extension, not the .gz suffix. */
-    httpd_resp_set_type(req, mime_type(file));
+    httpd_resp_set_type(req, web_mime_type(file));
 
     /* index.html must not be cached — it changes with every firmware flash.
      * Other static assets (JS, SVG) are versioned by flash and can be cached. */
@@ -751,13 +488,10 @@ static esp_err_t file_get(httpd_req_t *req)
 #ifdef CONFIG_APP_MATTER_ENABLE
 static esp_err_t api_matter_decommission(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_401(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
 
     if (!matter_is_commissioned()) {
-        httpd_resp_set_status(req, "409 Conflict");
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, "{\"error\":\"not_commissioned\"}");
-        return ESP_OK;
+        return web_send_json(req, "409 Conflict", "{\"error\":\"not_commissioned\"}");
     }
 
     httpd_resp_set_type(req, "application/json");
@@ -771,7 +505,7 @@ static esp_err_t api_matter_decommission(httpd_req_t *req)
 
 static esp_err_t api_matter_pairing(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_401(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
 
     const char *qr  = matter_get_qr_code();
     const char *man = matter_get_manual_code();
@@ -779,10 +513,7 @@ static esp_err_t api_matter_pairing(httpd_req_t *req)
 
     /* Return 404 only when Matter is truly inactive (no QR code AND not commissioned). */
     if ((!qr || !qr[0]) && !commissioned) {
-        httpd_resp_set_status(req, "404 Not Found");
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, "{\"error\":\"matter_not_enabled\"}");
-        return ESP_OK;
+        return web_send_json(req, "404 Not Found", "{\"error\":\"matter_not_enabled\"}");
     }
 
     cJSON *root = cJSON_CreateObject();
@@ -805,20 +536,20 @@ static void do_restart(void *arg);  /* defined below in /api/reboot section */
 
 static esp_err_t api_eth_only(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_401(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
     if (req->content_len > 64) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body too large");
         return ESP_OK;
     }
 
     char body[65] = {};
-    int received = recv_body(req, body, sizeof(body) - 1);
+    int received = web_recv_body(req, body, sizeof(body) - 1);
     if (received < 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv failed");
         return ESP_OK;
     }
 
-    cJSON *root = cJSON_Parse(body);
+    cJSON *root = json_parse_exact(body, (size_t)received);
     if (!root) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
         return ESP_OK;
@@ -833,12 +564,23 @@ static esp_err_t api_eth_only(httpd_req_t *req)
     bool want_eth_only = cJSON_IsTrue(enabled);
     cJSON_Delete(root);
 
+    /* Rebooted only once the flash has it: answering "rebooting" over a
+       failed write came back up in the old mode while the page said the
+       new one. */
     nvs_handle_t nvs_h;
-    if (nvs_open(NVS_ETH_NS, NVS_READWRITE, &nvs_h) == ESP_OK) {
-        if (want_eth_only) nvs_set_u8(nvs_h, NVS_ETH_KEY, 1);
-        else               nvs_erase_key(nvs_h, NVS_ETH_KEY);
-        nvs_commit(nvs_h);
+    esp_err_t err = nvs_open(NVS_ETH_NS, NVS_READWRITE, &nvs_h);
+    if (err == ESP_OK) {
+        if (want_eth_only) err = nvs_set_u8(nvs_h, NVS_ETH_KEY, 1);
+        else {
+            err = nvs_erase_key(nvs_h, NVS_ETH_KEY);
+            if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;
+        }
+        if (err == ESP_OK) err = nvs_commit(nvs_h);
         nvs_close(nvs_h);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "eth-only: not stored: %s", esp_err_to_name(err));
+        return web_send_json(req, "500 Internal Server Error", "{\"error\":\"setting could not be stored, not rebooting\"}");
     }
 
     httpd_resp_set_type(req, "application/json");
@@ -858,13 +600,19 @@ static void do_restart(void *arg) { esp_restart(); }
 
 static esp_err_t api_factory_reset(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_401(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
+
+    /* Erase the entire NVS default partition, then reboot. This clears WiFi
+       credentials, all config, and IO names. Erased first, answered after:
+       "resetting" over a failed erase rebooted into the old configuration
+       and password. */
+    esp_err_t err = nvs_flash_erase();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "factory reset: erase failed: %s", esp_err_to_name(err));
+        return web_send_json(req, "500 Internal Server Error", "{\"error\":\"erase failed, nothing reset\"}");
+    }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"resetting\"}");
-
-    /* Erase the entire NVS default partition, then reboot.
-       This clears WiFi credentials, all config, and IO names. */
-    nvs_flash_erase();
 
     esp_timer_handle_t t;
     esp_timer_create(&(esp_timer_create_args_t){
@@ -876,7 +624,7 @@ static esp_err_t api_factory_reset(httpd_req_t *req)
 
 static esp_err_t api_reboot(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_401(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"rebooting\"}");
@@ -895,7 +643,7 @@ static esp_err_t api_reboot(httpd_req_t *req)
 /* GET /api/io/state — current logical state of all DI and DO channels */
 static esp_err_t api_io_state(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_401(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
 
     cJSON *root = cJSON_CreateObject();
     cJSON *di   = cJSON_AddArrayToObject(root, "di");
@@ -903,6 +651,9 @@ static esp_err_t api_io_state(httpd_req_t *req)
     for (int i = 0; i < APP_CFG_DI_COUNT; i++) {
         cJSON_AddItemToArray(di,   cJSON_CreateBool(di_get((uint8_t)i)));
     }
+#if APP_CFG_DI_AUX_COUNT
+    web_aux_state_json(root);
+#endif
     for (int i = 0; i < APP_CFG_DO_COUNT; i++) {
         cJSON_AddItemToArray(dout, cJSON_CreateBool(dout_get((uint8_t)i)));
     }
@@ -917,41 +668,57 @@ static esp_err_t api_io_state(httpd_req_t *req)
 /* POST /api/io/output — {"channel":0-7,"value":bool} or {"channel":0-7,"toggle":true} */
 static esp_err_t api_io_output(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_401(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
     if (req->content_len == 0 || req->content_len > 64) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad body");
         return ESP_OK;
     }
     char body[65];
-    int n = recv_body(req, body, sizeof(body) - 1);
+    int n = web_recv_body(req, body, sizeof(body) - 1);
     if (n < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
-    cJSON *root = cJSON_Parse(body);
+    cJSON *root = json_parse_exact(body, (size_t)n);
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
 
+    /* 0-7 are DO1-DO8; 8-10 the header pads, while they are outputs. */
+    const int last = APP_CFG_DO_COUNT - 1 + APP_CFG_DI_AUX_COUNT;
     cJSON *ch_j = cJSON_GetObjectItem(root, "channel");
-    if (!cJSON_IsNumber(ch_j) || (int)ch_j->valuedouble < 0 || (int)ch_j->valuedouble > 7) {
+    if (!cJSON_IsNumber(ch_j) || ch_j->valuedouble < 0 || ch_j->valuedouble > last ||
+        ch_j->valuedouble != (int)ch_j->valuedouble) {
         cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "channel 0-7 required");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            last > 7 ? "channel 0-10 required" : "channel 0-7 required");
         return ESP_OK;
     }
     uint8_t ch = (uint8_t)ch_j->valuedouble;
 
-    bool new_val;
+#if APP_CFG_DI_AUX_COUNT
+    if (ch >= APP_CFG_DO_COUNT) {
+        esp_err_t r = web_aux_output(req, (uint8_t)(ch - APP_CFG_DO_COUNT), root);
+        cJSON_Delete(root);
+        return r;
+    }
+#endif
+
+    /* A toggle goes to dout_modify() as one: read and flip under the output
+       lock. Reading here and setting the opposite lost one of two toggles
+       arriving together, and the output ended where neither asked for. */
+    esp_err_t set_ret;
     cJSON *tog = cJSON_GetObjectItem(root, "toggle");
     cJSON *val = cJSON_GetObjectItem(root, "value");
     if (cJSON_IsTrue(tog)) {
-        new_val = !dout_get(ch);
+        cJSON_Delete(root);
+        set_ret = dout_toggle(ch);
     } else if (cJSON_IsBool(val)) {
-        new_val = cJSON_IsTrue(val);
+        bool new_val = cJSON_IsTrue(val);
+        cJSON_Delete(root);
+        set_ret = dout_set(ch, new_val);
     } else {
         cJSON_Delete(root);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "value or toggle required");
         return ESP_OK;
     }
-    cJSON_Delete(root);
 
-    esp_err_t set_ret = dout_set(ch, new_val);
     if (set_ret != ESP_OK) {
         /* dout_set() restores the previous state when the transfer fails, so
            confirming the command here would report a switch that never
@@ -968,32 +735,24 @@ static esp_err_t api_io_output(httpd_req_t *req)
 /* POST /api/io/led — {"r":0-255,"g":0-255,"b":0-255} or {"color":"#RRGGBB"} */
 static esp_err_t api_io_led(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_401(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
     if (req->content_len == 0 || req->content_len > 64) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad body");
         return ESP_OK;
     }
     char body[65];
-    int n = recv_body(req, body, sizeof(body) - 1);
+    int n = web_recv_body(req, body, sizeof(body) - 1);
     if (n < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
-    cJSON *root = cJSON_Parse(body);
+    cJSON *root = json_parse_exact(body, (size_t)n);
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
 
-    uint8_t r = 0, g = 0, b = 0;
-    cJSON *color_j = cJSON_GetObjectItem(root, "color");
-    if (cJSON_IsString(color_j) && color_j->valuestring[0] == '#') {
-        unsigned int ri = 0, gi = 0, bi = 0;
-        if (sscanf(color_j->valuestring + 1, "%02x%02x%02x", &ri, &gi, &bi) == 3) {
-            r = (uint8_t)ri; g = (uint8_t)gi; b = (uint8_t)bi;
-        }
-    } else {
-        cJSON *rj = cJSON_GetObjectItem(root, "r");
-        cJSON *gj = cJSON_GetObjectItem(root, "g");
-        cJSON *bj = cJSON_GetObjectItem(root, "b");
-        if (cJSON_IsNumber(rj)) r = (uint8_t)(int)rj->valuedouble;
-        if (cJSON_IsNumber(gj)) g = (uint8_t)(int)gj->valuedouble;
-        if (cJSON_IsNumber(bj)) b = (uint8_t)(int)bj->valuedouble;
+    uint8_t r, g, b;
+    if (!web_led_color_parse(root, &r, &g, &b)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "Expected color #RRGGBB or integer r, g, b in 0-255");
+        return ESP_OK;
     }
     cJSON_Delete(root);
 
@@ -1003,51 +762,66 @@ static esp_err_t api_io_led(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* POST /api/io/buzzer — {"freq":440,"duration":200} */
-static esp_err_t api_io_buzzer(httpd_req_t *req)
-{
-    if (!check_auth(req)) return send_401(req);
-    if (req->content_len == 0 || req->content_len > 64) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad body");
-        return ESP_OK;
-    }
-    char body[65];
-    int n = recv_body(req, body, sizeof(body) - 1);
-    if (n < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
-
-    cJSON *root = cJSON_Parse(body);
-    if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
-
-    uint32_t freq = 440, dur = 200;
-    cJSON *fj = cJSON_GetObjectItem(root, "freq");
-    cJSON *dj = cJSON_GetObjectItem(root, "duration");
-    if (cJSON_IsNumber(fj)) freq = (uint32_t)fj->valuedouble;
-    if (cJSON_IsNumber(dj)) dur  = (uint32_t)dj->valuedouble;
-    cJSON_Delete(root);
-
-    buzzer_beep_once(freq, dur);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
-    return ESP_OK;
-}
-
 /* ------------------------------------------------------------ rules endpoints */
 
-/* GET /api/rules — returns {"script":"..."} from NVS, or the demo script if unset */
+/* GET /api/rules — returns {"script":"..."} from NVS, or the demo script if unset.
+   Only "unset" means the demo: a stored script that cannot be read is an
+   error, not the demo -- the UI reloads the script after saving and showed
+   the demo in place of the user's code, ready to be saved over it. */
+esp_err_t rules_nvs_read(char **out)
+{
+    *out = NULL;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(RULES_NVS_NS, NVS_READONLY, &h);
+    if (err != ESP_OK) return err;
+    /* Size, then read -- and a save may land in between: a script stored
+       after a 202 grew past the buffer, NVS answered INVALID_LENGTH with the
+       new size in len, and the terminator went past the end of the buffer.
+       The buffer's own size bounds every write. A script that changed in
+       between -- grew, or moved from the old string to the blob -- is looked
+       up again from the start. */
+    for (int tries = 0; tries < 3; tries++) {
+        bool blob = true;
+        size_t len = 0;
+        err = nvs_get_blob(h, RULES_NVS_BLOB, NULL, &len);
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            blob = false;
+            err = nvs_get_str(h, RULES_NVS_KEY, NULL, &len);
+        }
+        if (err != ESP_OK) break;            /* NOT_FOUND: none stored */
+        size_t cap = len;
+        char *buf = malloc(cap + 1);
+        if (!buf) { err = ESP_ERR_NO_MEM; break; }
+        err = blob ? nvs_get_blob(h, RULES_NVS_BLOB, buf, &len)
+                   : nvs_get_str(h, RULES_NVS_KEY, buf, &len);
+        if (err == ESP_OK && len <= cap) {
+            buf[len] = '\0';
+            *out = buf;
+            break;
+        }
+        free(buf);
+        if (err == ESP_OK) err = ESP_ERR_INVALID_SIZE;   /* never: NVS keeps within cap */
+        if (err != ESP_ERR_NVS_INVALID_LENGTH && err != ESP_ERR_NVS_NOT_FOUND) break;
+        err = ESP_ERR_INVALID_STATE;                     /* changed while read, and kept changing */
+    }
+    nvs_close(h);
+    return err;
+}
+
 static esp_err_t api_rules_get(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_401(req);
+    if (!web_check_auth(req)) return web_send_denied(req);
 
-    char *buf = malloc(RULES_MAX_LEN + 1);
-    if (!buf) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_OK; }
-
+    char *buf = NULL;
     const char *script = DEMO_SCRIPT;
-    nvs_handle_t h;
-    size_t len = RULES_MAX_LEN + 1;
-    if (nvs_open(RULES_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
-        if (nvs_get_str(h, RULES_NVS_KEY, buf, &len) == ESP_OK)
-            script = buf;
-        nvs_close(h);
+    esp_err_t err = rules_nvs_read(&buf);
+    if (err == ESP_OK) script = buf;
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGE(TAG, "stored rules unreadable: %s", esp_err_to_name(err));
+        char msg[128];
+        snprintf(msg, sizeof(msg), "{\"status\":\"error\",\"error\":\"stored rules unreadable: %s\"}",
+                 esp_err_to_name(err));
+        return web_send_json(req, "500 Internal Server Error", msg);
     }
 
     cJSON *root = cJSON_CreateObject();
@@ -1063,10 +837,37 @@ static esp_err_t api_rules_get(httpd_req_t *req)
 }
 
 /* POST /api/rules — {"script":"..."} saves to NVS and hot-reloads the engine */
+/* Makes to_store the script the next boot loads ("" = the built-in demo).
+   Called by the rule engine, on its own task, once it has accepted the
+   script -- see scripting_reload_and_store(). */
+static esp_err_t store_rules(const char *to_store)
+{
+    nvs_handle_t h;
+    esp_err_t ret = nvs_open(RULES_NVS_NS, NVS_READWRITE, &h);
+    if (ret != ESP_OK) return ret;
+    if (to_store[0] == '\0') {
+        ret = nvs_erase_key(h, RULES_NVS_BLOB);
+        if (ret == ESP_ERR_NVS_NOT_FOUND) ret = ESP_OK;   /* erasing what was not there */
+    } else {
+        ret = nvs_set_blob(h, RULES_NVS_BLOB, to_store, strlen(to_store));
+    }
+    if (ret == ESP_OK) {
+        /* The blob comes first when reading, but the old string would take
+           up a page's worth of entries for nothing. */
+        esp_err_t e = nvs_erase_key(h, RULES_NVS_KEY);
+        if (e != ESP_OK && e != ESP_ERR_NVS_NOT_FOUND) ret = e;
+    }
+    if (ret == ESP_OK) ret = nvs_commit(h);
+    nvs_close(h);
+    return ret;
+}
+
 static esp_err_t api_rules_post(httpd_req_t *req)
 {
-    if (!check_auth(req)) return send_401(req);
-    if (req->content_len == 0 || req->content_len > RULES_MAX_LEN + 100) {
+    if (!web_check_auth(req)) return web_send_denied(req);
+    /* Room for the escapes, at worst six bytes for one (\u00e4 for an umlaut,
+       as Python's json writes it); the script's own length is checked below. */
+    if (req->content_len == 0 || req->content_len > 6 * RULES_MAX_LEN + 100) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body too large");
         return ESP_OK;
     }
@@ -1074,10 +875,10 @@ static esp_err_t api_rules_post(httpd_req_t *req)
     char *body = malloc(req->content_len + 1);
     if (!body) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM"); return ESP_OK; }
 
-    int n = recv_body(req, body, req->content_len);
+    int n = web_recv_body(req, body, req->content_len);
     if (n < 0) { free(body); httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Recv"); return ESP_OK; }
 
-    cJSON *root = cJSON_Parse(body);
+    cJSON *root = json_parse_exact(body, (size_t)n);
     free(body);
     if (!root) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON"); return ESP_OK; }
 
@@ -1089,27 +890,25 @@ static esp_err_t api_rules_post(httpd_req_t *req)
     }
 
     const char *script = script_j->valuestring;
-    nvs_handle_t h;
-    /* Reported rather than discarded: a failed write left the rule running
-       until the next reboot, when the previous script silently came back,
-       while the handler had answered ok. */
-    esp_err_t nvs_ret = nvs_open(RULES_NVS_NS, NVS_READWRITE, &h);
-    if (nvs_ret == ESP_OK) {
-        nvs_ret = (script[0] == '\0') ? nvs_erase_key(h, RULES_NVS_KEY)
-                                      : nvs_set_str(h, RULES_NVS_KEY, script);
-        if (nvs_ret == ESP_ERR_NVS_NOT_FOUND) nvs_ret = ESP_OK;   /* erasing what was not there */
-        if (nvs_ret == ESP_OK) nvs_ret = nvs_commit(h);
-        nvs_close(h);
-    }
-    if (nvs_ret != ESP_OK) {
-        ESP_LOGE(TAG, "storing rules failed: %s", esp_err_to_name(nvs_ret));
+    size_t script_len = strlen(script);
+    if (script_len > RULES_MAX_LEN) {
         cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                            "rules could not be stored");
-        return ESP_OK;
+        char msg[160];
+        snprintf(msg, sizeof(msg), "{\"status\":\"rejected\",\"error\":\"script too long: %u bytes of UTF-8, at most %d\","
+                 "\"detail\":\"previous rules still running\"}", (unsigned)script_len, RULES_MAX_LEN);
+        return web_send_json(req, "400 Bad Request", msg);
     }
 
-    /* Wait for the engine's verdict instead of acknowledging a request we
+    /* The engine first, the flash second. Stored before the verdict, a
+       script the engine refused -- a syntax error, say -- was what the
+       device booted into next time, with no fallback. The last script the
+       engine accepted is the only one worth keeping -- so the engine stores
+       it itself, the moment it accepts it (store_rules, on its task).
+       Stored here after the verdict instead, a script accepted after this
+       handler had stopped waiting was running but never stored, and the next
+       boot brought the old one back.
+
+       Wait for the engine's verdict instead of acknowledging a request we
        cannot see through. A reload can be refused -- a syntax error, a global
        const clashing with the previous script, no free timers -- and the rules
        already running then stay in place, which the caller has to be told.
@@ -1117,30 +916,30 @@ static esp_err_t api_rules_post(httpd_req_t *req)
        Bounded on purpose: handlers run on the server's own task, so a long
        wait here would hold up every other request. A reload normally finishes
        in milliseconds; if it has not after RULES_APPLY_TIMEOUT_MS the request
-       is answered with 202 and the outcome is left to the log. */
-    scripting_reload_status_t before;
-    scripting_reload_status(&before);
-
-    scripting_reload(script[0] ? script : DEMO_SCRIPT);
+       is answered with 202, and the engine still stores the script if it
+       accepts it. The verdict is matched to this request by ticket. */
+    uint32_t mine = scripting_reload_and_store(script[0] ? script : DEMO_SCRIPT,
+                                               script, store_rules);
     cJSON_Delete(root);
+    if (!mine)
+        return web_send_json(req, "503 Service Unavailable", "{\"status\":\"busy\",\"detail\":\"engine queue full, nothing stored\"}");
 
-    scripting_reload_status_t now = before;
+    scripting_reload_status_t now = { 0 };
     for (int waited = 0; waited < RULES_APPLY_TIMEOUT_MS; waited += 10) {
         scripting_reload_status(&now);
-        if (now.generation != before.generation) break;
+        if (now.ticket >= mine) break;
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 
-    if (now.generation == before.generation) {
-        httpd_resp_set_status(req, "202 Accepted");
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, "{\"status\":\"accepted\"}");
-        return ESP_OK;
+    if (now.ticket != mine) {
+        /* No verdict for this request yet, or already a later one's: the
+           engine stores this script if and when it accepts it. */
+        return web_send_json(req, "202 Accepted", "{\"status\":\"accepted\",\"detail\":\"pending; stored once the engine accepts it\"}");
     }
 
     if (!now.ok) {
-        /* Stored but not running: say so plainly, including that the previous
-           rules are the ones still in effect. */
+        /* Refused and not stored: say so plainly, including that the previous
+           rules are the ones still in effect, in memory and in flash. */
         cJSON *resp = cJSON_CreateObject();
         cJSON_AddStringToObject(resp, "status", "rejected");
         cJSON_AddStringToObject(resp, "error", now.message);
@@ -1154,6 +953,17 @@ static esp_err_t api_rules_post(httpd_req_t *req)
         return ESP_OK;
     }
 
+    /* Accepted and running. A failed write is reported rather than
+       discarded: the rules run until the next reboot, when the previous
+       script comes back, and the caller has to know that. */
+    if (!now.store_tried || now.store_err != ESP_OK) {
+        char msg[192];
+        snprintf(msg, sizeof(msg), "{\"status\":\"error\",\"error\":\"rules running but not stored: %s\","
+                 "\"detail\":\"the previous script returns at the next reboot\"}",
+                 now.store_tried ? esp_err_to_name(now.store_err) : "not tried");
+        return web_send_json(req, "500 Internal Server Error", msg);
+    }
+
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
     return ESP_OK;
@@ -1163,11 +973,26 @@ static esp_err_t api_rules_post(httpd_req_t *req)
 
 static esp_err_t api_version(httpd_req_t *req)
 {
+    /* Firmware and IDF version, build date and the last reset reason tell an
+       attacker which known bugs apply and when the device crashed: behind the
+       password like everything else outside the setup flow. */
+    if (!web_check_auth(req)) return web_send_denied(req);
     const esp_app_desc_t *d = esp_app_get_description();
-    char json[160];
+    /* Why the board last started: a watchdog or a panic otherwise leaves no
+       trace unless something happened to be reading the console. */
+    static const char *const reasons[] = {
+        [ESP_RST_UNKNOWN] = "unknown",   [ESP_RST_POWERON] = "poweron",  [ESP_RST_EXT] = "ext",
+        [ESP_RST_SW] = "sw",             [ESP_RST_PANIC] = "panic",      [ESP_RST_INT_WDT] = "int_wdt",
+        [ESP_RST_TASK_WDT] = "task_wdt", [ESP_RST_WDT] = "wdt",          [ESP_RST_DEEPSLEEP] = "deepsleep",
+        [ESP_RST_BROWNOUT] = "brownout", [ESP_RST_SDIO] = "sdio",        [ESP_RST_USB] = "usb",
+        [ESP_RST_JTAG] = "jtag",
+    };
+    esp_reset_reason_t rr = esp_reset_reason();
+    const char *rs = ((size_t)rr < sizeof(reasons) / sizeof(reasons[0]) && reasons[rr]) ? reasons[rr] : "other";
+    char json[256];
     snprintf(json, sizeof(json),
-             "{\"version\":\"%s\",\"idf\":\"%s\",\"date\":\"%s\",\"time\":\"%s\"}",
-             d->version, d->idf_ver, d->date, d->time);
+             "{\"variant\":\"full\",\"version\":\"%s\",\"idf\":\"%s\",\"date\":\"%s\",\"time\":\"%s\",\"reset_reason\":\"%s\"}",
+             d->version, d->idf_ver, d->date, d->time, rs);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, json);
     return ESP_OK;
@@ -1175,17 +1000,41 @@ static esp_err_t api_version(httpd_req_t *req)
 
 /* -------------------------------------------------------------- start / stop */
 
+/* What the two Modbus sides are doing, as opposed to how they are set up.
+   Without it a value that never arrives looks the same as one that arrives
+   wrong. */
+static esp_err_t api_modbus_status(httpd_req_t *req)
+{
+    if (!web_check_auth(req)) return web_send_denied(req);
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_OK;
+    }
+
+    mb_status_json(root);
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json ? json : "{}");
+    cJSON_free(json);
+    return ESP_OK;
+}
+
 static const httpd_uri_t s_handlers[] = {
-    { .uri = "/api/auth/status",       .method = HTTP_GET,  .handler = api_auth_status       },
-    { .uri = "/api/auth/begin",        .method = HTTP_POST, .handler = api_auth_begin        },
-    { .uri = "/api/auth/token",        .method = HTTP_GET,  .handler = api_auth_token        },
-    { .uri = "/api/auth/set-password", .method = HTTP_POST, .handler = api_auth_set_password },
+    { .uri = "/api/auth/status",       .method = HTTP_GET,  .handler = web_api_auth_status       },
+    { .uri = "/api/auth/begin",        .method = HTTP_POST, .handler = web_api_auth_begin        },
+    { .uri = "/api/auth/token",        .method = HTTP_GET,  .handler = web_api_auth_token        },
+    { .uri = "/api/auth/set-password", .method = HTTP_POST, .handler = web_api_auth_set_password },
     { .uri = "/api/config",            .method = HTTP_GET,  .handler = api_config_get        },
     { .uri = "/api/config",            .method = HTTP_POST, .handler = api_config_post       },
     { .uri = "/api/io/state",          .method = HTTP_GET,  .handler = api_io_state          },
+    { .uri = "/api/modbus/status",     .method = HTTP_GET,  .handler = api_modbus_status     },
     { .uri = "/api/io/output",         .method = HTTP_POST, .handler = api_io_output         },
     { .uri = "/api/io/led",            .method = HTTP_POST, .handler = api_io_led            },
-    { .uri = "/api/io/buzzer",         .method = HTTP_POST, .handler = api_io_buzzer         },
+    { .uri = "/api/io/buzzer",         .method = HTTP_POST, .handler = web_api_io_buzzer     },
 #ifdef CONFIG_APP_MATTER_ENABLE
     { .uri = "/api/matter/pairing",       .method = HTTP_GET,  .handler = api_matter_pairing      },
     { .uri = "/api/matter/decommission", .method = HTTP_POST, .handler = api_matter_decommission },
@@ -1195,8 +1044,8 @@ static const httpd_uri_t s_handlers[] = {
     { .uri = "/api/factory-reset",     .method = HTTP_POST, .handler = api_factory_reset     },
     { .uri = "/api/rules",             .method = HTTP_GET,  .handler = api_rules_get         },
     { .uri = "/api/rules",             .method = HTTP_POST, .handler = api_rules_post        },
-    { .uri = "/api/time",              .method = HTTP_GET,  .handler = api_time_get          },
-    { .uri = "/api/time",              .method = HTTP_POST, .handler = api_time_post         },
+    { .uri = "/api/time",              .method = HTTP_GET,  .handler = web_api_time_get      },
+    { .uri = "/api/time",              .method = HTTP_POST, .handler = web_api_time_post     },
     { .uri = "/api/version",           .method = HTTP_GET,  .handler = api_version           },
     { .uri = "/*",                     .method = HTTP_GET,  .handler = file_get              },
 };
@@ -1206,6 +1055,7 @@ esp_err_t web_server_start(void)
     if (s_server) return ESP_OK;
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.max_open_sockets = NET_SOCK_HTTPD_CLIENTS;   /* the share net_budget.h allots */
     cfg.uri_match_fn     = httpd_uri_match_wildcard;
     /* Derive from the table so adding a handler never overflows the cap and
      * silently drops the last registration (the wildcard file-serving fallback). */
@@ -1219,6 +1069,12 @@ esp_err_t web_server_start(void)
      * and the DMA pool still has ~29 KB free at that point. */
     cfg.task_caps        = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
     cfg.send_wait_timeout = 10;   /* seconds; default 5 is too tight with Matter on WiFi */
+    /* HTTPD_DEFAULT_CONFIG gives 4096. A handler holds a whole app_config_t
+       (1.7 kB) or the Modbus status table (640 B) plus cJSON's own working
+       set, so the default leaves too little. sdkconfig carried a
+       CONFIG_HTTPD_STACK_SIZE line for years that does not exist as a Kconfig
+       symbol and therefore never did anything. */
+    cfg.stack_size        = 6144;
 
     esp_err_t ret = httpd_start(&s_server, &cfg);
     if (ret != ESP_OK) {

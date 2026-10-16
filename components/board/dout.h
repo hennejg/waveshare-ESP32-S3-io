@@ -1,5 +1,6 @@
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
 
@@ -30,11 +31,21 @@ esp_err_t dout_modify(uint8_t set, uint8_t clear, uint8_t toggle);
    Shorthand for dout_modify() on a single channel. */
 esp_err_t dout_set(uint8_t n, bool state);
 
-/* Re-apply current logical states to hardware (e.g. after invert config
-   change) and publish all states. */
-/* Re-apply the logical state to the chip and publish it. Returns the result of
-   the transfer; on failure the previous state is restored and published, so
-   what is reported is always what the hardware actually holds. */
+/* Flips output n in one step under the output lock. Reading dout_get() and
+   setting the opposite loses one of two toggles that arrive together. */
+esp_err_t dout_toggle(uint8_t n);
+
+/* The payload vocabulary of an output command, shared with the header pads
+   (aux_io.c): true 1 high on / false 0 low off, and toggle; case-insensitive. */
+bool      dout_parse_state(const char *data, size_t len, bool *out);
+bool      dout_parse_toggle(const char *data, size_t len);
+
+/* Re-apply the logical states to the chip (after an invert change, the
+   physical levels change) and publish all of them. Tried up to three times;
+   returns the result of the last transfer. Nothing is restored on failure:
+   the logical states stay what they were -- and are what is published --
+   while the relays keep the levels of the old invert setting until the next
+   transfer that gets through, which then applies the new one. */
 esp_err_t dout_publish_all(void);
 
 /* Wire these into the MQTT callbacks in main.c. */

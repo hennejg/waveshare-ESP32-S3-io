@@ -6,6 +6,8 @@ cmake_minimum_required(VERSION 3.16)
 set(EXTRA_COMPONENT_DIRS
     "${CMAKE_CURRENT_SOURCE_DIR}/../../components/board"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../components/esp32-wifi-bootstrap"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../components/modbus"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../components/can"
 )
 
 # esp-matter is required for this app.
@@ -37,8 +39,9 @@ include(${ESP_MATTER_PATH}/examples/common/cmake_common/components_include.cmake
 
 project(waveshare_esp32s3_matter)
 
-# matter.h lives in main/ (app-layer API); expose it to the board component
-# which calls matter_di_update() / matter_do_update() when GPIO state changes.
+# matter.h lives in main/ (app-layer API); expose it to the board component,
+# which calls matter_di_update() when an input changes. Output changes are
+# reported by the callers of dout_set() in main/ (matter_do_update()).
 idf_component_get_property(board_lib board COMPONENT_LIB)
 target_include_directories(${board_lib} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/main")
 

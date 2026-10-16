@@ -2,6 +2,7 @@
 #ifdef CONFIG_APP_MQTT_ENABLE
 int app_mqtt_subscribe(const char *topic, int qos);
 #include "cJSON.h"
+#include "json_exact.h"
 #endif
 
 #include <string.h>
@@ -11,10 +12,13 @@ int app_mqtt_subscribe(const char *topic, int qos);
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
 #include "esp_check.h"
 #include "esp_log.h"
 
 #define TAG        "buzzer"
+#define BUZZER_PAYLOAD_MAX 1024   /* buzzer/beep payloads at or above this are ignored */
 #define GPIO_BUZZER GPIO_NUM_46
 #define LEDC_MODE   LEDC_LOW_SPEED_MODE
 #define LEDC_TIMER  LEDC_TIMER_0
@@ -50,16 +54,16 @@ static bool parse_bstep(cJSON *obj, bstep_t *s)
     cJSON *dur = cJSON_GetObjectItem(obj, "duration");
     if (!cJSON_IsNumber(dur)) return false;
 
-    uint32_t d = (uint32_t)dur->valuedouble;
-    if (d < DUR_MIN_MS) d = DUR_MIN_MS;
-    if (d > DUR_MAX_MS) d = DUR_MAX_MS;
+    /* Clamped as doubles, before the conversion: a negative or huge value
+       converted to uint32_t is undefined behaviour. NaN fails every test
+       and ends up at the low end. */
+    double dd = dur->valuedouble;
+    uint32_t d = dd >= DUR_MAX_MS ? DUR_MAX_MS : dd > DUR_MIN_MS ? (uint32_t)dd : DUR_MIN_MS;
 
     cJSON *freq = cJSON_GetObjectItem(obj, "freq");
-    uint32_t f = cJSON_IsNumber(freq) ? (uint32_t)freq->valuedouble : 0;
-    if (f > 0) {
-        if (f < FREQ_MIN) f = FREQ_MIN;
-        if (f > FREQ_MAX) f = FREQ_MAX;
-    }
+    double fd = cJSON_IsNumber(freq) ? freq->valuedouble : 0;
+    uint32_t f = 0;                                  /* below 1 Hz: silence */
+    if (fd >= 1) f = fd >= FREQ_MAX ? FREQ_MAX : fd > FREQ_MIN ? (uint32_t)fd : FREQ_MIN;
 
     s->freq_hz = f;
     s->dur_ms  = d;
@@ -109,6 +113,7 @@ void buzzer_beep_once(uint32_t freq_hz, uint32_t dur_ms)
     bseq_t seq = { .count = 1 };
     seq.steps[0].freq_hz = freq_hz;
     seq.steps[0].dur_ms  = dur_ms;
+    if (!s_queue) return;               /* before buzzer_init(): nothing to drive yet */
     xQueueOverwrite(s_queue, &seq);
 }
 
@@ -122,6 +127,7 @@ void buzzer_set_tone(uint32_t freq_hz)
     bseq_t seq = { .count = 1 };
     seq.steps[0].freq_hz = freq_hz;
     seq.steps[0].dur_ms  = 0;
+    if (!s_queue) return;               /* before buzzer_init(): nothing to drive yet */
     xQueueOverwrite(s_queue, &seq);
 }
 
@@ -148,7 +154,11 @@ esp_err_t buzzer_init(void)
     ESP_RETURN_ON_ERROR(ledc_channel_config(&ch), TAG, "channel config");
 
     s_queue = xQueueCreate(1, sizeof(bseq_t));
-    xTaskCreate(buzzer_task, "buzzer", 3072, NULL, 5, NULL);
+    /* Stack in PSRAM, like the aux task: LEDC calls and delays only, nothing
+       that writes the flash. */
+    if (!s_queue || xTaskCreateWithCaps(buzzer_task, "buzzer", 3072, NULL, 5, NULL,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS)
+        return ESP_ERR_NO_MEM;
 
     ESP_LOGI(TAG, "Initialized buzzer on GPIO%d", GPIO_BUZZER);
     return ESP_OK;
@@ -165,16 +175,15 @@ void buzzer_on_mqtt_message(const char *topic, size_t tlen,
                              const char *data,  size_t dlen)
 {
 #ifdef CONFIG_APP_MQTT_ENABLE
-    static const char SUFFIX[] = "buzzer/beep";
-    const size_t sl = sizeof(SUFFIX) - 1;
-    if (tlen < sl || memcmp(topic + tlen - sl, SUFFIX, sl) != 0) return;
+    /* Relative topic, compared whole -- see dout_on_mqtt_message(). */
+    static const char TOPIC[] = "buzzer/beep";
+    const size_t sl = sizeof(TOPIC) - 1;
+    if (tlen != sl || memcmp(topic, TOPIC, sl) != 0) return;
 
-    char buf[1024];
-    if (dlen == 0 || dlen >= sizeof(buf)) return;
-    memcpy(buf, data, dlen);
-    buf[dlen] = '\0';
+    /* Parsed in place: cJSON takes the length, no copy on the MQTT task's stack. */
+    if (dlen == 0 || dlen >= BUZZER_PAYLOAD_MAX) return;
 
-    cJSON *root = cJSON_Parse(buf);
+    cJSON *root = json_parse_exact(data, dlen);
     if (!root) { ESP_LOGW(TAG, "JSON parse failed"); return; }
 
     bseq_t seq = { .count = 0 };

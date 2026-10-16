@@ -76,3 +76,19 @@ test('.heldFor() fires once per sustained period (re-arms after drop/rise)', () 
   e.input(5, false); e.input(5, true); e.advance(1000);
   assert.equal(e.T.n, 2);                              // dropped and rose → fires again
 });
+
+test('.heldFor() is cancelled by a late LOW even when the pin is HIGH again', () => {
+  // Events are queued; the pin can already be back at HIGH when the LOW is
+  // processed. The condition must see the level the event carried.
+  const e = createEngine();
+  e.load(`rule('h').when(input(5).isOn()).heldFor(5000).then(function(){ output(5).on(); });`);
+  e.input(5, true);
+  e.advance(2000);
+  e.setInput(5, true);                 // the pin as the engine would read it now
+  e.evalIn('_on_input(5, false)');     // the queued LOW, processed late
+  e.evalIn('_on_input(5, true)');      // and the queued HIGH after it
+  e.advance(3000);
+  assert.equal(e.output(5), false);    // the first timer was cancelled by the LOW
+  e.advance(2000);
+  assert.equal(e.output(5), true);     // the second one, armed by the HIGH, fires
+});

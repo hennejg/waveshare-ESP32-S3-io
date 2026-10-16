@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Builds a host test for the number checks of POST /api/config
+(apps/full/main/web_server.c) and the CAN settings' check on load
+(components/board/app_config.c).
+
+Cut out verbatim: json_uint(), the led_mode and CAN part of
+api_config_post(), can_normalize() and the CAN limits from app_config.h.
+cJSON is ESP-IDF's own copy.
+
+What it pins down, found by an outside review: base_id 4294967295 passed
+the 11-bit check -- "id + 5" wrapped to 4 -- and 0xFFFF was stored; the CAN
+server then sent on IDs folded to 16 bits, outside the 11-bit block. The
+other fields were cast from double before their range check the same way:
+n2k_addr 257 was stored as 1, mode 258 as 2, tx_interval_ms 65536 as 0.
+OLD=1 cuts the code from git (OLDREV, default HEAD) as it was before.
+
+  make -C test/host cfgnum
+"""
+import os, pathlib, subprocess
+from cutter import Source
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+old  = os.environ.get("OLD") == "1"
+def source(rel):
+    s = Source(ROOT / rel)
+    if old:
+        s.text = subprocess.run(["git", "show", os.environ.get("OLDREV", "HEAD") + ":" + rel],
+                                cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    return s
+web = source("apps/full/main/web_server.c")
+# json_uint() moved to components/board/web_common.c as web_json_uint().
+def json_uint_cut():
+    if "static bool json_uint(" in web.text:
+        return web.func("static bool json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out)")
+    return source("components/board/web_common.c").func(
+        "bool web_json_uint(const cJSON *v, uint32_t lo, uint32_t hi, uint32_t *out)")
+cfg = source("components/board/app_config.c")
+hdr = Source(ROOT / "components/board/app_config.h")
+
+if old:
+    cuts = ""
+    body = web.span("    cJSON *led_mode_v = cJSON_GetObjectItem(root, \"led_mode\");",
+                    "            cfg.can.tx_interval_ms = (uint16_t)v->valuedouble;\n    }\n")
+    norm = "static void can_normalize(app_config_t *c) { (void)c; }\n"
+elif "web_can_config_parse(" in web.text:
+    # The CAN fields moved to web_common.c too, shared with the Matter firmware.
+    common = source("components/board/web_common.c")
+    whdr   = source("components/board/web_common.h")
+    cuts = (json_uint_cut()
+            + whdr.span("typedef struct { char field[40]; } web_cfg_err_t;", "typedef struct { char field[40]; } web_cfg_err_t;")
+            + common.func("void web_cfg_bad(web_cfg_err_t *bad, const char *where, const char *key)")
+            + common.func("bool web_cfg_uint(const cJSON *obj, const char *where, const char *key,")
+            + common.func("void web_can_config_parse(const cJSON *can_j, app_config_t *cfg, web_cfg_err_t *bad)"))
+    body = ("    web_cfg_err_t bad = { \"\" };\n"
+            + web.span("    uint32_t n;\n    if (web_cfg_uint(root, \"\", \"led_mode\"",
+                       "    web_can_config_parse(cJSON_GetObjectItem(root, \"can\"), &cfg, &bad);\n")
+            + "    (void)bad;\n")
+    norm = cfg.func("static void can_normalize(app_config_t *c)")
+elif "web_cfg_uint(" in web.text:
+    # cfg_uint() and its error type moved to web_common.c as web_cfg_*.
+    common = source("components/board/web_common.c")
+    whdr   = source("components/board/web_common.h")
+    cuts = (json_uint_cut()
+            + whdr.span("typedef struct { char field[40]; } web_cfg_err_t;", "typedef struct { char field[40]; } web_cfg_err_t;")
+            + common.func("void web_cfg_bad(web_cfg_err_t *bad, const char *where, const char *key)")
+            + common.func("bool web_cfg_uint(const cJSON *obj, const char *where, const char *key,"))
+    body = ("    web_cfg_err_t bad = { \"\" };\n"
+            + web.span("    uint32_t n;\n    if (web_cfg_uint(root, \"\", \"led_mode\"",
+                       "            cfg.can.tx_interval_ms = (uint16_t)n;\n    }\n")
+            + "    (void)bad;\n")
+    norm = cfg.func("static void can_normalize(app_config_t *c)")
+elif "static bool cfg_uint(" not in web.text:
+    cuts = json_uint_cut()
+    body = web.span("    uint32_t n;\n    if (json_uint(cJSON_GetObjectItem(root, \"led_mode\")",
+                    "            cfg.can.tx_interval_ms = (uint16_t)n;\n    }\n")
+    norm = cfg.func("static void can_normalize(app_config_t *c)")
+else:
+    # Since the fields are taken through cfg_uint(), which also names a bad
+    # one for the 400; what is stored is what this test looks at.
+    cuts = (json_uint_cut()
+            + web.span("typedef struct { char field[40]; } cfg_err_t;", "typedef struct { char field[40]; } cfg_err_t;")
+            + web.func("static void cfg_bad(cfg_err_t *bad, const char *where, const char *key)")
+            + web.func("static bool cfg_uint(const cJSON *obj, const char *where, const char *key,"))
+    body = ("    cfg_err_t bad = { \"\" };\n"
+            + web.span("    uint32_t n;\n    if (cfg_uint(root, \"\", \"led_mode\"",
+                       "            cfg.can.tx_interval_ms = (uint16_t)n;\n    }\n")
+            + "    (void)bad;\n")
+    norm = cfg.func("static void can_normalize(app_config_t *c)")
+
+HARNESS = r"""
+/* GENERATED by gen_cfgnum_test.py -- do not edit; edit the firmware. */
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "cJSON.h"
+
+__DEFINES__
+typedef struct {
+    uint8_t led_mode;
+    struct { uint8_t mode, n2k_addr; uint16_t base_id; uint32_t bitrate; uint16_t tx_interval_ms; } can;
+} app_config_t;
+
+__CUTS__
+__NORM__
+
+static app_config_t post(const app_config_t *before, const char *json)
+{
+    app_config_t cfg = *before;
+    cJSON *root = cJSON_Parse(json);
+__BODY__
+    cJSON_Delete(root);
+    return cfg;
+}
+
+static int failures;
+#define CHECK(c, ...) do { if (!(c)) { failures++; printf("  FEHLER: "); printf(__VA_ARGS__); printf("\n"); } } while (0)
+
+int main(void)
+{
+    printf("Zahlenpruefung von POST /api/config (CAN, LED)\n");
+    const app_config_t d = { .led_mode = 0, .can = { 0, 0x50, 0x100, 250000, 1000 } };
+    app_config_t c;
+    static const struct { const char *json; unsigned want; const char *what; } base[] = {
+        { "{\"can\":{\"base_id\":4294967295}}", 0x100, "4294967295 (Ueberlauf von id + 5)" },
+        { "{\"can\":{\"base_id\":4294967296}}", 0x100, "2^32" },
+        { "{\"can\":{\"base_id\":1e300}}",      0x100, "1e300" },
+        { "{\"can\":{\"base_id\":-1}}",         0x100, "-1" },
+        { "{\"can\":{\"base_id\":2043}}",       0x100, "0x7FB: Block ragt ueber 0x7FF" },
+        { "{\"can\":{\"base_id\":2042}}",       0x7FA, "0x7FA: letzter passender Block" },
+        { "{\"can\":{\"base_id\":0}}",          0,     "0" },
+        { "{\"can\":{\"base_id\":512.7}}",      512,   "512.7 abgeschnitten wie bisher" },
+    };
+    for (unsigned i = 0; i < sizeof(base) / sizeof(base[0]); i++) {
+        c = post(&d, base[i].json);
+        CHECK(c.can.base_id == base[i].want, "base_id %s: 0x%X statt 0x%X", base[i].what, c.can.base_id, base[i].want);
+        CHECK(c.can.base_id + 5u <= 0x7FFu, "base_id %s: Block 0x%X..0x%X ausserhalb 11 Bit", base[i].what, c.can.base_id, c.can.base_id + 5u);
+    }
+    printf("  base_id: nur 0..0x7FA, auch bei Werten ueber 2^32\n");
+
+    c = post(&d, "{\"can\":{\"n2k_addr\":257}}");
+    CHECK(c.can.n2k_addr == 0x50, "n2k_addr 257 als %u gespeichert", c.can.n2k_addr);
+    c = post(&d, "{\"can\":{\"mode\":258}}");
+    CHECK(c.can.mode == 0, "mode 258 als %u gespeichert", c.can.mode);
+    c = post(&d, "{\"can\":{\"tx_interval_ms\":65536}}");
+    CHECK(c.can.tx_interval_ms == 1000, "tx_interval_ms 65536 als %u gespeichert", c.can.tx_interval_ms);
+    c = post(&d, "{\"can\":{\"bitrate\":4294977296}}");
+    CHECK(c.can.bitrate == 250000, "bitrate 2^32+10000 als %u gespeichert", c.can.bitrate);
+    c = post(&d, "{\"led_mode\":2}");
+    CHECK(c.led_mode == 0, "led_mode 2 gespeichert");
+    c = post(&d, "{\"led_mode\":1,\"can\":{\"mode\":2,\"n2k_addr\":251,\"bitrate\":500000,\"tx_interval_ms\":0}}");
+    CHECK(c.led_mode == 1 && c.can.mode == 2 && c.can.n2k_addr == 251 && c.can.bitrate == 500000 && c.can.tx_interval_ms == 0,
+          "gueltige Werte nicht uebernommen");
+    printf("  die uebrigen Felder: gepruefte Werte statt abgeschnittener\n");
+
+    c = d; c.can.base_id = 0xFFFF;
+    can_normalize(&c);
+    CHECK(c.can.base_id == 0x100, "gespeichertes 0xFFFF beim Laden nicht zurueckgesetzt");
+    c = d; c.can.base_id = 0x7FA;
+    can_normalize(&c);
+    CHECK(c.can.base_id == 0x7FA, "gueltiges 0x7FA beim Laden veraendert");
+    printf("  ein frueher gespeichertes 0xFFFF wird beim Laden auf 0x100 gesetzt\n");
+
+    printf("%s\n", failures ? "FEHLER" : "alles in Ordnung");
+    return failures ? 1 : 0;
+}
+"""
+defines = hdr.defines("APP_CFG_CAN_BASE_ID_DEFAULT", "APP_CFG_CAN_BASE_ID_MAX") + \
+          "#define LED_MODE_IO     0\n#define LED_MODE_STATUS 1\n"
+out = pathlib.Path(__file__).with_name("test_cfgnum.c")
+out.write_text(HARNESS.replace("__DEFINES__", defines).replace("__CUTS__", cuts)
+               .replace("__NORM__", norm).replace("__BODY__", body))
+print("erzeugt:", out.name)

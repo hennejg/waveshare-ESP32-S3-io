@@ -1,13 +1,14 @@
 set(SRCS
-    "main.c" "matter.cpp" "web_server.c"
+    "main.c" "matter.cpp" "matter_mbm.cpp" "mbm_value.c" "web_server.c"
 )
 
 idf_component_register(
     SRCS ${SRCS}
     INCLUDE_DIRS "."
     REQUIRES esp32-wifi-bootstrap nvs_flash spiffs esp_http_server
-             esp_netif esp_wifi esp_coex board lwip mbedtls esp_app_format
+             esp_netif esp_wifi esp_coex board modbus can lwip mbedtls esp_app_format
     PRIV_REQUIRES esp_matter
+    LDFRAGMENTS linker.lf
 )
 
 set(_WWW  ${CMAKE_SOURCE_DIR}/../../www)

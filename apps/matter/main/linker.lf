@@ -1,0 +1,19 @@
+# Static data (.bss) of the Matter stack goes to PSRAM: about 60 KB of the
+# internal RAM this firmware runs short of. As documented by esp-matter
+# (docs/en/faq.rst, "Moving BSS Segments to PSRAM"); no ISR of these
+# libraries runs while the flash cache is off.
+[mapping:CHIP]
+archive: libCHIP.a
+entries:
+  if ESP_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y:
+    * (extram_bss)
+  else:
+    * (default)
+
+[mapping:esp_matter]
+archive: libesp_matter.a
+entries:
+  if ESP_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y:
+    * (extram_bss)
+  else:
+    * (default)

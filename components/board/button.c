@@ -45,7 +45,8 @@ static void button_task(void *arg)
 
             if (held_ms >= HOLD_MS) {
                 ESP_LOGW(TAG, "WiFi reset triggered — clearing credentials and rebooting");
-                wifi_config_reset();
+                if (wifi_config_reset() != ESP_OK)
+                    ESP_LOGE(TAG, "Clearing the WiFi credentials failed -- the old ones stay");
                 /* Also clear ETH-only flag so WiFi is re-enabled after reboot. */
                 nvs_handle_t h;
                 if (nvs_open("app_config", NVS_READWRITE, &h) == ESP_OK) {

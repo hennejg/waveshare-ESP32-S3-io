@@ -9,3 +9,7 @@
 // Start SNTP per the current config, or reconfigure if already running (call when the
 // network comes up, and again after the SNTP settings change). Safe to call repeatedly.
 void sntp_sync_apply(void);
+
+// Once, before anything can call sntp_sync_apply(): the network-up path and a
+// configuration save call it from different tasks.
+void sntp_sync_init(void);

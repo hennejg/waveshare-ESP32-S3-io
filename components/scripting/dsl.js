@@ -1,6 +1,6 @@
 // Rule Engine DSL — evaluated once at scripting startup.
 // C bindings available as globals:
-//   _di_get(ch)          → bool    read digital input 0-7
+//   _di_get(ch)          → bool    read digital input 0-7, 0-10 with the header pads
 //   _dout_set(ch, bool)  → void    write digital output 0-7
 //   _dout_get(ch)        → bool    read current digital output state
 //   _led_set(r, g, b)    → void    drive the RGB LED (IO mode only)
@@ -74,7 +74,9 @@ function _schedule(ms, fn) {
         var k = _pending.indexOf(id);
         if (k >= 0) _pending.splice(k, 1);
         _resetCascade();   // a timer firing is a fresh trigger → fresh cascade budget
-        fn();
+        // Its own re-arm first (an every() takes its slot straight back),
+        // then whatever the full table refused gets what is left.
+        try { fn(); } finally { _retry_arms(); }
     };
     if (typeof _set_timer === 'function')      id = _set_timer(ms, wrapped);
     else if (typeof setTimeout === 'function') id = setTimeout(wrapped, ms);
@@ -83,7 +85,7 @@ function _schedule(ms, fn) {
     // result in _timer and guard on `!= null`, and -1 != null is true in JS —
     // so returning it would mark the rule as armed forever and stop it from
     // ever trying again. Report "not scheduled" instead.
-    if (id == null || id < 0) return null;
+    if (id == null || id < 0) { _refused = true; return null; }
     _pending.push(id);
     return id;
 }
@@ -92,6 +94,58 @@ function _unschedule(id) {
     var k = _pending.indexOf(id); if (k >= 0) _pending.splice(k, 1);
     if (typeof _clear_timer === 'function')      _clear_timer(id);
     else if (typeof clearTimeout === 'function') clearTimeout(id);
+    _retry_arms();
+}
+
+// Timers the full table refused. every(), cron(), a watchdog, the later
+// steps of .after() -- and a heldFor() whose condition simply stays true --
+// have no next event of their own: refused once, an every() never ticked again, a
+// watchdog fed while the table was full never expired -- the case it exists
+// for -- and an .after() that switches an output off was dropped. They wait
+// here, in order, and are tried again when a slot may have freed (a timer
+// fires or is cleared, an event comes in): late rather than never. An entry
+// answers whether the table took it; the first one refused ends the pass,
+// since the table is full again -- trying the rest would only be refused too.
+var _retryArms = [];
+var _refused = false;        // set by _schedule() when the table said no
+var _retrying = false;       // a pass is running (a clear inside it must not start another)
+var RETRY_CAP = 256;         // every/cron/watchdog queue once each; .after() steps
+var _retryWarned = false;    // pile up under sustained overload -- not without bound
+// first: an every(), cron() or watchdog -- one entry each, and what keeps a
+// rule set running -- goes ahead of the .after() steps that may pile up.
+function _arm_later(fn, first) {
+    if (first) { _retryArms.unshift(fn); return; }
+    if (_retryArms.length >= RETRY_CAP) {
+        if (!_retryWarned) { _retryWarned = true; print('[rules] timer table full and ' + RETRY_CAP + ' timers waiting: further ones dropped'); }
+        return;
+    }
+    _retryArms.push(fn);
+}
+function _retry_arms() {
+    if (_retrying || !_retryArms.length) return;
+    _retrying = true;
+    try {
+        while (_retryArms.length && _retryArms[0]()) _retryArms.shift();
+    } finally { _retrying = false; }
+    if (_retryArms.length < RETRY_CAP) _retryWarned = false;
+}
+function _schedule_retrying(ms, fn) {
+    if (_schedule(ms, fn) == null)
+        _arm_later(function() { return _schedule(ms, fn) != null; });
+}
+// For an every(), cron() or watchdog whose own arm the table refused: queued
+// once (o._waiting), and taken off the queue once rearm() got past the table
+// -- armed, or nothing to arm (cron without a valid clock).
+function _rearm_when_free(o, rearm) {
+    if (o._timer != null || o._waiting) return;
+    o._waiting = true;
+    _arm_later(function() {
+        _refused = false;
+        if (o._timer == null) rearm.call(o);   // a refusal in there finds o._waiting set
+        if (_refused) return false;
+        o._waiting = false;
+        return true;
+    }, true);
 }
 function _cancel_all_timers() { while (_pending.length) _unschedule(_pending[0]); }
 
@@ -102,30 +156,43 @@ function _cancel_all_timers() { while (_pending.length) _unschedule(_pending[0])
 // firing resets it). When the budget is exhausted the cascade stops with a logged
 // warning instead of looping forever — important on-device, where an unbounded loop
 // would block the scripting task and trip the watchdog.
+//
+// CASCADE_CAP is the depth -- how many hops one change may chain through, as
+// documented. It used to count every change of the event instead: one action
+// setting 20 watched facts fired only 16 rules, and the 17th top-level
+// fact.set() of a script was dropped while it loaded. The total cap is the
+// backstop for wide fan-out, which depth alone does not bound.
 var CASCADE_CAP = 16;
-var _cascade = 0;
+var CASCADE_TOTAL_CAP = 256;
+var _cascade = 0;            // current depth
+var _cascadeTotal = 0;       // changes emitted for this triggering event
 var _cascadeWarned = false;
 var _watchOutputs = false;   // does any rule reference an output fact / is wildcard?
 
-function _resetCascade() { _cascade = 0; _cascadeWarned = false; }
+function _resetCascade() { _cascade = 0; _cascadeTotal = 0; _cascadeWarned = false; }
 
 function _emit(factKey) {
-    if (_cascade >= CASCADE_CAP) {
+    if (_cascade >= CASCADE_CAP || _cascadeTotal >= CASCADE_TOTAL_CAP) {
         if (!_cascadeWarned) {
             _cascadeWarned = true;
-            print('[rules] cascade limit (' + CASCADE_CAP + ') reached — stopping (output feedback loop?)');
+            print('[rules] cascade limit (' + (_cascade >= CASCADE_CAP ? CASCADE_CAP + ' hops'
+                  : CASCADE_TOTAL_CAP + ' changes') + ') reached — stopping (output feedback loop?)');
         }
         return;
     }
     _cascade++;
-    _fire_matching(factKey, true);   // cascade pass — does NOT reset the budget
+    _cascadeTotal++;
+    try { _fire_matching(factKey, true); }   // cascade pass — does NOT reset the budget
+    finally { _cascade--; }                  // skipped by the budget's interrupt; the next event resets
 }
 
 // Drive an output through the host binding; emit only on an actual change, and only
 // when some rule is watching outputs (keeps the common no-watcher case free of cost).
+// v === null flips the output in one host call, under the output lock;
+// reading it here and setting the opposite lost one of two concurrent toggles.
 function _drive_output(ch, v) {
     var before = _dout_get(ch);
-    _dout_set(ch, v);
+    if (v === null) _dout_toggle(ch); else _dout_set(ch, v);
     var after = _dout_get(ch);
     if (after !== before && _watchOutputs) _emit('output:' + ch);
     return after;
@@ -134,11 +201,15 @@ function _drive_output(ch, v) {
 // Called on rule reload (EVT_RELOAD / simulator "Apply") — drop the rule set and
 // any in-flight timers so stale callbacks can't fire against the old rules.
 function _reset_rules() {
+    _retryArms = [];           // refused arms of the old rules -- before the clears below retry them
     _cancel_all_timers();
     _rules = [];
     _cronTriggers = [];        // timers already cancelled above; drop the old trigger registry
+    _mqttIndex = Object.create(null);   // topic index of the old rules
     _activityWatchdogs = {};   // drop modbus()/can() health watchdogs from the old rule set
     _watchOutputs = false;
+    _passes = [];              // a cut-short pass of the old rules has nothing left to visit
+    _heldCheck = null;
     _resetCascade();
 }
 
@@ -196,7 +267,22 @@ function _channel(ch, what) {
     var n = Number(ch);
     if (!isFinite(n) || Math.floor(n) !== n)
         throw new RangeError(what + ' channel must be a whole number, got ' + ch);
+    // Refused when the rule is built, before a fact key like 'input:4294967296'
+    // exists that no event ever matches; the bindings check the real range.
+    if ((what === 'input' || what === 'output') && (n < 0 || n > 255))
+        throw new RangeError(what + ' channel out of range: ' + ch);   // pads: pad_arg() in C
     return n;
+}
+
+// A rule's error, logged without throwing again: '' + e throws for a Symbol
+// and for an object whose toString() throws, and an exception escaping the
+// catch block left the pass on _passes and the rule's _firing set -- every
+// later event pushed another stale pass, and a noLoop rule never ran again.
+function _log_rule_error(r, what, e) {
+    var name, msg;
+    try { name = String(r.name); } catch (_) { name = '?'; }
+    try { msg = String(e); } catch (_) { msg = '(error that cannot be printed)'; }
+    try { print('[rule:' + name + '] ' + what + ': ' + msg); } catch (_) {}
 }
 
 function InputCondition(ch) {
@@ -215,8 +301,15 @@ InputCondition.prototype.is = function(expected) {
 };
 InputCondition.prototype.isOn  = function() { return this.is(true);  };
 InputCondition.prototype.isOff = function() { return this.is(false); };
+// The level an input condition is checked against comes from the event
+// stream, not from the live pin: events are queued, and by the time a LOW is
+// processed the pin may be HIGH again. Checking the live level then made a
+// late LOW look like HIGH, and a running heldFor() timer that the LOW should
+// have cancelled kept going. .value and .get() stay live -- they are for
+// then() bodies, which want the pin as it is now.
+var _di_seen = {};   // channel -> last level delivered by _on_input()
 InputCondition.prototype._check = function() {
-    var cur = _di_get(this.channel);
+    var cur = (this.channel in _di_seen) ? _di_seen[this.channel] : _di_get(this.channel);
     if (this._expected === undefined) return true;
     return cur === this._expected;
 };
@@ -226,6 +319,66 @@ Object.defineProperty(InputCondition.prototype, 'value', {
     get: function() { return _di_get(this.channel); }
 });
 InputCondition.prototype.get = function() { return _di_get(this.channel); };
+
+// ── pwm(pad) / analog(pad) — the IO1/RXD/TXD header pads, numbered 1..3 ──────
+// Which pad does what is set in the web UI; these only act on a pad in that mode.
+// pwm(pad).set(duty%, freq?) changes a running PWM output (not stored: a reboot
+// starts from the configured values); .duty / .freq / .get() read it back.
+// Pads are 1..3; checked here so that a typo fails where it is written, in
+// the simulator and the tests as on the device.
+function _pad(pad, what) {
+    var n = _channel(pad, what);
+    if (n < 1 || n > 3) throw new RangeError(what + ' pad must be 1, 2 or 3, got ' + pad);
+    return n;
+}
+function PwmChannel(pad) { this.pad = _pad(pad, 'pwm'); }
+PwmChannel.prototype.set = function(duty, freq) {
+    _aux_pwm_set(this.pad, Number(duty), freq === undefined ? undefined : Number(freq));
+    return this.get();
+};
+PwmChannel.prototype.off = function() { return this.set(0); };
+PwmChannel.prototype.get = function() { return _aux_pwm_get(this.pad); };   // {duty, freq} or null
+Object.defineProperty(PwmChannel.prototype, 'duty', {
+    get: function() { var p = _aux_pwm_get(this.pad); return p ? p.duty : null; }
+});
+Object.defineProperty(PwmChannel.prototype, 'freq', {
+    get: function() { var p = _aux_pwm_get(this.pad); return p ? p.freq : null; }
+});
+function pwm(pad) { return new PwmChannel(pad); }
+
+// analog(pad) is a fact like input(): bare, it matches any new reading; narrowed
+// with .above(mV) / .below(mV) / .between(lo, hi) it matches a band. A rule
+// gated on an analog band fires when the reading ENTERS the band, not on every
+// reading inside it -- a reading moves a little all the time, and a level
+// trigger would re-run the action on each one. .value / .get() read live (mV).
+var _an_seen = {};   // pad -> last reading delivered by _on_analog()
+function AnalogCondition(pad) {
+    this.pad = _pad(pad, 'analog');
+    this._factKey = 'analog:' + this.pad;
+    this._lo = undefined;    // strictly above
+    this._hi = undefined;    // strictly below
+}
+AnalogCondition.prototype._narrow = function(lo, hi) {
+    var c = new AnalogCondition(this.pad);
+    c._lo = (lo === undefined) ? this._lo : Number(lo);
+    c._hi = (hi === undefined) ? this._hi : Number(hi);
+    return c;
+};
+AnalogCondition.prototype.above   = function(mv)     { return this._narrow(mv, undefined); };
+AnalogCondition.prototype.below   = function(mv)     { return this._narrow(undefined, mv); };
+AnalogCondition.prototype.between = function(lo, hi) { return this._narrow(lo, hi); };
+AnalogCondition.prototype._check = function() {
+    var v = (this.pad in _an_seen) ? _an_seen[this.pad] : _aux_analog_get(this.pad);
+    if (v === null || v === undefined) return false;
+    if (this._lo !== undefined && !(v > this._lo)) return false;
+    if (this._hi !== undefined && !(v < this._hi)) return false;
+    return true;
+};
+Object.defineProperty(AnalogCondition.prototype, 'value', {
+    get: function() { return _aux_analog_get(this.pad); }
+});
+AnalogCondition.prototype.get = function() { return _aux_analog_get(this.pad); };
+function analog(pad) { return new AnalogCondition(pad); }
 
 // ── OutputCondition ──────────────────────────────────────────────────────────
 // output(ch) is dual-purpose: an actuator (set/on/off/toggle/get/value, used in
@@ -240,7 +393,7 @@ function OutputCondition(ch) {
 OutputCondition.prototype.set    = function(v) { return _drive_output(this.channel, !!v); };
 OutputCondition.prototype.on     = function()  { return _drive_output(this.channel, true); };
 OutputCondition.prototype.off    = function()  { return _drive_output(this.channel, false); };
-OutputCondition.prototype.toggle = function()  { return _drive_output(this.channel, !_dout_get(this.channel)); };
+OutputCondition.prototype.toggle = function()  { return _drive_output(this.channel, null); };
 OutputCondition.prototype.get    = function()  { return _dout_get(this.channel); };
 Object.defineProperty(OutputCondition.prototype, 'value', {
     get: function() { return _dout_get(this.channel); }
@@ -338,6 +491,7 @@ IntervalCondition.prototype._arm = function() {
         self._armed = false;
         self._arm();                          // re-arm for the next period
     });
+    if (self._timer == null) _rearm_when_free(self, self._arm);   // table full: when a slot frees
 };
 
 // ── Cron: cron("min hour dom month dow") — standard 5-field, local time ──
@@ -396,16 +550,34 @@ function _cronDayOk(f, d) {
 // Next epoch ms strictly after fromMs matching the cron fields in LOCAL time; -1 if none
 // in ~5y. Field tests/steps use local Date getters/setters (so the JS engine applies the
 // TZ + DST when mapping local fields ↔ epoch); the returned d.getTime() is still UTC ms.
+// Minutes are stepped in absolute time, the coarser fields in local time. Stepping the
+// minute through the local fields jumped from 02:59 summer time to 03:00 winter time on
+// the night clocks go back, and the repeated hour never came: a "* * * * *" rule went
+// silent for an hour. Absolute steps walk through the repeated hour like any other, so a
+// rule with a wildcard hour runs in both of them (as Vixie cron does); one with a fixed
+// hour runs once -- the second pass through the same local time is skipped below.
 function _cronNext(f, fromMs) {
-    var d = new Date(fromMs);
-    d.setSeconds(0, 0);
-    d.setMinutes(d.getMinutes() + 1);              // minute granularity, strictly after
+    var d = new Date(Math.floor(fromMs / 60000) * 60000 + 60000);   // the next whole minute
     var capYear = new Date(fromMs).getFullYear() + 5;
+    var anyHour = true;
+    for (var h = 0; h < 24; h++) if (f.hour[h] !== true) { anyHour = false; break; }
     while (d.getFullYear() <= capYear) {
         if (f.month[d.getMonth() + 1] !== true) { d.setMonth(d.getMonth() + 1, 1); d.setHours(0, 0, 0, 0); continue; }
         if (!_cronDayOk(f, d))                   { d.setDate(d.getDate() + 1);     d.setHours(0, 0, 0, 0); continue; }
         if (f.hour[d.getHours()] !== true)       { d.setHours(d.getHours() + 1, 0, 0, 0); continue; }
-        if (f.minute[d.getMinutes()] !== true)   { d.setMinutes(d.getMinutes() + 1, 0, 0); continue; }
+        if (f.minute[d.getMinutes()] !== true)   { d = new Date(d.getTime() + 60000); continue; }
+        // Never a time at or before fromMs. Local-time arithmetic around a
+        // daylight saving switch is where engines go wrong (QuickJS put "the
+        // next minute" an hour in the past on the spring-forward night); a
+        // match in the past would fire at once and re-arm into the past again,
+        // running the action over and over. Step on to the next minute instead.
+        if (d.getTime() <= fromMs) { d = new Date(Math.floor(fromMs / 60000) * 60000 + 60000); continue; }
+        // The hour repeated when clocks go back: the same local time an hour earlier.
+        // A job at a fixed hour has run then already.
+        if (!anyHour) {
+            var e = new Date(d.getTime() - 3600000);
+            if (e.getHours() === d.getHours() && e.getMinutes() === d.getMinutes()) { d = new Date(d.getTime() + 60000); continue; }
+        }
         return d.getTime();
     }
     return -1;
@@ -413,8 +585,9 @@ function _cronNext(f, fromMs) {
 // Clock validity gates cron. Until the wall-clock is real (host _time_valid() — set by an
 // RTC seed at boot or the first SNTP sync) cron stays unarmed, so "0 7 * * *" can't fire
 // ~7 h after boot off a 1970 clock. Without the host binding (simulator, tests) the clock
-// is assumed real, so cron behaves as before. All cron triggers are tracked so the host
-// can re-arm them when the clock jumps from boot-relative to real (see _on_time_sync).
+// is assumed real, so cron behaves as before. Cron triggers of registered rules are
+// tracked so the host can re-arm them when the clock jumps from boot-relative to real
+// (see _on_time_sync); a cron() no rule uses is never armed and holds no timer slot.
 var _clockValid   = (typeof _time_valid === 'function') ? !!_time_valid() : true;
 var _cronTriggers = [];
 
@@ -424,10 +597,10 @@ function CronCondition(expr) {
     this._factKey = 'time:' + (++_timeSeq);
     this._armed    = false;
     this._timer    = null;
-    _cronTriggers.push(this);
 }
 CronCondition.prototype._check = function() { return this._armed; };
 CronCondition.prototype._arm = function() {
+    if (_cronTriggers.indexOf(this) < 0) _cronTriggers.push(this);   // first rule using it
     if (this._timer != null) return;       // already armed (shared across rules)
     if (!_clockValid) return;              // suppressed until time is valid; _on_time_sync arms
     var self = this;
@@ -441,6 +614,7 @@ CronCondition.prototype._arm = function() {
         self._armed = false;
         self._arm();                       // schedule the following occurrence
     });
+    if (self._timer == null) _rearm_when_free(self, self._arm);   // table full: when a slot frees
 };
 
 // Called by the host (EVT_TIME_SYNC) when SNTP (re)syncs the clock. esp_timer delays are
@@ -514,6 +688,7 @@ Watchdog.prototype._rearm = function() {
         self._timer = null;
         if (self._alive) { self._alive = false; _emit(self._factKey); }   // timed out → expired
     });
+    if (this._timer == null) _rearm_when_free(this, this._rearm);   // table full: when a slot frees
 };
 Watchdog.prototype._arm = function() {           // at rule registration; idempotent
     if (this._started) return;
@@ -563,6 +738,7 @@ function _activitySource(key, ms) {
 // Host-called when an upstream command arrives on `key` — keep its watchdogs alive
 // (feed() emits only on a quiet→active recovery, so gating rules re-evaluate on edges).
 function _on_activity(key) {
+    _retry_arms();
     var list = _activityWatchdogs[key];
     if (!list) return;
     _resetCascade();                       // root event → fresh cascade budget
@@ -643,8 +819,22 @@ RuleBuilder.prototype.when = function() {
 RuleBuilder.prototype.heldFor = function(ms) {
     this._heldFor = ms;
     if (this._rule) this._rule.heldFor = ms;
+    _check_held_edges(this);
     return this;
 };
+
+// An edge -- mqtt().once(), every(), cron() -- is true only during the pass
+// it triggers, never when the held period runs out: such a rule never fired,
+// and nothing said why. Refused when the rule is built, in either order.
+function _check_held_edges(b) {
+    if (!(b._heldFor > 0)) return;
+    for (var i = 0; i < b._conditions.length; i++) {
+        var c = b._conditions[i];
+        if ((c instanceof MqttCondition && c._once) || c instanceof IntervalCondition || c instanceof CronCondition)
+            throw new Error('rule "' + b.name + '": heldFor() cannot be combined with once(), every() or cron() -- ' +
+                            'an edge is never still true when the held period ends');
+    }
+}
 // No-loop (Drools-style): the rule will not be re-fired by changes its OWN action
 // causes — directly or through the cascade it triggers. Other rules still react to
 // its writes, and it still fires on later, independent events. Order-independent.
@@ -660,6 +850,7 @@ RuleBuilder.prototype.after = function(ms) {
     return this;
 };
 RuleBuilder.prototype.then = function(fn) {
+    _check_held_edges(this);
     this._steps.push({ delay: this._nextDelay, fn: fn });
     this._nextDelay = 0;
     if (!this._rule) {
@@ -678,10 +869,12 @@ RuleBuilder.prototype.then = function(fn) {
             noLoop:     this._noLoop,  // .noLoop(): suppress self-re-firing
             _firing:    false,         // re-entrancy guard for noLoop
             _timer:     null,          // pending heldFor timer
-            _fired:     false          // heldFor latch (one fire per sustained period)
+            _fired:     false,         // heldFor latch (one fire per sustained period)
+            _analogIn:  false          // analog edge latch: conditions held at the last evaluation
         };
         this._rule.action = function() { _run_steps(ref, 0); };
         _rules.push(this._rule);
+        _indexMqtt(this._conditions);
         // Arm any time triggers (every/cron) now that the rule is live. Idempotent,
         // so a trigger shared across rules is armed once; _reset_rules cancels them.
         for (var ci = 0; ci < this._conditions.length; ci++) {
@@ -700,32 +893,61 @@ function _run_steps(r, idx) {
     if (idx >= r.steps.length) return;
     var step = r.steps[idx];
     var go = function() {
-        try { step.fn(); } catch (e) { print('[rule:' + r.name + '] error: ' + e); }
-        _run_steps(r, idx + 1);
+        // A delayed next step is armed before this one runs. The budget's
+        // interrupt cannot be caught here: when it landed in step.fn the rest
+        // of the timeline went with it -- an output switched on by step 0
+        // stayed on, its "off" never armed.
+        var next = r.steps[idx + 1];
+        var armedNext = !!next && next.delay > 0;
+        if (armedNext) _run_steps(r, idx + 1);
+        // A delayed step runs from its timer, outside _run_action and its
+        // no-loop guard: a .noLoop() rule's own .after() step re-fired it
+        // (on, off, on, ... for good). The guard is taken here for it.
+        var guard = r.noLoop && !r._firing;
+        if (guard) r._firing = true;
+        try { step.fn(); } catch (e) { _log_rule_error(r, 'error', e); }
+        finally { if (guard) r._firing = false; }
+        if (!armedNext) _run_steps(r, idx + 1);
     };
-    if (step.delay > 0) _schedule(step.delay, go);
+    if (step.delay > 0) _schedule_retrying(step.delay, go);
     else go();
 }
 
 // ── Internal event handlers — called from C ──────────────────────────────────
 
-function _on_mqtt(topic, payload) {
-    _resetCascade();                 // root event — fresh cascade budget (stale feeds may emit)
-    var armed = [], feed = [];
-    for (var i = 0; i < _rules.length; i++) {
-        var conds = _rules[i].conditions;
-        for (var j = 0; j < conds.length; j++) {
-            var c = conds[j];
-            if (c instanceof MqttCondition && c.topic === topic) {
-                c.value = payload;
-                c._seen = true;
-                if (c._once) { c._armed = true; armed.push(c); }
-            } else if (c instanceof StaleCondition && c.topic === topic) {
-                feed.push(c);
-            }
-        }
+// MQTT conditions of the registered rules by topic, each once even when rules
+// share it -- a shared stale() was fed (its timer re-created) once per rule.
+// A null-prototype map: a topic like "constructor" is no inherited key.
+var _mqttIndex = Object.create(null);   // topic → { conds: [MqttCondition], stale: [StaleCondition] }
+function _indexMqtt(conds) {
+    for (var j = 0; j < conds.length; j++) {
+        var c = conds[j], list;
+        if (c instanceof MqttCondition) list = 'conds';
+        else if (c instanceof StaleCondition) list = 'stale';
+        else continue;
+        var e = _mqttIndex[c.topic] || (_mqttIndex[c.topic] = { conds: [], stale: [] });
+        if (e[list].indexOf(c) < 0) e[list].push(c);
     }
-    for (var fi = 0; fi < feed.length; fi++) feed[fi]._feed();   // re-arm stale watchdogs
+}
+
+// The topics the loaded rules read -- what the host subscribes at the broker
+// (besides "rules/#"). Called by the host after every load.
+function _mqtt_topics() { return Object.keys(_mqttIndex); }
+
+function _on_mqtt(topic, payload) {
+    _retry_arms();                   // slots may have freed since (a reload, a clear)
+    _resetCascade();                 // root event — fresh cascade budget (stale feeds may emit)
+    var e = _mqttIndex[topic];
+    var armed = [];
+    if (e) {
+        for (var i = 0; i < e.conds.length; i++) {
+            var c = e.conds[i];
+            c.value = payload;
+            c._seen = true;
+            if (c._once) { c._armed = true; armed.push(c); }
+        }
+        for (var fi = 0; fi < e.stale.length; fi++) e.stale[fi]._feed();   // re-arm stale watchdogs
+    }
     _fire_matching('mqtt:' + topic);
     // Disarm edge conditions: they match only during this message's pass, so a
     // later _on_input → _fire_matching won't re-fire the rule.
@@ -733,7 +955,17 @@ function _on_mqtt(topic, payload) {
 }
 
 function _on_input(channel, state) {
+    _retry_arms();
+    _di_seen[channel] = !!state;
     _fire_matching('input:' + channel);
+}
+
+// An input change the engine's queue dropped: the live level is delivered
+// as the event it would have been, unless it is what was last seen anyway.
+function _resync_input(channel, live) {
+    live = !!live;
+    if ((channel in _di_seen) && _di_seen[channel] === live) return;
+    _on_input(channel, live);
 }
 
 function _rule_matches(r) {
@@ -743,7 +975,7 @@ function _rule_matches(r) {
         try {
             ok = (cond && typeof cond._check === 'function') ? cond._check() : !!cond;
         } catch (e) {
-            print('[rule:' + r.name + '] condition error: ' + e);
+            _log_rule_error(r, 'condition error', e);
             ok = false;   // a throwing condition blocks rather than crashing the engine
         }
         if (!ok) return false;
@@ -757,8 +989,134 @@ function _rule_matches(r) {
 function _run_action(r) {
     if (r.noLoop && r._firing) return;   // its own consequence reached it again — skip
     r._firing = true;
-    try { r.action(); } catch (e) { print('[rule:' + r.name + '] error: ' + e); }
-    r._firing = false;
+    try { r.action(); } catch (e) { _log_rule_error(r, 'error', e); }
+    finally { r._firing = false; }     // the budget's interrupt skips this: _after_interrupt
+}
+
+// Called by the host after the time budget interrupted a call. QuickJS's
+// interrupt is uncatchable: it unwinds past every catch and finally, so the
+// flags a pass sets before its work and clears after it stay set -- a noLoop
+// rule's _firing (the rule would never run again), an edge condition's _armed
+// (an mqtt().once() or a time trigger would keep matching on later, unrelated
+// events) -- and a time trigger whose callback was cut short never re-armed
+// itself. All of these are only true during a pass, and no pass is running now.
+//
+// Before the flags are cleared, the passes the interrupt cut short are taken
+// up again past the rule that ran over (see _pass), so the later rules still
+// see the event -- with the edge flags it armed. Cut short again, the next
+// call goes on past the next such rule. resume === false (the host's last
+// try) drops what is left of them instead: clearing flags evaluates no rule.
+// A heldFor check cut short is set again for another held period.
+function _after_interrupt(resume) {
+    _resetCascade();
+    _retrying = false;          // a retry pass the interrupt cut short (its finally skipped)
+    for (var f = 0; f < _rules.length; f++) _rules[f]._firing = false;
+    var h = _heldCheck;
+    _heldCheck = null;
+    if (h && h._timer == null && !h._fired) {
+        print('[rule:' + h.name + '] time budget exceeded in the heldFor() check -- checked again after another ' + h.heldFor + ' ms');
+        h._timer = _schedule(h.heldFor, _held_elapsed(h));
+        if (h._timer == null) _held_later(h);
+    }
+    if (resume === false) {
+        if (_passes.length) print('[rules] time budget exceeded again -- the event is not passed on to the remaining rules');
+        _passes = [];
+    }
+    while (_passes.length) {
+        var p = _passes.pop();
+        print('[rule:' + (p.rule ? p.rule.name : '?') + '] time budget exceeded -- the event goes on to the rules after it');
+        _pass(p);
+    }
+    _resetCascade();
+    var rearm = [];
+    for (var i = 0; i < _rules.length; i++) {
+        var r = _rules[i];
+        r._firing = false;
+        var conds = r.conditions;
+        for (var j = 0; j < conds.length; j++) {
+            var c = conds[j];
+            if (c instanceof MqttCondition) c._armed = false;
+            else if (c instanceof IntervalCondition || c instanceof CronCondition) {
+                c._armed = false;
+                if (c._timer == null) rearm.push(c);
+            }
+        }
+    }
+    for (var k = 0; k < rearm.length; k++) rearm[k]._arm();   // idempotent per trigger
+}
+
+// Whether a rule is edge-triggered on analog readings: it has a band on some
+// pad, or it is a predicate rule (wildcard), which would otherwise re-run its
+// action on every reading -- several a second -- while its predicate holds.
+// A bare analog(pad) is not: it is meant to see every reading.
+function _analogEdge(r) {
+    if (r._wildcard) return true;
+    for (var j = 0; j < r.conditions.length; j++) {
+        var c = r.conditions[j];
+        if (c instanceof AnalogCondition && (c._lo !== undefined || c._hi !== undefined)) return true;
+    }
+    return false;
+}
+
+// The heldFor timer's callback. The check runs with _heldCheck naming the
+// rule: cut short by the time budget there, the timer is gone and nothing
+// has fired, and with no further event the rule would never fire although
+// its conditions keep holding -- _after_interrupt() sets it again.
+var _heldCheck = null;
+function _held_elapsed(rule) {
+    return function() {
+        rule._timer = null;
+        _heldCheck = rule;
+        var m = _rule_matches(rule);
+        _heldCheck = null;
+        if (m) { rule._fired = true; _run_action(rule); }
+    };
+}
+
+// Fire, arm or disarm one rule for a match result -- shared by _fire_matching()
+// and _on_analog(). The analog latch follows every evaluation, not only those
+// from analog readings: a band rule fired by another fact while the reading is
+// inside its band has taken that band's edge.
+function _apply_match(r, matched) {
+    r._analogIn = matched;
+    if (matched) {
+        if (r.heldFor > 0) {
+            // sustained gate: arm a timer once; fire only if still matching at
+            // elapse; latch so it fires once per held period, not every event
+            if (r._timer == null && !r._fired) {
+                r._timer = _schedule(r.heldFor, _held_elapsed(r));
+                if (r._timer == null) _held_later(r);
+            }
+        } else {
+            _run_action(r);
+        }
+    } else {
+        // conditions no longer hold — cancel a pending sustain timer and re-arm
+        if (r._timer != null) { _unschedule(r._timer); r._timer = null; }
+        r._fired = false;
+        r._heldWaiting = false;   // a queued arm (_held_later) is dropped when it comes up
+    }
+}
+
+// A heldFor() the full table refused. Waiting for its next matching event was
+// not enough: an input that went HIGH and stays HIGH sends none, and the rule
+// never fired. Queued once, armed as soon as a slot frees -- the hold counts
+// from then, late rather than never -- and dropped if the condition has gone
+// in the meantime.
+function _held_later(r) {
+    if (r._heldWaiting) return;
+    r._heldWaiting = true;
+    _arm_later(function() {
+        if (!r._heldWaiting || r._timer != null || r._fired) { r._heldWaiting = false; return true; }
+        _heldCheck = r;
+        var m = _rule_matches(r);
+        _heldCheck = null;
+        if (!m) { r._heldWaiting = false; return true; }
+        r._timer = _schedule(r.heldFor, _held_elapsed(r));
+        if (r._timer == null) return false;          // still full: stays first in line
+        r._heldWaiting = false;
+        return true;
+    });
 }
 
 // factKey identifies the fact that changed (e.g. 'input:4', 'mqtt:rules/trigger').
@@ -767,28 +1125,42 @@ function _run_action(r) {
 // evaluates every rule.
 function _fire_matching(factKey, _isCascade) {
     if (!_isCascade) _resetCascade();   // a root event/timer starts a fresh cascade budget
-    for (var i = 0; i < _rules.length; i++) {
-        var r = _rules[i];
-        if (factKey != null && !r._wildcard && !r._facts[factKey]) continue;
-        if (_rule_matches(r)) {
-            if (r.heldFor > 0) {
-                // sustained gate: arm a timer once; fire only if still matching at
-                // elapse; latch so it fires once per held period, not every event
-                if (r._timer == null && !r._fired) {
-                    r._timer = _schedule(r.heldFor, (function(rule) {
-                        return function() {
-                            rule._timer = null;
-                            if (_rule_matches(rule)) { rule._fired = true; _run_action(rule); }
-                        };
-                    })(r));
-                }
-            } else {
-                _run_action(r);
-            }
-        } else {
-            // conditions no longer hold — cancel a pending sustain timer and re-arm
-            if (r._timer != null) { _unschedule(r._timer); r._timer = null; }
-            r._fired = false;
+    _pass({ key: factKey, analog: false, next: 0, rule: null });
+}
+
+// One event's walk over the rules. The passes in progress are kept on
+// _passes, innermost last, each with the index of the next rule to take:
+// when the time budget cuts a rule short, the interrupt unwinds the whole
+// pass -- and every pass around it -- and the rules after that one never
+// saw the event. _after_interrupt() goes on from `next`, past the rule that
+// ran over. `next` moves before the rule runs, in the one expression that
+// reads it, so wherever the interrupt lands no rule runs twice.
+var _passes = [];
+function _pass(p) {
+    _passes.push(p);
+    try {
+        while (p.next < _rules.length) {
+            var r = _rules[p.next++];
+            if (p.key != null && !r._wildcard && !r._facts[p.key]) continue;
+            p.rule = r;
+            var m = _rule_matches(r);
+            if (p.analog && m && r._analogIn && !(r.heldFor > 0) && _analogEdge(r)) continue;   // edge taken
+            _apply_match(r, m);
         }
+    } finally {
+        _passes.pop();                 // the budget's interrupt skips this: _after_interrupt
     }
+}
+
+// A new analog reading. Edge-triggered per rule: a rule fires when its
+// conditions start to hold on an analog reading, and not again until they have
+// stopped holding on one -- see AnalogCondition.
+// mv null: the pad has stopped being an analog input -- its last reading is
+// forgotten, and band conditions on it no longer match.
+function _on_analog(pad, mv) {
+    _retry_arms();
+    if (mv === null || mv === undefined) delete _an_seen[pad];
+    else _an_seen[pad] = mv;
+    _resetCascade();
+    _pass({ key: 'analog:' + pad, analog: true, next: 0, rule: null });
 }

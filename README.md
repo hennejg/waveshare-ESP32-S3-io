@@ -20,8 +20,8 @@ board hardware abstraction layer (`components/board/`):
 
 | Flavor | Binary | What it includes |
 |--------|--------|-----------------|
-| **Full** (`apps/full/`) | `waveshare_esp32s3_full.bin` | [WiFi provisioning](#connectivity), [Ethernet](#connectivity), [Rule engine](#automation-rules), [MQTT](#mqtt), [CAN bus](#can-bus), [Modbus RTU](#modbus-rtu), [full web UI](#web-configuration-ui) — **no Matter** |
-| **Matter** (`apps/matter/`) | `waveshare_esp32s3_matter.bin` | [WiFi provisioning](#connectivity), [Ethernet](#connectivity), [Matter](#matter) (Apple Home / Google Home), minimal web UI — no rule engine, no MQTT |
+| **Full** (`apps/full/`) | `waveshare_esp32s3_full.bin` | [WiFi provisioning](#connectivity), [Ethernet](#connectivity), [Rule engine](#automation-rules), [MQTT](#mqtt), [CAN bus](#can-bus), [Modbus](#modbus) (RTU slave or RS-485 master + gateway, Modbus TCP server and master), [header pads](#header-pads-io1-rxd-txd) (input, output, PWM, analog), [full web UI](#web-configuration-ui) — **no Matter** |
+| **Matter** (`apps/matter/`) | `waveshare_esp32s3_matter.bin` | [WiFi provisioning](#connectivity), [Ethernet](#connectivity), [Matter](#matter) (Apple Home / Google Home), [header pads](#header-pads-io1-rxd-txd), buzzer, NTP time + RTC, Modbus RTU slave or RS-485 master (values as Matter sensors) + Modbus TCP server, CAN bus, minimal web UI — no rule engine, no MQTT |
 
 **If you are not sure which to use, start with the full firmware** — it is what the CI builds and the releases contain.
 
@@ -32,7 +32,7 @@ board hardware abstraction layer (`components/board/`):
 | **MCU**             | ESP32-S3-WROOM-1U-N16R8 (dual-core Xtensa LX7, 240 MHz, 16 MB Flash, 8 MB PSRAM)                        |
 | **Ethernet**        | W5500 SPI (10/100 Mbit)                                                                                 |
 | **Digital inputs**  | 8 × optocoupler-isolated (DI1–DI8, GPIO4–GPIO11)                                                        |
-| **Extra inputs**    | 3 × **non-isolated** 3.3 V GPIO (AUX1–AUX3, GPIO1/43/44) — [optional, off by default](#optional-extra-inputs-app_aux_di_enable) |
+| **Header pads**     | 3 × **non-isolated** 3.3 V GPIO (IO1/RXD/TXD = GPIO1/44/43): input, output, PWM output, IO1 also analog — [switched in the web UI](#header-pads-io1-rxd-txd) |
 | **Digital outputs** | (ESP32-S3-POE-ETH-8DI-8DO only) 8 × optocoupler-isolated Darlington (DO1–DO8, via TCA9554 I²C expander) |
 | **Relay outputs**   | (ESP32-S3-POE-ETH-8DI-8RO only) 8 × 1NO 1NC; ≤10A 250V AC or ≤10A 30V DC                                |
 | **CAN bus**         | ESP32-S3 TWAI peripheral (GPIO2 TX, GPIO3 RX)                                                           |
@@ -49,6 +49,10 @@ board hardware abstraction layer (`components/board/`):
 
 - **WiFi provisioning** — on first boot the device opens a `Waveshare-Setup` access point. Connect to it on any device;
   a captive portal appears automatically to enter WiFi credentials. The LED blinks 30% blue while the portal is active.
+  The access point is open (no WiFi password), so it only comes up while **no credentials are stored**. Once the device
+  has credentials, a lost WiFi link is retried every 10 s and nothing else happens: no reboot (outputs, Modbus, CAN
+  and rules keep running, Ethernet stays up) and no open access point that someone in radio range could use to point
+  the device at a network of their own. If the stored network is gone for good, hold BOOT for ≥ 5 s (see below).
 - **ETH-only mode** — if you have an Ethernet cable, tap **"Use Ethernet only →"** on the provisioning portal to skip
   WiFi entirely. The preference is stored and survives reboots.
 - **Ethernet** — W5500 SPI Ethernet always runs in parallel (or alone in ETH-only mode); whichever interface gets an IP
@@ -74,25 +78,53 @@ the tab is closed).
 **Password reset** (forgotten password): click **"Forgot password?"** on the login screen and repeat the BOOT button
 flow — no prior authentication required, physical access is sufficient.
 
+**Only press BOOT for a request you started yourself.** The device cannot tell who asked: the token goes to whichever
+client started the pending request, and anyone on the network can start one. If the page reports that another
+request is already pending, do not press the button. Known limitation; a confirmation code shown on both sides would
+close it.
+
+**Storage:** the password is kept as PBKDF2-HMAC-SHA256 (2000 iterations, random salt). A wrong password costs about
+a quarter second on the device, which also slows down guessing over the network. Hashes stored by older firmware
+(one SHA-256 round) are replaced at the next login.
+
+**Transport security — plain HTTP only.** The web server speaks HTTP, not HTTPS, and the password travels with every
+request as HTTP Basic authentication, i.e. Base64 — readable to anyone who can see the traffic. The same holds for the
+setup token, the configuration (including MQTT credentials) and the rules. Run the device only on a network you trust
+for this: a separate management VLAN or segment, not a shared, guest or public network, and not reachable from the
+internet. Reach it from elsewhere through a VPN or a TLS-terminating reverse proxy on that trusted segment. Choose a
+password used nowhere else. This is an accepted limitation, not an oversight: there is no TLS on the HTTP server.
+
 ### Web Configuration UI
 
 Served at `http://<device-ip>/` on port 80. Settings include (full firmware):
 
 | Section          | What you can configure                                                      |
 |------------------|-----------------------------------------------------------------------------|
-| Device           | Device name (DHCP hostname), LED mode                                       |
+| Device           | Device name (DHCP hostname), LED mode, mode of the header pads IO1/RXD/TXD  |
 | MQTT Broker      | Broker URL, username/password, topic prefix                                 |
-| Digital Inputs   | Per-input name and invert flag                                              |
-| Digital Outputs  | Per-output name and invert flag                                             |
+| Inputs           | Per-input name and invert flag, pads set to input or analog                 |
+| Outputs          | Per-output name and invert flag, pads as output or PWM (frequency, duty)    |
 | CAN Bus          | Mode (Off / Basic / NMEA2000), address, bit rate                            |
-| Modbus RTU       | Enable/disable, slave address, baudrate                                     |
+| Modbus           | RS-485 role (slave/master), address, baud rate, gateway, Modbus TCP server, |
+|                  | table of values read from other Modbus devices (RS-485 or TCP)              |
+| Time             | NTP server, time zone, clock set by hand (kept in the RTC)                  |
 | Automation Rules | JavaScript rule script (see [Automation Rules](#automation-rules))          |
 
-The UI also provides **Save**, **Reboot**, and **Factory Reset** buttons.
+The UI also provides **Save**, **Reboot**, and **Factory Reset** buttons. A badge next to the title names the
+firmware variant that is running (full or matter).
 
 #### REST API (full firmware)
 
-All endpoints except the auth flow require an `Authorization: Basic base64(:<password>)` header when a password is set.
+All endpoints except the auth flow require an `Authorization: Basic base64(:<password>)` header.
+Until a password has been set they answer `403 {"error":"setup_required"}`: a device that has not been
+set up yet is closed, not open, and the only way in is the button-confirmed password flow.
+That includes `/api/version` and `/api/time`. `/api/version` names the firmware in `"variant"` (`"full"` or
+`"matter"`); both web UIs show it as a badge next to the title, so the two look-alike pages cannot be confused.
+
+Requests a browser sends on behalf of another site are refused even with the right password
+(`Sec-Fetch-Site` other than `same-origin`/`none`, or an `Origin` that is not the device itself): once
+the browser has cached the password, any web page could otherwise post to the API. curl and scripts send
+neither header and are not affected.
 
 | Endpoint                 | Method | Auth required | Description                                      |
 |--------------------------|--------|---------------|--------------------------------------------------|
@@ -107,9 +139,15 @@ All endpoints except the auth flow require an `Authorization: Basic base64(:<pas
 | `/api/rules`             | GET    | Yes           | Read the current rule script as `{"script":"…"}` |
 | `/api/rules`             | POST   | Yes           | Save + hot-reload rules from `{"script":"…"}`    |
 
-The matter firmware exposes a smaller API: `/api/auth/*`, `/api/config` (subset), `/api/reboot`,
-`/api/factory-reset`, `/api/matter/pairing` (GET — QR code + commissioning status), and
-`/api/matter/decommission` (POST — erase fabrics and reboot).
+The matter firmware exposes a smaller API: `/api/auth/*`, `/api/config` (subset, with `sntp`, `tz` and
+`aux`), `/api/io/state`, `/api/io/output` (DO1–DO8 and the header pads), `/api/io/led`, `/api/io/buzzer`,
+`/api/time`, `/api/version` (with the free internal heap), `/api/reboot`, `/api/factory-reset`,
+`/api/modbus/status`, `/api/matter/pairing` (GET — QR code + commissioning status), and `/api/matter/decommission` (POST — erase
+fabrics and reboot).
+
+`POST /api/io/led` accepts either `{"color":"#RRGGBB"}` (exactly six hex digits)
+or `{"r":255,"g":128,"b":0}` (all three components, integers from 0 to 255).
+Invalid commands return HTTP 400 without changing the LED, in both firmwares.
 
 ### Automation Rules
 
@@ -117,7 +155,9 @@ A built-in rule engine wires digital inputs, digital outputs, and MQTT messages 
 with a small JavaScript DSL. Rules are edited in the **Rules** tab of the web UI — a
 CodeMirror editor with JavaScript syntax highlighting and line numbers (self-hosted, so it
 works on an isolated network) — or via `POST /api/rules`, saved to NVS, and hot-reloaded
-without a reboot.
+without a reboot. A script is at most 3900 bytes of UTF-8 (an umlaut counts twice); a longer
+one is refused with 400 and nothing is stored. If the stored script cannot be read,
+`GET /api/rules` answers 500 rather than the demo.
 
 See the **[Rule Language Reference](components/scripting/RULES.md)** for the full syntax —
 rule structure, the `input` / `output` / `mqtt` facts and their helpers, time-based rules
@@ -137,10 +177,14 @@ Full details in [`docs/mqtt.md`](docs/mqtt.md).
 | Digital outputs (bulk) | `<prefix>/output/set`                |
 | LED                    | `<prefix>/led/set`                   |
 | Buzzer                 | `<prefix>/buzzer/beep`               |
+| Header pads            | `<prefix>/aux/<n>/pwm/set`, `<prefix>/aux/1/analog` |
+| Modbus values read     | `<prefix>/modbus/<name>`             |
 
 - Input/output topics use a configured channel name, or the index number (1–8) if no name is set — inputs run to 11
-  with [`APP_AUX_DI_ENABLE`](#optional-extra-inputs-app_aux_di_enable).
-- Output commands accept `true`/`false`/`1`/`0`/`on`/`off`/`high`/`low`/`toggle` (case-insensitive).
+  with [header pads](#header-pads-io1-rxd-txd).
+- Output commands accept `true`/`false`/`1`/`0`/`on`/`off`/`high`/`low`/`toggle` (case-insensitive). A command is the
+  whole payload: a NUL byte or anything after the value refuses it.
+- Rules receive `rules/#` and every topic a loaded rule reads (up to 32), see [RULES.md](components/scripting/RULES.md).
 - The LED accepts `#RRGGBB`, a timed single step `{"color":"#RRGGBB","duration":ms}`, or a multi-step sequence array.
 - The buzzer accepts a single `{"freq":Hz,"duration":ms}` or a sequence array; omit `freq` for silent pauses.
 
@@ -173,12 +217,20 @@ It is **not** present in the full firmware because the CHIP SDK exhausts DMA-cap
 the rule engine and MQTT stack.
 
 Flash `apps/matter/` if you need to integrate the device into Apple Home, Google Home, or Home Assistant via the
-Matter protocol. You give up the rule engine, MQTT, CAN bus, and Modbus RTU in exchange.
+Matter protocol. You give up the rule engine, MQTT, the RS-485 gateway and the Modbus TCP master in exchange;
+Modbus RTU slave or RS-485 master, the Modbus TCP server and CAN are there, once the device is commissioned. As
+master the board reads values from devices on RS-485 and reports them as Matter sensors.
 
 | Feature               | Description                                                                               |
 |-----------------------|-------------------------------------------------------------------------------------------|
 | **8 Digital Outputs** | Exposed as *On/Off Plug-in Unit* endpoints (controllable)                                 |
 | **8 Digital Inputs**  | Exposed as *Contact Sensor* endpoints (read-only state)                                   |
+| **Header pads**       | IO1/RXD/TXD by mode: input → *Contact Sensor*, output → *On/Off Plug-in Unit*, PWM → *Dimmable Plug-in Unit*; analog in the web UI only |
+| **Time**              | NTP sync and the battery-backed RTC, time zone, set by hand from the web UI               |
+| **Buzzer**            | Test beep from the web UI (`POST /api/io/buzzer`)                                         |
+| **Modbus**            | RTU slave on RS-485 and TCP server (port 502, 4 clients), started once commissioned       |
+| **Modbus values**     | RS-485 as master: polled values become temperature, humidity, pressure, flow, power or energy sensor endpoints |
+| **CAN bus**           | Basic and NMEA 2000 modes as in the full firmware, started once commissioned              |
 | **Pairing code**      | Unique passcode + discriminator generated on first boot; survives reboot and decommission |
 | **QR code**           | Shown in the web UI; scan with your home app to pair                                      |
 | **Decommission**      | Erase all fabric data via `POST /api/matter/decommission` or the minimal web UI           |
@@ -189,18 +241,32 @@ Contact Sensor endpoints as door or window sensors (open/closed), not as generic
 Matter spec but can look surprising. See [`docs/matter.md`](docs/matter.md) for details on renaming endpoints and
 alternative device types.
 
-### Modbus RTU
+### Modbus
 
 Full details in [`docs/modbus.md`](docs/modbus.md).
 
-RS-485, configurable baud rate and slave address. Register map:
+- **RS-485 slave** (default) — Modbus RTU, configurable baud rate and address, answers with the register map below.
+- **RS-485 master** — reads other devices on the segment by itself; with the **gateway** on it also forwards
+  Modbus TCP requests to them by unit ID.
+- **Modbus TCP server** — port 502, the same register map, up to 8 connections. No authentication: enable it only on
+  a network you control.
+- **Reading other devices** — up to eight values from Modbus TCP or RS-485 devices, polled from a table in the web
+  UI; published as `modbus/<name>` and handed to the rules (full firmware) or reported as Matter sensors (matter).
+- **Read Device Identification** (FC 43/14) and identification input registers.
+
+Register map:
 
 | Register    | Type                  | Description                           |
 |-------------|-----------------------|---------------------------------------|
 | 1–8         | Coil (RW)             | DO1–DO8                               |
+| 9–11        | Coil (RW)             | Header pads set to output (DO9–DO11)  |
 | 10001–10008 | Discrete input (RO)   | DI1–DI8                               |
+| 10009–10011 | Discrete input (RO)   | AUX1–AUX3 (header pads set to input)  |
+| 30001–30080 | Input register (RO)   | Device identification                 |
+| 30101–30104 | Input register (RO)   | IO1 analog mV, pad modes              |
 | 40001       | Holding register (RW) | LED colour (RGB252, 16-bit)           |
 | 40002       | Holding register (RW) | Buzzer: write frequency → 200 ms beep |
+| 40003–40011 | Holding register (RW) | PWM duty and frequency of the pads    |
 
 ### LED Modes
 
@@ -232,47 +298,95 @@ Status mode all LED commands from MQTT, Modbus, and CAN are ignored.
 - **Unified state** — a DO write via any interface (MQTT, Modbus, CAN) is reflected immediately on all others. MQTT
   confirmation is published, Modbus coil is updated, CAN echoes the new state.
 
-### Optional Extra Inputs (`APP_AUX_DI_ENABLE`)
+### Header pads (IO1, RXD, TXD)
 
-> Build-time option, **off by default** — the released binaries do not contain it.
+> Switched per pin in the web UI. Every pin starts in its **standard function**.
 
-`APP_AUX_DI_ENABLE` adds three further digital inputs on the **IO1, RXD and TXD** pads (GPIO1, GPIO44, GPIO43), behind the eight
-isolated ones.
-They show up as **AUX1–AUX3** in the web UI and occupy DI indices 8, 9 and 10. Enable it with
-`CONFIG_APP_AUX_DI_ENABLE=y` in `apps/full/sdkconfig.defaults`, or in `./idf.sh menuconfig` under
-*Board driver options → Three extra NON-ISOLATED digital inputs (GPIO1, GPIO44, GPIO43)*.
+The **IO1, RXD and TXD** pads (GPIO1, GPIO44, GPIO43) can each be put in their standard function, used as a digital
+input, or driven as a digital output or a PWM output; IO1 can also be an analog input. The choice is made per pin on the *Device* tab, or
+with `"aux"` in `POST /api/config`, and takes effect on saving, without a reboot. As inputs they show up as
+**AUX1–AUX3** behind the eight isolated ones and occupy DI indices 8, 9 and 10.
+
+| Pad | GPIO | Standard function             | Modes                                     |
+|-----|------|-------------------------------|-------------------------------------------|
+| IO1 | 1    | unused by this firmware       | input (AUX1), output (DO9), PWM, analog   |
+| RXD | 44   | UART0 RX                      | input (AUX2), output (DO10), PWM          |
+| TXD | 43   | UART0 TX — the serial console | input (AUX3), output (DO11), PWM          |
+
+```json
+"aux": [
+  { "mode": "analog" },
+  { "mode": "pwm", "pwm_freq": 1000, "pwm_duty": 25.0 },
+  { "mode": "standard" }
+]
+```
+
+- **PWM**: 5 Hz to 1 MHz, duty 0–100 % in steps of 0.1 %. Each pad has its own timer, so the three frequencies are
+  independent. The duty resolution follows from the frequency: 14 bits up to about 4.9 kHz, fewer above — 6 bits
+  at 1 MHz. `/api/io/state` reports the frequency as set, the frequency the timer really produces and the
+  resolution in bits. The output is a 3.3 V logic signal straight from the MCU, a few milliamperes at most: drive a
+  MOSFET, an LED driver or a 0–10 V converter from it, never a load.
+- **Analog** (IO1 only, ADC1 channel 0): 0 to about 3.1 V, calibrated from eFuse, averaged over 16 conversions,
+  reported in millivolts in `/api/io/state`. Divide larger voltages down externally.
+- **Digital output**: on/off like DO1–DO8, with its own name and invert flag, as channel 8–10 after them. It
+  starts off after a reboot and whenever the pad enters output mode; its state is not stored.
+- The mode is chosen on the *Device* tab. A pad appears on the *Inputs* tab only as a digital or analog input, and on
+  the *Outputs* tab only as a digital or PWM output — name and invert of an output, frequency and duty of a PWM
+  output; a pad in its standard function appears on neither.
+- At run time the PWM can also be changed over Modbus (holding registers 40003–40011), MQTT (`aux/<n>/pwm/set`)
+  and from rules (`pwm(pad).set()`); such changes are not stored. The analog reading is available over Modbus
+  (input register 30101), MQTT (`aux/1/analog`) and to rules (`analog(1)`). See [docs/modbus.md](docs/modbus.md),
+  [docs/mqtt.md](docs/mqtt.md) and [RULES.md](components/scripting/RULES.md).
+
+A pad in any mode other than its standard function is taken off UART0. The console carries on over USB-Serial/JTAG; on UART0 it no longer
+reaches the pin until the pad is switched back. A channel that is not set to input reads `false`, is not published,
+and `/api/io/state` marks it in `di_active`.
+
+**An output or PWM output is under control only while the firmware runs.** Plan the load's driver for the rest of
+the time:
+
+- **Switching such a pad to another mode does not switch its load off.** As an input the pad has its pull-up on, and
+  RXD/TXD in their standard function idle high as UART lines. Switch the output off, or set the duty cycle to 0.
+- **TXD is driven at every reset.** It is UART0 TX: the ROM bootloader, the second-stage bootloader and the early
+  application log drive it from every reset until the pads are set up, and indefinitely while the chip sits in
+  download mode (esptool, BOOT button). A load on TXD sees that traffic. Prefer IO1 or RXD for outputs.
+- **Give the driver input a pull-down.** Until the firmware sets a pad up after reset, IO1 and RXD are undriven
+  inputs (RXD with its reset pull-up), so a MOSFET gate on them is only held low by an external pull-down.
+
+The build option `CONFIG_APP_AUX_DI_ENABLE` (default on, in both firmwares) only decides whether the switch is
+offered at all.
 
 **These three pins are not isolated.** They run straight to the ESP32-S3 — no optocoupler, no series resistor, no
 reverse protection — and must never see more than 3.3 V or less than 0 V. Conditioning them is up to the external
 circuit.
 
-**Important — GPIO43 needs a series resistor of at least 1 kΩ.** GPIO43 is U0TXD, and the ROM bootloader drives it as
-a push-pull output from every reset until the second-stage bootloader releases it — and indefinitely while the chip
-sits in UART download mode (esptool, BOOT button). A contact wired straight from GPIO43 to ground therefore shorts that
-driver on every boot and during every flash. It is deliberately the last channel, so a board that needs only two
-extra inputs can leave it unwired. GPIO44 (AUX2, U0RXD) is an input and has no such problem; GPIO1 is otherwise
-unused by this firmware.
+**Important — GPIO43 needs a series resistor of at least 1 kΩ as an input.** GPIO43 is U0TXD: the console stays on
+UART0, so the ROM bootloader, the second-stage bootloader and the early application log all drive it as a push-pull
+output, from every reset until the pads are set up — and indefinitely while the chip sits in UART download mode
+(esptool, BOOT button). A contact wired straight from GPIO43 to ground shorts that driver for the whole boot log and
+during every flash. It is deliberately the last channel, so a board that needs only two extra inputs can leave it
+unwired. GPIO44 (AUX2, U0RXD) is an input and has no such problem; GPIO1 is otherwise unused by this firmware.
 
-**The console has to move.** GPIO43/44 are UART0 TX/RX, so the option also requires
-`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` (*Component config → ESP System Settings → Channel for console output →
-USB Serial/JTAG Controller*). Building with the console still on UART0 fails with an `#error`.
+**Going back to an older firmware loses the input names.** This firmware stores eleven input entries in one NVS blob
+the first time any setting is saved. An eight-input firmware — every release up to v1.1.13 or a build without
+`APP_AUX_DI_ENABLE` — cannot read that blob: `nvs_get_blob()` returns
+`ESP_ERR_NVS_INVALID_LENGTH`, and *every* input name and invert flag falls back to its default, the eight isolated ones
+included. Note them down before going back.
 
-**Turning the option back off loses the input names.** The per-input settings are stored as one NVS blob. Eleven
-entries written by an option-on firmware do not fit the eight-entry buffer of an option-off one, so `nvs_get_blob()`
-returns `ESP_ERR_NVS_INVALID_LENGTH` and *every* input name and invert flag falls back to its default — the eight
-isolated ones included. Note them down before switching back.
+A board that ran a firmware built with `APP_AUX_DI_ENABLE` before the pads became switchable keeps its three inputs:
+with no pad modes stored and an eleven-entry input table, all three pads start as inputs.
 
 Not every interface grows with the extra channels:
 
 | Interface        | AUX1–AUX3 | Detail                                                              |
 |------------------|-----------|---------------------------------------------------------------------|
-| Web UI           | yes       | Listed as AUX1–AUX3, marked as not isolated                         |
+| Web UI           | yes       | Listed as AUX1–AUX3, marked as not isolated, switch per pin         |
 | REST API         | yes       | `/api/config` and the status JSON carry 11 input entries            |
-| MQTT             | yes       | `input/9`, `input/10`, `input/11` — the topic index is DI index + 1 |
+| MQTT             | yes       | `input/9`, `input/10`, `input/11` — only for pads set to input      |
 | CAN bus          | **no**    | DI state is packed into a single byte — room for 8                  |
-| Modbus RTU       | **no**    | Discrete inputs 10001–10008 only                                    |
-| Matter           | **no**    | 8 Contact Sensor endpoints, unchanged                               |
-| Automation rules | **no**    | `input` / `output` channels are limited to 0–7 (`RangeError` above) |
+| Modbus RTU / TCP | yes       | Discrete inputs 10009–10011                                         |
+| Matter           | yes       | Input → Contact Sensor, output → On/Off, PWM → Dimmable Plug-in Unit |
+| Automation rules | yes       | `input(8)`–`input(10)`                                              |
 
 ---
 
@@ -375,21 +489,23 @@ python -m esptool --chip esp32s3 -p /dev/ttyUSBx -b 460800 \
 │   │   └── main/
 │   │       ├── main.c            Entry point, event/callback wiring
 │   │       ├── app_mqtt.c/h      MQTT client wrapper
-│   │       ├── app_time.c/h      Timezone / local-time helpers
-│   │       ├── can_server.c/h    CAN bus (Basic + NMEA2000 modes)
-│   │       ├── mb_server.c/h     Modbus RTU slave
+│   │       ├── net_budget.h      lwIP socket budget, checked at compile time
 │   │       └── web_server.c/h    HTTP config UI + full REST API
-│   └── matter/                   Matter firmware (WiFi + Matter — no rule engine, no MQTT)
+│   └── matter/                   Matter firmware (WiFi + Matter + Modbus + CAN — no rule engine, no MQTT)
 │       ├── CMakeLists.txt
 │       ├── sdkconfig.defaults
 │       ├── partitions.csv        App-only layout (no SPIFFS)
 │       └── main/
 │           ├── main.c            Thin entry point
-│           ├── matter.cpp/h      Matter integration (esp-matter, 8 DO + 8 DI endpoints)
+│           ├── matter.cpp/h      Matter integration (esp-matter, 8 DO + 8 DI + header pad endpoints)
+│           ├── matter_mbm.cpp/h  Modbus values as Matter sensor endpoints
+│           ├── mbm_value.c/h     Modbus value to Matter attribute units
+│           ├── net_budget.h      lwIP socket budget, checked at compile time
 │           └── web_server.c/h    Minimal HTTP UI + matter/status endpoints
 ├── components/
 │   ├── board/                    Shared hardware abstraction layer (both firmware flavors)
 │   │   ├── app_config.c/h        NVS-backed configuration store
+│   │   ├── app_time.c/h          Time zone, clock seeded from the RTC
 │   │   ├── auth.c/h              Web UI authentication (password + BOOT button token flow)
 │   │   ├── button.c/h            BOOT button — long-press WiFi reset, short-press auth token
 │   │   ├── buzzer.c/h            Piezo buzzer (LEDC PWM) — single beep + sequences
@@ -397,9 +513,13 @@ python -m esptool --chip esp32s3 -p /dev/ttyUSBx -b 460800 \
 │   │   ├── dout.c/h              Digital outputs (TCA9554 I²C)
 │   │   ├── eth.c/h               W5500 Ethernet (SPI)
 │   │   ├── i2c_bus.c/h           Shared I²C bus init
+│   │   ├── json_exact.c/h        JSON commands parsed as the whole payload, no NUL bytes
 │   │   ├── led.c/h               WS2812 LED (RMT) — IO and Status modes
 │   │   ├── rtc.c / app_rtc.h     DS3231 battery-backed RTC
-│   │   └── sntp_sync.c/h         SNTP client + RTC write-back
+│   │   ├── sntp_sync.c/h         SNTP client + RTC write-back
+│   │   └── web_common.c/h        Web API parts both firmwares share (auth, time, pads)
+│   ├── can/                      CAN bus, Basic + NMEA2000 modes (both firmwares)
+│   ├── modbus/                   Modbus RTU slave, Modbus TCP server and master, RS-485 gateway, poll table (both firmwares)
 │   ├── scripting/                Rule engine (QuickJS DSL — full firmware only)
 │   │   └── RULES.md              Rule language reference
 │   ├── quickjs/                  QuickJS JS engine (git submodule)
@@ -412,11 +532,30 @@ python -m esptool --chip esp32s3 -p /dev/ttyUSBx -b 460800 \
 │   ├── can.md                    CAN bus API (Basic and NMEA2000 modes)
 │   ├── matter.md                 Matter integration — device model, commissioning, known quirks
 │   ├── mqtt.md                   MQTT API reference
-│   └── modbus.md                 Modbus RTU register map
+│   └── modbus.md                 Modbus RTU/TCP, gateway, reading other devices, register map
+├── doc/cra/                      Cyber Resilience Act due-diligence notes
+├── test/
+│   ├── host/                     Host tests: firmware functions cut out verbatim, built and run on the PC
+│   └── hw/                       Hardware integration tests (matter_it.py: Matter firmware + chip-tool)
 ├── esp-idf/                      ESP-IDF v5.5.4 (git submodule)
 ├── esp-matter/                   Matter SDK / connectedhomeip (git submodule, matter firmware only)
 └── idf.sh                        Convenience wrapper: sources export.sh, defaults to apps/full
 ```
+
+---
+
+## Tests
+
+```bash
+make -C test/host                        # host tests (ASAN/UBSAN), also run by CI on every pull request
+cd components/scripting && node --test   # rule-engine DSL tests
+```
+
+Each `test/host/gen_<name>_test.py` cuts the firmware functions it tests out of the source verbatim, so a test
+cannot drift from the code. `OLD=1 make -C test/host <name>` runs it against the source before a fix
+(`OLDREV`, default `HEAD`), which shows that the test catches the defect it was written for.
+`test/hw/matter_it.py` is an integration test for a board running the Matter firmware (see its header and
+[`docs/matter.md`](docs/matter.md)).
 
 ---
 
@@ -433,9 +572,12 @@ python -m esptool --chip esp32s3 -p /dev/ttyUSBx -b 460800 \
 
 | Component                     | Source             | Purpose          |
 |-------------------------------|--------------------|------------------|
-| `espressif/esp-modbus ^2.1.2` | Component Registry | Modbus RTU slave |
 | `espressif/mqtt ^1.0.0`       | Component Registry | MQTT client      |
 | `espressif/cjson *`           | Component Registry | JSON parsing     |
+
+Both firmwares take Modbus RTU from `components/modbus/`, which pulls a fork of `espressif/esp-modbus` 2.1.4
+(adds `mbc_master_get_last_exception()` so the gateway can pass a slave's exception code on); the Modbus TCP
+side is this project's own.
 
 ### Matter firmware (`apps/matter/`)
 

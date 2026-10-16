@@ -8,12 +8,13 @@
 typedef void (*app_mqtt_connected_cb_t)(void);
 
 /* Called for each incoming message. topic and data are NOT null-terminated.
-   Runs inside the MQTT task — keep it short, no blocking calls. */
+   The topic is relative: the configured prefix has been stripped, so it is
+   the string a handler subscribed with. Runs inside the MQTT task — keep it
+   short, no blocking calls. */
 typedef void (*app_mqtt_msg_cb_t)(const char *topic, size_t topic_len,
                                    const char *data,  size_t data_len);
 
 esp_err_t app_mqtt_start(void);
-void      app_mqtt_stop(void);
 bool      app_mqtt_is_connected(void);
 
 /* Publish / subscribe — the configured topic prefix is prepended automatically.
@@ -23,6 +24,19 @@ int app_mqtt_publish(const char *topic, const char *payload, int len,
                      int qos, bool retain);
 int app_mqtt_subscribe(const char *topic, int qos);
 int app_mqtt_unsubscribe(const char *topic);
+
+/* The same, for one owner of the subscription. A topic filter is one
+   subscription at the broker, whoever asked for it: the rule engine
+   unsubscribing a filter it no longer reads ("output/set" in a rule) took
+   it away from the module that switches the outputs. A filter is
+   unsubscribed only once no owner wants it any more. app_mqtt_subscribe()
+   and app_mqtt_unsubscribe() are the firmware modules' owner. The record
+   starts empty with every connection, as the subscriptions do. Returns 0
+   for an unsubscribe that is kept for another owner. */
+#define APP_MQTT_OWNER_FW    0x01
+#define APP_MQTT_OWNER_RULES 0x02
+int app_mqtt_subscribe_as(unsigned owner, const char *topic, int qos);
+int app_mqtt_unsubscribe_as(unsigned owner, const char *topic);
 
 void app_mqtt_set_connected_callback(app_mqtt_connected_cb_t cb);
 void app_mqtt_set_msg_callback(app_mqtt_msg_cb_t cb);

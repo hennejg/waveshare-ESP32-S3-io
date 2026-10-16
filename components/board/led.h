@@ -14,6 +14,10 @@ esp_err_t led_set_rgb(uint8_t r, uint8_t g, uint8_t b);
    For use by system functions (e.g. authentication blink). */
 void led_force_set(uint8_t r, uint8_t g, uint8_t b);
 
+/* End a forced colour: the LED shows again what its mode says -- the status
+   colour, or the last colour set in IO mode. */
+void led_force_release(void);
+
 /* Status mode API — only active when led_mode == LED_MODE_STATUS.
    Call from network / MQTT event handlers in main.c. */
 void led_status_set_network(bool up);   /* true once WiFi or ETH gets an IP */

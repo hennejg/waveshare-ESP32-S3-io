@@ -8,7 +8,13 @@
   <style>
     *, *::before, *::after { box-sizing: border-box; }
     body { font-family: system-ui, sans-serif; max-width: 560px; margin: 2rem auto; padding: 0 1rem; color: #222; }
-    h1 { font-size: 1.3rem; margin: 0 0 .9rem; }
+    h1 { font-size: 1.3rem; margin: 0 0 .9rem; display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+    /* Which firmware this is: the two look alike, and the device name
+       replaces the title once the configuration is loaded. */
+    .fw-badge { font-size: .7rem; font-weight: 600; letter-spacing: .02em; padding: .15rem .5rem;
+                border-radius: 999px; color: #fff; white-space: nowrap; }
+    .fw-badge.full   { background: #2f6f9f; }
+    .fw-badge.matter { background: #7b4fa3; }
     h2 { font-size: .95rem; color: #555; border-bottom: 1px solid #e8e8e8; padding-bottom: .25rem; margin: 1.5rem 0 .6rem; }
     label { display: block; margin-top: 1rem; font-size: 0.85rem; font-weight: 600; color: #555; }
     input[type="text"], input[type="password"] {
@@ -24,6 +30,29 @@
     th { font-weight: 600; color: #555; }
     td:last-child { text-align: center; }
     .hint { font-size: 0.78rem; color: #888; margin-top: 0.25rem; }
+
+    /* Modbus-Master-Liste: ein Block je Eintrag statt einer Tabelle. Die
+       Tabelle brauchte 52rem, der Seitenkoerper ist 560px breit -- sie liess
+       sich nur seitlich scrollen. Das Raster bricht stattdessen um. Ein
+       Eintrag ohne Haken bei "Poll" zeigt nur seine Kopfzeile: der Haken
+       schaltet die Abfrage und klappt die Einstellungen auf und zu. */
+    .mbm-entry { border:1px solid #e8e8e8; border-radius:4px; padding:.45rem .55rem; margin-top:.45rem; }
+    .mbm-entry.off { background:#fafafa; }
+    .mbm-head { display:flex; align-items:center; gap:.5rem; }
+    .mbm-head input[type="text"] { margin-top:0; padding:.3rem .45rem; font-size:.9rem;
+                                   flex:1 1 8rem; min-width:0; }
+    .mbm-stat { flex:1 1 7rem; text-align:right; font-size:.75rem; color:#888;
+                white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .mbm-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(6.5rem,1fr));
+                gap:.35rem .5rem; margin-top:.45rem; }
+    .mbm-entry.off .mbm-grid { display:none; }
+    .mbm-poll { display:flex; align-items:center; gap:.25rem; margin:0; font-size:.75rem;
+                font-weight:600; color:#555; white-space:nowrap; cursor:pointer; }
+    .mbm-poll input { margin:0; }
+    .mbm-entry.off .mbm-poll { color:#999; }
+    .mbm-f { margin-top:0; font-size:.7rem; font-weight:600; color:#777; text-transform:uppercase; }
+    .mbm-f input, .mbm-f select { width:100%; margin-top:.1rem; padding:.3rem .4rem; font-size:.85rem; }
+    .mbm-f input[type="checkbox"] { width:auto; margin-top:.35rem; }
     button {
       padding: 0.6rem 1.6rem; margin-top: 0;
       background: #1a73e8; color: #fff; border: none; border-radius: 4px;
@@ -136,7 +165,7 @@
     </div>
   </div>
 
-  <h1 id="page-title">Device Configuration</h1>
+  <h1><span id="page-title">Device Configuration</span><span id="fw-badge" class="fw-badge full" title="Firmware variant">Full firmware</span></h1>
 
   <nav class="tab-bar">
     <button type="button" class="tab-btn" data-tab="device"  onclick="switchTab('device')">Device</button>
@@ -181,6 +210,23 @@
         <button type="button" onclick="testBuzzer()">Beep</button>
       </div>
 
+      <div id="aux-dev" style="display:none">
+        <h2>Header pads IO1 / RXD / TXD</h2>
+        <p class="hint err">Not isolated: 0–3.3 V logic levels only, no protection. Condition every signal externally.</p>
+        <p class="hint err">An output or PWM output is only under control while the firmware runs. Switching such a
+          pad to another mode does not switch its load off — the input pull-up, or on RXD/TXD the UART's idle level,
+          pulls it high: switch the output off (duty cycle 0) instead. TXD carries the boot log at every reset and
+          while flashing, so a load on it is driven then too; prefer IO1 or RXD, and give the driver input a
+          pull-down.</p>
+        <p class="hint">Digital input and analog input appear on the Inputs tab, digital output and PWM output on the
+          Outputs tab; a pad in its standard function appears on neither.</p>
+        <table>
+          <thead><tr><th>Pad</th><th>Mode</th></tr></thead>
+          <tbody id="aux-table"></tbody>
+        </table>
+        <p class="hint">Applies on Save, no reboot. A digital output starts off.</p>
+      </div>
+
       <div id="network-mode" style="display:none;margin-top:1.5rem;border-top:1px solid #ccc;padding-top:1rem;font-size:.9rem;color:#555">
         <h2 style="margin:0 0 .5rem">Network Mode</h2>
         <p id="network-mode-msg"></p>
@@ -213,7 +259,7 @@
         <thead><tr><th>Input</th><th>Name</th><th>Invert</th></tr></thead>
         <tbody id="di-table"></tbody>
       </table>
-      <p class="hint">Name: used as MQTT topic fragment instead of the number (max 20 chars, no <code>/</code>, unique). Invert: checked = active-low (GPIO low → <code>true</code>).</p>
+      <p class="hint">Name: used as MQTT topic fragment instead of the number (max 20 chars, no <code>/ + #</code>, not <code>set</code> or <code>read</code>, unique including the numbers of unnamed channels). Invert: checked = active-low (GPIO low → <code>true</code>).</p>
       <div id="di-grid" class="io-grid" style="margin-top:.6rem"></div>
     </div>
 
@@ -225,6 +271,15 @@
       </table>
       <p class="hint">Name: used as MQTT topic fragment. Invert: checked = physical bit flipped relative to logical state.</p>
       <div id="do-grid" class="io-grid" style="margin-top:.6rem"></div>
+      <div id="aux-pwm-box" style="display:none">
+        <h2>PWM outputs — header pads, not isolated</h2>
+        <table>
+          <thead><tr><th>Pad</th><th>Frequency (Hz)</th><th>Duty cycle (%)</th></tr></thead>
+          <tbody id="aux-pwm-table"></tbody>
+        </table>
+        <p class="hint">5 Hz – 1 MHz, duty cycle in 0.1 % steps. These are the values the pad starts with; Modbus, MQTT and rules can change them while it runs. A 3.3 V logic signal of a few mA — drive a MOSFET or a driver from it, never a load.</p>
+        <div id="aux-pwm-live" class="hint"></div>
+      </div>
     </div>
 
     <!-- ── CAN Bus / NMEA2000 ── -->
@@ -264,10 +319,18 @@
     <!-- ── Modbus ── -->
     <div id="tab-modbus" class="tab-pane">
       <label style="display:flex;align-items:center;gap:.5rem;font-weight:600;color:#555;margin-top:1rem">
-        <input type="checkbox" id="mb_enable"> Enable Modbus RTU server
+        <input type="checkbox" id="mb_enable" onchange="updateModbusFields()"> Enable Modbus
       </label>
-      <p class="hint">RS485 on GPIO17/18. Changes take effect after reboot.</p>
-      <label>Slave Address (1–247)
+      <p class="hint">Changes take effect after reboot.</p>
+
+      <h2 style="margin-top:1rem">RS485 (GPIO17/18)</h2>
+      <label>This device is
+        <select id="mb_role" onchange="updateModbusFields()">
+          <option value="slave">a slave — it answers requests addressed to it</option>
+          <option value="master">the master — it reads the devices on the segment</option>
+        </select>
+      </label>
+      <label id="mb_address_row">Slave Address (1–247)
         <input type="number" id="mb_address" min="1" max="247" value="1">
       </label>
       <label>Baudrate
@@ -279,6 +342,42 @@
           <option value="115200">115200</option>
         </select>
       </label>
+
+      <label id="mb_tout_row">Response timeout of the devices on the segment (ms)
+        <input type="number" id="mb_tout" min="50" max="10000" step="50" value="1000">
+      </label>
+      <p class="hint" id="mb_tout_hint">How long a device may take to answer before it is
+      reported as not responding. The Modbus serial specification leaves this to the
+      application and calls 1 s to several seconds typical at 9600 baud; lower it only for a
+      segment you know is faster.</p>
+
+      <h2 style="margin-top:1.5rem">Modbus TCP (port 502)</h2>
+      <label style="display:flex;align-items:center;gap:.5rem;font-weight:600;color:#555">
+        <input type="checkbox" id="mb_tcp_server" onchange="updateModbusFields()"> Answer Modbus TCP
+      </label>
+      <p class="hint" style="color:#a33">Modbus TCP has no password. Anything that can reach this
+      device can read its inputs and switch its outputs — and, with RS485 set to master, everything
+      on the RS485 segment as well. Only enable it on a network you control.</p>
+      <label>This device answers unit ID
+        <input type="number" id="mb_tcp_uid" min="1" max="247" value="247" oninput="updateModbusFields()">
+      </label>
+      <label style="display:flex;align-items:center;gap:.5rem;font-weight:600;color:#555">
+        <input type="checkbox" id="mb_gateway" onchange="updateModbusFields()"> Gateway: forward every other unit ID to RS485
+      </label>
+      <p class="hint" id="mb_gateway_off_hint">Needs RS485 set to master and Modbus TCP answered.</p>
+      <p class="hint" id="mb_tcp_hint"></p>
+
+      <h2 style="margin-top:1.5rem">Read other Modbus devices</h2>
+      <p class="hint">Each row is one value this device fetches by itself. It is published on
+      MQTT as <code>modbus/&lt;name&gt;</code> and is readable in a rule as
+      <code>mqtt('modbus/&lt;name&gt;')</code> — that works even with no broker configured.
+      Reading only; nothing is ever written to the other device. A row reads a device on the
+      network (host and port) or on RS485 — the latter needs RS485 set to master above, with or
+      without the gateway. Rows take effect on save without a reboot.</p>
+      <div id="mbm_rows"></div>
+      <p class="hint">The register number is the zero-based one from the device's manual — the
+      same number a Modbus master would put on the wire, not the 4xxxx form. If a 32-bit value
+      comes out as nonsense, the device most likely uses the other word order: tick Swap.</p>
     </div>
 
     <!-- ── Time (SNTP / RTC) ── -->
@@ -392,6 +491,31 @@ rule('my-rule')
   <p id="fw-version" style="font-size:.75rem;color:#bbb;margin-top:1.5rem;text-align:right"></p>
 
   <script>
+    /* ---- Modbus master status poll ----
+       Declared here because switchTab() below drives it from page setup on. */
+    let mbmPollTimer  = null;
+    let mbmPollActive = false;
+
+    function startMbmPoll() {
+      if (mbmPollActive) return;
+      mbmPollActive = true;
+      refreshMbmStatus();          // so the table is not left on its dashes
+      scheduleMbmPoll();
+    }
+
+    function scheduleMbmPoll() {
+      mbmPollTimer = setTimeout(async () => {
+        if (!mbmPollActive) return;
+        await refreshMbmStatus();
+        if (mbmPollActive) scheduleMbmPoll();
+      }, 5000);
+    }
+
+    function stopMbmPoll() {
+      mbmPollActive = false;
+      if (mbmPollTimer) { clearTimeout(mbmPollTimer); mbmPollTimer = null; }
+    }
+
     /* ---- Tab switching ---- */
     function switchTab(name) {
       document.querySelectorAll('.tab-btn').forEach(b =>
@@ -400,6 +524,7 @@ rule('my-rule')
         p.classList.toggle('active', p.id === 'tab-' + name));
       try { localStorage.setItem('active_tab', name); } catch (_) {}
       if (name === 'rules') loadRules();
+      if (name === 'modbus') startMbmPoll(); else stopMbmPoll();
     }
 
     (function initTabs() {
@@ -418,15 +543,39 @@ rule('my-rule')
     let pollTimer    = null;
     let countdown    = 30;
 
+    /* HTTP Basic carries bytes; the device stores the password as UTF-8.
+       btoa() alone takes Latin-1: "ä" went out as one byte that matched
+       nothing, and "€" made it throw -- either way no login. */
+    function basicAuth(pw) {
+      const bytes = new TextEncoder().encode(':' + pw);
+      let bin = '';
+      for (const b of bytes) bin += String.fromCharCode(b);
+      return 'Basic ' + btoa(bin);
+    }
+
+    /* What a refused request says. The device answers in JSON or in plain
+       text depending on the handler; r.json() alone threw on the plain-text
+       ones ("password too long", "Invalid JSON") and the reason was lost. */
+    async function responseError(r) {
+      const t = await r.text();
+      try { const d = JSON.parse(t); return d.error || d.message || d.detail || t; }
+      catch (_) { return t.replace(/<[^>]*>/g, ' ').trim() || ('HTTP ' + r.status); }
+    }
+
     function authHeaders() {
       if (!authPassword) return {};
-      return { 'Authorization': 'Basic ' + btoa(':' + authPassword) };
+      return { 'Authorization': basicAuth(authPassword) };
     }
 
     async function apiFetch(url, opts = {}) {
       opts.headers = { ...(opts.headers || {}), ...authHeaders() };
       const r = await fetch(url, opts);
-      if (r.status === 401) { showLogin(); throw new Error('unauthorized'); }
+      if (r.status === 401 || r.status === 403) {
+        // 403 before the first password is set, 401 with a wrong one;
+        // initAuth() asks the device which and shows the matching screen.
+        initAuth();
+        throw new Error('unauthorized');
+      }
       return r;
     }
 
@@ -437,6 +586,7 @@ rule('my-rule')
 
     function showOverlay(screen) {
       stopIoPoll();
+      stopMbmPoll();
       document.getElementById('auth-overlay').style.display = 'flex';
       showScreen(screen);
     }
@@ -463,6 +613,14 @@ rule('my-rule')
       document.getElementById('auth-begin-btn').disabled = true;
       try {
         const r = await fetch('/api/auth/begin', { method: 'POST' });
+        /* One setup can be pending at a time, and whoever started it gets
+           the token when BOOT is pressed. A 409 here means someone else's
+           is pending -- possibly another machine on the network waiting for
+           exactly that press. */
+        if (r.status === 409)
+          throw new Error('Another setup request is already pending on the device, not started from this page. ' +
+                          'Do NOT press BOOT now: the password would be set by whoever started it. ' +
+                          'Wait 30 s and try again; if this keeps happening, someone on the network is trying to take over the device.');
         if (!r.ok) throw new Error('Failed (' + r.status + ')');
         const d = await r.json();
         startPolling(d.session);
@@ -508,7 +666,6 @@ rule('my-rule')
 
     function cancelSetup() {
       stopPolling();
-      fetch('/api/auth/token?s=cancel');  /* let server timeout naturally */
       showScreen('auth-no-pw');
       document.getElementById('auth-begin-btn').disabled = false;
     }
@@ -526,7 +683,7 @@ rule('my-rule')
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ token: authToken, password: p1 }),
         });
-        if (!r.ok) { const d = await r.json(); err.textContent = d.error || 'Error'; return; }
+        if (!r.ok) { err.textContent = await responseError(r); return; }
         authPassword = p1;
         sessionStorage.setItem('auth_pw', p1);
         authToken = '';
@@ -540,7 +697,7 @@ rule('my-rule')
       const err = document.getElementById('auth-login-err');
       err.textContent = '';
       const r = await fetch('/api/config', {
-        headers: { 'Authorization': 'Basic ' + btoa(':' + pw) }
+        headers: { 'Authorization': basicAuth(pw) }
       });
       if (r.ok) {
         authPassword = pw;
@@ -563,7 +720,21 @@ rule('my-rule')
     const AUX_GPIO = [1, 44, 43];
     /* Silkscreen names of the same three pads, in channel order. */
     const AUX_PAD  = ['IO1', 'RXD', 'TXD'];
+    /* What each pad does in its standard function, and how a mode reads. */
+    const AUX_STD  = ['unused', 'UART0 RX', 'UART0 TX (console)'];
+    const AUX_MODE_LABEL = { input: 'Digital input', output: 'Digital output', pwm: 'PWM output',
+                             analog: 'Analog input (0–3.1 V)' };
+    const AUX_NOTE = { standard: 'standard function', input: 'digital input', output: 'digital output',
+                       pwm: 'PWM output', analog: 'analog input' };
+    const AUX_HEAD_OUT = 'Direct GPIO outputs — not isolated';
+    /* Which tab a pad belongs on in each mode; standard is on neither. */
+    const AUX_ON_INPUTS  = m => m === 'input' || m === 'analog';
+    const AUX_ON_OUTPUTS = m => m === 'output' || m === 'pwm';
     const AUX_HEAD = 'Direct GPIO inputs — not isolated';
+    const AUX_TXD  = 'TXD (GPIO43) is UART0 TX: from every reset until the firmware has started, and all the time ' +
+                     'while flashing, it is driven with the boot log. As an input, wire it through a series resistor ' +
+                     'of at least 1 kΩ; as an output or PWM output, expect the load to see that traffic.';
+    let aux = null;     /* cfg.aux from /api/config; null = firmware without the switch */
     const AUX_WARN = 'No optocoupler, no protection: 0–3.3 V logic levels only. ' +
                      'A field voltage destroys the MCU — condition these signals externally.';
     let diCount    = 8;
@@ -593,17 +764,110 @@ rule('my-rule')
       for (let i = 0; i < diCount; i++) {
         if (i === diIsolated) {
           diTbl.insertAdjacentHTML('beforeend',
-            `<tr class="aux-sep"><td colspan="3"><strong>${AUX_HEAD}</strong>` +
+            `<tr class="aux-sep" id="aux-sep-in"><td colspan="3"><strong>${AUX_HEAD}</strong>` +
             `<div class="hint err">${AUX_WARN}</div></td></tr>`);
         }
         const pin = auxPin(i);
+        const a   = i - diIsolated;
+        /* A pad is listed here only while it is an input (Device tab);
+           as an analog input it has no name or invert, just a note. */
+        const note = (a >= 0 && Array.isArray(aux) && aux[a])
+          ? `<br><span class="hint" id="aux_${a}_note"></span>` : '';
         const tr = document.createElement('tr');
+        tr.id = `di_${i}_row`;
         tr.innerHTML =
-          `<td>${diLabel(i)}${pin === undefined ? '' : ` <span class="hint">${pin}</span>`}</td>` +
+          `<td>${diLabel(i)}${pin === undefined ? '' : ` <span class="hint">${pin}</span>`}${note}</td>` +
           `<td><input type="text" id="di_${i}_name" maxlength="20" style="width:9rem"></td>` +
           `<td style="text-align:center"><input type="checkbox" id="di_${i}_invert"></td>`;
         diTbl.appendChild(tr);
       }
+      buildAuxRows();
+    }
+
+    /* The pads' roles on the Device tab, their PWM settings on the Outputs
+       tab. Both built from cfg.aux, which also says which modes a pad has. */
+    function buildAuxRows() {
+      const dev = document.getElementById('aux-dev');
+      const box = document.getElementById('aux-pwm-box');
+      const tb  = document.getElementById('aux-table');
+      const pt  = document.getElementById('aux-pwm-table');
+      if (!Array.isArray(aux) || !aux.length) { dev.style.display = 'none'; box.style.display = 'none'; return; }
+      dev.style.display = '';
+      tb.innerHTML = ''; pt.innerHTML = '';
+      doutTbl.querySelectorAll('.aux-out').forEach(e => e.remove());
+      doutTbl.insertAdjacentHTML('beforeend',
+        `<tr class="aux-sep aux-out" id="aux-sep-out"><td colspan="3"><strong>${AUX_HEAD_OUT}</strong>` +
+        `<div class="hint err">${AUX_WARN}</div></td></tr>`);
+      aux.forEach((p, a) => {
+        const opts = (p.modes || ['standard']).map(m =>
+          `<option value="${esc(m)}">${m === 'standard'
+             ? `Standard: ${AUX_STD[a] ?? 'standard function'}` : (AUX_MODE_LABEL[m] ?? esc(m))}</option>`).join('');
+        tb.insertAdjacentHTML('beforeend',
+          `<tr><td>${AUX_PAD[a] ?? a + 1} <span class="hint">GPIO${AUX_GPIO[a] ?? '?'}</span></td>` +
+          `<td><select id="aux_${a}_mode" onchange="auxModeChanged()">${opts}</select>` +
+          (AUX_PAD[a] === 'TXD' ? `<div class="hint err">${AUX_TXD}</div>` : '') + `</td></tr>`);
+        pt.insertAdjacentHTML('beforeend',
+          `<tr id="aux_${a}_pwmrow"><td>${AUX_PAD[a] ?? a + 1} <span class="hint">GPIO${AUX_GPIO[a] ?? '?'}</span></td>` +
+          `<td><input type="number" id="aux_${a}_freq" min="5" max="1000000" step="1" style="width:7rem"></td>` +
+          `<td><input type="number" id="aux_${a}_duty" min="0" max="100" step="0.1" style="width:5rem"></td></tr>`);
+        doutTbl.insertAdjacentHTML('beforeend',
+          `<tr class="aux-out" id="auxo_${a}_row"><td>DO${8 + a + 1} <span class="hint">${AUX_PAD[a] ?? a + 1} \u00b7 GPIO${AUX_GPIO[a] ?? '?'}</span></td>` +
+          `<td><input type="text" id="auxo_${a}_name" maxlength="20" style="width:9rem"></td>` +
+          `<td style="text-align:center"><input type="checkbox" id="auxo_${a}_invert"></td></tr>`);
+        document.getElementById(`aux_${a}_mode`).value = p.mode ?? 'standard';
+        document.getElementById(`aux_${a}_freq`).value = p.pwm_freq ?? 1000;
+        document.getElementById(`aux_${a}_duty`).value = p.pwm_duty ?? 0;
+        document.getElementById(`auxo_${a}_name`).value = p.out_name ?? '';
+        document.getElementById(`auxo_${a}_invert`).checked = !!p.out_invert;
+      });
+      auxModeChanged();
+    }
+
+    /* The first PWM field that would be refused, or null. */
+    function auxCheck() {
+      if (!Array.isArray(aux)) return null;
+      for (let a = 0; a < aux.length; a++) {
+        if (document.getElementById(`aux_${a}_mode`)?.value !== 'pwm') continue;
+        const pad = AUX_PAD[a] ?? a + 1;
+        const f = document.getElementById(`aux_${a}_freq`);
+        const fv = Number(f.value);
+        if (f.value === '' || !Number.isInteger(fv) || fv < 5 || fv > 1000000)
+          return { el: f, msg: `${pad}: the PWM frequency must be a whole number of Hz from 5 to 1000000.` };
+        const d = document.getElementById(`aux_${a}_duty`);
+        const dv = Number(d.value);
+        if (d.value === '' || !(dv >= 0 && dv <= 100))
+          return { el: d, msg: `${pad}: the duty cycle must be a percentage from 0 to 100.` };
+      }
+      return null;
+    }
+
+    /* Follows the mode selects before they are saved: the PWM rows on the
+       Outputs tab and the notes on the Inputs tab show what the form says. */
+    function auxModeChanged() {
+      if (!Array.isArray(aux)) return;
+      let anyPwm = false, anyIn = false, anyOut = false;
+      const show = (id, on) => { const e = document.getElementById(id); if (e) e.style.display = on ? '' : 'none'; };
+      aux.forEach((_, a) => {
+        const m = document.getElementById(`aux_${a}_mode`)?.value ?? 'standard';
+        const i = diIsolated + a;
+        /* Inputs tab: input and analog pads; analog without name and invert. */
+        show(`di_${i}_row`, AUX_ON_INPUTS(m));
+        for (const id of [`di_${i}_name`, `di_${i}_invert`]) {
+          const e = document.getElementById(id);
+          if (e) e.style.visibility = m === 'analog' ? 'hidden' : '';
+        }
+        const note = document.getElementById(`aux_${a}_note`);
+        if (note) note.textContent = m === 'analog' ? 'analog input — the reading is shown below' : '';
+        /* Outputs tab: output pads in the table, PWM pads in the PWM table. */
+        show(`auxo_${a}_row`, m === 'output');
+        show(`aux_${a}_pwmrow`, m === 'pwm');
+        anyIn  ||= AUX_ON_INPUTS(m);
+        anyOut ||= m === 'output';
+        anyPwm ||= m === 'pwm';
+      });
+      show('aux-sep-in', anyIn);
+      show('aux-sep-out', anyOut);
+      show('aux-pwm-box', anyPwm);
     }
     buildDiRows();
 
@@ -614,6 +878,7 @@ rule('my-rule')
       diCount    = (cfg.di ?? []).length || 8;
       diIsolated = Number.isInteger(cfg.di_isolated)
                    ? Math.min(cfg.di_isolated, diCount) : 0;
+      aux        = Array.isArray(cfg.aux) ? cfg.aux : null;
       buildDiRows();
     }
 
@@ -627,6 +892,7 @@ rule('my-rule')
     }
 
     async function load() {
+      loadVersion();   /* behind the login like every other endpoint */
       try {
         const r = await apiFetch('/api/config');
         if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -648,11 +914,29 @@ rule('my-rule')
           document.getElementById('can_tx_interval').value  = cfg.can.tx_interval_ms ?? 1000;
           updateCanFields();
         }
+        // Before anything is painted, not after: updateModbusFields() runs
+        // inside the block below and would otherwise apply a snapshot taken
+        // before this load -- turning Modbus TCP off from a value the user
+        // never chose, on the next switch back to slave.
         if (cfg.modbus) {
           document.getElementById('mb_enable').checked  = !!cfg.modbus.enable;
           document.getElementById('mb_address').value   = cfg.modbus.address  ?? 1;
           document.getElementById('mb_baudrate').value  = cfg.modbus.baudrate ?? 9600;
+          document.getElementById('mb_role').value      = cfg.modbus.rs485_role ?? 'slave';
+          document.getElementById('mb_tcp_server').checked = !!cfg.modbus.tcp_server;
+          document.getElementById('mb_gateway').checked    = !!cfg.modbus.gateway;
+          document.getElementById('mb_tcp_uid').value   = cfg.modbus.tcp_uid ?? 247;
+          document.getElementById('mb_tout').value      = cfg.modbus.rs485_tout_ms ?? 1000;
+          updateModbusFields();
         }
+        // The snapshot belongs to one sequence of clicks. Carried across a
+        // reload it would restore a state two page loads old -- switching the
+        // role to master and back would then turn Modbus TCP off behind the
+        // user, from a value they never chose.
+        renderMbm(cfg.mbm);
+        /* Only worth an HTTP round trip while the Modbus tab is on screen. */
+        if (document.getElementById('tab-modbus').classList.contains('active'))
+          startMbmPoll();
         if (cfg.sntp) {
           document.getElementById('sntp_enable').checked = !!cfg.sntp.enable;
           document.getElementById('sntp_server').value   = cfg.sntp.server ?? '';
@@ -717,6 +1001,17 @@ rule('my-rule')
         status.textContent = 'Device name is required.';
         return;
       }
+      /* PWM values are checked here, where the field can be pointed at: the
+         form is novalidate, and an emptied or unparsable number field reads
+         as '' -- which Number() would have turned into 0 % or 0 Hz. */
+      const auxBad = auxCheck();
+      if (auxBad) {
+        switchTab('outputs');
+        auxBad.el.focus();
+        status.className = 'err';
+        status.textContent = auxBad.msg;
+        return;
+      }
       btn.disabled = true;
       status.textContent = '';
       try {
@@ -749,10 +1044,17 @@ rule('my-rule')
             tx_interval_ms: parseInt(document.getElementById('can_tx_interval').value, 10),
           },
           modbus: {
-            enable:   document.getElementById('mb_enable').checked,
-            address:  parseInt(document.getElementById('mb_address').value, 10),
-            baudrate: parseInt(document.getElementById('mb_baudrate').value, 10),
+            enable:     document.getElementById('mb_enable').checked,
+            address:    parseInt(document.getElementById('mb_address').value, 10),
+            baudrate:   parseInt(document.getElementById('mb_baudrate').value, 10),
+            rs485_role: document.getElementById('mb_role').value,
+            tcp_server: document.getElementById('mb_tcp_server').checked,
+            gateway:    document.getElementById('mb_gateway').checked
+                        && !document.getElementById('mb_gateway').disabled,
+            tcp_uid:    parseInt(document.getElementById('mb_tcp_uid').value, 10),
+            rs485_tout_ms: parseInt(document.getElementById('mb_tout').value, 10),
           },
+          mbm: collectMbm(),
           sntp: {
             enable: document.getElementById('sntp_enable').checked,
             server: document.getElementById('sntp_server').value.trim(),
@@ -761,11 +1063,34 @@ rule('my-rule')
           di,
           dout,
         };
+        /* PWM values only for a pad set to PWM: a hidden row's leftover value
+           must not get the whole save refused. */
+        if (Array.isArray(aux))
+          cfg.aux = aux.map((_, a) => {
+            const mode = document.getElementById(`aux_${a}_mode`).value;
+            if (mode === 'output') return {
+              mode,
+              out_name:   document.getElementById(`auxo_${a}_name`).value.trim(),
+              out_invert: document.getElementById(`auxo_${a}_invert`).checked,
+            };
+            return mode !== 'pwm' ? { mode } : {
+              mode,
+              pwm_freq: Number(document.getElementById(`aux_${a}_freq`).value),
+              pwm_duty: Number(document.getElementById(`aux_${a}_duty`).value),
+            };
+          });
         const r = await apiFetch('/api/config', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(cfg),
         });
+        if (!r.ok) {
+          // The device explains itself in a plain-text body; without this the
+          // JSON parse below throws and the explanation is thrown away, so a
+          // refused name or an oversized body reads as a script error.
+          const why = (await r.text()).replace(/<[^>]*>/g, ' ').trim();
+          throw new Error(why || ('HTTP ' + r.status));
+        }
         const res = await r.json();
         if (res.status === 'ok') {
           status.className = 'ok';
@@ -792,6 +1117,177 @@ rule('my-rule')
     updateCanFields();
 
     /* ── Timezone select / custom field ── */
+    // Keeps the Modbus tab honest: the firmware refuses a master with no TCP
+    // server, and a local unit ID below 247 that would shadow a real device on
+    // the segment. Rather than let someone fill in a form that will be
+    // rejected, the fields that cannot apply are taken away.
+    // ── Modbus TCP master table ───────────────────────────────────────────────
+    // Eight fixed rows rather than add/remove buttons: the firmware stores a
+    // fixed-size table anyway, and a row left empty costs nothing.
+    const MBM_ROWS  = 8;
+    const MBM_TYPES = [['u16','u16'], ['s16','s16'], ['u32','u32'],
+                       ['s32','s32'], ['f32','float32']];
+
+    function _mbmF(label, html) {
+      return '<label class="mbm-f">' + label + html + '</label>';
+    }
+
+    /* Ein Eintrag, den niemand angefasst hat, klappt auf seine Kopfzeile zu --
+       acht volle Bloecke waeren sonst fast nur Leerformular. */
+    /* The Poll checkbox switches the row's polling and opens or closes its
+       settings with it: a row that is not polled shows only its header. */
+    function mbmToggle(i) {
+      var row = document.getElementById('mbm_row_' + i);
+      row.classList.toggle('off', !document.getElementById('mbm_en_' + i).checked);
+      // A device on RS485 has no host or port: the unit ID is its address.
+      var rtu = document.getElementById('mbm_tr_' + i).value === 'rtu';
+      document.getElementById('mbm_host_' + i).disabled = rtu;
+      document.getElementById('mbm_port_' + i).disabled = rtu;
+    }
+
+    // The Matter type of each row is set in the Matter firmware's page. Kept
+    // here as it came, so that saving from this page does not clear it.
+    var mbmMatter = [];
+
+    function renderMbm(list) {
+      list = list || [];
+      mbmMatter = list.map(function (e) { return (e && e.matter) || 'none'; });
+      var box = document.getElementById('mbm_rows');
+      box.innerHTML = '';
+      for (var i = 0; i < MBM_ROWS; i++) {
+        var e = list[i] || {};
+        var opts = MBM_TYPES.map(function (t) {
+          return '<option value="' + t[0] + '"' +
+                 ((e.type || 'u16') === t[0] ? ' selected' : '') + '>' + t[1] + '</option>';
+        }).join('');
+        var d = document.createElement('div');
+        d.className = 'mbm-entry';
+        d.id = 'mbm_row_' + i;
+        d.innerHTML =
+          '<div class="mbm-head">' +
+            '<label class="mbm-poll" title="Poll this value; the settings open while it is on">' +
+              '<input type="checkbox" id="mbm_en_' + i + '"' + (e.enable ? ' checked' : '') +
+                     ' onchange="mbmToggle(' + i + ')">Poll</label>' +
+            '<input type="text" id="mbm_name_' + i + '" maxlength="20" ' +
+                   'placeholder="name — row ' + (i + 1) + '" oninput="mbmToggle(' + i + ')">' +
+            '<span class="mbm-stat" id="mbm_stat_' + i + '">\u2014</span>' +
+          '</div>' +
+          '<div class="mbm-grid">' +
+            _mbmF('On', '<select id="mbm_tr_' + i + '" onchange="mbmToggle(' + i + ')">' +
+                          '<option value="tcp"' + (e.transport !== 'rtu' ? ' selected' : '') + '>network</option>' +
+                          '<option value="rtu"' + (e.transport === 'rtu' ? ' selected' : '') + '>RS485</option></select>') +
+            _mbmF('Host', '<input type="text" id="mbm_host_' + i + '" maxlength="48" ' +
+                          'oninput="mbmToggle(' + i + ')">') +
+            _mbmF('Port', '<input type="number" id="mbm_port_' + i + '" min="1" max="65535" value="' +
+                          (e.port || 502) + '">') +
+            _mbmF('Unit', '<input type="number" id="mbm_uid_' + i + '" min="1" max="247" value="' +
+                          (e.unit_id || 1) + '">') +
+            _mbmF('Read', '<select id="mbm_fc_' + i + '">' +
+                          '<option value="holding"' + (e.fc !== 'input' ? ' selected' : '') + '>holding</option>' +
+                          '<option value="input"'   + (e.fc === 'input' ? ' selected' : '') + '>input</option></select>') +
+            _mbmF('Register', '<input type="number" id="mbm_reg_' + i + '" min="0" max="65535" value="' +
+                          (e.reg || 0) + '">') +
+            _mbmF('Type', '<select id="mbm_type_' + i + '">' + opts + '</select>') +
+            _mbmF('Swap', '<input type="checkbox" id="mbm_sw_' + i + '"' + (e.word_swap ? ' checked' : '') +
+                          ' title="The two registers of a 32-bit value the other way round (CDAB)">') +
+            _mbmF('Scale', '<input type="number" id="mbm_scale_' + i + '" step="any" ' +
+                          'title="Any non-zero number" value="' + (e.scale != null ? e.scale : 1) + '">') +
+            _mbmF('Every (ms)', '<input type="number" id="mbm_int_' + i + '" min="200" step="100" value="' +
+                          (e.interval_ms || 5000) + '">') +
+          '</div>';
+        box.appendChild(d);
+        // Text fields are filled through .value, never through markup, so a
+        // name or host cannot smuggle HTML into the page.
+        document.getElementById('mbm_name_' + i).value = e.name || '';
+        document.getElementById('mbm_host_' + i).value = e.host || '';
+        mbmToggle(i);
+      }
+    }
+
+    function collectMbm() {
+      var out = [];
+      for (var i = 0; i < MBM_ROWS; i++) {
+        var name = document.getElementById('mbm_name_' + i).value.trim();
+        var host = document.getElementById('mbm_host_' + i).value.trim();
+        var on   = document.getElementById('mbm_en_' + i).checked;
+        // Every row is sent, empty ones included. The device stores the array
+        // by position, so skipping blanks would shift the rows below them up
+        // and the table would come back rearranged.
+        out.push({
+          enable:      on,
+          name:        name,
+          host:        host,
+          transport:   document.getElementById('mbm_tr_' + i).value,
+          port:        parseInt(document.getElementById('mbm_port_'  + i).value, 10),
+          unit_id:     parseInt(document.getElementById('mbm_uid_'   + i).value, 10),
+          fc:          document.getElementById('mbm_fc_' + i).value,
+          reg:         parseInt(document.getElementById('mbm_reg_'   + i).value, 10),
+          type:        document.getElementById('mbm_type_' + i).value,
+          word_swap:   document.getElementById('mbm_sw_' + i).checked,
+          scale:       parseFloat(document.getElementById('mbm_scale_' + i).value),
+          interval_ms: parseInt(document.getElementById('mbm_int_'  + i).value, 10),
+          matter:      mbmMatter[i] || 'none',
+        });
+      }
+      return out;
+    }
+
+    // Shows what each row last actually read, which is the only way to tell a
+    // wrong register from a device that is not answering.
+    function refreshMbmStatus() {
+      return apiFetch('/api/modbus/status').then(function (r) {
+        return r.ok ? r.json() : null;
+      }).then(function (d) {
+        if (!d || !d.tcp_master) return;
+        d.tcp_master.forEach(function (m, i) {
+          var cell = document.getElementById('mbm_stat_' + i);
+          if (!cell) return;
+          if (!m.enabled)            cell.textContent = '—';
+          else if (m.last_error)     cell.textContent = m.last_error;
+          else if (m.value == null)  cell.textContent = 'waiting…';
+          else cell.textContent = m.value + '  (' + Math.round(m.age_ms / 1000) + ' s ago)';
+        });
+      }).catch(function () { /* the page is still usable without it */ });
+    }
+
+
+    function updateModbusFields() {
+      const on     = document.getElementById('mb_enable').checked;
+      const master = document.getElementById('mb_role').value === 'master';
+      const tcp    = document.getElementById('mb_tcp_server');
+      const uid    = document.getElementById('mb_tcp_uid');
+
+      for (const id of ['mb_role', 'mb_address', 'mb_baudrate', 'mb_tcp_server',
+                        'mb_tcp_uid', 'mb_tout'])
+        document.getElementById(id).disabled = !on;
+
+      // Only the master waits for anybody.
+      document.getElementById('mb_tout_row').style.display  = master ? '' : 'none';
+      document.getElementById('mb_tout_hint').style.display = master ? '' : 'none';
+
+      // As a master the device has no address of its own on the segment.
+      document.getElementById('mb_address_row').style.display = master ? 'none' : '';
+
+      /* Master and gateway are separate: the master reads the RS485 rows of
+         the table below by itself; the gateway additionally forwards Modbus TCP
+         requests for other unit IDs, and needs both the master and the TCP
+         server. The unit ID stays editable in every mode. */
+      const gw = document.getElementById('mb_gateway');
+      gw.disabled = !(on && master && tcp.checked);
+      document.getElementById('mb_gateway_off_hint').style.display = gw.disabled ? '' : 'none';
+      uid.disabled = !(on && tcp.checked);
+      const fwd = gw.checked && !gw.disabled;
+      const u   = parseInt(uid.value, 10) || 247;
+      document.getElementById('mb_tcp_hint').textContent = fwd
+        ? `Unit ID ${u} reaches this device\u2019s own inputs and outputs. Every other unit ID is `
+          + 'forwarded to that address on RS485; a device that does not answer gives exception 0x0B. '
+          + `A device on RS485 with address ${u} cannot be reached through the gateway`
+          + (u === 247 ? ' — 247 is the highest address and the least likely to be taken.' : '; 247 avoids that best.')
+        : 'Only this unit ID is answered. Unit IDs 0 and 255 reach this device as well, since a '
+          + 'client with nothing to address sends one of them. Any other gives exception 0x0A, '
+          + 'because nothing is forwarded to RS485.';
+    }
+
     function updateTzFields() {
       const isCustom = document.getElementById('tz_select').value === '__custom__';
       document.getElementById('tz_custom_wrap').style.display = isCustom ? '' : 'none';
@@ -921,7 +1417,16 @@ rule('my-rule')
         '  • IO names and invert flags\n' +
         '  • Modbus configuration\n\n' +
         'Continue?')) return;
-      try { await apiFetch('/api/factory-reset', { method: 'POST' }); } catch (_) {}
+      /* No answer is fine -- the device may already be going down. A refusal
+         is not: "erase failed, nothing reset" used to be followed by
+         "Resetting…" and "Back online", as if it had worked. */
+      let r = null;
+      try { r = await apiFetch('/api/factory-reset', { method: 'POST' }); } catch (_) {}
+      if (r && !r.ok) {
+        status.className = 'err';
+        status.textContent = 'Factory reset failed: ' + await responseError(r);
+        return;
+      }
       waitForReboot('Resetting to factory defaults…', true);
     });
 
@@ -937,7 +1442,7 @@ rule('my-rule')
       for (let i = 0; i < diCount; i++) {
         if (i === diIsolated) {
           diG.insertAdjacentHTML('beforeend',
-            `<div class="aux-head"><strong>${AUX_HEAD}</strong>` +
+            `<div class="aux-head" id="aux-head-in"><strong>${AUX_HEAD}</strong>` +
             `<div class="hint err">${AUX_WARN}</div></div>`);
         }
         const pin = auxPin(i);
@@ -946,14 +1451,28 @@ rule('my-rule')
                 : pin === undefined ? `${n} — not isolated`
                                     : `${n} — ${pin}, not isolated`;
         diG.insertAdjacentHTML('beforeend',
-          `<div class="io-cell"><span id="di-dot-${i}" class="io-dot" title="${t}"></span>` +
-          `<span class="io-lbl" title="${t}">${n}</span></div>`);
+          `<div class="io-cell" id="di-cell-${i}"><span id="di-dot-${i}" class="io-dot" title="${t}" data-t="${t}"></span>` +
+          `<span class="io-lbl" title="${t}">${n}<span id="aux-val-${i}" class="hint"></span></span></div>`);
       }
       for (let i = 0; i < 8; i++) {
         const n = esc(cfg.dout?.[i]?.name || `DO${i + 1}`);
         doG.insertAdjacentHTML('beforeend',
           `<div class="io-cell"><button type="button" id="do-btn-${i}" class="io-toggle"` +
           ` title="Click to toggle ${n}" onclick="toggleOutput(${i})">${n}</button></div>`);
+      }
+      /* The pads that are outputs, after DO1-DO8, as channels 8-10. Shown
+         while the pad runs as an output; updateIoState() follows changes. */
+      if (Array.isArray(cfg.aux)) {
+        doG.insertAdjacentHTML('beforeend',
+          `<div class="aux-head" id="aux-head-out" style="display:none"><strong>${AUX_HEAD_OUT}</strong></div>`);
+        cfg.aux.forEach((p, a) => {
+          const ch = 8 + a;
+          const n = esc(p.out_name || `DO${ch + 1}`);
+          doG.insertAdjacentHTML('beforeend',
+            `<div class="io-cell" id="do-cell-${ch}" style="display:none"><button type="button" id="do-btn-${ch}"` +
+            ` class="io-toggle" title="Click to toggle ${n} — ${AUX_PAD[a] ?? a + 1}, not isolated"` +
+            ` onclick="toggleOutput(${ch})">${n}</button></div>`);
+        });
       }
     }
 
@@ -983,8 +1502,41 @@ rule('my-rule')
         const d = await r.json();
         (d.di   || []).forEach((v, i) => {
           const el = document.getElementById(`di-dot-${i}`);
-          if (el) el.className = 'io-dot' + (v ? ' on' : '');
+          const p  = (Array.isArray(d.aux) && i >= diIsolated) ? d.aux[i - diIsolated] : undefined;
+          /* A pad is on the Inputs tab only while it runs as an input; as an
+             analog input it shows the reading instead of a level. */
+          if (p) {
+            const cell = document.getElementById(`di-cell-${i}`);
+            if (cell) cell.style.display = AUX_ON_INPUTS(p.mode) ? '' : 'none';
+          }
+          if (el) {
+            el.className = 'io-dot' + (v ? ' on' : '');
+            el.style.visibility = p?.mode === 'analog' ? 'hidden' : '';
+          }
+          const val = document.getElementById(`aux-val-${i}`);
+          if (val) val.textContent = p?.mode === 'analog' && p.mv !== undefined ? ` ${p.mv} mV` : '';
         });
+        if (Array.isArray(d.aux)) {
+          const vis = (id, on) => { const e = document.getElementById(id); if (e) e.style.display = on ? '' : 'none'; };
+          vis('aux-head-in',  d.aux.some(q => AUX_ON_INPUTS(q.mode)));
+          vis('aux-head-out', d.aux.some(q => q.mode === 'output'));
+          d.aux.forEach((q, a) => {
+            const ch = 8 + a;
+            vis(`do-cell-${ch}`, q.mode === 'output');
+            const b = document.getElementById(`do-btn-${ch}`);
+            if (b) b.className = 'io-toggle' + (q.out ? ' on' : '');
+          });
+        }
+        /* What the PWM pads run now, on the Outputs tab: Modbus, MQTT and
+           rules may have changed it since the form was loaded. */
+        const live = document.getElementById('aux-pwm-live');
+        if (live && Array.isArray(d.aux)) {
+          const runs = d.aux.map((q, k) => q.mode !== 'pwm' ? null
+            : `${AUX_PAD[k] ?? k + 1}: ${q.pwm_duty} % at ${q.pwm_freq} Hz` +
+              (q.pwm_freq_actual && q.pwm_freq_actual !== q.pwm_freq ? ` (timer ${q.pwm_freq_actual} Hz)` : '') +
+              `, ${q.pwm_bits} bit`).filter(Boolean);
+          live.textContent = runs.length ? 'Running now — ' + runs.join(' · ') : '';
+        }
         (d.dout || []).forEach((v, i) => {
           const el = document.getElementById(`do-btn-${i}`);
           if (el) el.className = 'io-toggle' + (v ? ' on' : '');
@@ -1052,7 +1604,15 @@ rule('my-rule')
       if (rulesLoaded) return;
       try {
         const r = await apiFetch('/api/rules');
-        if (!r.ok) return;
+        if (!r.ok) {
+          // Never the demo or a stale editor in place of rules that could not be read.
+          let msg = 'HTTP ' + r.status;
+          try { msg = (await r.json()).error || msg; } catch (_) {}
+          const st = document.getElementById('rules-status');
+          st.className = 'err';
+          st.textContent = 'Could not load the stored rules: ' + msg;
+          return;
+        }
         const d = await r.json();
         setRulesText(d.script || '');
         if (rulesCM) rulesCM.refresh();
@@ -1077,12 +1637,24 @@ rule('my-rule')
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ script }),
         });
+        if (!r.ok && r.status !== 202) {
+          st.className = 'err';
+          st.textContent = 'Error: ' + await responseError(r);
+          return;
+        }
         const d = await r.json();
         if (d.status === 'ok') {
           st.className = 'ok';
           st.textContent = successMsg;
           rulesLoaded = false;
           await loadRules();
+        } else if (d.status === 'accepted') {
+          /* 202: the engine has the script and has not ruled on it yet; it
+             stores it once it does. Not an error -- it was shown as one, and
+             invited saving a script that was already on its way in. */
+          st.className = '';
+          st.textContent = 'Accepted — the engine is still checking it. Reload in a moment to see the result.';
+          rulesLoaded = false;
         } else {
           st.className = 'err';
           st.textContent = 'Error: ' + JSON.stringify(d);
@@ -1095,10 +1667,12 @@ rule('my-rule')
 
     function saveRules() {
       const script = rulesText().trim();
-      if (script.length > 3900) {
+      // The device counts bytes of UTF-8: an umlaut is two, not one.
+      const bytes = new TextEncoder().encode(script).length;
+      if (bytes > 3900) {
         const st = document.getElementById('rules-status');
         st.className = 'err';
-        st.textContent = 'Script too long: ' + script.length + ' / 3900 characters.';
+        st.textContent = 'Script too long: ' + bytes + ' / 3900 bytes (UTF-8; umlauts count as 2).';
         return;
       }
       return postRules(script, 'Saved and applied.');
@@ -1111,15 +1685,20 @@ rule('my-rule')
 
     async function loadVersion() {
       try {
-        const r = await fetch('/api/version');
+        const r = await fetch('/api/version', { headers: authHeaders() });
         if (!r.ok) return;
         const v = await r.json();
         document.getElementById('fw-version').textContent =
-          'fw ' + v.version + ' · ' + v.idf + ' · ' + v.date;
+          'fw ' + (v.variant ? v.variant + ' ' : '') + v.version + ' · ' + v.idf + ' · ' + v.date;
+        /* The device's own word over the page's: a web partition left over
+           from the other firmware would otherwise name the wrong one. */
+        if (v.variant === 'full' || v.variant === 'matter') {
+          const b = document.getElementById('fw-badge');
+          b.className = 'fw-badge ' + v.variant;
+          b.textContent = v.variant === 'full' ? 'Full firmware' : 'Matter firmware';
+        }
       } catch (_) {}
     }
-    loadVersion();
-
     initAuth();
 
     /* ---- Matter pairing info ---- */

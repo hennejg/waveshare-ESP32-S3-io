@@ -40,7 +40,9 @@ CONFIG_LWIP_IPV6_NUM_ADDRESSES=6
 CONFIG_LWIP_HOOK_IP6_ROUTE_DEFAULT=y
 CONFIG_LWIP_HOOK_ND6_GET_GW_DEFAULT=y
 
-CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT=20
+# Root + 8 outputs + 8 inputs + 3 header pads + 8 Modbus sensor rows;
+# matter_mbm.cpp checks the sum at compile time.
+CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT=28
 
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 CONFIG_CHIP_TASK_STACK_SIZE=8192
@@ -48,6 +50,8 @@ CONFIG_BT_NIMBLE_TASK_STACK_SIZE=5120
 CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=8192
 
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
+# Lets main/linker.lf put the static data of libCHIP and libesp_matter
+# (about 60 KB) in PSRAM.
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
@@ -63,6 +67,33 @@ CONFIG_ESP_WIFI_NVS_ENABLED=n
 
 # Board driver options — no MQTT/scripting in matter app
 CONFIG_APP_MQTT_ENABLE=n
-CONFIG_APP_SNTP_ENABLE=n
 CONFIG_APP_SCRIPTING_ENABLE=n
 CONFIG_APP_MATTER_ENABLE=y
+
+# Modbus: RTU slave or RS-485 master on RS-485, and the Modbus TCP server.
+# As master the board reads the RS-485 rows of the poll table and reports
+# them on Matter sensor endpoints. No gateway, no Modbus TCP master. Started
+# only once the device is commissioned (main.c). Four TCP clients at a time,
+# a short backlog.
+CONFIG_MB_RS485_MASTER=y
+CONFIG_MB_GATEWAY=n
+CONFIG_MB_TCP_MASTER=n
+CONFIG_MB_TCP_MAX_CONN=4
+CONFIG_MB_TCP_BACKLOG=4
+# The UART driver's ring buffer functions sit in IRAM by default, 2.9 KB of
+# the internal RAM this firmware runs short of. Only the non-ISR ones move;
+# the UART ISR is not in IRAM here (CONFIG_UART_ISR_IN_IRAM is off).
+CONFIG_RINGBUF_PLACE_FUNCTIONS_INTO_FLASH=y
+
+# Sockets: the web server (7 clients + 3), the setup portal (3) and Modbus
+# TCP (listen + 4 + 1 refused) -- apps/matter/main/net_budget.h adds them up
+# and checks the sum at compile time.
+CONFIG_LWIP_MAX_SOCKETS=20
+CONFIG_LWIP_MAX_ACTIVE_TCP=28
+
+# Wi-Fi code in flash instead of internal RAM: 18 KB. Costs Wi-Fi throughput,
+# which Matter control traffic and the setup portal do not need. Nothing here
+# posts events from an ISR.
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+CONFIG_ESP_EVENT_POST_FROM_IRAM_ISR=n
